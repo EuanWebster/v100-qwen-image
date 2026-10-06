@@ -1,0 +1,16 @@
+name: v100-qwen-image
+purpose: Hand-rolled Qwen-Image-2.1 image generation pipeline for a Tesla V100 16GB
+  (fp16/GGUF, engine+CLI, modelled on the LTX-2.5 ROCm build)
+harnesses:
+- claude
+- omp
+- dsh
+- codex
+memory: vault
+network: bridge
+services:
+- dsh-web
+ports:
+- host: 3082
+  container: 3081
+  exposure: tailnet
