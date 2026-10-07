@@ -451,3 +451,22 @@ standing rule that executed plans stay honest.)*
   never mask primaries. `license = "MIT"` removed (none selected); build backend
   pinned `setuptools==84.0.0`; uv lock in sync. 182 CPU tests pass on Python 3.13;
   Python 3.11 execution still outstanding (M0/R7 fresh-env rule).
+- 2026-10-07 task 1.4 (`encoder.py`, commit `8f1bcc4`): worker command is
+  **required** (no default heavy worker at M1) with `{python}/{request}/{response}`
+  placeholders; worker stdio redirects to scratch files (no pipe deadlock, output
+  never lost across poll slices); cancel is cooperative via injected
+  `threading.Event`, timeout path is terminate→wait→kill. Entry format
+  `embed_entry.v1` = canonical JSON header line + raw **opaque** blob bytes —
+  tensor payloads join later from the worker side without the cache importing
+  torch. Corrupt entries quarantine under `<cache>/embeds/quarantine/`; LRU cap
+  128 by mtime with refresh-on-hit; same-key in-process locks. 64 fake-worker
+  tests; suite 246.
+- 2026-10-07 task 1.5 (`bench.py`, commit `258385f`): `benchmark_result.v1`
+  records phase ms, peak host RSS (stdlib `resource`; real bytes or `null`), and
+  peak CUDA allocated/reserved **as null unless an adapter supplies them** —
+  `bench.py` itself never imports torch, so unmeasured fields cannot be
+  fabricated; denoise-per-step is derived, never stored. Aggregation
+  `benchmark_aggregate.v1` is order-free and keeps unmeasured ≠ 0.
+  `calibration_observation.v1` staleness key = (schema, model revision, backend,
+  quant) for M5.3; `calibration.json` writes are atomic. 50 synthetic tests;
+  suite 296; heavy-import boundary still clean in package and CLI dry run.
