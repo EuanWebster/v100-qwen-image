@@ -1,10 +1,14 @@
 # Model assets (M2.1 manifest preparation)
 
-Status: the **manifest is committed; the assets are not**. No model file has
-ever been downloaded into this environment, no checkpoint has been loaded, no
-inference has run, and no GPU is installed. Everything size- or hash-shaped
-below is **expected identity from pinned upstream metadata**, never a local
-measurement.
+Status: the **manifest is committed; the assets are not**. No model *weight*
+has ever been downloaded into this environment, nothing is installed under
+`models/assets/`, no checkpoint has been loaded, no inference has run, and no
+GPU is installed. What *has* happened: root fetched **bounded bytes of the 16
+small non-weight upstream source files** at the pinned revision and hashed
+them directly for the identity audit (§3) — fetched audit bytes, not
+installed assets. Everything size- or hash-shaped below is **expected
+identity from pinned upstream metadata**, never a measurement of installed
+local storage.
 
 ## 1. What is pinned
 
@@ -18,13 +22,18 @@ runtime files of the full-precision reference build:
   per-file immutable links have the form
   <https://huggingface.co/Qwen/Qwen-Image-2.1/blob/d26bb61231c349cf6b7896fa83353113880e1ba3/`filename`>
 * per artifact: `role`, `repo`, `revision`, `filename`, `sha256`, `bytes`
+* direct named links at that same immutable revision:
+  [**README.md** — the model card](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/d26bb61231c349cf6b7896fa83353113880e1ba3/README.md)
+  and
+  [**LICENSE**](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/d26bb61231c349cf6b7896fa83353113880e1ba3/LICENSE)
 
-The model card and the repository's license file live at that same pinned
-revision (repo root / model-card page on the Hugging Face hub); the license
-governs any download, and neither is part of the *runtime* file set. The
-upstream README, license, `.gitattributes` and preview image are deliberately
-**excluded** from the manifest — the resolver's contract is the 24 files the
-pipeline actually reads.
+The model card (repo-root `README.md`) and the repository's `LICENSE` are
+documentation/license resources at the pinned revision: they are **excluded
+from the runtime file set** — the resolver's contract is the 24 files the
+pipeline actually reads — which is a manifest-scope decision, **not**
+permission to ignore licensing: the LICENSE governs any download and use of
+these assets. The upstream `README.md`, `LICENSE`, `.gitattributes` and
+preview image are likewise absent from the manifest by design.
 
 There is no LoRA, no GGUF entry and no implicit accelerator/quant selection
 anywhere in this manifest: it describes the full reference weights only.
@@ -46,7 +55,7 @@ claim is made for the full reference either (see §6).
 
 These totals are **expected upstream metadata byte totals** (root verified
 them on 2026-10-07; see §3). They are *not* measured local disk totals — no
-asset exists locally yet.
+asset is installed locally yet.
 
 ## 3. Provenance of the hashes (read this before trusting §2)
 
@@ -65,10 +74,18 @@ Two evidence classes, deliberately kept apart:
   real bytes.
 
 So: every hash in the manifest is a claim about the file at the pinned
-revision; the first real download plus the resolver's sha256 check (future
-task) is what *confirms* those claims on this machine. Until then no
-statement here says "the bytes on this disk hash to X" — there are no bytes
-on this disk.
+revision, and the two classes differ in *local* evidence. For the 16 small
+regular files the claim is **locally verified**: root fetched their bounded
+bytes at the pinned revision and hashed exactly those bytes here — that was
+a bounded audit read, not an install: nothing landed under
+`models/assets/`, no asset was put in place for the pipeline, and no weight
+was ever fetched. For the 8 LFS identities (tokenizer.json + 7 weight
+safetensors) no local byte verification has happened; there are no
+installed-asset or weight bytes on this disk at all, and the first real
+download plus the resolver's sha256 check (future task) is what *confirms*
+those claims here. No statement in this file says "the installed assets hash
+to X" — no assets are installed — and no statement extends to environment
+files, tensor code or anything else beyond what §3 explicitly scopes.
 
 ## 4. Storage location and the no-download rule
 
@@ -106,9 +123,12 @@ this manifest.
 ## 5. Reference dtype vs. execution dtype (unverified territory)
 
 * The weight shards are the **reference full-precision build**; the text
-  encoder's `config.json` *declares* `torch_dtype: bfloat16`, and the model
-  card describes BF16 storage. A declared dtype is **config metadata**, not a
-  measured fact about tensor contents in shards that were never downloaded.
+  encoder's `config.json` declares **`dtype: bfloat16`** at the top level
+  (root inspected the pinned file directly at 2026-10-07 19:36 UTC: the key
+  is `dtype` — also in the nested text/vision sub-configs — and there is no
+  `torch_dtype` key), and the model card describes BF16 storage. A declared
+  dtype is **config metadata**, not a measured fact about tensor contents in
+  shards that were never downloaded.
 * Our target path converts/loads for **CPU probes (measured dtype TBD)** and
   **fp16 execution on sm_70 (V100)**. Whether BF16→FP16 conversion is
   lossless-enough for the encoder, what dtype actually lands in memory, and
@@ -120,19 +140,22 @@ this manifest.
 
 ## 6. What is *not* claimed
 
-No statement in this file or the manifest asserts: downloaded byte counts,
-locally verified hashes, a successful model load, numerical fidelity, image
-quality, or 16 GB fit. The old PLAN model-facts table's third-party size
-claims (DiT ~14.2 GB, encoder ~17.5 GB, VAE ~0.7–1.4 GB BF16) are now backed
-by the **expected** upstream sizes in §2 — an evidence upgrade from "card
-claim" to "pinned metadata", still *not* a local measurement.
+No statement in this file or the manifest asserts: downloaded *weight* byte
+counts, a locally verified hash of an installed asset or weight (the §3
+exception stands: the 16 small fetched audit files' SHA256s were computed
+from bytes fetched directly at the pinned revision), a successful model
+load, numerical fidelity, image quality, or 16 GB fit. The old PLAN
+model-facts table's third-party size claims (DiT ~14.2 GB, encoder ~17.5 GB,
+VAE ~0.7–1.4 GB BF16) are now backed by the **expected** upstream sizes in
+§2 — an evidence upgrade from "card claim" to "pinned metadata", still *not*
+a local measurement of installed assets.
 
 ## 7. Pending gates (honest state of play)
 
 | Gate | State |
 |---|---|
 | Manifest committed, schema v1, 24 entries, roles, deterministic order | **done (this task)** |
-| Offline tests: identity digest, roles/shards, dry-run all-missing, run→exit 4 | **done (this task)** |
+| Offline tests: identity digest, roles/shards, dry-run all-missing, run→exit 4 | **done (this task)** — the *fresh-child* no-network / no-heavy-import evidence is a property of the **guarded runner** (`bash run_cpu_tests.sh`, both Pythons, audit hook riding into children); plain `pytest` proves only the exit-code/output contract, and acceptance is recorded on the guarded runs |
 | Operator download of 33.1 GB + local sha256/size confirmation | pending (explicit future step; disk/RAM budget needed) |
 | M2.2 CPU load-path probes / encoder fidelity | pending |
 | M4 adapter (`qwen21_diffusers`) | pending — `--run` reaches it only after assets verify |
