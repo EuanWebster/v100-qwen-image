@@ -10,7 +10,10 @@ small non-weight upstream source files** at the pinned revision and hashed
 them directly for the identity audit (§3) — fetched audit bytes, not
 installed assets. Everything size- or hash-shaped below is **expected
 identity from pinned upstream metadata**, never a measurement of installed
-local storage.
+local storage. Separately, the **local reference-bundle contract (M2.2a part
+1, `qwen_engine/local_bundle.py`) is implemented and offline-tested**: it is
+a pure *projection* of already resolver-verified paths (§8) and asserts
+nothing about installed assets, loads or fit.
 
 ## 1. What is pinned
 
@@ -228,7 +231,32 @@ a local measurement of installed assets.
 | Offline tests: identity digest, roles/shards, dry-run all-missing, run→exit 4 | **done (this task)** — the *fresh-child* no-network / no-heavy-import evidence is a property of the **guarded runner** (`bash run_cpu_tests.sh`, both Pythons, audit hook riding into children); plain `pytest` proves only the exit-code/output contract, and acceptance is recorded on the guarded runs |
 | Operator fetch **tool** (`tools/fetch_models.py`): code + offline fake-stream tests | **done (root-review fix pass applied), awaiting root re-review** — plan/help read-only and socket-free; `--fetch` only with explicit paths; resume/publish/escape rules above; **no real download executed** |
 | Operator download of 33.1 GB + local sha256/size confirmation | pending (the tool exists but has never touched the network; a lead/operator decision after review; disk budget needed — the tool prints a bounded disk estimate, nothing about RAM/GPU fit) |
+| Local reference-bundle contract (`qwen_engine/local_bundle.py`, M2.2a part 1) | **implemented and offline-tested** — projects a successful `resolve_manifest` report into role-grouped adapter `assets` + explicit component dirs under an explicit root, against the committed 24-file layout table, with version-tagged bundle and encoder+processor artifact-set fingerprints; **offline-tested only**: real-file hash verification, CPU component load and everything after them remain pending |
 | M2.2 CPU load-path probes / encoder fidelity | pending |
 | M4 adapter (`qwen21_diffusers`) | pending — `--run` reaches it only after assets verify |
 | M3 GPU bring-up | gated on physical V100 installation (confirmed not installed) |
 | M5 memory-policy calibration | pending; nothing here proves 16 GB fit |
+
+## 8. Local reference-bundle contract (M2.2a part 1 — implemented, offline-tested only)
+
+`qwen_engine/local_bundle.py` turns a *successful* `resolve_manifest` report
+plus the same schema-v1 manifest into the `GenerationAdapter.load(config,
+assets)` shape: verified paths grouped by role (manifest order, immutable)
+and explicit component directories under the **explicit** model root, ready
+for future `local_files_only=True` probes (pipeline dir = root; the `dit`
+role's files live under `transformer/`). It is a projection, not a second
+verifier: content is never re-hashed (the resolver already did that), and
+paths come only from `root/filename` — never repo ids, never an ambient HF
+cache. The committed full-reference set is an explicit immutable table
+(24 files; pipeline 1, processor 9, scheduler 1, text_encoder 7, dit 4, vae
+2; one pinned repo/revision); no GGUF/LoRA/single-file in this profile —
+future variants are separate profiles, not fallbacks. Incomplete, reordered,
+padded or field-forged reports, escaped symlinks and file-vs-directory
+layouts are refused with typed errors (exit-4 channel) before any ML import.
+Version-tagged **artifact-set fingerprints** (SHA256 over sorted
+repo/revision/filename/sha256/bytes rows) give a whole-bundle digest and an
+encoder+processor digest for future cache keys — a change to any encoder
+shard, index/config, tokenizer or chat template flips the encoder digest.
+Digests are identity metadata: they prove nothing about tensor load,
+generation or quality. Tests are offline with tiny fake contents through the
+real resolver; nothing here inspects or requires `models/assets/`.

@@ -130,6 +130,7 @@ CPU tests never touch a heavy ML import:
 |---|---|---|
 | `qwen_engine/config.py` | **Immutable** (frozen dataclass) generation config + field-level validation: dimensions multiple of 32, resolution→token math (1024² = 4096, 2048² = 16384 — C6), steps/seed ranges, quant/offload/backend enums, paths. Lossless JSON round-trip. | stdlib |
 | `qwen_engine/manifest.py` | **Versioned model-manifest schema + `resolve_model_path`** — pinned repo/revision/artifact/sha256/size contract, existence/size verification, **no-download policy** (R3; schema in M2.1). | stdlib |
+| `qwen_engine/local_bundle.py` | **Local reference-bundle contract (M2.2a)** — projects an already `resolve_manifest`-verified local set into role-grouped adapter `assets` plus explicit component dirs under an explicit model root, enforcing the committed 24-file full-reference layout table; version-tagged artifact-set fingerprints (whole bundle + encoder+processor). No content hashing, no downloads, no ML imports. | manifest types, stdlib |
 | `qwen_engine/adapters/base.py` | **Pipeline adapter protocol** the engine core calls (`load`, `encode`, `denoise`, `decode`, `save`) plus dry-run status types. Deliberately **no `plan` method** — dry-run planning is adapter-independent (`core.plan()` builds the document itself). The core runs end-to-end against a fake adapter in tests. | config/manifest/memory/log types |
 | `qwen_engine/adapters/qwen21_diffusers.py` | The eventual `Qwen21DiffusersAdapter` — the **only** module that imports torch / diffusers / transformers, and those imports are deferred *inside* the adapter (lazy), executed only on an actual run. Does not exist yet; stubbing it at M1 is a boundary violation the import test catches. | torch, diffusers, transformers |
 | `qwen_engine/log.py` | Structured **phase/event logging**: JSONL events `{ts, phase, event, elapsed_ms, counters…}` to a configurable sink, plus human-readable phase lines. Shared by engine, CLI and bench. | stdlib |
@@ -936,3 +937,43 @@ standing rule that executed plans stay honest.)*
   `--models-dir` `..` refusal — manifest-content checks now gate both
   paths identically. No network, no weights, no model load, no GPU, no
   service change.
+- 2026-10-07 **M2.2a part 1: local reference-bundle contract — implemented and
+  offline-tested** (this commit; sole writer Qwen, task
+  `/tmp/v100-m22a-bundle-task.md`, on accepted `a434855`):
+  `src/qwen_engine/local_bundle.py` (stdlib-only, ML-free) projects an already
+  `resolve_manifest`-verified local file set into the adapter
+  `load(config, assets)` shape — role-grouped immutable paths in manifest
+  order, explicit component dirs (`dit` → `transformer/`, pipeline = root)
+  for future `local_files_only=True` probes — under an **explicit** model
+  root only; never a repo id, never an ambient HF cache, never a second
+  downloader or rehash of 33 GB. The committed full-reference layout is an
+  explicit immutable table (24 files: pipeline 1, processor 9, scheduler 1,
+  text_encoder 7, dit 4, vae 2; one pinned repo+revision); per-file SHA/sizes
+  stay in the manifest so offline tests use tiny fake contents. A report is
+  accepted only if complete, `ok` and **positionally and field-for-field
+  equal** to the manifest (`report.resolved` never trusted; paths re-derived
+  as `root/filename` and cheap-probed: regular file, resolves inside the
+  root — so missing/extra/reordered/forged statuses, escaped symlinks and
+  file-vs-directory swaps are refused with typed errors — `LocalBundleError`
+  under `ManifestError`, exit 4 — before any ML import). Version-tagged
+  canonical **artifact-set fingerprints** (SHA256 over sorted
+  repo/revision/filename/sha256/bytes rows) give a whole-bundle digest and an
+  encoder+processor digest for future cache keys (any encoder shard/index/
+  config/tokenizer/chat-template change flips the encoder digest); digests
+  are identity metadata, not load or quality proof. `tests/test_local_bundle.py`
+  adds **31** offline tests (tiny 24-file fixture through the **real**
+  resolver; order-independent fingerprints; identity-change → relevant-digest
+  mapping incl. VAE-only change leaving the encoder digest intact; committed
+  manifest layout + anchored bundle digest; every refusal class; inside-root
+  symlink tolerated like the resolver; fresh-interpreter ML-free import);
+  writes only to `tmp_path` — `models/assets/` (root's concurrent pinned
+  fetch) never inspected or touched. Evidence: guarded suite **541 passed +
+  1 skip** without / **542 passed** with pinned source envs on 3.11.15
+  (`/work/.venv`) and 3.13.5 (`/tmp/qwen-review.bIFHcI/venv`,
+  `PYTHONPATH=/work/src`), pytest 9.1.1; pinned-interface checker **53/53
+  exit 0** both Pythons, trees re-verified `c6df88a5`/`856157a2`.
+  **Pending, unchanged:** 24 real-file hash verification, CPU component
+  load, encoder fidelity, adapter generation, RAM/VRAM fit and GPU all
+  remain unverified until measured. `manifest.py`, `models/manifest.json`,
+  fetcher, engine no-download semantics and `sandbox.yaml` untouched; no
+  network, no model load, no GPU, no service change.
