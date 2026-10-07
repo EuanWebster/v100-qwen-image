@@ -445,6 +445,39 @@ def test_mixed_repo_or_revision_refused():
             ModelManifest(schema_version=1, artifacts=tuple(arts)))
 
 
+def test_profile_pins_the_exact_reviewed_identity():
+    """The named profile is THIS repo at THIS revision — the constants the
+    review pinned, spelled independently here so silent edits fail."""
+    assert lb.FULL_REFERENCE_REPO == "Qwen/Qwen-Image-2.1"
+    assert lb.FULL_REFERENCE_REVISION == (
+        "d26bb61231c349cf6b7896fa83353113880e1ba3")
+    assert (REPO, REVISION) == (lb.FULL_REFERENCE_REPO,
+                                lb.FULL_REFERENCE_REVISION)
+
+
+def test_all_artifacts_wrong_repo_refused():
+    """An internally consistent manifest at ANOTHER repo is NOT the reviewed
+    full-reference profile: layout validation refuses it (review item 1),
+    so the pinned interface assumptions behind the profile name cannot be
+    inherited by an arbitrary consistent repo."""
+    wrong = ModelManifest(schema_version=1, artifacts=tuple(
+        ModelArtifact(**{**a.to_dict(), "repo": "Someone-Else/Qwen-Image-2.1"})
+        for a in _manifest_with().artifacts))
+    with pytest.raises(lb.BundleLayoutError, match="pinned to repo"):
+        lb.validate_local_reference_layout(wrong)
+
+
+def test_all_artifacts_wrong_revision_refused():
+    """Even a fully consistent, plausible 40-hex revision other than the
+    reviewed one is refused: a new model revision requires a NEW reviewed
+    profile, not a relaxed check here (review item 1)."""
+    wrong = ModelManifest(schema_version=1, artifacts=tuple(
+        ModelArtifact(**{**a.to_dict(), "revision": "f" * 40})
+        for a in _manifest_with().artifacts))
+    with pytest.raises(lb.BundleLayoutError, match="pinned to revision"):
+        lb.validate_local_reference_layout(wrong)
+
+
 # ---------------------------------------------------------------------------
 # Report refusals
 # ---------------------------------------------------------------------------
@@ -756,18 +789,28 @@ def test_altered_identity_changes_the_relevant_fingerprint(tmp_path):
     # A byte-size (not hash) change still changes identity.
     size = swap("scheduler/scheduler_config.json", bytes=4242)
     assert size.bundle != base.bundle
-    # repo/revision changes flip everything (validated at layout level too).
-    rev = ModelManifest(schema_version=1, artifacts=tuple(
-        ModelArtifact(**{**a.to_dict(), "revision": "1" * 40})
-        for a in manifest.artifacts))
-    assert lb.reference_bundle_fingerprints(rev).bundle != base.bundle
+    # repo/revision changes flip the GENERIC digest function: it is an
+    # identity function over whatever it is given (digest drift stays
+    # demonstrable), while the PROFILE-level API refuses a different
+    # identity before any digest is taken (review item 1).
+    rev_arts = tuple(ModelArtifact(**{**a.to_dict(), "revision": "1" * 40})
+                     for a in manifest.artifacts)
+    rev = ModelManifest(schema_version=1, artifacts=rev_arts)
+    assert lb.artifact_set_fingerprint(rev_arts) != base.bundle
+    repo_arts = tuple(ModelArtifact(**{**a.to_dict(),
+                                       "repo": "someone-else/model"})
+                      for a in manifest.artifacts)
+    assert lb.artifact_set_fingerprint(repo_arts) != base.bundle
+    with pytest.raises(lb.BundleLayoutError, match="pinned to"):
+        lb.reference_bundle_fingerprints(rev)
 
 
 def test_fingerprint_needs_one_repo_one_revision_and_artifacts():
     arts_a = [ModelArtifact(role="vae", repo="r/x", revision="a" * 40,
                             filename="vae/config.json", sha256="ab" * 32, bytes=1)]
     arts_b = [ModelArtifact(role="vae", repo="r/y", revision="a" * 40,
-                             filename="vae/config.json", sha256="ab" * 32, bytes=1)]
+                             filename="vae/diffusion_pytorch_model.safetensors",
+                             sha256="ab" * 32, bytes=1)]
     with pytest.raises(lb.BundleLayoutError, match="one repo"):
         lb.artifact_set_fingerprint(arts_a + arts_b)
     with pytest.raises(lb.BundleLayoutError, match="at least one"):

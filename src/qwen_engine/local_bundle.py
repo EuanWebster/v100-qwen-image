@@ -9,11 +9,14 @@ worse than useless. What happens here, all of it before any ML import:
 
 1. The supplied schema-v1 :class:`~qwen_engine.manifest.ModelManifest` must
    match the :data:`LOCAL_REFERENCE_LAYOUT` table exactly — the committed
-   24 relative filenames, their role mapping, and one single pinned
-   repo/revision for the whole set. The layout is an explicit immutable table
-   so it stays reviewable; per-file SHA/byte sizes are *not* hardcoded here
-   (the manifest owns those claims; offline tests fabricate tiny contents
-   with the same layout).
+   24 relative filenames, their role mapping — and carry exactly the
+   profile's pinned identity :data:`FULL_REFERENCE_REPO` @
+   :data:`FULL_REFERENCE_REVISION`. Internal consistency is NOT enough: any
+   other repo or revision (whole-set or mixed) is a different model identity
+   and requires a NEW reviewed profile, never a relaxed check here. The
+   layout is an explicit immutable table so it stays reviewable; per-file
+   SHA/byte sizes are *not* hardcoded here (the manifest owns those claims;
+   offline tests fabricate tiny contents with the same layout).
 2. The supplied :class:`~qwen_engine.manifest.ResolutionReport` must be a
    *coherent* success claim: complete, ``ok``, with an empty ``errors``
    tuple, every status ``present`` with ``error is None``, and matching the
@@ -71,6 +74,16 @@ from qwen_engine.manifest import (
 #: LoRA, single-file) are *new profiles with their own tables*, never guessed
 #: fallbacks inside this one.
 LOCAL_REFERENCE_PROFILE = "full-reference"
+
+#: The EXACT upstream identity this reviewed profile is pinned to. The named
+#: profile is not "whatever internally consistent repo/revision the manifest
+#: happens to declare" — it is *this* repo at *this* revision, so the pinned
+#: interface assumptions behind the profile hold. A manifest at any other
+#: repo or revision — however internally consistent — is a different model
+#: identity and requires a NEW reviewed profile (new name, new table, new
+#: review), never a relaxed check here.
+FULL_REFERENCE_REPO = "Qwen/Qwen-Image-2.1"
+FULL_REFERENCE_REVISION = "d26bb61231c349cf6b7896fa83353113880e1ba3"
 
 #: The committed full-reference layout: role -> relative filenames, in
 #: deterministic (sorted-filename) order. 24 files, 6 roles. Identity is the
@@ -217,9 +230,22 @@ def validate_local_reference_layout(manifest: ModelManifest) -> tuple[str, str]:
     if len(repos) != 1:
         errors.append(f"the bundle pins ONE repo; manifest mixes: "
                       + ", ".join(repos))
+    elif repos[0] != FULL_REFERENCE_REPO:
+        errors.append(
+            f"the {LOCAL_REFERENCE_PROFILE} profile is pinned to repo "
+            f"{FULL_REFERENCE_REPO!r}; manifest says {repos[0]!r} — a "
+            "different repo is a different model identity and needs a new "
+            "reviewed profile, not this one")
     if len(revisions) != 1:
         errors.append(f"the bundle pins ONE revision; manifest mixes: "
                       + ", ".join(revisions))
+    elif revisions[0] != FULL_REFERENCE_REVISION:
+        errors.append(
+            f"the {LOCAL_REFERENCE_PROFILE} profile is pinned to revision "
+            f"{FULL_REFERENCE_REVISION!r}; manifest says {revisions[0]!r} — "
+            "a new model revision requires a new reviewed profile (the "
+            "interface assumptions behind this profile name were reviewed "
+            "against the pinned commit only)")
     if errors:
         raise BundleLayoutError(
             f"{LOCAL_REFERENCE_PROFILE} layout violation "
@@ -248,15 +274,40 @@ def artifact_set_fingerprint(artifacts: Iterable[ModelArtifact]) -> str:
     """SHA256 over the sorted ``[filename, sha256, bytes]`` identity rows of
     *artifacts*, plus the version tag and the single repo/revision they share.
 
+    A GENERIC identity function: it pins nothing — it happily digests a
+    different repo or revision so digest drift stays demonstrable. Enforcing
+    THIS profile's exact pinned identity is
+    :func:`validate_local_reference_layout`'s job, not this function's.
+
     Independent of input ordering and of manifest ordering — re-listing the
     same 24 files yields the same digest; changing *any* repo, revision,
-    filename, sha256 or byte size changes it. Identity metadata only: it is
-    not evidence a model loaded, ran, or produced anything good.
+    filename, sha256 or byte size changes it. Rejects non-
+    :class:`~qwen_engine.manifest.ModelArtifact` entries and duplicate
+    filename identities with a typed :class:`BundleLayoutError` (a silently
+    deduplicated digest would look plausible and be wrong). Identity
+    metadata only: it is not evidence a model loaded, ran, or produced
+    anything good.
     """
     items = list(artifacts)
     if not items:
         raise BundleLayoutError("artifact-set fingerprint needs at least "
                                 "one artifact")
+    bad = [type(a).__name__ for a in items if not isinstance(a, ModelArtifact)]
+    if bad:
+        raise BundleLayoutError(
+            "artifact-set fingerprint needs ModelArtifact entries; got "
+            + ", ".join(bad))
+    seen_ids: set[str] = set()
+    dupes: list[str] = []
+    for a in items:
+        if a.identity in seen_ids and a.identity not in dupes:
+            dupes.append(a.identity)
+        seen_ids.add(a.identity)
+    if dupes:
+        raise BundleLayoutError(
+            "artifact-set fingerprint needs distinct filenames; duplicate "
+            "identities would silently collapse in the sorted digest rows: "
+            + ", ".join(sorted(dupes)))
     repos = sorted({a.repo for a in items})
     revisions = sorted({a.revision for a in items})
     if len(repos) != 1 or len(revisions) != 1:
