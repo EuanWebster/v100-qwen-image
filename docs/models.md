@@ -112,18 +112,30 @@ paths remain no-download and network-free). Its contract: the default and
 the only network/write path is an unmistakable `--fetch` with explicit
 `--manifest` and `--models-dir`. Downloads are pinned to
 `https://huggingface.co/<repo>/resolve/<pinned-commit>/<filename>` (host is
-a constant; non-HTTPS redirects refused; signed redirect queries are
-stripped from every message), stream in bounded 1 MiB chunks with the
+a constant; non-HTTPS redirects refused; every message renders only scheme,
+host/port and path — URL userinfo, query (incl. signed-URL signatures),
+server reason text and untrusted header values are never echoed), stream in
+bounded 1 MiB chunks with the
 manifest byte count enforced as an upper bound while reading, and publish
 **only** on exact size + SHA256 match via an atomic no-clobber link of the
 `<file>.partial` in the same asset directory. Interrupted downloads resume
-in that partial **only** against a 206 response whose `Content-Range`
-proves the server resumed at the requested offset (Range ignored or
-misstated → refused, partial untouched); final verification always rehashes
+in that partial **only** against a 206 response whose numeric
+`Content-Range` proves the server resumed at the requested offset with a
+total exactly equal to the manifest size and a coherent span
+(`start <= end < total`; a wildcard `*` total is refused) — Range ignored or
+misstated → refused, partial untouched. A partial already at exactly the
+manifest byte length is rehashed and published without any request (never an
+impossible Range from EOF), or fails integrity without publishing.
+Partials are opened `O_NOFOLLOW`, new ones created `O_EXCL` (a concurrently
+appeared or changed partial is refused, never truncated over), and every
+`os.write` is repeated until the chunk is fully written. Final verification
+always rehashes
 the whole assembled file from disk, so a corrupt partial can never publish.
 An existing file that verifies is skipped; an existing file whose identity
 does **not** match is refused, never deleted or overwritten; symlinked
-paths on the write path are refused; a bounded disk estimate (manifest
+paths on the write path are refused, and an explicit `--models-dir` root
+that is (or sits under) a symlink is refused before any mkdir, network
+access or write; a bounded disk estimate (manifest
 bytes + 1 MiB headroom per file) is compared with fresh free space before
 any transfer — a **disk** estimate only, no RAM/GPU fit claim (fit is M5
 calibration territory). Tool-specific exit codes are in its `--help`.
@@ -197,7 +209,7 @@ a local measurement of installed assets.
 |---|---|
 | Manifest committed, schema v1, 24 entries, roles, deterministic order | **done (this task)** |
 | Offline tests: identity digest, roles/shards, dry-run all-missing, run→exit 4 | **done (this task)** — the *fresh-child* no-network / no-heavy-import evidence is a property of the **guarded runner** (`bash run_cpu_tests.sh`, both Pythons, audit hook riding into children); plain `pytest` proves only the exit-code/output contract, and acceptance is recorded on the guarded runs |
-| Operator fetch **tool** (`tools/fetch_models.py`): code + offline fake-stream tests | **done, awaiting root review** — plan/help read-only and socket-free; `--fetch` only with explicit paths; resume/publish/escape rules above; **no real download executed** |
+| Operator fetch **tool** (`tools/fetch_models.py`): code + offline fake-stream tests | **done (root-review fix pass applied), awaiting root re-review** — plan/help read-only and socket-free; `--fetch` only with explicit paths; resume/publish/escape rules above; **no real download executed** |
 | Operator download of 33.1 GB + local sha256/size confirmation | pending (the tool exists but has never touched the network; a lead/operator decision after review; disk budget needed — the tool prints a bounded disk estimate, nothing about RAM/GPU fit) |
 | M2.2 CPU load-path probes / encoder fidelity | pending |
 | M4 adapter (`qwen21_diffusers`) | pending — `--run` reaches it only after assets verify |

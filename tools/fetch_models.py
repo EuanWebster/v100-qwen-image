@@ -7,7 +7,7 @@ torch / diffusers / transformers, no model load, no inference. It exists so a
 download is an *unmistakable operator action*, never a side effect of imports,
 the resolver, or a CLI run — those paths stay no-download and network-free.
 
-Contract (see ``docs/models.md`` §4 and ``/tmp/v100-m2-fetch-task.md``):
+Contract (see ``docs/models.md`` §4):
 
 * Default (and ``--help`` / plan) is **read-only and offline**: it verifies
   disk state against the manifest and prints a deterministic JSON report; no
@@ -29,17 +29,29 @@ Contract (see ``docs/models.md`` §4 and ``/tmp/v100-m2-fetch-task.md``):
   truncated or oversized response can never become a final asset.
 * Resume: a partial lives in the same asset directory as ``<file>.partial``.
   A resume request sends ``Range: bytes=<offset>-`` and is accepted only on
-  status 206 with a well-formed ``Content-Range`` whose start equals the
-  requested offset (and total equal to the manifest size). A server that
-  ignores Range (200) or misstates Content-Range is refused — bytes are never
-  silently concatenated, and the partial is left untouched. Final
-  verification always **rehashes the full assembled file from disk**
-  (existing partial prefix included), so a garbage partial can never publish.
+  status 206 with a well-formed numeric ``Content-Range`` whose start equals
+  the requested offset, whose total equals the manifest size exactly (a
+  wildcard ``*`` total is refused), and whose span is coherent
+  (``start <= end < total``). A server that ignores Range (200) or misstates
+  Content-Range is refused — bytes are never silently concatenated, and the
+  partial is left untouched. A partial already at exactly the manifest byte
+  length is rehashed instead of resumed: if it verifies it is published
+  without any request (never an impossible Range from EOF); if it does not,
+  integrity fails without publishing. Final verification always **rehashes
+  the full assembled file from disk** (existing partial prefix included), so
+  a garbage partial can never publish.
 * Existing files: a final file that already verifies is skipped; a final file
   whose identity does not match the manifest (or that is not a regular file /
-  escapes the asset root) is refused and NEVER deleted or overwritten. A
-  symlinked partial or symlinked directory on the write path is refused; the
-  tool never follows a symlink it is about to write through.
+  escapes the asset root) is refused and NEVER deleted or overwritten. The
+  ``--models-dir`` root itself (and any existing component of its path) must
+  not be a symlink — checked before any mkdir, network access or write,
+  because a resolved symlinked root would otherwise define its own boundary.
+  A symlinked partial or symlinked directory on the write path is refused;
+  partials are opened ``O_NOFOLLOW`` (where the platform provides it), a new
+  partial is created ``O_EXCL`` (a concurrently appeared partial is refused,
+  never truncated), and the opened FD is re-verified as the expected regular
+  file at the expected resume size before any byte is written. The tool
+  never follows a symlink it is about to write through.
 * Before any transfer, a bounded disk estimate (remaining manifest bytes plus
   a 1 MiB headroom per pending file) is compared with fresh ``statvfs`` free
   space. No RAM/GPU fit claim is made anywhere — capacity evidence belongs
@@ -157,15 +169,32 @@ class RefuseClobberError(FetchError):
 # ---------------------------------------------------------------------------
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
 def _clean_url(url: str) -> str:
-    """Strip query/fragment so a signed-URL redirect target can never be
-    echoed (credentials and signatures live in the query)."""
+    """Render ONLY scheme, host/port and path: no userinfo (credentials may
+    sit there), no query (signed-URL signatures live there), no fragment.
+    Never echo the raw netloc — rebuild it from parsed host/port only."""
     try:
         parts = urllib.parse.urlsplit(url)
-        return urllib.parse.urlunsplit((parts.scheme, parts.netloc,
-                                        parts.path, "", ""))
+        host = parts.hostname
+        if not host:
+            return "<url without host: userinfo/query/fragment stripped>"
+        if ":" in host:  # IPv6 literal needs its brackets back
+            host = f"[{host}]"
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        if port is not None and port == _DEFAULT_PORTS.get(
+                parts.scheme.lower()):
+            port = None
+        netloc = host if port is None else f"{host}:{port}"
+        return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path,
+                                        "", ""))
     except ValueError:
-        return "<unparseable url: query stripped>"
+        return "<unparseable url: userinfo/query/fragment stripped>"
 
 
 def artifact_url(art: ModelArtifact) -> str:
@@ -202,9 +231,11 @@ class Stream:
 
 
 def _fmt_http_error(exc: urllib.error.HTTPError) -> str:
-    return (f"HTTP {exc.code} for {_clean_url(exc.url)}"
-            f"{' (' + exc.reason + ')' if exc.reason else ''} "
-            "— query parameters stripped from this message")
+    # The server-supplied reason is untrusted text (it can carry a signed
+    # URL or credentials), so it is NEVER echoed — only our own rendering.
+    return (f"HTTP {exc.code} for {_clean_url(str(exc.url))} — host and path "
+            "only; URL userinfo/query and the server reason text are not "
+            "shown")
 
 
 class UrllibTransport:
@@ -227,14 +258,17 @@ class UrllibTransport:
             raise NetworkError(_fmt_http_error(exc)) from None
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", exc)
-            detail = " ".join(str(reason).split())[:200]
+            # reason is untrusted (may embed a signed URL or credentials):
+            # render only its TYPE, never its text.
             raise NetworkError(
-                f"network failure for {_clean_url(url)}: {type(reason).__name__}: {detail}"
-            ) from None
+                f"network failure for {_clean_url(url)}: "
+                f"URLError({type(reason).__name__}) — reason text not "
+                "shown (may contain signed URLs or credentials)") from None
         except OSError as exc:  # socket-level mid-connect failures
             raise NetworkError(
                 f"network failure for {_clean_url(url)}: "
-                f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]}") from None
+                f"{type(exc).__name__} — error text not shown (may contain "
+                "signed URLs or credentials)") from None
         return _UrllibStream(resp)
 
 
@@ -303,6 +337,26 @@ def _partial_path(dest: Path) -> Path:
     return dest.parent / (dest.name + ".partial")
 
 
+def _check_root_symlinks(root: Path) -> None:
+    """Refuse a symlinked asset root BEFORE any mkdir, network access or
+    write. The read-side resolver treats the *resolved* root as its boundary,
+    so an explicit lexical root that is (or sits under) a symlink would
+    silently redirect every write outside the directory the operator named.
+    Every EXISTING component of the given root path is checked; components
+    that do not exist yet cannot be symlinks and are created as plain dirs."""
+    node = Path(os.path.abspath(str(root)))
+    while True:
+        if os.path.islink(node):
+            raise UnsafePathError(
+                f"--models-dir root or one of its existing path components "
+                f"is a symlink: {node} — refusing to fetch through it (a "
+                "resolved symlinked root would define its own boundary and "
+                "redirect writes outside)")
+        if node.parent == node:
+            return
+        node = node.parent
+
+
 def _check_write_path_symlinks(root: Path, filename: str) -> None:
     """Refuse ANY symlink on the directory path we are about to create/write
     through (stricter than the read-side resolver, which only requires
@@ -318,12 +372,13 @@ def _check_write_path_symlinks(root: Path, filename: str) -> None:
             raise UnsafePathError(f"not a directory on the write path: {node}")
 
 
-def _resume_offset(art: ModelArtifact, partial: Path) -> int:
-    """Size of a resumable partial; raises on anything we refuse to append to."""
+def _resume_offset(art: ModelArtifact, partial: Path) -> tuple[int, bool]:
+    """Size of a resumable partial plus whether one exists at all; raises on
+    anything we refuse to append to. ``(0, False)`` means no partial."""
     try:
         st = partial.lstat()
     except FileNotFoundError:
-        return 0
+        return 0, False
     except OSError as exc:
         raise UnsafePathError(f"cannot stat partial {partial}: {exc}") from None
     if _stat.S_ISLNK(st.st_mode):
@@ -335,7 +390,87 @@ def _resume_offset(art: ModelArtifact, partial: Path) -> int:
             f"partial for '{art.filename}' is {_human(st.st_size)} — larger "
             f"than the manifest's {_human(art.bytes)}; the partial is corrupt. "
             f"Delete it deliberately and rerun: {partial}")
-    return st.st_size
+    return st.st_size, True
+
+
+def _open_partial(partial: Path, start: int) -> int:
+    """Open the partial for writing WITHOUT ever following a symlink, and
+    re-verify on the opened FD that it is a regular file of exactly the
+    expected resume size (ordinary concurrent filesystem changes between the
+    earlier lstat and this open are refused, not truncated over):
+
+    * ``start == 0``: create with ``O_CREAT | O_EXCL`` — a partial that
+      appeared concurrently is refused, never truncated;
+    * ``start  > 0``: open the existing file only (no ``O_CREAT``).
+
+    ``O_NOFOLLOW`` (POSIX) closes the lstat→open symlink race; platforms
+    without it keep the pre-existing lstat-based refusal above."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if start == 0:
+        try:
+            fd = os.open(partial,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                         0o644)
+        except FileExistsError:
+            try:
+                st = partial.lstat()
+            except OSError:
+                st = None
+            if st is not None and not _stat.S_ISREG(st.st_mode):
+                raise UnsafePathError(
+                    f"the partial path {partial} is not a regular file — "
+                    "refusing to write through it") from None
+            raise RefuseClobberError(
+                f"a partial appeared at {partial} while this fetch was "
+                "starting — refusing to truncate a file that appeared "
+                "concurrently; inspect or remove it deliberately") from None
+        except OSError as exc:
+            raise UnsafePathError(
+                f"cannot create partial {partial}: "
+                f"{type(exc).__name__} — refusing (symlink or path issue)") from None
+    else:
+        try:
+            fd = os.open(partial, os.O_WRONLY | nofollow)
+        except FileNotFoundError:
+            raise RefuseClobberError(
+                f"the partial vanished while resuming: {partial} — refusing "
+                "to create it implicitly; rerun from scratch deliberately"
+            ) from None
+        except OSError as exc:
+            raise UnsafePathError(
+                f"cannot open partial {partial}: "
+                f"{type(exc).__name__} — refusing (symlink or path issue)") from None
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise UnsafePathError(
+                f"the opened partial {partial} is not a regular file — "
+                "refusing to write through it")
+        if st.st_size != start:
+            raise RefuseClobberError(
+                f"the partial {partial} changed while this fetch was "
+                f"starting: expected {_human(start)} bytes, the opened file "
+                f"has {_human(st.st_size)} — refusing to truncate or append "
+                "over a file we no longer recognize")
+        os.ftruncate(fd, start)  # no-op on a verified match; no seek races
+        if start:
+            os.lseek(fd, start, os.SEEK_SET)  # append AFTER the verified prefix
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """os.write may accept fewer bytes than offered: keep writing until this
+    bounded chunk is fully on disk (a non-advancing write is an error, not
+    an infinite loop)."""
+    view = memoryview(data)
+    while len(view) > 0:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError("local write made no progress")
+        view = view[n:]
 
 
 def _validate_response(art: ModelArtifact, stream: Stream, url: str,
@@ -363,21 +498,30 @@ def _validate_response(art: ModelArtifact, stream: Stream, url: str,
     if m is None:
         raise NetworkError(
             f"missing or malformed Content-Range on the 206 resume response "
-            f"for '{art.filename}' (got {raw!r}); refusing to guess the "
-            "resume offset")
+            f"for '{art.filename}' (header value not echoed — untrusted); "
+            "refusing to guess the resume offset")
     first, last, total = m.group(1), m.group(2), m.group(3)
     if int(first) != start:
         raise NetworkError(
             f"Content-Range starts at {first}, not the requested offset "
             f"{start}, for '{art.filename}' — refusing to concatenate a "
             "range the server did not actually resume from")
-    if total not in ("*", str(art.bytes)):
+    if total == "*":
         raise NetworkError(
-            f"Content-Range total {total!r} disagrees with the manifest size "
-            f"{art.bytes} for '{art.filename}'")
-    if total != "*" and int(last) + 1 != int(total):
+            f"Content-Range total is the wildcard '*' for '{art.filename}': "
+            f"refusing to resume against a server that hides the total size "
+            f"(the manifest pins exactly {_human(art.bytes)} bytes)")
+    total_n = int(total)
+    if total_n != art.bytes:
         raise NetworkError(
-            f"Content-Range {raw!r} is not a coherent byte span")
+            f"Content-Range total disagrees with the manifest size "
+            f"{art.bytes} for '{art.filename}' (header value not echoed)")
+    last_n = int(last)
+    if not (start <= last_n < total_n):
+        raise NetworkError(
+            f"Content-Range is not a coherent byte span "
+            f"(need start <= end < total, total {total_n}) for "
+            f"'{art.filename}' (header value not echoed)")
 
 
 def _download(art: ModelArtifact, dest: Path, transport,
@@ -386,7 +530,31 @@ def _download(art: ModelArtifact, dest: Path, transport,
     Returns a short outcome string; raises FetchError on any refusal."""
     url = artifact_url(art)
     partial = _partial_path(dest)
-    start = _resume_offset(art, partial)
+    start, present = _resume_offset(art, partial)
+
+    # A partial that already holds every byte the manifest expects is
+    # REHASHED, never "resumed" with an impossible Range from EOF: valid →
+    # publish with no request at all; invalid → integrity failure, published
+    # never, the unrecoverable partial removed deliberately.
+    if present and start == art.bytes:
+        print(f"  partial '{art.filename}' already holds all "
+              f"{_human(art.bytes)} — rehashing, no Range request", flush=True)
+        try:
+            actual = _hash_file(partial)
+        except OSError as exc:
+            raise IntegrityError(f"cannot rehash partial {partial}: {exc}") from None
+        if actual != art.sha256:
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+            raise IntegrityError(
+                f"'{art.filename}': the byte-complete partial failed the "
+                f"full SHA256 rehash (expected {art.sha256}, computed "
+                f"{actual}) — no final written, the unrecoverable partial "
+                "removed")
+        _atomic_no_clobber_publish(partial, dest)
+        return "partial-complete-and-verified"
 
     # Disk estimate for THIS run's remaining bytes, bounded and honest:
     remaining = art.bytes - start
@@ -399,10 +567,16 @@ def _download(art: ModelArtifact, dest: Path, transport,
             f"{_human(remaining)} + 1 MiB headroom) but only {_human(free)} "
             f"free on the filesystem holding {probe_dir} — nothing written")
 
-    mode = "wb" if start == 0 else "ab"
-    if start == 0 and partial.exists():
-        partial.unlink()  # it was 0 bytes (only path here); fresh start
-    if mode == "ab":
+    if start == 0 and present:
+        # A 0-byte partial is the only present size that reaches here with
+        # start == 0: remove it so _open_partial can create the real file
+        # with O_EXCL. Anything that appeared concurrently is refused there,
+        # never truncated.
+        try:
+            partial.unlink()
+        except FileNotFoundError:
+            pass
+    if start:
         print(f"  resume '{art.filename}' at offset {start:,} "
               f"of {_human(art.bytes)}", flush=True)
     else:
@@ -418,13 +592,8 @@ def _download(art: ModelArtifact, dest: Path, transport,
                            f"{type(exc).__name__}") from None
     try:
         _validate_response(art, stream, url, start)
-        flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if start else os.O_TRUNC)
-        fd = os.open(partial, flags, 0o644)
+        fd = _open_partial(partial, start)
         try:
-            if start:
-                os.ftruncate(fd, start)  # atomic truncate-to-EOF, no seek races
-            else:
-                os.ftruncate(fd, 0)
             while True:
                 try:
                     chunk = stream.read(CHUNK_BYTES)
@@ -449,7 +618,13 @@ def _download(art: ModelArtifact, dest: Path, transport,
                         f"'{art.filename}': server sent more than the manifest's "
                         f"{_human(art.bytes)} bytes — response rejected, no "
                         "final written and the unrecoverable partial removed")
-                os.write(fd, chunk)
+                try:
+                    _write_all(fd, chunk)
+                except OSError as exc:
+                    raise NetworkError(
+                        f"local write failure at {written:,} B for "
+                        f"'{art.filename}': {type(exc).__name__} — the "
+                        f"partial is preserved for resume") from None
         finally:
             if fd != -1:
                 os.close(fd)
@@ -576,6 +751,7 @@ def do_fetch(manifest_path: str, models_dir: str, transport,
           flush=True)
 
     # Refuse ALL unsafe paths before creating a single directory:
+    _check_root_symlinks(root)
     for art in manifest.artifacts:
         _check_write_path_symlinks(root, art.filename)
 
@@ -606,7 +782,7 @@ def do_fetch(manifest_path: str, models_dir: str, transport,
     remaining = 0
     for art in pending:
         partial = _partial_path(root / art.filename)
-        start = _resume_offset(art, partial)
+        start, _present = _resume_offset(art, partial)
         remaining += art.bytes - start
     need = remaining + DISK_HEADROOM_PER_FILE * len(pending)
     probe = root if root.exists() else root.parent

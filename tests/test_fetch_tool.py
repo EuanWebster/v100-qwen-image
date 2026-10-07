@@ -5,10 +5,14 @@ fetcher's transport is *injected* (a fake byte stream), so no socket is ever
 constructed, no real weight bytes exist anywhere, and every write lands in
 pytest ``tmp_path`` (R7). Tests cover: happy path, already-good and
 mismatched finals, truncated / oversized / wrong-hash responses,
-interrupted-then-resumed Range, ignored Range, forged/wrong Content-Range,
-partial too big, symlinked partial / symlinked write path / symlinked final,
-path escape, disk-space refusal, no-clobber publish, URL/host pinning and
-sanitized (query-stripped) error messages, and read-only/offline plan+help.
+interrupted-then-resumed Range, ignored Range, forged/wrong Content-Range
+(incl. wildcard total and reversed span), partial too big, symlinked partial
+/ symlinked write path / symlinked final / symlinked --models-dir root (and
+its existing ancestors), path escape, disk-space refusal, no-clobber publish,
+byte-complete-partial rehash-and-publish, nofollow/O_EXCL/size-drift partial
+opens, short-``os.write`` completion, URL/host pinning and sanitized
+(query-, userinfo- and reason-stripped) error messages, and read-only/
+offline plan+help.
 """
 from __future__ import annotations
 
@@ -461,7 +465,9 @@ def test_ignored_range_never_concatenated(tmp_path):
 @pytest.mark.parametrize("headers,fragment", [
     ({"Content-Range": "bytes 0-399/400"}, "starts at 0"),      # wrong start
     ({"Content-Range": "bytes 150-399/999999"}, "total"),       # wrong total
+    ({"Content-Range": "bytes 150-399/*"}, "wildcard"),         # hidden total
     ({"Content-Range": "bytes 150-999/400"}, "coherent"),       # bad span
+    ({"Content-Range": "bytes 150-149/400"}, "coherent"),       # reversed span
     ({}, "missing or malformed Content-Range"),                 # absent
 ])
 def test_forged_or_wrong_content_range_refused(tmp_path, headers, fragment):
@@ -621,3 +627,248 @@ def test_no_heavy_modules_after_inprocess_activity(tmp_path):
     assert run(tmp_path, manifest, root, transport=t).rc == 0
     assert run(tmp_path, manifest, root, fetch_mode=False).rc == 0
     assert not set(HEAVY_MODULES) & set(sys.modules)
+
+
+# ---------------------------------------------------------------------------
+# M2.1 fix pass — symlinked --models-dir root refused before anything happens
+# ---------------------------------------------------------------------------
+
+
+def test_symlinked_models_root_refused_external_untouched(tmp_path):
+    blob = b"W" * 60
+    entry = art(blob, "a/x.bin")
+    manifest = write_manifest(tmp_path, [entry])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "assets"
+    os.symlink(outside, root)  # the explicit lexical root IS a symlink
+    t = ExplodingTransport()
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == fetch.EXIT_REFUSED, res.err
+    assert "symlink" in res.err
+    assert not list(outside.iterdir())  # external dir untouched, no dirs made
+    assert root.is_symlink()
+    assert t.calls == []
+
+
+def test_symlinked_ancestor_of_models_root_refused(tmp_path):
+    blob = b"W" * 60
+    entry = art(blob, "a/x.bin")
+    manifest = write_manifest(tmp_path, [entry])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = tmp_path / "link"
+    os.symlink(outside, link)
+    root = link / "assets"  # final component does not exist (no speculation)
+    t = ExplodingTransport()
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == fetch.EXIT_REFUSED, res.err
+    assert "symlink" in res.err
+    assert not list(outside.iterdir())
+    assert t.calls == []
+
+
+def test_missing_nonsymlink_root_components_are_not_refused(tmp_path):
+    """Legitimate multi-component roots that simply do not exist yet are
+    created and fetched into — the ancestor check refuses REAL symlinks,
+    not absent parent paths by assumption."""
+    blob = b"N" * 70
+    entry = art(blob, "a/x.bin")
+    manifest = write_manifest(tmp_path, [entry])
+    root = tmp_path / "deep" / "nested" / "assets"
+    t = FakeTransport({_url(entry): ok_stream(blob)})
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == 0, res.err
+    assert (root / "a" / "x.bin").read_bytes() == blob
+
+
+# ---------------------------------------------------------------------------
+# M2.1 fix pass — complete-partial recovery (no Range request from EOF)
+# ---------------------------------------------------------------------------
+
+
+def test_byte_complete_partial_rehashed_and_published_no_network(tmp_path):
+    blob = os.urandom(400)
+    entry = art(blob, "a/x.bin")
+    manifest = write_manifest(tmp_path, [entry])
+    root = tmp_path / "assets"
+    (root / "a").mkdir(parents=True)
+    (root / "a" / "x.bin.partial").write_bytes(blob)  # exactly art.bytes
+    t = ExplodingTransport()
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == 0, res.err
+    assert "partial-complete-and-verified" in res.out
+    assert (root / "a" / "x.bin").read_bytes() == blob
+    assert t.calls == []  # no impossible Range: bytes=<size>- request
+    _no_partial_left(root)
+
+
+def test_byte_complete_partial_wrong_hash_fails_never_published(tmp_path):
+    blob = b"truth" * 40
+    entry = art(blob, "a/x.bin")
+    manifest = write_manifest(tmp_path, [entry])
+    root = tmp_path / "assets"
+    (root / "a").mkdir(parents=True)
+    partial = root / "a" / "x.bin.partial"
+    partial.write_bytes(b"X" * len(blob))  # right size, wrong content
+    t = ExplodingTransport()
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == fetch.EXIT_INTEGRITY, res.err
+    assert "complete partial failed" in res.err
+    assert not (root / "a" / "x.bin").exists()
+    _no_partial_left(root)  # removed deliberately: unrecoverable
+    assert t.calls == []
+
+
+# ---------------------------------------------------------------------------
+# M2.1 fix pass — nofollow / O_EXCL / size-drift partial opens, short writes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"),
+                    reason="platform without O_NOFOLLOW")
+def test_open_partial_resume_never_follows_symlink_to_target(tmp_path):
+    victim = tmp_path / "victim.bin"
+    victim.write_bytes(b"do not touch" * 8)
+    link = tmp_path / "x.bin.partial"
+    os.symlink(victim, link)
+    with pytest.raises(fetch.UnsafePathError):
+        fetch._open_partial(link, 10)
+    assert victim.read_bytes() == b"do not touch" * 8
+
+
+def test_open_partial_excl_refuses_concurrently_appeared_partial(tmp_path):
+    p = tmp_path / "x.bin.partial"
+    p.write_bytes(b"appeared by another process")
+    with pytest.raises(fetch.RefuseClobberError):
+        fetch._open_partial(p, 0)  # start==0 → O_EXCL create must not truncate
+    assert p.read_bytes() == b"appeared by another process"
+
+
+def test_open_partial_refuses_size_drift_without_truncating(tmp_path):
+    p = tmp_path / "x.bin.partial"
+    p.write_bytes(b"0" * 30)
+    with pytest.raises(fetch.RefuseClobberError):
+        fetch._open_partial(p, 10)  # lstat said 10, the FD says 30
+    assert p.read_bytes() == b"0" * 30  # untouched, not truncated to 10
+
+
+def test_open_partial_refuses_non_regular_file(tmp_path):
+    not_a_file = tmp_path / "x.bin.partial"  # a DIRECTORY on the partial path
+    not_a_file.mkdir()
+    with pytest.raises(fetch.UnsafePathError):
+        fetch._open_partial(not_a_file, 0)
+    with pytest.raises(fetch.UnsafePathError):
+        fetch._open_partial(not_a_file, 10)
+
+
+def test_write_all_loops_until_chunk_fully_written(tmp_path, monkeypatch):
+    real_write = os.write
+
+    def capped(fd, b):
+        return real_write(fd, memoryview(b)[:7])  # every call truncates
+
+    monkeypatch.setattr(os, "write", capped)
+    target = tmp_path / "out.bin"
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        fetch._write_all(fd, b"z" * 50)
+    finally:
+        os.close(fd)
+    assert target.read_bytes() == b"z" * 50
+
+
+def test_short_writes_end_to_end_still_verify(tmp_path, monkeypatch):
+    """A filesystem/OS that accepts fewer bytes per os.write must still get
+    every byte down: the loop continues until the chunk is fully written."""
+    blob = os.urandom(900)
+    entry = art(blob, "a/x.bin")
+    manifest = write_manifest(tmp_path, [entry])
+    root = tmp_path / "assets"
+    real_write = os.write
+
+    def capped(fd, b):
+        return real_write(fd, memoryview(b)[:64])
+
+    monkeypatch.setattr(os, "write", capped)
+    t = FakeTransport({_url(entry): ok_stream(blob)})
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == 0, res.err
+    assert (root / "a" / "x.bin").read_bytes() == blob
+    _no_partial_left(root)
+
+
+# ---------------------------------------------------------------------------
+# M2.1 fix pass — diagnostics never echo userinfo, reasons or header values
+# ---------------------------------------------------------------------------
+
+
+def test_clean_url_strips_userinfo_query_and_fragment():
+    s = fetch._clean_url(
+        "https://user:SU-PER-SECRET@hf.example:443/repo/x?X-Amz-Signature"
+        "=deadbeef#frag")
+    assert s == "https://hf.example/repo/x"
+    assert "SU-PER-SECRET" not in s and "deadbeef" not in s
+    assert "@" not in s and "?" not in s and "#" not in s
+
+
+def test_http_error_reason_carrying_signed_url_is_not_echoed():
+    import urllib.error
+    err = urllib.error.HTTPError(
+        "https://huggingface.co/Qwen/Qwen-Image-2.1/resolve/" + REV + "/a/x.bin",
+        503, "Redirect to https://cas-bridge.xethub.hf.co/x?token=SIGNING-SECRET",
+        {}, None)
+    msg = fetch._fmt_http_error(err)
+    assert "SIGNING-SECRET" not in msg and "cas-bridge" not in msg
+    assert "HTTP 503" in msg and "huggingface.co/Qwen/Qwen-Image-2.1" in msg
+
+
+def test_urlerror_reason_text_never_echoed(monkeypatch):
+    import urllib.error
+    tr = fetch.UrllibTransport()
+
+    def boom(request, timeout=None):
+        raise urllib.error.URLError(
+            "cannot reach https://cas-bridge.example/p?token=SIGNING-SECRET")
+
+    monkeypatch.setattr(tr._opener, "open", boom)
+    url = (f"https://{fetch.HF_HOST}/{REPO}/resolve/{REV}/a/x.bin")
+    with pytest.raises(fetch.NetworkError) as ei:
+        tr.get(url, 0)
+    assert "SIGNING-SECRET" not in str(ei.value)
+    assert "URLError" in str(ei.value)
+    assert url in str(ei.value)
+
+
+def test_urlerror_oserror_reason_shows_only_type(monkeypatch):
+    import urllib.error
+    tr = fetch.UrllibTransport()
+
+    def boom(request, timeout=None):
+        raise urllib.error.URLError(ConnectionRefusedError(
+            111, "refused https://evil.example/?sig=SECRET-TEXT"))
+
+    monkeypatch.setattr(tr._opener, "open", boom)
+    with pytest.raises(fetch.NetworkError) as ei:
+        tr.get(f"https://{fetch.HF_HOST}/{REPO}/resolve/{REV}/a/x.bin", 0)
+    assert "SECRET-TEXT" not in str(ei.value)
+    assert "ConnectionRefusedError" in str(ei.value)
+
+
+def test_malformed_content_range_value_never_echoed(tmp_path):
+    blob = b"C" * 400
+    entry = art(blob, "a/x.bin")
+    manifest = write_manifest(tmp_path, [entry])
+    root = tmp_path / "assets"
+    (root / "a").mkdir(parents=True)
+    partial = root / "a" / "x.bin.partial"
+    partial.write_bytes(blob[:150])
+    t = FakeTransport({_url(entry): FakeStream(
+        206, {"Content-Range":
+              "bytes garbage https://cas-bridge.example/x?token=HEADER-SECRET"},
+        blob[150:])})
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == fetch.EXIT_NETWORK
+    assert "HEADER-SECRET" not in res.err
+    assert partial.read_bytes() == blob[:150]  # untouched
+    assert not (root / "a" / "x.bin").exists()
