@@ -29,15 +29,19 @@ Every statement is tagged:
   lines. True for those commits, full stop.
 * **[I]** import smoke — the symbol imports cleanly in the temporary ML venvs
   (3.11.15 / 3.13.5, M0.1 fix pass, `QwenImage21Pipeline` import verified both
-  interpreters). **No weights were loaded and no tensor was ever run.**
+  interpreters). **No model weights were loaded and no pipeline inference was
+  performed.** Honest limit: this is NOT an assertion that zero tensor code
+  executed anywhere — import-time module code was never instrumented;
+  "no model loading and no inference run" is what [I] claims and nothing more.
 * **[U]** unverified — needs GPU execution, real checkpoints, or numerical
   fidelity work (M3/M4). Nothing in this document is [U] *evidence*; [U] marks
-  the boundary of what [S]/[I] can prove.
+  the boundary of what [S]/[I] can prove: checkpoint fidelity, image quality,
+  numerical agreement, GPU execution, VRAM behaviour, attention-backend
+  performance on sm_70, and correctness of any GGUF quantization — all land
+  with the gated milestones, not with this survey.
 
-**Not claimed anywhere in this survey:** checkpoint fidelity, image quality,
-numerical agreement, GPU execution, VRAM behaviour, attention-backend
-performance on sm_70, or correctness of any GGUF quantization. Those are all
-[U] and land with the gated milestones.
+The taxonomy above is the tagging rule only; when each class was gathered and
+what it does not prove is recorded once, in the §9 evidence ledger.
 
 Key files:
 
@@ -60,6 +64,8 @@ Pipeline class `QwenImage21Pipeline`, VAE class **`AutoencoderKLQwenImage21`**
 
 ## 1. Pipeline constructor
 
+Immutable permalink: [pipeline_qwenimage21.py#L186-L232](https://github.com/huggingface/diffusers/blob/c6df88a511a98740646ee55577b590c9852650ce/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py#L186-L232).
+
 `QwenImage21Pipeline.__init__(scheduler, vae, text_encoder, processor,
 transformer, sample_sigmas=None)` — `pipeline_qwenimage21.py#L186-L232` [S]:
 
@@ -73,25 +79,61 @@ transformer, sample_sigmas=None)` — `pipeline_qwenimage21.py#L186-L232` [S]:
   pixel tile [S]. (Token math our config layer already uses: 1024²→4096 tokens.)
 * `sys_prompt = "Comprehend and analyze the provided prompt."` (#L212).
 * **Raw prompt templates — deliberate, do not "modernize" them** (#L213-L226):
-  `prompt_template_t2i` is an `<|im_start|>system\n{sys}…<|user|>\n{prompt}…
-  <|assistant|>` string formatted directly and handed to
-  `processor(text=…)` — the code comments state `apply_chat_template` tokenizes
-  *differently* and the checkpoint expects the raw form (#L213-L216).
-  `prompt_template_ti2i` adds the `<|im_start|>…
-  vision placeholders (T2I never uses them) (#L222).
+  each template is a raw ChatML-style envelope — the checkpoint's message
+  start/end control tokens around the `system` / `user` / `assistant` role
+  segments — written as literal strings, interpolated with `str.format` and
+  handed straight to `processor(text=…)`. The code comments state that
+  `apply_chat_template` tokenizes *differently* and the checkpoint expects
+  the raw form (#L213-L216). `prompt_template_ti2i` is the same envelope
+  plus, before the `{}` prompt slot, a numbered per-image marker with its
+  three vision-placeholder control tokens (T2I never uses them, #L222-L226).
+  Verbatim from the pinned source (#L212-L232) — this mechanically copied
+  block is the only sanctioned copy of those literal token bytes in this
+  repo; they are never retyped by hand:
+
+  ```python
+  self.sys_prompt = "Comprehend and analyze the provided prompt."
+  # The prompt is built as a raw template string and passed straight to
+  # `self.processor(text=..., images=...)`, rather than going through `apply_chat_template`:
+  # the two tokenize differently and the checkpoint expects this one. The "Picture 1: ..."
+  # vision prefix only appears in the image-conditioned template.
+  self.prompt_template_t2i = (
+      f"<|im_start|>system\n{self.sys_prompt}<|im_end|>\n"
+      f"<|im_start|>user\n{{}}<|im_end|>\n"
+      f"<|im_start|>assistant\n"
+  )
+  self.prompt_template_ti2i = (
+      f"<|im_start|>system\n{self.sys_prompt}<|im_end|>\n"
+      f"<|im_start|>user\n<image1><|vision_start|><|image_pad|><|vision_end|>{{}}<|im_end|>\n"
+      f"<|im_start|>assistant\n"
+  )
+  # Number of leading system-role tokens to drop from the hidden states. Derived from the
+  # tokenized system message rather than hardcoded, so it tracks the processor's template.
+  sys_message = [{"role": "system", "content": [{"type": "text", "text": self.sys_prompt}]}]
+  sys_tokens = self.processor.apply_chat_template(sys_message, tokenize=True, return_dict=False)
+  self._drop_idx = len(sys_tokens[0])
+  self._img_token_id = self.processor.tokenizer.encode("<|image_pad|>")[0]
+  ```
+
 * `_drop_idx` (number of leading system-role tokens stripped from the hidden
   states) is **derived at construction** by tokenizing the system message
   through `apply_chat_template` — the *only* place the chat template is used
-  (#L227-L231); `_img_token_id = tokenizer.encode("")[0]` (#L232) marks VLM
-  image slots.
+  (#L227-L231); `_img_token_id` (#L232) is the token id obtained by encoding
+  the tokenizer's vision-placeholder string (visible in the verbatim block
+  above), marking VLM image slots. All of this is structural source evidence
+  for the adapter contract, not runtime-behaviour proof.
 
 `model_cpu_offload_seq = "text_encoder->transformer->vae"` (#L183) — relevant
-to our M5 offload design. Constructor signature and both template attributes
-are asserted by `tools/check_pinned_interfaces.py` [S].
+to our M5 offload design. Constructor signature, both template-attribute
+names and the `_drop_idx` derivation are asserted by
+`tools/check_pinned_interfaces.py` (AST structure only — never a runtime
+behaviour proof) [S].
 
 ---
 
 ## 2. Prompt encoding — template, drop index, masks, pre-RMSNorm hook
+
+Immutable permalinks: [pipeline_qwenimage21.py#L240-L393](https://github.com/huggingface/diffusers/blob/c6df88a511a98740646ee55577b590c9852650ce/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py#L240-L393), [output_capturing.py#L234-L305](https://github.com/huggingface/transformers/blob/856157a2f3e9594954310df18fdccc31ffddebe9/src/transformers/utils/output_capturing.py#L234-L305).
 
 `_get_qwen_prompt_embeds` (#L240-L337) + `encode_prompt` (#L339-L393):
 
@@ -144,8 +186,10 @@ are asserted by `tools/check_pinned_interfaces.py` [S].
   transformer only reads layout from row 0 ("samples share a layout",
   `transformer_qwenimage21.py#L910-L912`), so a homogeneous batch happens to
   survive — but that replication semantics is *untested by us and unstated by
-  upstream*. **v1 pins `num_images_per_prompt=1`, one output image per call**
-  (T2I-only, confirmed requirement 3); the checker asserts the non-repetition
+  upstream*. **v1 pins `num_images_per_prompt=1`:** T2I-only is the user
+  requirement (requirement 3); *one output image per `__call__`* is **our v1
+  scope choice**, not a user-imposed one (it also sidesteps this hazard); the
+  checker asserts the non-repetition
   so the note cannot rot silently. No upstream patch is made or proposed
   here.
 * External-embeds + condition images cannot be expressed through `__call__`
@@ -155,6 +199,8 @@ are asserted by `tools/check_pinned_interfaces.py` [S].
 ---
 
 ## 3. `__call__` — signature, defaults, timesteps
+
+Immutable permalink: [pipeline_qwenimage21.py#L511-L535](https://github.com/huggingface/diffusers/blob/c6df88a511a98740646ee55577b590c9852650ce/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py#L511-L535).
 
 `__call__` (#L511-L535) v1-relevant defaults [S]: `num_inference_steps=40`
 (#L519; the docstring is explicit that it is *ignored* when a sigma schedule
@@ -183,6 +229,8 @@ per-pipeline-object* — see §8 concurrency.
 
 ## 4. CFG inactive semantics — the `None` contract
 
+Immutable permalink: [pipeline_qwenimage21.py#L677-L686](https://github.com/huggingface/diffusers/blob/c6df88a511a98740646ee55577b590c9852650ce/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py#L677-L686).
+
 Activation is exactly (#L677-L686) [S]:
 
 ```
@@ -200,11 +248,16 @@ do_true_cfg    = true_cfg_scale > 1 and has_neg_prompt
   negative with scale<=1 → warning, off (#L684-L686).
 * When active, the negative branch runs a second `encode_prompt` and a second
   transformer pass under its own cache context (#L697-L705, #L799-L813);
-  combination `neg + scale*(cond-neg)` at #L813.
+  combination `neg + scale*(cond-neg)` at #L813. **Guidance is two separate
+  forwards with separate cache branches (`cond_cache`/`neg_cache`) — not one
+  doubled batch**: per-forward activation stays single-batch; memory planning
+  must not assume `2×batch` peak.
 
 ---
 
 ## 5. VAE / latent scales — no scalar factor anywhere
+
+Immutable permalinks: [pipeline_qwenimage21.py#L416-L451](https://github.com/huggingface/diffusers/blob/c6df88a511a98740646ee55577b590c9852650ce/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py#L416-L451), [autoencoder_kl_qwenimage21.py#L977-L1004](https://github.com/huggingface/diffusers/blob/c6df88a511a98740646ee55577b590c9852650ce/src/diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py#L977-L1004).
 
 * VAE class `AutoencoderKLQwenImage21` (`autoencoder_kl_qwenimage21.py#L977`,
   ctor #L993-L1004: `z_dim=64` default, `dim_mult=[1,2,4,8,8]` → 16× spatial,
@@ -226,6 +279,8 @@ do_true_cfg    = true_cfg_scale > 1 and has_neg_prompt
 
 ## 6. Attention: default segmented processor, Flex opt-in, real backend selection
 
+Immutable permalink: [transformer_qwenimage21.py#L462-L561](https://github.com/huggingface/diffusers/blob/c6df88a511a98740646ee55577b590c9852650ce/src/diffusers/models/transformers/transformer_qwenimage21.py#L462-L561).
+
 * Two processors: `QwenImage21AttnProcessor` (#L462-L549) and
   `QwenImage21FlexAttnProcessor` (#L369-L459). **Default is the segmented,
   non-Flex one** (`_default_processor_cls = QwenImage21AttnProcessor`,
@@ -236,21 +291,26 @@ do_true_cfg    = true_cfg_scale > 1 and has_neg_prompt
   attend prefix+own block) + one call for the target image (#L501-L540);
   decode (no `segments`) = single full attention over
   `[cached prefix, target]` (#L489-L499).
-* **Actual backend selection (honest version):** every segmented call passes
-  `backend=None` explicitly (#L492-L500, #L522-L538); `dispatch_attention_fn`
-  then resolves the *active registry backend* — default `native`
+* **Actual backend selection (honest version).** The two call families differ
+  (#L471, #L492-L500, #L522-L541): **decode** (no `segments`) passes
+  `backend=self._attention_backend` — the *processor-specific* attribute,
+  whose class default is `None` (the Flex processor's decode honours
+  `set_attention_backend()`, #L378-L380; nothing sets it in our path).
+  **Prefill** calls pass `backend=None` literally, so `dispatch_attention_fn`
+  resolves the *active global registry backend* — default `native`
   (torch `F.scaled_dot_product_attention`) unless `DIFFUSERS_ATTN_BACKEND`
   or the `attention_backend` context manager set one
   (`attention_dispatch.py#L400-L430`, `#L267`,
-  `utils/constants.py#L56`) [S]. On Volta the flash-attention backends are
-  unavailable in practice, so resolution lands on SDPA — **but which SDPA
-  kernel (math / mem-efficient / flash-class) runs per call is torch's
-  runtime heuristic; unverified on this hardware [U]**. Do not claim a
-  guaranteed kernel on sm_70 without measurement; do not replace the
+  `utils/constants.py#L56`) [S]. **Do not read this as "Flash with automatic
+  fallback on Volta":** the flash-class backends are not usable on sm_70 and
+  were never exercised here; on this hardware resolution lands on SDPA, and
+  **which SDPA kernel (math / mem-efficient / flash-class) runs per call is
+  torch's runtime heuristic — unverified on this hardware [U]**. Do not claim
+  a guaranteed kernel on sm_70 without measurement; do not replace the
   processors with generic `AttnProcessor` (mask semantics would be wrong).
-  The model deliberately keeps `backend=None` on prefill calls — the checker
-  pins that so a future "fix" re-routing them is treated as a contract
-  change.
+  The model deliberately keeps literal `backend=None` on prefill calls — the
+  checker pins ≥2 such real call nodes so a future "fix" re-routing them is
+  treated as a contract change.
 * Flex path: prefill as one `flex_attention` call via a `BlockMask`
   (#L408-L441), **requires torch.compile** — the processor warns loudly
   because uncompiled flex materializes dense fp32 scores and OOMs at high
@@ -265,6 +325,8 @@ do_true_cfg    = true_cfg_scale > 1 and has_neg_prompt
   fail loudly there, which is what the §2 hazard note stays honest about.
 
 ## 7. Single-file checkpoints (Qwen21 mapping) and GGUF fallback vs remote kernels
+
+Immutable permalinks: [single_file_model.py#L199-L202](https://github.com/huggingface/diffusers/blob/c6df88a511a98740646ee55577b590c9852650ce/src/diffusers/loaders/single_file_model.py#L199-L202), [gguf/utils.py#L34-L51](https://github.com/huggingface/diffusers/blob/c6df88a511a98740646ee55577b590c9852650ce/src/diffusers/quantizers/gguf/utils.py#L34-L51).
 
 * **Single-file is transformer-scoped only.**
   `SINGLE_FILE_LOADABLE_CLASSES["QwenImage21Transformer2DModel"] =
@@ -294,10 +356,13 @@ do_true_cfg    = true_cfg_scale > 1 and has_neg_prompt
   MMQ/MMVQ disabled (#L94-L107). This is a *policy/dependency choice*, not a
   Volta incompatibility; kernel performance on the V100 remains untested [U].
 * GGUF loading enters through the quantizer with `from_single_file` on the
-  transformer class with a `GGUFQuantConfig` (same local-only discipline as
+  transformer class with a `GGUFQuantizationConfig`
+  (`quantization_config.py#L412`; same local-only discipline as
   §8); exact end-to-end GGUF load with a real file is an M4 task [U].
 
 ## 8. Local-only loading, KV lifecycle, and concurrency
+
+Immutable permalink: [pipeline_qwenimage21.py#L762-L799](https://github.com/huggingface/diffusers/blob/c6df88a511a98740646ee55577b590c9852650ce/src/diffusers/pipelines/qwenimage21/pipeline_qwenimage21.py#L762-L799).
 
 **Local-only loading (no-download contract, R3).** Every component loads from
 explicit local paths with `local_files_only=True` —
@@ -336,20 +401,41 @@ mutable-state sites].
 | Class | What | When |
 |---|---|---|
 | [S] | Everything cited by line above; both pinned checkouts re-verified via `git rev-parse HEAD` | 2026-10-07 |
-| [I] | `QwenImage21Pipeline` imports on 3.11.15 + 3.13.5 from the locked envs; signatures inspected in-process; **no weights loaded, no tensor executed** | M0.1 fix pass |
+| [I] | `QwenImage21Pipeline` imports on 3.11.15 + 3.13.5 from the locked envs; signatures inspected in-process; **no model weights loaded and no inference run** (not a claim that zero tensor code ever executed — see [I] limits above) | M0.1 fix pass |
 | [U] | checkpoint fidelity/quality, numerical agreement, GPU execution, VRAM, SDPA kernel identity/perf on sm_70, GGUF file loads, `from_pretrained`/`from_single_file` end-to-end | M3/M4 gates |
 
 Contract automation: `tools/check_pinned_interfaces.py` (stdlib `ast` only —
-no ML imports, no network, R7-safe) asserts the 36 source-signature facts
-this document depends on. Verified 36/36 against the pinned trees; deliberate
-drift copies (steps default 40→4, CFG-gate rewrite, `>=7`→`>7`, Flex-default
-processor swap, `image_pad_mask` repetition "fix",
-`tie_last_hidden_states` arrival) each fail loudly with exit 1; missing input
-trees exit 2 = *not run*. `tests/test_pinned_interfaces.py` executes it only
-when `QWEN_DIFFUSERS_SRC`/`QWEN_TRANSFORMERS_SRC` name real trees — otherwise
-it skips **explicitly**; a skip is never a validation claim.
+no ML imports, no network, R7-safe) asserts **53 structural contract checks**
+on the pinned trees — 38 AST-code checks and 15 text markers — covering the
+facts this document depends on. Verified 53/53 (exit 0) against the pinned
+trees on 2026-10-07; deliberate drift copies (steps default 40→4, CFG-gate
+rewrite incl. *extra boolean operands* like `... or True` / `... and False`,
+`>=7`→`>7`, Flex-default processor swap, `image_pad_mask` repetition "fix",
+`tie_last_hidden_states` arrival, norm-hook moved out of the prompt-encoding
+method) each fail loudly with exit 1; a source file that cannot be parsed
+(SyntaxError or bare ValueError) is a contract FAIL (exit 1), never a crash;
+missing/unreadable/non-UTF-8 inputs exit 2 = *not run*.
+`tests/test_pinned_interfaces.py` adds 15 always-run synthetic regressions
+(fresh state per invocation, comment/docstring-only evidence rejected,
+commented-out CFG/hook code, missing methods, signature/kind drift, parse
+failures, input errors) and executes the real-tree check only when
+`QWEN_DIFFUSERS_SRC`/`QWEN_TRANSFORMERS_SRC` name real trees — otherwise it
+skips **explicitly**; a skip is never a validation claim.
 
-*v1 scope reminder (confirmed requirements + lead review): T2I only; one
-image per `__call__` (`num_images_per_prompt=1`); raw upstream templates,
-drop-index, mask and pre-RMSNorm-hook semantics preserved verbatim; no
-upstream patch is made or endorsed.*
+**Checker limitations (read before citing it as proof).** (1) AST *structure*
+only: every PASS — including the "code" kind — says the surveyed shape exists
+in the file; the checker never executes upstream code, so no check proves
+runtime behaviour, numerical fidelity, or absence of network calls; that proof
+belongs to adapter-level tests (M4+). (2) Inputs are caller-provided trees:
+the checker does NOT verify them against the pinned commits above — revision
+verification (`git -C <tree> rev-parse HEAD` vs the recorded hashes) is a
+separate required step, done manually at the dates in the ledger. (3) The
+guarded CPU suite never imports torch/diffusers/transformers or loads
+weights; model loading and inference have NOT been performed anywhere in this
+project to date — that statement is about our actions, not a proof that no
+tensor code executed as an import side effect.
+
+*v1 scope reminder (confirmed requirements + lead review): T2I-only is the
+user requirement; one image per `__call__` (`num_images_per_prompt=1`) is our
+v1 scope choice; raw upstream templates, drop-index, mask and pre-RMSNorm-hook
+semantics preserved verbatim; no upstream patch is made or endorsed.*

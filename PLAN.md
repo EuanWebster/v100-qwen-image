@@ -334,8 +334,10 @@ unexpected (logged with context, traceback only into the log sink).
   path* check, the legitimate use of numerical diffing (C7).
 - **5.3** `memory.py` policy wired into the CLI and the adapter (R4). Every guard query
   carries a **policy descriptor**: phase (load / encode / denoise-step / decode / save);
-  token count + resolution (C6); prompt token length; **CFG duplication** (does the
-  negative prompt double the batch); attention backend; quant format; residency mode
+  token count + resolution (C6); prompt token length; **CFG activity** (guidance
+  on/off — in this pipeline CFG runs as *separate* cond/uncond forwards with their
+  own cache branches, NOT necessarily a doubled batch; cost it as extra forwards,
+  not `2×batch`); attention backend; quant format; residency mode
   (resident / streamed / offload); VAE mode (tiled decode on/off — decode memory only,
   C6); pinned model revision; **current free GPU and host memory** with configured
   headroom. Rules:
@@ -620,16 +622,19 @@ standing rule that executed plans stay honest.)*
   scales, local-only loading, default segmented processor vs. Flex and real
   dispatch-backend selection, singlefile Qwen21 mapping + GGUF native fallback
   vs. opt-in remote kernels at capability **≥7**, per-call KV lifecycle and
-  shared-pipeline call serialization). v1 stays T2I, one image per call; the
+  shared-pipeline call serialization). v1 stays T2I (user requirement) with one
+  image per call (our v1 scope choice); the
   unfixed upstream `image_pad_mask` × `num_images_per_prompt` replication
   hazard is **documented, not patched** (no upstream patch). Added
   `tools/check_pinned_interfaces.py` (stdlib-only AST source-signature
-  contract checker, offline, no ML imports): 36/36 contracts pass against the
+  contract checker, offline, no ML imports): all contracts pass against the
   verified pinned trees and it fails loudly on deliberate signature drift
   (defaults, CFG gate, ≥7 gate, default processor swap, `tie_last_hidden_states`
   arrival); missing input trees exit 2 = "not run", never a silent pass — the
   optional `tests/test_pinned_interfaces.py` skips explicitly without the
-  env-provided trees. PLAN fixes: stale `adapter.plan` references corrected
+  env-provided trees. (Check-count "36/36" in this note is superseded by the
+  final-polish note below: now 53 checks, 38 AST-code + 15 markers.) PLAN
+  fixes: stale `adapter.plan` references corrected
   (protocol has no `plan`; `core.plan()` is adapter-independent — matches the
   shipped code) and the V100 install row now records the user-confirmed fact
   **card NOT installed** (all pre-existing decisions/corrections preserved).
@@ -638,4 +643,41 @@ standing rule that executed plans stay honest.)*
   hash** (commit-SHA source anchor; registry wheels carry the hashes), and the
   isolated VCS *build* tooling is not captured by the runtime lock, so installs
   are not advertised as bit-reproducible builds.
+- 2026-10-07 **M0.2 final polish** (this commit; accepted M1 `fd3ba15` and
+  M0.1 `315705d` untouched): checker hardening — CFG-gate AST checks now require
+  **exactly** the two documented operands (`... or True` / `... and False` is
+  drift; regression added); `parse_source` handles a bare `ValueError` from
+  `ast.parse` (no `.msg`/`.lineno`) as a clean FAIL + exit 1, never an
+  AttributeError (regression added); the pre-RMSNorm-hook registration and
+  `finally`-remove checks are scoped to `_get_qwen_prompt_embeds` (a hook
+  parked in another method is drift; regression added); checker output now
+  states explicitly that a "code" PASS is AST **structure**, never runtime
+  behaviour proof. Checker total: **53 checks = 38 AST-code + 15 markers,
+  53/53 exit 0** against the pinned trees (was 36/36 in the M0.2 notes).
+  `docs/interfaces.md` corrections: duplicated evidence-ledger material
+  deduplicated (top taxonomy now defers to the single §9 ledger); stale 36/36
+  count fixed; "no tensor was ever run" replaced with the truthful "no model
+  loading, no inference performed — NOT a claim that zero tensor code executed
+  anywhere"; `GGUFQuantConfig` → **`GGUFQuantizationConfig`**; §6 backend truth
+  — decode passes the *processor-specific* `_attention_backend` (class default
+  `None`), prefill passes literal `backend=None` to the global registry, and
+  no automatic-Flash-fallback-on-Volta is implied; CFG documented as separate
+  forwards/cache branches, not a doubled batch (PLAN §5.3 descriptor updated
+  to match); T2I (user requirement) separated from one-image-per-call (our v1
+  scope choice); clickable commit-permalinks added per section; the mangled §1
+  constructor/template/image-token paragraphs were repaired by **mechanically
+  copying** the pinned `__init__` source bytes (L212–L232) into a verbatim
+  fenced block via a generated patch — the raw token literals never passed
+  through the writing model's context and are never retyped by hand; §9 now
+  lists checker/tests/input/pin-verification limitations truthfully (revision
+  verification remains a separate manual step; the guarded suite never imports
+  torch/diffusers/transformers and no model loading/inference has been
+  performed anywhere in this project to date). `tests/test_pinned_interfaces.py`:
+  15 always-run synthetic regressions (+3 this pass) plus the explicit-skip
+  external check. Evidence: guarded suite (R7) **410 passed + 1 skip** without
+  `QWEN_{DIFFUSERS,TRANSFORMERS}_SRC` and **411 passed** with them, on both
+  3.11.15 and 3.13.5; standalone checker 53/53 exit 0 on the pinned trees
+  (commits re-verified by `git rev-parse HEAD` the same day). No weights, GPU,
+  driver, service or sandbox-infra changes. M2 manifest is the next separate
+  assignment.
 
