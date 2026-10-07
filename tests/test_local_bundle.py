@@ -1020,3 +1020,73 @@ def test_preflight_refuses_wrong_entry_kind_and_missing_entry(tmp_path):
 def test_preflight_missing_root_refused(tmp_path):
     with pytest.raises(lb.BundleTreeError, match="not a directory"):
         lb.preflight_closed_tree(tmp_path / "nowhere")
+
+
+# ---------------------------------------------------------------------------
+# Constructor / fingerprint-input invariants (review item 5): typed refusals
+# at the API surface, without claiming resolver verification
+# ---------------------------------------------------------------------------
+
+
+def _direct_bundle(**overrides):
+    kwargs = dict(
+        profile=lb.LOCAL_REFERENCE_PROFILE,
+        root=Path("/abs/root"), root_resolved=Path("/abs/root"),
+        repo=lb.FULL_REFERENCE_REPO, revision=lb.FULL_REFERENCE_REVISION,
+        assets={"vae": (Path("/abs/root/vae/diffusion_pytorch_model.safetensors"),)},
+        component_dirs={"vae": Path("/abs/root/vae")},
+        fingerprints=lb.ArtifactSetFingerprints(bundle="a" * 64,
+                                               encoder="b" * 64))
+    kwargs.update(overrides)
+    return lb.LocalReferenceBundle(**kwargs)
+
+
+def test_direct_construction_enforces_profile_scalars():
+    _direct_bundle()  # positive control: the honest shape constructs
+    with pytest.raises(lb.BundleLayoutError, match="profile"):
+        _direct_bundle(profile="gguf-ladder")
+    with pytest.raises(lb.BundleLayoutError, match="absolute"):
+        _direct_bundle(root=Path("relative/root"))
+    with pytest.raises(lb.BundleLayoutError, match="root_resolved"):
+        _direct_bundle(root=Path("/abs/root"),
+                       root_resolved=Path("/abs/different/resolved"))
+    with pytest.raises(lb.BundleLayoutError, match="repo"):
+        _direct_bundle(repo="someone-else/model")
+    with pytest.raises(lb.BundleLayoutError, match="revision"):
+        _direct_bundle(revision="f" * 40)
+    with pytest.raises(lb.BundleLayoutError, match="fingerprints"):
+        _direct_bundle(fingerprints={"bundle": "a" * 64, "encoder": "b" * 64})
+    # Honest promise kept: scalar validation is data hygiene, NOT disk or
+    # resolver verification — the constructed bundle above points at a path
+    # that does not exist and raised nothing for that.
+    assert not Path("/abs/root").exists()
+
+
+def test_fingerprints_reject_non_digest_strings():
+    lb.ArtifactSetFingerprints(bundle="a" * 64, encoder="b" * 64)
+    for bad in ("", "a" * 63, "a" * 65, "z" * 64, "AB" * 32, None):
+        with pytest.raises(lb.BundleLayoutError, match="hex digest"):
+            lb.ArtifactSetFingerprints(bundle=bad, encoder="b" * 64)
+        with pytest.raises(lb.BundleLayoutError, match="hex digest"):
+            lb.ArtifactSetFingerprints(bundle="a" * 64, encoder=bad)
+
+
+def test_artifact_set_fingerprint_rejects_non_artifacts_and_duplicates():
+    good = ModelArtifact(role="vae", repo=lb.FULL_REFERENCE_REPO,
+                         revision=lb.FULL_REFERENCE_REVISION,
+                         filename="vae/config.json", sha256="ab" * 32, bytes=1)
+    lb.artifact_set_fingerprint([good])  # positive control
+    with pytest.raises(lb.BundleLayoutError, match="ModelArtifact"):
+        lb.artifact_set_fingerprint([good, {"role": "vae"}])  # type: list
+    # Same filename twice (different roles/hashes): the sorted digest rows
+    # could silently collapse toward a plausible-looking digest — refuse.
+    twin = ModelArtifact(role="pipeline", repo=lb.FULL_REFERENCE_REPO,
+                         revision=lb.FULL_REFERENCE_REVISION,
+                         filename="vae/config.json", sha256="cd" * 32,
+                         bytes=2)
+    with pytest.raises(lb.BundleLayoutError, match="duplicate"):
+        lb.artifact_set_fingerprint([good, twin])
+    # Identical entries twice collapse in a SET and would silently digest
+    # the SAME as once — also a duplicate identity, also refused.
+    with pytest.raises(lb.BundleLayoutError, match="duplicate"):
+        lb.artifact_set_fingerprint([good, good])

@@ -348,10 +348,32 @@ def artifact_set_fingerprint(artifacts: Iterable[ModelArtifact]) -> str:
 @dataclass(frozen=True)
 class ArtifactSetFingerprints:
     """The two digests the cache design needs. ``model_sha256``-style naming
-    would lie: neither digest is *one shard* — each covers a whole set."""
+    would lie: neither digest is *one shard* — each covers a whole set.
+
+    **Cache-key scope warning (review item 4).** ``encoder`` is only the
+    ASSET component of a future encoder-worker cache key. A production
+    worker cache key must additionally include the worker protocol /
+    implementation revision and the exact diffusers/transformers pins —
+    wiring ``EncoderRequest.model_sha256`` (or any worker cache key) to this
+    asset digest ALONE is a contract violation: identical weights under a
+    different encoder implementation are NOT a cache hit. The full cache-
+    key implementation belongs to the worker milestone, not to this module.
+    """
 
     bundle: str  #: all roles — any file's identity change flips it
-    encoder: str  #: ENCODER_ROLES only — invalidates encoder cache entries
+    encoder: str  #: ENCODER_ROLES only — the ASSET component of the future
+    #: encoder cache key (never the whole key; see the scope warning above)
+
+    def __post_init__(self) -> None:
+        errors = [f"{name}: must be a 64-char lowercase hex digest, got "
+                  f"{value!r}"
+                  for name, value in (("bundle", self.bundle),
+                                      ("encoder", self.encoder))
+                  if not (isinstance(value, str) and len(value) == 64
+                          and all(c in "0123456789abcdef" for c in value))]
+        if errors:
+            raise BundleLayoutError(
+                "invalid artifact-set fingerprints: " + "; ".join(errors))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -419,6 +441,45 @@ class LocalReferenceBundle:
     fingerprints: ArtifactSetFingerprints
 
     def __post_init__(self) -> None:
+        # Scalar invariants (review item 5): the *data* this dataclass
+        # carries about the named profile is policed on EVERY construction —
+        # a direct construction cannot smuggle a foreign identity or a
+        # non-digest "digest" into a bundle-shaped object. This is data
+        # hygiene, NOT resolver verification: nothing here reads disk, a
+        # report or a manifest.
+        errors: list[str] = []
+        if self.profile != LOCAL_REFERENCE_PROFILE:
+            errors.append(
+                f"profile: this class describes only "
+                f"{LOCAL_REFERENCE_PROFILE!r}, got {self.profile!r} (a new "
+                "profile is new reviewed code, not a string here)")
+        for name in ("root", "root_resolved"):
+            value = getattr(self, name)
+            if not isinstance(value, Path):
+                errors.append(f"{name}: must be a Path, got "
+                              f"{type(value).__name__}")
+            elif not value.is_absolute():
+                errors.append(f"{name}: must be absolute, got {value}")
+        if (isinstance(self.root, Path) and isinstance(self.root_resolved, Path)
+                and self.root != self.root_resolved):
+            errors.append(
+                f"root {self.root} != root_resolved {self.root_resolved}: "
+                "the bundle publishes the canonical resolved root, and "
+                "records the canonical root as its own resolved form")
+        if self.repo != FULL_REFERENCE_REPO:
+            errors.append(f"repo: profile {LOCAL_REFERENCE_PROFILE} pins "
+                          f"{FULL_REFERENCE_REPO!r}, got {self.repo!r}")
+        if self.revision != FULL_REFERENCE_REVISION:
+            errors.append(f"revision: profile {LOCAL_REFERENCE_PROFILE} pins "
+                          f"{FULL_REFERENCE_REVISION!r}, got {self.revision!r}")
+        if not isinstance(self.fingerprints, ArtifactSetFingerprints):
+            errors.append("fingerprints: must be ArtifactSetFingerprints, "
+                          f"got {type(self.fingerprints).__name__}")
+        if errors:
+            raise BundleLayoutError(
+                "invalid LocalReferenceBundle (scalar invariants of the "
+                "named profile; no disk/resolver verification implied): "
+                + "; ".join(errors))
         # Defensive snapshot: copy the mappings, tuple-ise and Path-ise the
         # values, and re-freeze — a caller holding the original dicts/lists
         # can no longer mutate the "immutable" bundle afterwards. This does
