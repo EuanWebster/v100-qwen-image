@@ -470,3 +470,43 @@ standing rule that executed plans stay honest.)*
   `calibration_observation.v1` staleness key = (schema, model revision, backend,
   quant) for M5.3; `calibration.json` writes are atomic. 50 synthetic tests;
   suite 296; heavy-import boundary still clean in package and CLI dry run.
+- 2026-10-07 senior-review correction pass on top of `6955b92`, two scoped
+  commits. `cbecacf` (encoder): shared `_jsonsafe` deep-freeze means
+  `EncoderRequest.kwargs`/`EncodedPayload.metadata` snapshots and
+  `Blob` bytes are immutable all the way down — one request ⇒ one key ⇒ one
+  wire document, immune to later caller mutation; direct invalid inputs
+  (non-`ComponentIdentity` components, non-`Blob` entries, non-string JSON
+  keys, NaN/Inf numbers) are typed `EncoderRequestError`; NaN/Inf
+  `timeout_s`/`cancel_grace_s` rejected (NaN had silently disabled the
+  timeout). Cache mutations/quarantine/LRU now run under one in-process
+  mutex per canonical root with per-key locks shared per root: the
+  deterministic max_entries=1 concurrent-put race (both puts snapshot, then
+  evict each other → empty cache) is gone, and two instances on one root
+  cannot double-encode; atomic publication kept. Worker reaps live children
+  on **every** exit path before scratch cleanup — including
+  `KeyboardInterrupt` during the wait (`Popen.wait` is sleep-based, so the
+  interrupted teardown reaps via `os.waitpid`); returncode is checked
+  before any response read; scratch/request/stdio setup failures are typed
+  and clean up. Every failure branch emits a terminal
+  `encoder_worker_failed` event carrying captured stderr, typed failures
+  keep `.stderr`, dead log sinks can neither mask errors nor orphan
+  workers, and stderr excerpts are bounded tail reads. Strict result wire:
+  unknown result/error/blob fields and non-finite JSON constants are typed
+  protocol errors; entry headers the same (corrupt = miss + quarantine).
+  `929e0ef` (bench): `from_dict`/`from_json`/`load_result` require the
+  exact explicit `benchmark_result.v1` (and explicit observation schema) —
+  no silent re-labelling of missing/old/future tags; records deep-freeze
+  config/model/phases/resolution so post-construction mutation cannot
+  change saved output or aggregation; invalid direct constructions
+  (NaN/Inf or non-string-keyed config, non-sequence model/resolution,
+  10**400-ms phases, duplicate model identifiers) are `BenchSchemaError`,
+  never raw `TypeError`/`OverflowError`. `resource` import is guarded;
+  `host_rss_bytes` is documented as the parent-process lifetime peak,
+  multiplies KiB→bytes only on Linux (macOS already bytes, unknown units →
+  null). `add_observation` is synchronized per canonical path in-process
+  (cross-process not required at this milestone — documented);
+  `matching_observations` documented as staleness-key prefilter only, M5.3
+  must still match phase/tokens/resolution/residency/CFG/VAE/prompt length;
+  optional `prompt_tokens` added (null = unknown). No memory guard
+  implemented early. 56 new tests; suite 352 on Python 3.13, fake workers
+  only — no GPU/model measurements claimed.
