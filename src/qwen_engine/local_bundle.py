@@ -14,11 +14,18 @@ worse than useless. What happens here, all of it before any ML import:
    so it stays reviewable; per-file SHA/byte sizes are *not* hardcoded here
    (the manifest owns those claims; offline tests fabricate tiny contents
    with the same layout).
-2. The supplied :class:`~qwen_engine.manifest.ResolutionReport` must be
-   complete, ``ok``, and match the manifest **positionally and field-for-
-   field** — a reordered, truncated, padded or field-forged report is refused
-   with a typed error. ``report.resolved`` is never trusted: paths are
-   re-derived as ``root / filename`` and checked equal to the status paths.
+2. The supplied :class:`~qwen_engine.manifest.ResolutionReport` must be a
+   *coherent* success claim: complete, ``ok``, with an empty ``errors``
+   tuple, every status ``present`` with ``error is None``, and matching the
+   manifest **positionally and field-for-field**; ``report.resolved`` must
+   additionally equal the role-grouped status paths (keys and tuples, in
+   manifest order). A reordered, truncated, padded, field-forged or
+   internally inconsistent report is refused with a typed error. These are
+   *shape* checks on the success claim, not byte re-verification: a caller
+   who hand-forges both the manifest and the report can still produce a
+   bundle — only running the trusted resolver
+   (:func:`~qwen_engine.manifest.resolve_manifest`) over the real bytes is
+   verification. This projection is not cryptographic re-verification.
 3. Every projected path gets a *cheap* structural probe only — regular file,
    resolves inside the explicit model root, expected relative filename — so
    missing files, escaped symlinks, and file-vs-directory swaps cannot leak
@@ -31,9 +38,14 @@ worse than useless. What happens here, all of it before any ML import:
    identities changes, and proves nothing about tensor load or quality.
 
 Paths come only from the explicit ``models_dir`` root plus manifest filenames
-— never from a repo id, never from an ambient Hugging Face cache. This profile
-is the full-precision reference set only: no GGUF, no LoRA, no single-file
-checkpoint. Future variants are separate profiles, not fallbacks tried here.
+— never from a repo id, never from an ambient Hugging Face cache. Everything
+the bundle *publishes* (root, ``assets``, ``component_dirs``) is an absolute
+path under the canonical resolved root, so a future worker started from a
+different working directory can still load it even when the caller passed a
+relative ``models_dir``; the report is still matched against the caller's
+lexical ``root / filename``. This profile is the full-precision reference
+set only: no GGUF, no LoRA, no single-file checkpoint. Future variants are
+separate profiles, not fallbacks tried here.
 """
 from __future__ import annotations
 
@@ -144,7 +156,10 @@ class BundleLayoutError(LocalBundleError):
 
 
 class BundleReportError(LocalBundleError):
-    """The ResolutionReport is incomplete, not ``ok``, or does not match the
+    """The ResolutionReport is incomplete, not ``ok``, internally
+    inconsistent (nonempty ``errors`` despite success, a present status
+    carrying ``error``, a ``resolved`` mapping that does not equal the
+    role-grouped status paths in manifest order), or does not match the
     supplied manifest positionally and field-for-field (missing, reordered,
     extra, or forged status entries; paths that are not ``root/filename``)."""
 
@@ -293,21 +308,45 @@ class LocalReferenceBundle:
     ``GenerationAdapter.load(config, assets)`` and for future
     ``local_files_only=True`` component probes.
 
-    All mappings/tuples are immutable; :meth:`to_assets` hands out a defensive
-    plain-dict copy for callers that want one. Paths are ``root / filename``
-    for the layout's filenames — never repo ids, never an ambient HF cache.
+    Every mapping and path tuple is snapshotted into an immutable copy in
+    :meth:`__post_init__` (defensive freeze — mutable dicts or lists handed
+    to the constructor cannot mutate the bundle afterwards), and
+    :meth:`to_assets` hands out a defensive plain-dict copy for callers that
+    want one. Published paths are absolute (``root / filename`` for the
+    layout's filenames, rooted at the canonical resolved root) — never repo
+    ids, never an ambient HF cache.
+
+    **Direct construction performs no resolver verification.** It only
+    shapes and freezes whatever it is given; use
+    :func:`local_bundle_from_resolution` for the checked projection.
     """
 
     profile: str
+    #: Canonical *absolute* model root all published paths sit under.
     root: Path
+    #: Canonical resolved form of the caller's root (equals ``root``).
     root_resolved: Path
     repo: str
     revision: str
-    #: role -> verified paths in manifest order (adapter ``assets`` shape).
+    #: role -> verified absolute paths in manifest order (adapter
+    #: ``assets`` shape); immutable whatever was passed in.
     assets: Mapping[str, tuple[Path, ...]]
-    #: role -> explicit component directory (pipeline's is the root itself).
+    #: role -> explicit absolute component directory (pipeline's is the
+    #: root itself); immutable whatever was passed in.
     component_dirs: Mapping[str, Path]
     fingerprints: ArtifactSetFingerprints
+
+    def __post_init__(self) -> None:
+        # Defensive snapshot: copy the mappings, tuple-ise and Path-ise the
+        # values, and re-freeze — a caller holding the original dicts/lists
+        # can no longer mutate the "immutable" bundle afterwards. This does
+        # NOT verify anything against disk or a resolver report.
+        object.__setattr__(self, "assets", MappingProxyType({
+            role: tuple(Path(p) for p in paths)
+            for role, paths in self.assets.items()}))
+        object.__setattr__(self, "component_dirs", MappingProxyType({
+            role: Path(directory)
+            for role, directory in self.component_dirs.items()}))
 
     def to_assets(self) -> dict[str, tuple[Path, ...]]:
         """Defensive copy for ``adapter.load(config, adapter_assets)``."""
@@ -391,10 +430,18 @@ def local_bundle_from_resolution(manifest: ModelManifest,
     role mapping, single repo+revision); ``report`` must be the complete,
     ``ok`` report *for that manifest* — statuses align positionally, every
     field of every status artifact equals the manifest's, every state is
-    ``present`` with path exactly ``root/filename``. ``report.resolved`` is
-    ignored; paths are re-derived and probed (regular file, under the root)
-    without re-reading content. All refusal happens with typed errors before
-    any ML import. Performs no network access, no mkdir, no writes.
+    ``present`` with ``error is None`` and path exactly ``root/filename``
+    (the caller's lexical root), ``report.errors`` is empty, and
+    ``report.resolved`` equals the role-grouped status paths (keys and
+    tuples, manifest order). The bundle **publishes absolute paths under the
+    canonical resolved root** so a future worker started from a different
+    working directory can load them even when ``models_dir`` was relative.
+    Published paths are probed (regular file, under the root) without
+    re-reading content. These checks police the *shape* of the success
+    claim — they are not cryptographic re-verification: forging bytes still
+    requires defeating the trusted resolver itself. All refusal happens with
+    typed errors before any ML import. Performs no network access, no mkdir,
+    no writes.
     """
     repo, revision = validate_local_reference_layout(manifest)
 
@@ -414,6 +461,12 @@ def local_bundle_from_resolution(manifest: ModelManifest,
             "resolution report is not successful (not every artifact is "
             f"verified present/size/hash-correct): {problems or 'no statuses'}")
 
+    if report.errors:
+        raise BundleReportError(
+            f"a successful report must carry no errors, got "
+            f"{len(report.errors)} (ok=True is contradicted by "
+            f"report.errors)")
+
     statuses = tuple(report.statuses)
     artifacts = tuple(manifest.artifacts)
     if len(statuses) != len(artifacts):
@@ -432,37 +485,55 @@ def local_bundle_from_resolution(manifest: ModelManifest,
             raise BundleReportError(
                 f"status[{i}] for {art.filename} has state {status.state!r}; "
                 "only a fully present report projects")
+        if status.error is not None:
+            raise BundleReportError(
+                f"status[{i}] for {art.filename} is marked present but "
+                f"carries error {status.error!r}; a successful report must "
+                "have no per-artifact errors")
         expected = root / art.identity
         if status.path is None or status.path != expected:
             raise BundleReportError(
                 f"status[{i}] path {status.path!r} is not the expected "
                 f"{expected} (report does not match this root/manifest)")
 
+    # Role grouping of the statuses in manifest order, compared against the
+    # caller's *lexical* root (how resolve_manifest builds report.resolved).
+    resolved_grouping: dict[str, tuple[Path, ...]] = {
+        role: () for role in LOCAL_REFERENCE_LAYOUT}
+    # Published paths, rooted at the canonical ABSOLUTE root so they stay
+    # loadable from any future working directory (relative models_dir safe).
     assets: dict[str, tuple[Path, ...]] = {
         role: () for role in LOCAL_REFERENCE_LAYOUT}
     for art in artifacts:
-        assets[art.role] += (root / art.identity,)
+        resolved_grouping[art.role] += (root / art.identity,)
+        assets[art.role] += (root_resolved / art.identity,)
+    if dict(report.resolved) != resolved_grouping:
+        raise BundleReportError(
+            f"report.resolved does not match the role-grouped status paths "
+            f"in manifest order (keys and tuples) for root {root} (missing, "
+            "extra or reordered resolved entries are refused)")
 
     for role, paths in assets.items():
         for path in paths:
             _probe_regular_file_under_root(path, role, root_resolved)
 
-    # Explicit, unresolved-under-root component directories: every path here
-    # is literally `root/<component dir>` — the only load paths in existence.
+    # Explicit component directories, all under the canonical ABSOLUTE root:
+    # every path here is literally `root/<component dir>` — the only load
+    # paths in existence, stable across working-directory changes.
     component_dirs = {
-        role: (root if directory == "."
-               else root.joinpath(*directory.split("/")))
+        role: (root_resolved if directory == "."
+               else root_resolved.joinpath(*directory.split("/")))
         for role, directory in ROLE_DIRECTORIES.items()
     }
     fingerprints = reference_bundle_fingerprints(manifest)
 
     return LocalReferenceBundle(
         profile=LOCAL_REFERENCE_PROFILE,
-        root=root,
+        root=root_resolved,
         root_resolved=root_resolved,
         repo=repo,
         revision=revision,
-        assets=MappingProxyType(assets),
-        component_dirs=MappingProxyType(component_dirs),
+        assets=assets,
+        component_dirs=component_dirs,
         fingerprints=fingerprints,
     )
