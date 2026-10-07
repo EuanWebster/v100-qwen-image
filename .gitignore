@@ -12,6 +12,10 @@ dist/
 .pytest_cache/
 .coverage
 
+# Model asset storage (M2.1): operator-fetched weights live here and are far
+# too large for git; the committed models/manifest.json pins their identities.
+models/assets/
+
 # Engine runtime artifacts (all config-relocatable; must never land in the repo)
 output/
 cache/
