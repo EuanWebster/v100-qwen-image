@@ -882,3 +882,26 @@ standing rule that executed plans stay honest.)*
   `sandbox.yaml` user edit still uncommitted (deliberately untouched).
   Awaiting root re-review.
 
+- 2026-10-07 **M2.1 fetcher review2 (path-normalization bypass)** (this commit;
+  sole writer Qwen, review `/tmp/v100-m2-fetch-review2.md` applied in full, on
+  accepted `bd596d8`/`51608ef`): closed the symlink+`..` escape —
+  `_check_root_symlinks`'s `os.path.abspath` collapses `..` **lexically**, so
+  with `in/link` → `out/deep` the root `in/link/../assets` inspected
+  symlink-free `in/assets` while `makedirs`/`open` wrote under `out/assets`
+  (A/B probe on the pre-fix tree: rc 0, 1 transport call, external
+  `out/assets/a/x.bin` written). `do_fetch` now calls
+  `_check_root_no_dotdot(root)` before ANY normalization/mkdir/network/write
+  (exit 6, no writes anywhere, transport never called); the read-only
+  offline plan is deliberately unaffected. `artifact_url` now also refuses
+  whole `.`/`..` repo namespace/name segments (character-legal but they
+  collapse inside the URL path; `[A-Za-z0-9._-]` and the two-segment
+  contract otherwise unchanged). `tests/test_fetch_tool.py` **49 → 64**
+  offline tests: reproduced bypass end-to-end (abspath vs resolve disagree,
+  fake transport, refusal pre-network, both trees untouched), plain `..`
+  refusal, exact `_check_root_no_dotdot` parametrization (`a/./b` legal,
+  any `..` refused), read-only plan unaffected by the new refusal,
+  dot-repo malformed-manifest regressions (plan exit 2, fetch exit 2 with
+  transport never called, no file written) and dotted-but-valid repo names.
+  All prior safety behaviour and `sandbox.yaml` (user-owned, untouched)
+  unchanged; engine semantics and the 24-entry manifest unchanged. No
+  network, no weights, no model load, no GPU, no service change.

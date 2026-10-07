@@ -18,9 +18,11 @@ Contract (see ``docs/models.md`` §4):
   enforced by the schema-v1 parser).
 * Fixed HTTPS official Hub: every URL is
   ``https://huggingface.co/<repo>/resolve/<revision>/<filename>`` — the host
-  is a constant, repo segments are restricted to ``[A-Za-z0-9._-]``, and
-  redirects to non-HTTPS targets are refused. Signed redirect query
-  parameters are never printed: URLs shown anywhere are query-stripped.
+  is a constant, repo segments are restricted to ``[A-Za-z0-9._-]`` whole
+  segments that are never ``.`` or ``..`` (a dot-segment would collapse
+  inside the URL path), and redirects to non-HTTPS targets are refused.
+  Signed redirect query parameters are never printed: URLs shown anywhere
+  are query-stripped.
 * Bounded streaming: chunks of at most 1 MiB; never buffers a whole file.
   The expected byte count is enforced as an upper bound *while reading*.
 * Publish only on an exact size+SHA256 match, atomically and no-clobber
@@ -44,8 +46,11 @@ Contract (see ``docs/models.md`` §4):
   whose identity does not match the manifest (or that is not a regular file /
   escapes the asset root) is refused and NEVER deleted or overwritten. The
   ``--models-dir`` root itself (and any existing component of its path) must
-  not be a symlink — checked before any mkdir, network access or write,
-  because a resolved symlinked root would otherwise define its own boundary.
+  not be a symlink, and the root must contain no ``..`` component (a lexical
+  ``..`` collapse after a symlinked step resolves elsewhere than the
+  filesystem path, which would blind the symlink check) — both checked before
+  any mkdir, network access or write, because a resolved symlinked root would
+  otherwise define its own boundary.
   A symlinked partial or symlinked directory on the write path is refused;
   partials are opened ``O_NOFOLLOW`` (where the platform provides it), a new
   partial is created ``O_EXCL`` (a concurrently appeared partial is refused,
@@ -120,6 +125,10 @@ DISK_HEADROOM_PER_FILE = 1 << 20
 DEFAULT_TIMEOUT_S = 60.0
 
 _REPO_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
+#: Character-legal but semantically invalid whole-segment repo ids: '.' and
+#: '..' would collapse inside the URL path and break the fixed
+#: '<repo>/resolve/<revision>/<file>' shape, so they are never accepted.
+_DOT_SEGMENTS = frozenset({".", ".."})
 _CONTENT_RANGE_RE = re.compile(
     r"^bytes (\d+)-(\d+)/(\d+|\*)$", re.IGNORECASE)
 
@@ -201,10 +210,13 @@ def artifact_url(art: ModelArtifact) -> str:
     """Canonical pinned download URL — host is a constant, so a tampered
     manifest can never steer this tool to another host."""
     segments = art.repo.split("/")
-    if len(segments) != 2 or not all(_REPO_SEGMENT_RE.fullmatch(s) for s in segments):
+    if len(segments) != 2 or not all(
+            s not in _DOT_SEGMENTS and _REPO_SEGMENT_RE.fullmatch(s)
+            for s in segments):
         raise UsageError(
             f"manifest repo {art.repo!r} is not a single 'namespace/name' "
-            "Hub repository id — refusing to build a URL from it")
+            "Hub repository id ('.' and '..' are not valid namespace/name "
+            "components) — refusing to build a URL from it")
     path = "/".join(urllib.parse.quote(seg, safe="")
                     for seg in art.filename.split("/"))
     return (f"https://{HF_HOST}/{segments[0]}/{segments[1]}"
@@ -337,13 +349,35 @@ def _partial_path(dest: Path) -> Path:
     return dest.parent / (dest.name + ".partial")
 
 
+def _check_root_no_dotdot(root: Path) -> None:
+    """Refuse any ``..`` component in the operator-supplied ``--models-dir``
+    BEFORE any normalization, mkdir, network access or write.
+
+    ``os.path.abspath`` collapses ``..`` *lexically*, while the filesystem
+    collapses it only after following symlinks: with ``in/link/../assets``
+    where ``link`` is a symlink to ``out/deep``, the checker would inspect
+    ``in/assets`` (no symlink) while ``os.makedirs``/``os.open`` would write
+    under ``out/assets`` — outside the directory the operator named.
+    Rejecting ``..`` up front keeps the component-by-component symlink
+    check below sound. The read-only offline plan does not write and stays
+    unaffected."""
+    if any(part == ".." for part in root.parts):
+        raise UnsafePathError(
+            f"--models-dir contains a '..' component: {root} — '..' after a "
+            "symlinked path component resolves on the filesystem somewhere "
+            "else than its lexical collapse, so the fetcher refuses it; pass "
+            "the asset root as a plain path without '..'")
+
+
 def _check_root_symlinks(root: Path) -> None:
     """Refuse a symlinked asset root BEFORE any mkdir, network access or
     write. The read-side resolver treats the *resolved* root as its boundary,
     so an explicit lexical root that is (or sits under) a symlink would
     silently redirect every write outside the directory the operator named.
     Every EXISTING component of the given root path is checked; components
-    that do not exist yet cannot be symlinks and are created as plain dirs."""
+    that do not exist yet cannot be symlinks and are created as plain dirs.
+    Sound only because ``_check_root_no_dotdot`` has already rejected any
+    ``..`` component whose lexical collapse could hide a symlinked step."""
     node = Path(os.path.abspath(str(root)))
     while True:
         if os.path.islink(node):
@@ -746,12 +780,15 @@ def do_fetch(manifest_path: str, models_dir: str, transport,
              disk_free_fn) -> int:
     manifest = load_manifest_checked(manifest_path)
     root = Path(models_dir)
+    # Refuse '..' in the asset root and symlinked root components BEFORE any
+    # normalization, mkdir, network access or write:
+    _check_root_no_dotdot(root)
+    _check_root_symlinks(root)
     print(f"fetch plan: {len(manifest.artifacts)} pinned artifact(s) from "
           f"https://{HF_HOST} at their pinned revisions into {root}",
           flush=True)
 
-    # Refuse ALL unsafe paths before creating a single directory:
-    _check_root_symlinks(root)
+    # Refuse ALL remaining unsafe paths before creating a single directory:
     for art in manifest.artifacts:
         _check_write_path_symlinks(root, art.filename)
 

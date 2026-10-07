@@ -11,8 +11,9 @@ interrupted-then-resumed Range, ignored Range, forged/wrong Content-Range
 its existing ancestors), path escape, disk-space refusal, no-clobber publish,
 byte-complete-partial rehash-and-publish, nofollow/O_EXCL/size-drift partial
 opens, short-``os.write`` completion, URL/host pinning and sanitized
-(query-, userinfo- and reason-stripped) error messages, and read-only/
-offline plan+help.
+(query-, userinfo- and reason-stripped) error messages, read-only/offline
+plan+help, and (review2) the symlink+``..`` lexical-collapse escape from
+``--models-dir`` plus ``.``/``..`` Hub repo segments.
 """
 from __future__ import annotations
 
@@ -872,3 +873,118 @@ def test_malformed_content_range_value_never_echoed(tmp_path):
     assert "HEADER-SECRET" not in res.err
     assert partial.read_bytes() == blob[:150]  # untouched
     assert not (root / "a" / "x.bin").exists()
+
+
+# ---------------------------------------------------------------------------
+# M2.1 review2 — the symlink + '..' lexical-collapse escape, closed
+# ---------------------------------------------------------------------------
+
+
+def test_dotdot_after_symlink_in_models_dir_refused_no_external_write(tmp_path):
+    """Reproduces the reported bypass and proves it is closed.
+
+    ``in/link`` -> ``out/deep``; the supplied root is ``in/link/../assets``.
+    ``os.path.abspath`` collapses that *lexically* to ``in/assets`` (a path
+    with no symlink, which the old check inspected), while the filesystem
+    resolves it through the link to ``out/assets`` — where makedirs/open
+    would have written. The fetcher must refuse the '..' component BEFORE
+    any mkdir or network call, leaving both trees untouched."""
+    blob = b"X" * 80
+    entry = art(blob, "a/x.bin")
+    manifest = write_manifest(tmp_path, [entry])
+    inside = tmp_path / "in"
+    inside.mkdir()
+    outside_deep = tmp_path / "out" / "deep"
+    outside_deep.mkdir(parents=True)
+    os.symlink(outside_deep, inside / "link")
+    root = inside / "link" / ".." / "assets"
+    # The two normalizations this bypass exploited really do disagree:
+    assert Path(os.path.abspath(str(root))) == inside / "assets"
+    assert root.resolve() == tmp_path / "out" / "assets"
+
+    t = FakeTransport({_url(entry): ok_stream(blob)})  # would write if reached
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == fetch.EXIT_REFUSED, res.err
+    assert "'..'" in res.err
+    assert t.calls == []                                   # refused pre-network
+    assert not (tmp_path / "out" / "assets").exists()      # no external write
+    assert not list(outside_deep.iterdir())
+    assert not (inside / "assets").exists()                # no mkdir happened
+
+
+def test_dotdot_in_models_dir_refused_before_mkdir_and_network(tmp_path):
+    entry = art(b"D" * 40, "a/x.bin")
+    manifest = write_manifest(tmp_path, [entry])
+    root = tmp_path / "assets" / ".." / "elsewhere"
+    t = ExplodingTransport()
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == fetch.EXIT_REFUSED, res.err
+    assert "'..'" in res.err
+    assert not (tmp_path / "elsewhere").exists()
+    assert not (tmp_path / "assets").exists()
+    assert t.calls == []
+
+
+@pytest.mark.parametrize("root,refused", [
+    ("a/../b", True), ("../a", True), ("/abs/x/..", True),
+    ("/abs/x/../y", True), ("a/b", False), (".", False), ("a/./b", False),
+])
+def test_root_no_dotdot_check_is_exact(root, refused):
+    if refused:
+        with pytest.raises(fetch.UnsafePathError):
+            fetch._check_root_no_dotdot(Path(root))
+    else:
+        fetch._check_root_no_dotdot(Path(root))
+
+
+def test_plan_read_only_still_allows_dotdot_root_and_writes_nothing(
+        tmp_path, monkeypatch):
+    """Scope discipline: only the --fetch write path gained the '..' refusal.
+    The offline read-only plan stays unaffected (it resolves like the
+    resolver does and touches nothing)."""
+    _no_network(monkeypatch)
+    blob = b"P" * 10
+    manifest = write_manifest(tmp_path, [art(blob, "a/x.bin")])
+    root = tmp_path / "assets" / ".." / "other"
+    res = run(tmp_path, manifest, root, fetch_mode=False)
+    assert res.rc == 0, res.err
+    doc = json.loads(res.out)
+    assert doc["mode"] == "plan" and doc["network"].startswith("offline")
+    assert not (tmp_path / "other").exists()
+    assert not (tmp_path / "assets").exists()
+
+
+# ---------------------------------------------------------------------------
+# M2.1 review2 — '.' and '..' are not valid Hub repo namespace/name segments
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("repo", ["Qwen/.", "Qwen/..", "./Qwen", "../Qwen"])
+def test_dot_repo_segments_refused_no_url_no_network(tmp_path, repo):
+    entry = art(b"Z" * 10, "a/x.bin")
+    entry["repo"] = repo
+    manifest = write_manifest(tmp_path, [entry])
+    from qwen_engine.manifest import ModelArtifact
+    with pytest.raises(fetch.UsageError):
+        fetch.artifact_url(ModelArtifact(**entry))
+    # Plan mode: malformed-manifest refusal, no URL ever printed.
+    res = run(tmp_path, manifest, tmp_path / "assets", fetch_mode=False)
+    assert res.rc == fetch.EXIT_USAGE, res.err
+    assert "namespace/name" in res.err
+    # Fetch mode: the URL is refused before any transport call; no asset file.
+    t = ExplodingTransport()
+    res2 = run(tmp_path, manifest, tmp_path / "assets2", transport=t)
+    assert res2.rc == fetch.EXIT_USAGE, res2.err
+    assert t.calls == []
+    assert not (tmp_path / "assets2" / "a" / "x.bin").exists()
+    _no_partial_left(tmp_path / "assets2")
+
+
+def test_dotted_but_valid_repo_segments_still_accepted(tmp_path):
+    """'.hidden' or 'a.b' are legitimate names — only the WHOLE segment
+    being exactly '.' or '..' is refused."""
+    from qwen_engine.manifest import ModelArtifact
+    entry = art(b"V" * 4, "a/x.bin")
+    for repo in ("a.b/c", ".hidden/c", "org/a.b-c_1"):
+        url = fetch.artifact_url(ModelArtifact(**{**entry, "repo": repo}))
+        assert url == (f"https://{fetch.HF_HOST}/{repo}/resolve/{REV}/a/x.bin")

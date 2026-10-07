@@ -133,9 +133,16 @@ always rehashes
 the whole assembled file from disk, so a corrupt partial can never publish.
 An existing file that verifies is skipped; an existing file whose identity
 does **not** match is refused, never deleted or overwritten; symlinked
-paths on the write path are refused, and an explicit `--models-dir` root
+paths on the write path are refused; an explicit `--models-dir` root
 that is (or sits under) a symlink is refused before any mkdir, network
-access or write; a bounded disk estimate (manifest
+access or write, and the fetch root may contain **no `..` component** —
+a lexical `..` collapse after a symlinked step (e.g. `in/link/../assets`
+with `in/link` a symlink) resolves on the filesystem elsewhere than the
+`abspath` the checker would inspect, so `--fetch` refuses it up front;
+the read-only offline plan is unaffected; a manifest `repo` must be
+exactly one `namespace/name` whose `[A-Za-z0-9._-]` segments are never
+exactly `.` or `..` (whole dot-segments would collapse inside the URL
+path); a bounded disk estimate (manifest
 bytes + 1 MiB headroom per file) is compared with fresh free space before
 any transfer — a **disk** estimate only, no RAM/GPU fit claim (fit is M5
 calibration territory). Tool-specific exit codes are in its `--help`.
