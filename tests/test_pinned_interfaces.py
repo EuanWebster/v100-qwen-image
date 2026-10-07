@@ -497,6 +497,87 @@ def test_encoder_forward_must_be_inside_the_hook_protected_try(tmp_path):
             f"{label}: registration wrongly failed:\n{out}"
 
 
+def test_method_calls_are_not_the_forward_in_the_protected_try(tmp_path):
+    """The anchored check matches the DIRECT forward call only
+    (self.text_encoder(...) surveyed / bare text_model(...) fixture).
+    Two lead-repro negatives:
+      (a) the protected try contains ONLY self.text_encoder.eval() — a
+          method call whose target merely CONTAINS the encoder's name —
+          and the real self.text_encoder(...) forward sits AFTER the
+          try/finally. A broad dotted-segment matcher wrongly called this
+          a forward; the exact-call predicate must FAIL it;
+      (b) the protected try contains only method calls around the hook
+          (register_forward_hook / norm on text_model), direct forward
+          outside. Registration still passes; the anchored forward check
+          must FAIL. Static shape only."""
+    mod = _load_checker()
+    old_try = ("        try:\n"
+               "            outs = text_model(input_ids=input_ids)\n"
+               "        finally:\n"
+               "            handle.remove()\n")
+
+    eval_only = PIPELINE.replace(
+        old_try,
+        "        try:\n"
+        "            self.text_encoder.eval()  # method call, not a forward\n"
+        "        finally:\n"
+        "            handle.remove()\n"
+        "        outs = self.text_encoder(**forward_kwargs)\n"
+        "        # ^ real forward AFTER the try/finally: unprotected\n")
+    assert eval_only != PIPELINE
+
+    method_only = PIPELINE.replace(
+        old_try,
+        "        try:\n"
+        "            text_model.norm.register_forward_hook(\n"
+        "                lambda module, args, output: args[0])\n"
+        "            text_model.norm(hidden_states)\n"
+        "        finally:\n"
+        "            handle.remove()\n"
+        "        outs = text_model(input_ids=input_ids)\n"
+        "        # ^ direct forward AFTER the try/finally: unprotected\n")
+    assert method_only != PIPELINE
+
+    for label, bad in (("eval_only_try_forward_outside", eval_only),
+                       ("method_calls_only_in_try", method_only)):
+        rc, out, err = _run(mod, tmp_path / label, pipeline=bad)
+        assert rc == 1, f"{label}: rc={rc}\n{out}\n{err}"
+        fail_lines = [l for l in out.splitlines() if l.startswith("[FAIL]")]
+        assert any("encoder forward" in l and "finally" in l
+                   for l in fail_lines), \
+            f"{label}: method call satisfied the anchored forward check:\n{out}"
+        assert not any("forward hook returning args[0]" in l
+                       for l in fail_lines), \
+            f"{label}: registration wrongly failed:\n{out}"
+
+
+def test_direct_encoder_forward_classifier_exact_calls():
+    """Unit negatives/positives for the exact-call classifier used by the
+    anchored try check: only the surveyed DIRECT call targets are
+    forwards; attribute/method calls and dotted lookalikes are not."""
+    import ast
+
+    mod = _load_checker()
+
+    def _call(src):
+        return next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call))
+
+    for positive in ("outputs = self.text_encoder(**forward_kwargs)",
+                     "outs = text_model(input_ids=input_ids)",
+                     "return self.text_encoder(input_ids, output_hidden_states=True)"):
+        assert mod._is_direct_encoder_forward(_call(positive)), positive
+    for negative in ("self.text_encoder.eval()",
+                     "text_model.norm.register_forward_hook(f)",
+                     "text_model.norm(hidden_states)",
+                     "self.text_encoder.norm(hidden_states)",
+                     "self.text_model(input_ids=input_ids)",
+                     "helper.text_model(input_ids=input_ids)",
+                     "encoder(input_ids=input_ids)",
+                     "self.text_encoder[0](input_ids)",
+                     "get_encoder()(input_ids)"):
+        assert not mod._is_direct_encoder_forward(_call(negative)), negative
+
+
 # --- 2. optional external pinned-tree check (explicit skip when env absent) -
 
 @pytest.mark.skipif(

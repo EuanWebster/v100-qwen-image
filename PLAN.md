@@ -712,4 +712,36 @@ standing rule that executed plans stay honest.)*
   whitespace only — pre-existing presentation, untouched). No weights, GPU,
   driver, service or heavy-dependency changes; `sandbox.yaml` user edit left
   uncommitted. M2 manifest is the next separate assignment.
+- 2026-10-07 **M0.2 residual hook-call fix** (this commit; root repro
+  `/tmp/v100-m02-hook-repro.md`; sole writer Qwen; accepted M1 `fd3ba15` /
+  M0.1 `315705d` and the prior M0.2 commits stand): the anchored norm-hook
+  check's forward matcher was too broad — it accepted ANY call whose dotted
+  target *contained* a `text_encoder`/`text_model` path segment, so a
+  protected try containing only `self.text_encoder.eval()` satisfied it
+  while the real forward sat outside. Replaced with a tiny **exact-call
+  predicate** (`_is_direct_encoder_forward`): a forward is the direct call
+  `self.text_encoder(...)` (surveyed real form) or the direct bare-name
+  call `text_model(...)` (synthetic fixture form); attribute/method calls
+  merely containing those words (`self.text_encoder.eval()`,
+  `text_model.norm.register_forward_hook(...)`, `...norm(...)`) and dotted
+  lookalikes (`self.text_model(...)`, `helper.text_model(...)`) are NOT
+  forwards. Deliberately NOT expanded into control-flow/data-flow
+  verification — same AST-shape / no-runtime-proof limits as before (a
+  raise between registration and try entry stays out of scope).
+  Regressions +2: eval-only protected try with the actual direct forward
+  after the try/finally plus method-call-only variants (e2e), and a
+  classifier positive/negative unit test; both new tests verified to FAIL
+  on the pre-fix checker (`d8f2e77`). The real pinned source
+  (`outputs = self.text_encoder(**forward_kwargs)` inside the try,
+  `handle.remove()` in finally) keeps matching. Constructor snippet and raw
+  token literals untouched (never quoted or retyped). Checker total
+  unchanged: **53 checks = 38 AST-code + 15 markers, 53/53 exit 0** on the
+  pinned trees, both Pythons (pinned commits `c6df88a5`/`856157a2`
+  re-verified by `git rev-parse HEAD` this pass). Synthetic regressions
+  now **19**. Evidence: guarded suite (R7) **414 passed + 1 skip** without
+  `QWEN_{DIFFUSERS,TRANSFORMERS}_SRC` and **415 passed** with them, on both
+  3.11.15 and 3.13.5 (up from 412+1/413 — exactly the two new tests). No
+  weights, GPU, driver, service or heavy-dependency changes; `sandbox.yaml`
+  user edit still uncommitted. Awaiting root M0.2 acceptance; M2 manifest
+  stays a separate assignment.
 

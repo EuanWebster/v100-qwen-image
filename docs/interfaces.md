@@ -420,15 +420,18 @@ rewrite incl. *extra boolean operands* like `... or True` / `... and False`,
 `__call__`**, `>=7`→`>7`, Flex-default processor swap, `image_pad_mask`
 repetition "fix", `tie_last_hidden_states` arrival, norm-hook moved out of
 the prompt-encoding method, **encoder forward moved out of the try whose
-finally removes that registered hook handle**) each fail loudly with exit 1;
+finally removes that registered hook handle**, **a method/attribute call
+(`self.text_encoder.eval()`, norm/register-forward-hook calls) in the
+protected try instead of the direct forward**) each fail loudly with exit 1;
 a source file that cannot be parsed
 (SyntaxError or bare ValueError) is a contract FAIL (exit 1), never a crash;
 missing/unreadable/non-UTF-8 inputs exit 2 = *not run*.
-`tests/test_pinned_interfaces.py` adds 17 always-run synthetic regressions
+`tests/test_pinned_interfaces.py` adds 19 always-run synthetic regressions
 (fresh state per invocation, comment/docstring-only evidence rejected,
 commented-out CFG/hook code, missing methods, signature/kind drift, CFG
 overwrite, forward-outside-the-hook-protected-try, removing a different
-handle name, parse
+handle name, method-call-not-the-forward (eval-only try + forward outside,
+plus classifier positives/negatives), parse
 failures, input errors) and executes the real-tree check only when
 `QWEN_DIFFUSERS_SRC`/`QWEN_TRANSFORMERS_SRC` name real trees — otherwise it
 skips **explicitly**; a skip is never a validation claim.
@@ -442,7 +445,12 @@ CFG-gate checks are an **AST shape tripwire** — the unique-assignment +
 exact-operand shape is verified statically, and this is NOT runtime proof that
 the interpreter reaches or uses that assignment; the pre-RMSNorm-hook check
 confirms the surveyed forward-inside-try / finally-removes-that-handle shape
-but does NOT prove execution or full exception safety (e.g. a raise between
+— where "forward" means the **exact direct call target** (`self.text_encoder(
+...)` real form; bare `text_model(...)` fixture form), not a method/attribute
+call merely containing the encoder's name such as `self.text_encoder.eval()`;
+the classifier is exact AST-shape matching with deliberately NO control-flow
+or data-flow analysis — but this still does NOT prove execution or full
+exception safety (e.g. a raise between
 registration and try entry is outside its scope). (2) Inputs are
 caller-provided trees:
 the checker does NOT verify them against the pinned commits above — revision

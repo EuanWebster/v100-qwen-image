@@ -11,8 +11,10 @@ Every check carries an evidence kind:
   code    decided from real AST nodes — class/method presence, signature
           shape and defaults, real assignment expressions (including a
           UNIQUE-assignment requirement where the contract pins one
-          binding), forward-hook registration anchored to the encoder
-          forward running inside the try whose finally removes that same
+          binding), forward-hook registration anchored to the DIRECT
+          encoder forward call (exact call target — not a method call
+          merely containing the encoder's name) running inside the try
+          whose finally removes that same
           registered handle. Comments and docstrings can
           NEVER satisfy a ``code`` check. Caveat that applies to BOTH kinds:
           AST structure is NOT runtime behaviour — a passing ``code`` check
@@ -245,38 +247,40 @@ def hook_targets(node: ast.AST) -> set[str]:
     return out
 
 
-def _call_dotted(func: ast.expr) -> list[str]:
-    """Dotted-name path segments of a simple attribute-chain call target
-    (``self.text_encoder`` -> ["self", "text_encoder"]); [] if the call
-    target is not a plain Name/Attribute chain."""
-    parts: list[str] = []
-    node = func
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    if isinstance(node, ast.Name):
-        parts.append(node.id)
-        return list(reversed(parts))
-    return []
-
-
-# Path segments that mark a call as the text-encoder forward in the surveyed
-# shape (pipeline calls the encoder as self.text_encoder(...); fixtures and
-# the naming style around the hook use text_model). A rename is drift — the
-# FAIL detail then shows what WAS found, which is the point of the tripwire.
-_ENCODER_NAME_SEGMENTS = ("text_encoder", "text_model")
+def _is_direct_encoder_forward(call: ast.Call) -> bool:
+    """EXACT-call predicate for the text-encoder forward in the surveyed
+    shape: the pipeline invokes the encoder as the DIRECT call
+    ``self.text_encoder(...)`` (attribute target exactly ``self`` .
+    ``text_encoder`` — the real pinned form); synthetic fixtures use the
+    direct bare-name call ``text_model(...)``. NOTHING else is a forward:
+    attribute/method calls that merely CONTAIN those words —
+    ``self.text_encoder.eval()``, ``text_model.norm.register_forward_hook(...)``,
+    ``text_model.norm(...)``, helper calls — are NOT forwards, and neither
+    are dotted lookalikes such as ``self.text_model(...)`` or
+    ``helper.text_model(...)``. A rename of the call target is drift — the
+    FAIL detail shows the hook targets that WERE found, which is the point
+    of the tripwire. Exact AST shape only: no control-flow or data-flow
+    analysis, no execution claim."""
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        return (func.attr == "text_encoder"
+                and isinstance(func.value, ast.Name) and func.value.id == "self")
+    return isinstance(func, ast.Name) and func.id == "text_model"
 
 
 def encoder_forward_in_protected_try(node: ast.AST, targets: set[str]) -> bool:
     """True iff SOME try block in ``node`` has (a) its finally body calling
-    ``remove()`` on one of the registered-hook ``targets`` and (b) a
-    text-encoder forward call inside its own protected body (handlers,
-    else and finally bodies do NOT count). This anchors the surveyed
-    relationship — registration and a removal somewhere in the method are
-    NOT enough; the forward must run under the protection that removes that
-    same handle. AST shape only: this proves the surveyed SHAPE is present,
-    not that the interpreter executes it, and not full exception safety
-    (e.g. it cannot see raises between registration and try entry)."""
+    ``remove()`` on one of the registered-hook ``targets`` and (b) a DIRECT
+    text-encoder forward call (``_is_direct_encoder_forward`` —
+    ``self.text_encoder(...)`` or bare ``text_model(...)``; an
+    attribute/method call like ``self.text_encoder.eval()`` is NOT a
+    forward) inside its own protected body (handlers, else and finally
+    bodies do NOT count). This anchors the surveyed relationship —
+    registration and a removal somewhere in the method are NOT enough; the
+    forward must run under the protection that removes that same handle.
+    AST shape only: this proves the surveyed SHAPE is present, not that the
+    interpreter executes it, and not full exception safety (e.g. it cannot
+    see raises between registration and try entry)."""
     if not targets:
         return False
     for n in ast.walk(node):
@@ -290,9 +294,7 @@ def encoder_forward_in_protected_try(node: ast.AST, targets: set[str]) -> bool:
             continue
         for stmt in n.body:
             for m in ast.walk(stmt):
-                if isinstance(m, ast.Call) and any(
-                        seg in _ENCODER_NAME_SEGMENTS
-                        for seg in _call_dotted(m.func)):
+                if isinstance(m, ast.Call) and _is_direct_encoder_forward(m):
                     return True
     return False
 
@@ -441,8 +443,11 @@ def check_pipeline(src: str, rep: Report) -> None:
     # ACTUAL prompt-encoding method (upstream pins it there), not just
     # anywhere in the class — a hook parked in dead code would be structure
     # without the surveyed call-site context. The relationship is anchored:
-    # the text-encoder forward must run INSIDE the try whose finally removes
-    # that same registered handle — a registration plus a removal sitting in
+    # the DIRECT text-encoder forward call (exact call target per
+    # _is_direct_encoder_forward — a method/attribute call such as
+    # self.text_encoder.eval() is NOT a forward) must run INSIDE the try
+    # whose finally removes that same registered handle — a registration
+    # plus a removal sitting in
     # some unrelated finally does NOT protect the forward. The transformers
     # pin still ties hidden_states[-1]; removal without the transformers-side
     # fix is drift. AST structure is NOT runtime-behaviour proof and this
@@ -456,8 +461,10 @@ def check_pipeline(src: str, rep: Report) -> None:
                       "registered on the text-model norm in real code inside "
                       "_get_qwen_prompt_embeds",
               bool(targets), f"targets={sorted(targets)}")
-    rep.check("code", "pre-RMSNorm hook: encoder forward call is inside the "
-                      "try whose finally removes that registered handle "
+    rep.check("code", "pre-RMSNorm hook: direct encoder forward call (exact "
+                      "call target, not a method call merely containing the "
+                      "encoder's name) is inside the try whose finally "
+                      "removes that registered handle "
                       "(real code inside _get_qwen_prompt_embeds; shape only "
                       "— not an execution or exception-safety proof)",
               encoder_forward_in_protected_try(pem, targets)
