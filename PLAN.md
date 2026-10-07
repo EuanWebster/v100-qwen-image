@@ -680,4 +680,36 @@ standing rule that executed plans stay honest.)*
   (commits re-verified by `git rev-parse HEAD` the same day). No weights, GPU,
   driver, service or sandbox-infra changes. M2 manifest is the next separate
   assignment.
+- 2026-10-07 **M0.2 final-review fix pass** (this commit; sole writer Qwen,
+  lead queue `/tmp/v100-m02-final-review.md`; accepted M1 `fd3ba15` / M0.1
+  `315705d` untouched; the M0.2 polish commits `f354df2`/`7408115` stand,
+  full-M0.2 acceptance is root's call after this pass): checker hardening —
+  CFG-gate checks now require **exactly one assignment** to
+  `has_neg_prompt`/`do_true_cfg` in `__call__` (a later overwrite, including
+  in a branch, AugAssign or walrus, is drift; a next()-style scan would miss
+  it — regression added per target, verified to fail on the pre-fix checker);
+  the pre-RMSNorm-hook check is **anchored**: the text-encoder forward call
+  must sit inside the try whose `finally` removes that same registered
+  handle — registration + a removal in some unrelated `finally` no longer
+  passes (forward-outside-protected-try and removes-a-different-name
+  regressions added; static shape only — no execution or exception-safety
+  claim). `docs/interfaces.md` §6: removed the hardware-observed SDPA
+  wording — no GPU is installed; the default registry selects the native
+  SDPA implementation and the actual backend/kernel on sm_70 stays
+  unverified [U]; a user-selected backend is used as configured (nothing
+  surveyed shows automatic fallback). §9 states the CFG-uniqueness and
+  hook-anchoring limitations explicitly (AST shape tripwires, not runtime
+  proofs). Checker total unchanged: **53 checks = 38 AST-code + 15 markers,
+  53/53 exit 0** on the pinned trees (both Pythons; pinned commits
+  `c6df88a5`/`856157a2` re-verified by `git rev-parse HEAD` this pass).
+  Synthetic regressions now **17** (+2). Evidence: guarded suite (R7)
+  **412 passed + 1 skip** without `QWEN_{DIFFUSERS,TRANSFORMERS}_SRC` and
+  **413 passed** with them, on both 3.11.15 and 3.13.5 (up from 410+1/411 —
+  exactly the two new regressions). The mechanically-copied §1 constructor
+  block re-verified byte-equal to pinned L212–L232 after indentation removal
+  (nothing retyped; no raw control-token literal entered any model context);
+  the §4 CFG display block is token-equal to pinned L677–L686 (alignment
+  whitespace only — pre-existing presentation, untouched). No weights, GPU,
+  driver, service or heavy-dependency changes; `sandbox.yaml` user edit left
+  uncommitted. M2 manifest is the next separate assignment.
 

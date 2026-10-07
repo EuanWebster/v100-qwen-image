@@ -9,8 +9,11 @@ torch/diffusers/transformers), opens no sockets, reads no model files.
 Every check carries an evidence kind:
 
   code    decided from real AST nodes — class/method presence, signature
-          shape and defaults, real assignment expressions, forward-hook
-          registration with finally-remove. Comments and docstrings can
+          shape and defaults, real assignment expressions (including a
+          UNIQUE-assignment requirement where the contract pins one
+          binding), forward-hook registration anchored to the encoder
+          forward running inside the try whose finally removes that same
+          registered handle. Comments and docstrings can
           NEVER satisfy a ``code`` check. Caveat that applies to BOTH kinds:
           AST structure is NOT runtime behaviour — a passing ``code`` check
           says the surveyed code SHAPE is present in the file, not that the
@@ -170,6 +173,38 @@ def assigns_named(node: ast.AST, name: str):
             yield n.value
 
 
+def assignments_to(node: ast.AST, name: str) -> list[ast.expr]:
+    """Every value assigned to the local name ``name`` inside ``node``:
+    plain/chained/tuple-target Assigns, AnnAssign with value, AugAssign
+    (read-modify-write overwrite) and NamedExpr walrus. Used where the
+    contract pins EXACTLY ONE binding — a second assignment anywhere in the
+    walked body (even in a branch) is drift, even when the FIRST assignment
+    has the documented shape (a next()-style scan would miss it). AST shape
+    only: the checker cannot know which assignments an interpreter reaches."""
+    vals: list[ast.expr] = []
+    for n in ast.walk(node):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                if isinstance(t, ast.Name) and t.id == name:
+                    vals.append(n.value)
+                    break
+                if isinstance(t, (ast.Tuple, ast.List)) and any(
+                        isinstance(e, ast.Name) and e.id == name for e in t.elts):
+                    vals.append(n.value)
+                    break
+        elif isinstance(n, ast.AnnAssign):
+            if isinstance(n.target, ast.Name) and n.target.id == name \
+                    and n.value is not None:
+                vals.append(n.value)
+        elif isinstance(n, ast.AugAssign):
+            if isinstance(n.target, ast.Name) and n.target.id == name:
+                vals.append(n.value)
+        elif isinstance(n, ast.NamedExpr):
+            if isinstance(n.target, ast.Name) and n.target.id == name:
+                vals.append(n.value)
+    return vals
+
+
 def has_call_attr(node: ast.AST, attr: str) -> bool:
     return any(isinstance(m, ast.Call) and isinstance(m.func, ast.Attribute)
                and m.func.attr == attr for m in ast.walk(node))
@@ -210,18 +245,55 @@ def hook_targets(node: ast.AST) -> set[str]:
     return out
 
 
-def finally_removes(node: ast.AST, targets: set[str]) -> bool:
+def _call_dotted(func: ast.expr) -> list[str]:
+    """Dotted-name path segments of a simple attribute-chain call target
+    (``self.text_encoder`` -> ["self", "text_encoder"]); [] if the call
+    target is not a plain Name/Attribute chain."""
+    parts: list[str] = []
+    node = func
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return list(reversed(parts))
+    return []
+
+
+# Path segments that mark a call as the text-encoder forward in the surveyed
+# shape (pipeline calls the encoder as self.text_encoder(...); fixtures and
+# the naming style around the hook use text_model). A rename is drift — the
+# FAIL detail then shows what WAS found, which is the point of the tripwire.
+_ENCODER_NAME_SEGMENTS = ("text_encoder", "text_model")
+
+
+def encoder_forward_in_protected_try(node: ast.AST, targets: set[str]) -> bool:
+    """True iff SOME try block in ``node`` has (a) its finally body calling
+    ``remove()`` on one of the registered-hook ``targets`` and (b) a
+    text-encoder forward call inside its own protected body (handlers,
+    else and finally bodies do NOT count). This anchors the surveyed
+    relationship — registration and a removal somewhere in the method are
+    NOT enough; the forward must run under the protection that removes that
+    same handle. AST shape only: this proves the surveyed SHAPE is present,
+    not that the interpreter executes it, and not full exception safety
+    (e.g. it cannot see raises between registration and try entry)."""
     if not targets:
         return False
     for n in ast.walk(node):
-        if isinstance(n, _TRY_NODES) and n.finalbody:
-            for stmt in n.finalbody:
-                for m in ast.walk(stmt):
-                    if (isinstance(m, ast.Call) and isinstance(m.func, ast.Attribute)
-                            and m.func.attr == "remove"
-                            and isinstance(m.func.value, ast.Name)
-                            and m.func.value.id in targets):
-                        return True
+        if not isinstance(n, _TRY_NODES) or not n.finalbody:
+            continue
+        if not any(isinstance(m, ast.Call) and isinstance(m.func, ast.Attribute)
+                   and m.func.attr == "remove"
+                   and isinstance(m.func.value, ast.Name)
+                   and m.func.value.id in targets
+                   for stmt in n.finalbody for m in ast.walk(stmt)):
+            continue
+        for stmt in n.body:
+            for m in ast.walk(stmt):
+                if isinstance(m, ast.Call) and any(
+                        seg in _ENCODER_NAME_SEGMENTS
+                        for seg in _call_dotted(m.func)):
+                    return True
     return False
 
 
@@ -302,21 +374,28 @@ def check_pipeline(src: str, rep: Report) -> None:
                       "(v1 documented limitation)", "image_pad_mask" not in names)
 
     # CFG gate: real assignments in real code — a mention in a comment or
-    # docstring must NOT satisfy this. EXACTLY the two documented operands:
-    # extra ones are semantic drift even when both names appear
-    # (`... or True`, `... and False` must FAIL).
-    h = next((v for v in assigns_named(call, "has_neg_prompt")
-              if isinstance(v, ast.BoolOp) and isinstance(v.op, ast.Or)), None)
+    # docstring must NOT satisfy this. EXACTLY the two documented operands
+    # (extra ones are semantic drift even when both names appear —
+    # `... or True`, `... and False` must FAIL), and EXACTLY ONE assignment
+    # to the target in __call__: a later reassignment/overwrite of the same
+    # name is drift even though a next()-style scan would still find the
+    # documented first assignment. Shape tripwire, not runtime/dataflow proof.
+    h_all = assignments_to(call, "has_neg_prompt")
+    h = h_all[0] if len(h_all) == 1 and isinstance(h_all[0], ast.BoolOp) \
+        and isinstance(h_all[0].op, ast.Or) else None
     neg_names = ([n for c in (h.values if h is not None else [])
                   for n in ("negative_prompt", "negative_prompt_embeds")
                   if _is_is_not_none(c, {n})])
-    rep.check("code", "CFG gate: has_neg_prompt assigned from EXACTLY the two "
-                      "negative_* 'is not None' checks, no extra operands "
-                      "(real code)",
-              h is not None and len(h.values) == 2
+    rep.check("code", "CFG gate: has_neg_prompt assigned EXACTLY ONCE in "
+                      "__call__ (extra assignments/overwrites are drift) and "
+                      "from EXACTLY the two negative_* 'is not None' checks, "
+                      "no extra operands (real code)",
+              len(h_all) == 1 and h is not None and len(h.values) == 2
               and sorted(neg_names) == ["negative_prompt",
                                         "negative_prompt_embeds"],
-              f"operands={len(h.values) if h is not None else 0}, found {sorted(neg_names)}")
+              f"assignments={len(h_all)}, "
+              f"operands={len(h.values) if h is not None else 0}, "
+              f"found {sorted(neg_names)}")
 
     def _scale_gt(c: ast.expr) -> bool:
         return (isinstance(c, ast.Compare) and len(c.ops) == 1
@@ -328,16 +407,18 @@ def check_pipeline(src: str, rep: Report) -> None:
     def _is_hn(c: ast.expr) -> bool:
         return isinstance(c, ast.Name) and c.id == "has_neg_prompt"
 
-    d = next((v for v in assigns_named(call, "do_true_cfg")
-              if isinstance(v, ast.BoolOp) and isinstance(v.op, ast.And)), None)
+    d_all = assignments_to(call, "do_true_cfg")
+    d = d_all[0] if len(d_all) == 1 and isinstance(d_all[0], ast.BoolOp) \
+        and isinstance(d_all[0].op, ast.And) else None
     dv = d.values if d is not None else []
-    rep.check("code", "CFG gate: do_true_cfg assigned as EXACTLY "
-                      "(true_cfg_scale > 1) and has_neg_prompt, no extra "
-                      "operands (real code)",
-              len(dv) == 2
+    rep.check("code", "CFG gate: do_true_cfg assigned EXACTLY ONCE in "
+                      "__call__ (extra assignments/overwrites are drift) as "
+                      "EXACTLY (true_cfg_scale > 1) and has_neg_prompt, no "
+                      "extra operands (real code)",
+              len(d_all) == 1 and len(dv) == 2
               and ((_scale_gt(dv[0]) and _is_hn(dv[1]))
                    or (_scale_gt(dv[1]) and _is_hn(dv[0]))),
-              f"operands={len(dv)}")
+              f"assignments={len(d_all)}, operands={len(dv)}")
 
     rep.check("marker", "sigmas precedence text: call sigmas > config "
                         "sample_sigmas > linspace(steps)",
@@ -356,12 +437,17 @@ def check_pipeline(src: str, rep: Report) -> None:
               and "neg_cache = QwenImage21KVCache(num_blocks) if cache_enabled "
                   "and do_true_cfg else None" in src)
 
-    # pre-RMSNorm hook: registration AND finally-remove must be real AST code
-    # in the ACTUAL prompt-encoding method (upstream pins it there), not just
+    # pre-RMSNorm hook: registration AND removal must be real AST code in the
+    # ACTUAL prompt-encoding method (upstream pins it there), not just
     # anywhere in the class — a hook parked in dead code would be structure
-    # without the surveyed call-site context. The transformers pin still ties
-    # hidden_states[-1]; removal without the transformers-side fix is drift.
-    # AST structure is NOT runtime-behaviour proof (see module docstring).
+    # without the surveyed call-site context. The relationship is anchored:
+    # the text-encoder forward must run INSIDE the try whose finally removes
+    # that same registered handle — a registration plus a removal sitting in
+    # some unrelated finally does NOT protect the forward. The transformers
+    # pin still ties hidden_states[-1]; removal without the transformers-side
+    # fix is drift. AST structure is NOT runtime-behaviour proof and this
+    # check does NOT prove execution or full exception safety (see module
+    # docstring).
     pem = find_func(cls, "_get_qwen_prompt_embeds")
     rep.check("code", "pipeline: _get_qwen_prompt_embeds defined "
                       "(norm-hook scope anchor)", pem is not None)
@@ -370,9 +456,13 @@ def check_pipeline(src: str, rep: Report) -> None:
                       "registered on the text-model norm in real code inside "
                       "_get_qwen_prompt_embeds",
               bool(targets), f"targets={sorted(targets)}")
-    rep.check("code", "pre-RMSNorm hook: handle.remove() inside a finally "
-                      "block in real code inside _get_qwen_prompt_embeds",
-              finally_removes(pem, targets) if pem is not None else False)
+    rep.check("code", "pre-RMSNorm hook: encoder forward call is inside the "
+                      "try whose finally removes that registered handle "
+                      "(real code inside _get_qwen_prompt_embeds; shape only "
+                      "— not an execution or exception-safety proof)",
+              encoder_forward_in_protected_try(pem, targets)
+              if pem is not None else False,
+              f"targets={sorted(targets)}")
 
     rep.check("marker", "decode text: per-channel latents_std/latents_mean",
               "latents = latents * latents_std + latents_mean" in src

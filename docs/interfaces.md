@@ -302,11 +302,17 @@ Immutable permalink: [transformer_qwenimage21.py#L462-L561](https://github.com/h
   or the `attention_backend` context manager set one
   (`attention_dispatch.py#L400-L430`, `#L267`,
   `utils/constants.py#L56`) [S]. **Do not read this as "Flash with automatic
-  fallback on Volta":** the flash-class backends are not usable on sm_70 and
-  were never exercised here; on this hardware resolution lands on SDPA, and
-  **which SDPA kernel (math / mem-efficient / flash-class) runs per call is
-  torch's runtime heuristic — unverified on this hardware [U]**. Do not claim
-  a guaranteed kernel on sm_70 without measurement; do not replace the
+  fallback on Volta" — and do not claim anything hardware-observed either:
+  no V100 (no GPU at all) is installed here and no attention backend has
+  ever been exercised on this machine.** With the default configuration the
+  registry selects the native SDPA implementation (torch
+  `F.scaled_dot_product_attention`); **which backend and which SDPA kernel
+  (math / mem-efficient / flash-class) would actually run per call on sm_70
+  is torch's runtime decision — unverified here [U]**. A backend explicitly
+  selected via `DIFFUSERS_ATTN_BACKEND` / `set_attention_backend()` is used
+  as configured — nothing surveyed here shows any user-selected backend
+  automatically falling back. Do not claim a guaranteed kernel on sm_70
+  without measurement; do not replace the
   processors with generic `AttnProcessor` (mask semantics would be wrong).
   The model deliberately keeps literal `backend=None` on prefill calls — the
   checker pins ≥2 such real call nodes so a future "fix" re-routing them is
@@ -410,14 +416,19 @@ on the pinned trees — 38 AST-code checks and 15 text markers — covering the
 facts this document depends on. Verified 53/53 (exit 0) against the pinned
 trees on 2026-10-07; deliberate drift copies (steps default 40→4, CFG-gate
 rewrite incl. *extra boolean operands* like `... or True` / `... and False`,
-`>=7`→`>7`, Flex-default processor swap, `image_pad_mask` repetition "fix",
-`tie_last_hidden_states` arrival, norm-hook moved out of the prompt-encoding
-method) each fail loudly with exit 1; a source file that cannot be parsed
+**a second assignment/overwrite of `has_neg_prompt` or `do_true_cfg` in
+`__call__`**, `>=7`→`>7`, Flex-default processor swap, `image_pad_mask`
+repetition "fix", `tie_last_hidden_states` arrival, norm-hook moved out of
+the prompt-encoding method, **encoder forward moved out of the try whose
+finally removes that registered hook handle**) each fail loudly with exit 1;
+a source file that cannot be parsed
 (SyntaxError or bare ValueError) is a contract FAIL (exit 1), never a crash;
 missing/unreadable/non-UTF-8 inputs exit 2 = *not run*.
-`tests/test_pinned_interfaces.py` adds 15 always-run synthetic regressions
+`tests/test_pinned_interfaces.py` adds 17 always-run synthetic regressions
 (fresh state per invocation, comment/docstring-only evidence rejected,
-commented-out CFG/hook code, missing methods, signature/kind drift, parse
+commented-out CFG/hook code, missing methods, signature/kind drift, CFG
+overwrite, forward-outside-the-hook-protected-try, removing a different
+handle name, parse
 failures, input errors) and executes the real-tree check only when
 `QWEN_DIFFUSERS_SRC`/`QWEN_TRANSFORMERS_SRC` name real trees — otherwise it
 skips **explicitly**; a skip is never a validation claim.
@@ -426,14 +437,23 @@ skips **explicitly**; a skip is never a validation claim.
 only: every PASS — including the "code" kind — says the surveyed shape exists
 in the file; the checker never executes upstream code, so no check proves
 runtime behaviour, numerical fidelity, or absence of network calls; that proof
-belongs to adapter-level tests (M4+). (2) Inputs are caller-provided trees:
+belongs to adapter-level tests (M4+). Two specific scope statements: the
+CFG-gate checks are an **AST shape tripwire** — the unique-assignment +
+exact-operand shape is verified statically, and this is NOT runtime proof that
+the interpreter reaches or uses that assignment; the pre-RMSNorm-hook check
+confirms the surveyed forward-inside-try / finally-removes-that-handle shape
+but does NOT prove execution or full exception safety (e.g. a raise between
+registration and try entry is outside its scope). (2) Inputs are
+caller-provided trees:
 the checker does NOT verify them against the pinned commits above — revision
 verification (`git -C <tree> rev-parse HEAD` vs the recorded hashes) is a
 separate required step, done manually at the dates in the ledger. (3) The
 guarded CPU suite never imports torch/diffusers/transformers or loads
 weights; model loading and inference have NOT been performed anywhere in this
 project to date — that statement is about our actions, not a proof that no
-tensor code executed as an import side effect.
+tensor code executed as an import side effect. (4) No GPU is installed and no
+attention backend/kernel has ever been exercised here; nothing in this survey
+or the checker constitutes a hardware-observed claim (§6).
 
 *v1 scope reminder (confirmed requirements + lead review): T2I-only is the
 user requirement; one image per `__call__` (`num_images_per_prompt=1`) is our

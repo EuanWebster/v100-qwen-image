@@ -380,6 +380,39 @@ def test_cfg_gate_rejects_extra_boolean_operands(tmp_path):
             f"{label}: {probe} passed despite extra operand:\n{out}"
 
 
+def test_cfg_gate_rejects_later_overwrite(tmp_path):
+    """A next()-style scan finds the documented FIRST assignment and would
+    let a later reassignment of the same target evade the gate. The contract
+    is a UNIQUE assignment to has_neg_prompt / do_true_cfg in __call__; any
+    extra assignment or overwrite (even inside a branch) must FAIL. Shape
+    tripwire only — the checker proves nothing about which line a running
+    interpreter executes."""
+    mod = _load_checker()
+    cases = {
+        "overwrite_has_neg_prompt": (
+            "        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt\n",
+            "        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt\n"
+            "        if negative_prompt is not None:\n"
+            "            has_neg_prompt = negative_prompt is not None\n",
+            "CFG gate: has_neg_prompt"),
+        "overwrite_do_true_cfg": (
+            "        cache_enabled = use_kv_cache and "
+            "self.transformer.config.causal_condition\n",
+            "        do_true_cfg = do_true_cfg and use_kv_cache\n"
+            "        cache_enabled = use_kv_cache and "
+            "self.transformer.config.causal_condition\n",
+            "CFG gate: do_true_cfg"),
+    }
+    for label, (old, new, probe) in cases.items():
+        bad = PIPELINE.replace(old, new)
+        assert bad != PIPELINE, label
+        rc, out, err = _run(mod, tmp_path / label, pipeline=bad)
+        assert rc == 1, f"{label}: rc={rc}\n{out}\n{err}"
+        fail_lines = [l for l in out.splitlines() if l.startswith("[FAIL]")]
+        assert any(probe in l for l in fail_lines), \
+            f"{label}: {probe} passed despite a second assignment:\n{out}"
+
+
 def test_valueerror_on_parse_is_clean_failure_exit1(tmp_path, monkeypatch):
     """parse_source must survive a bare ValueError from ast.parse (no
     .msg/.lineno on ValueError) without AttributeError. On modern CPython
@@ -421,6 +454,47 @@ def test_norm_hook_must_live_in_prompt_encoding_method(tmp_path):
     for name in ("forward hook returning args[0]", "finally"):
         assert any(name in l for l in fail_lines), \
             f"{name} passed outside _get_qwen_prompt_embeds:\n{out}"
+
+
+def test_encoder_forward_must_be_inside_the_hook_protected_try(tmp_path):
+    """Registration + a removal in SOME finally is not the surveyed
+    relationship: the text-encoder forward must run inside the try whose
+    finally removes that same registered handle. Two negatives:
+      (a) forward moved OUT of the protected try (the finally now guards
+          unrelated work only) — registration still passes, the anchored
+          forward check must FAIL;
+      (b) the finally removes a DIFFERENT name than the one registered —
+          the forward is inside a try, but not one that removes THE handle.
+    Static shape only: this is not proof of execution or exception safety."""
+    mod = _load_checker()
+
+    forward_out = PIPELINE.replace(
+        "        try:\n"
+        "            outs = text_model(input_ids=input_ids)\n"
+        "        finally:\n"
+        "            handle.remove()\n",
+        "        outs = text_model(input_ids=input_ids)\n"
+        "        try:\n"
+        "            pass  # unrelated work is what the finally now guards\n"
+        "        finally:\n"
+        "            handle.remove()\n")
+    assert forward_out != PIPELINE
+
+    other_handle = PIPELINE.replace("            handle.remove()",
+                                    "            other_handle.remove()")
+    assert other_handle != PIPELINE
+
+    for label, bad in (("forward_outside_try", forward_out),
+                       ("removes_different_name", other_handle)):
+        rc, out, err = _run(mod, tmp_path / label, pipeline=bad)
+        assert rc == 1, f"{label}: rc={rc}\n{out}\n{err}"
+        fail_lines = [l for l in out.splitlines() if l.startswith("[FAIL]")]
+        assert any("encoder forward" in l and "finally" in l
+                   for l in fail_lines), \
+            f"{label}: anchored forward/finally check passed:\n{out}"
+        assert not any("forward hook returning args[0]" in l
+                       for l in fail_lines), \
+            f"{label}: registration wrongly failed:\n{out}"
 
 
 # --- 2. optional external pinned-tree check (explicit skip when env absent) -
