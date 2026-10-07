@@ -988,3 +988,181 @@ def test_dotted_but_valid_repo_segments_still_accepted(tmp_path):
     for repo in ("a.b/c", ".hidden/c", "org/a.b-c_1"):
         url = fetch.artifact_url(ModelArtifact(**{**entry, "repo": repo}))
         assert url == (f"https://{fetch.HF_HOST}/{repo}/resolve/{REV}/a/x.bin")
+
+
+# ---------------------------------------------------------------------------
+# M2.1 review3 — valid-manifest final/staging-name collision preflight
+# ---------------------------------------------------------------------------
+
+# ``_partial_path(dest)`` stages at ``<final>.partial`` in the same
+# directory, and schema-v1 rejects only duplicate *final* filenames: a
+# schema-valid manifest may list both ``foo`` and ``foo.partial``. If
+# ``foo.partial`` is an already-verified final and ``foo`` is missing,
+# pre-fix code skipped the former, mistook it for ``foo``'s resume
+# partial, appended to it and deleted it on the hash mismatch — breaking
+# the never-overwrite/never-delete promise for verified finals. The
+# fetcher must now refuse such a manifest BEFORE any mkdir/network/write.
+
+_COLLISION_ORDERS = ["foo-first", "partial-first"]
+
+
+def _collision_entries(tmp_path: Path) -> tuple[list[dict], bytes, bytes]:
+    missing_blob = b"M" * 64            # artifact 'a/foo', absent on disk
+    final_blob = b"P" * 32             # verified final 'a/foo.partial'
+    entries = [art(missing_blob, "a/foo"), art(final_blob, "a/foo.partial")]
+    return entries, missing_blob, final_blob
+
+
+@pytest.mark.parametrize("order", _COLLISION_ORDERS)
+def test_staging_collision_verified_final_preserved_before_transport(
+        tmp_path, order):
+    """Required regression, BOTH manifest orders: the verified final
+    'a/foo.partial' must survive byte-for-byte and the fake transport
+    (an exploding one) must never be reached."""
+    entries, _missing_blob, final_blob = _collision_entries(tmp_path)
+    if order == "partial-first":
+        entries = list(reversed(entries))
+    manifest = write_manifest(tmp_path, entries)
+    root = tmp_path / "assets"
+    (root / "a").mkdir(parents=True)
+    victim = root / "a" / "foo.partial"
+    victim.write_bytes(final_blob)
+    before = victim.stat().st_mtime_ns
+
+    t = ExplodingTransport()
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == fetch.EXIT_USAGE, res.err
+    assert "collision" in res.err and "foo.partial" in res.err and "foo'" in res.err
+    assert t.calls == []                                 # refused pre-network
+    assert victim.read_bytes() == final_blob             # byte-for-byte intact
+    assert victim.stat().st_mtime_ns == before           # never even opened
+    assert not (root / "a" / "foo").exists()             # nothing fetched
+    assert not (root / "a" / "foo.partial.partial").exists()  # no staging
+    assert sorted(p.name for p in root.rglob("*") if p.is_file()) \
+        == ["foo.partial"]                               # tree unchanged
+
+
+@pytest.mark.parametrize("order", _COLLISION_ORDERS)
+def test_staging_collision_refused_before_mkdir(tmp_path, order):
+    """Nothing on disk yet: refusal happens before the asset root exists."""
+    entries, _b1, _b2 = _collision_entries(tmp_path)
+    if order == "partial-first":
+        entries = list(reversed(entries))
+    manifest = write_manifest(tmp_path, entries)
+    root = tmp_path / "assets"
+    t = ExplodingTransport()
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == fetch.EXIT_USAGE, res.err
+    assert "collision" in res.err
+    assert t.calls == []
+    assert not root.exists()                             # no mkdir happened
+    assert not list(tmp_path.rglob("*.partial"))
+
+
+def test_staging_collision_refused_even_when_everything_verifies(tmp_path):
+    """The check is static: even a fully-populated store (both finals
+    present and correct, so 'nothing to fetch' would otherwise exit 0) is
+    refused — the reusable tool contract must never look fetch-safe."""
+    entries, blob_foo, blob_partial = _collision_entries(tmp_path)
+    manifest = write_manifest(tmp_path, entries)
+    root = tmp_path / "assets"
+    (root / "a").mkdir(parents=True)
+    (root / "a" / "foo").write_bytes(blob_foo)
+    (root / "a" / "foo.partial").write_bytes(blob_partial)
+    t = ExplodingTransport()
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == fetch.EXIT_USAGE, res.err
+    assert "collision" in res.err
+    assert t.calls == []
+    assert (root / "a" / "foo").read_bytes() == blob_foo
+    assert (root / "a" / "foo.partial").read_bytes() == blob_partial
+
+
+def test_plan_reports_staging_collision_read_only(tmp_path, monkeypatch):
+    """Plan mode: typed usage error (exit 2) naming both filenames; the
+    read-only offline path still performs no socket access and no writes."""
+    _no_network(monkeypatch)
+    entries, _b1, _b2 = _collision_entries(tmp_path)
+    manifest = write_manifest(tmp_path, entries)
+    root = tmp_path / "assets"
+    res = run(tmp_path, manifest, root, fetch_mode=False)
+    assert res.rc == fetch.EXIT_USAGE, res.err
+    assert "collision" in res.err and "foo.partial" in res.err
+    assert not root.exists()
+    assert not list(tmp_path.rglob("*.partial"))
+
+
+def test_partial_named_final_alone_is_not_a_false_positive(tmp_path):
+    """'a/foo.partial' as the ONLY artifact is a legitimate final whose own
+    staging path is 'a/foo.partial.partial' — it must fetch normally."""
+    blob = b"S" * 48
+    entry = art(blob, "a/foo.partial")
+    manifest = write_manifest(tmp_path, [entry])
+    root = tmp_path / "assets"
+    t = FakeTransport({_url(entry): ok_stream(blob)})
+    res = run(tmp_path, manifest, root, transport=t,
+              disk_free=lambda _p: 1 << 40)
+    assert res.rc == fetch.EXIT_OK, res.err
+    assert (root / "a" / "foo.partial").read_bytes() == blob
+    assert not (root / "a" / "foo.partial.partial").exists()
+    assert sorted(p.relative_to(root).as_posix() for p in root.rglob("*")
+                  if p.is_file()) == ["a/foo.partial"]
+
+
+def test_cross_directory_partial_names_are_not_collisions(tmp_path):
+    """'a/x' stages to 'a/x.partial'; a final 'b/x.partial' lives in a
+    different directory — no collision, both fetch normally."""
+    blob_x, blob_y = b"C" * 20, b"D" * 24
+    e_x = art(blob_x, "a/x.bin")
+    e_y = art(blob_y, "b/x.bin.partial")
+    manifest = write_manifest(tmp_path, [e_x, e_y])
+    root = tmp_path / "assets"
+    t = FakeTransport({_url(e_x): ok_stream(blob_x),
+                       _url(e_y): ok_stream(blob_y)})
+    res = run(tmp_path, manifest, root, transport=t,
+              disk_free=lambda _p: 1 << 40)
+    assert res.rc == fetch.EXIT_OK, res.err
+    assert (root / "a" / "x.bin").read_bytes() == blob_x
+    assert (root / "b" / "x.bin.partial").read_bytes() == blob_y
+    assert not (root / "a" / "x.bin.partial").exists()   # no staging created
+    assert not (root / "b" / "x.bin.partial.partial").exists()
+
+
+def test_file_directory_prefix_collision_refused_before_write(tmp_path):
+    """Usability preflight: 'a' (file) and 'a/b' (needs dir 'a') can never
+    both download — refused statically before mkdir/network/write."""
+    blob_a, blob_b = b"F" * 8, b"G" * 8
+    manifest = write_manifest(tmp_path,
+                              [art(blob_a, "a"), art(blob_b, "a/b")])
+    root = tmp_path / "assets"
+    t = ExplodingTransport()
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == fetch.EXIT_USAGE, res.err
+    assert "directory" in res.err
+    assert t.calls == []
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("filenames,refused", [
+    (("foo", "foo.partial"), True),
+    (("foo.partial", "foo"), True),
+    (("a/x", "a/x.partial"), True),
+    (("a/x.partial", "a/b/x"), False),
+    (("a/x", "b/x.partial"), False),
+    (("a/x.partial",), False),
+    (("a/x", "a/x.part"), False),
+    (("a", "a/b"), True),
+    (("a/b", "a"), True),
+    (("a/b", "a/b/c"), True),
+    (("a/b", "a_x/c"), False),
+    (("d/x", "d/x.partial", "d/y"), True),
+])
+def test_manifest_collision_check_is_exact(filenames, refused):
+    from qwen_engine.manifest import ModelArtifact, ModelManifest
+    arts = tuple(ModelArtifact(**art(b"T" * 4, fn)) for fn in filenames)
+    manifest = ModelManifest(schema_version=1, artifacts=arts)
+    if refused:
+        with pytest.raises(fetch.UsageError):
+            fetch._check_manifest_filename_collisions(manifest)
+    else:
+        fetch._check_manifest_filename_collisions(manifest)

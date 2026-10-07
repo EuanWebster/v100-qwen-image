@@ -57,6 +57,16 @@ Contract (see ``docs/models.md`` §4):
   never truncated), and the opened FD is re-verified as the expected regular
   file at the expected resume size before any byte is written. The tool
   never follows a symlink it is about to write through.
+* Manifest-safety preflight (static — no disk state, no network): before any
+  mkdir/network/write the manifest is refused (usage error, exit 2) if one
+  artifact's staged partial path ``<final>.partial`` equals another
+  artifact's final filename — schema-v1 accepts a manifest listing both
+  ``foo`` and ``foo.partial`` (only duplicate finals are rejected), yet
+  fetching ``foo`` would then mistake the verified final ``foo.partial``
+  for its own partial, append to it and delete it on a hash mismatch. A
+  filename that is simultaneously another's directory (``a`` and ``a/b``)
+  is refused the same way as a usability preflight. The read-only offline
+  plan reports this typed usage error too — never a write, never a socket.
 * Before any transfer, a bounded disk estimate (remaining manifest bytes plus
   a 1 MiB headroom per pending file) is compared with fresh ``statvfs`` free
   space. No RAM/GPU fit claim is made anywhere — capacity evidence belongs
@@ -714,11 +724,67 @@ def _atomic_no_clobber_publish(partial: Path, dest: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _check_manifest_filename_collisions(manifest: ModelManifest) -> None:
+    """Static, disk-free preflight refusal of manifest filename collisions,
+    BEFORE any mkdir, network access or write (schema-valid is not the same
+    as fetch-safe; the current committed manifest passes — this keeps the
+    generic tool contract safe for any schema-v1 manifest).
+
+    * **Staging collision (destructive, refused):** the staged partial of an
+      artifact is ``<final>.partial`` in the same directory, and schema-v1
+      rejects only duplicate *final* filenames — so a valid manifest may
+      also list ``foo.partial`` as its own final artifact. Fetching ``foo``
+      would then see the verified final ``foo.partial`` as ``foo``'s resume
+      partial, append to it, and delete it on a hash mismatch — breaking the
+      never-overwrite/never-delete promise for verified finals. Any pair
+      ``(foo, foo.partial)`` (either order, any depth) is refused outright.
+    * **File-versus-directory collision (refused as a usability preflight):**
+      filenames ``a`` and ``a/b`` cannot both be fetched — whichever runs
+      second hits ``makedirs`` over an existing file mid-run, after the
+      first has already transferred. Refusing up front names the conflict
+      while nothing has happened yet.
+    """
+    identities = [art.identity for art in manifest.artifacts]
+    # Schema-v1 guarantees uniqueness, so the identity -> index map is exact.
+    index = {ident: i for i, ident in enumerate(identities)}
+    for i, ident in enumerate(identities):
+        staged = f"{ident}.partial"
+        j = index.get(staged)
+        if j is not None:
+            raise UsageError(
+                f"manifest filename collision: the staged partial of "
+                f"artifacts[{i}] '{ident}' is '{staged}', which is also the "
+                f"final filename of artifacts[{j}] — fetching '{ident}' "
+                f"would treat the final file '{staged}' as a resume "
+                "partial (append to it, delete it on a hash mismatch), "
+                "which violates the never-overwrite/never-delete promise "
+                "for finals; rename or remove one of the two artifacts "
+                "and rerun")
+        # Every proper ancestor directory of this artifact must not itself
+        # be a final file somewhere else in the manifest:
+        parts = ident.split("/")
+        for depth in range(1, len(parts)):
+            ancestor = "/".join(parts[:depth])
+            k = index.get(ancestor)
+            if k is not None:
+                raise UsageError(
+                    f"manifest filename collision: artifacts[{k}] "
+                    f"'{ancestor}' is a final file while artifacts[{i}] "
+                    f"'{ident}' needs '{ancestor}' as a directory — the two "
+                    "can never both download; fix the manifest")
+
+
 def load_manifest_checked(path: str) -> ModelManifest:
     try:
-        return load_manifest(path)
+        manifest = load_manifest(path)
     except ManifestError as exc:
         raise UsageError(f"manifest error: {exc}") from None
+    # Schema-parsing alone is not enough for the FETCHER's safety promise
+    # (a v1-valid manifest can still stage one artifact's partial onto
+    # another artifact's final); the static refusal below runs for BOTH the
+    # read-only plan and --fetch, before any mkdir/network/write.
+    _check_manifest_filename_collisions(manifest)
+    return manifest
 
 
 def plan_rows(manifest: ModelManifest, models_dir: str) -> tuple[list[dict], int]:

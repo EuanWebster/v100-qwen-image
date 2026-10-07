@@ -905,3 +905,34 @@ standing rule that executed plans stay honest.)*
   All prior safety behaviour and `sandbox.yaml` (user-owned, untouched)
   unchanged; engine semantics and the 24-entry manifest unchanged. No
   network, no weights, no model load, no GPU, no service change.
+
+- 2026-10-07 **M2.1 fetcher review3 (final/staging-name collision preflight)**
+  (this commit; sole writer Qwen, review `/tmp/v100-m2-fetch-review3.md`
+  applied in full, on accepted `810a9ee`): schema-v1 rejects only duplicate
+  *final* filenames, so a valid manifest may list both `foo` and
+  `foo.partial`; pre-fix A/B probe (fake resume-capable transport, no
+  network) proved the destructive path — `--fetch` skipped the verified
+  final `foo.partial`, `_resume_offset` mistook it for `foo`'s partial,
+  appended over it and unlinked it on the hash mismatch (rc 5, 1 transport
+  call, final DELETED). `load_manifest_checked` now runs a static
+  `_check_manifest_filename_collisions` for BOTH plan and `--fetch`: any
+  artifact whose staged partial path `<final>.partial` equals another
+  artifact's final filename (either order, any depth) is a typed usage
+  error (exit 2) naming both filenames before any mkdir/network/write
+  (post-fix probe: rc 2, 0 transport calls, final byte-for-byte intact,
+  mtime unchanged); a filename that is simultaneously another's directory
+  (`a` and `a/b`) is refused the same way as the review's suggested
+  usability preflight. `tests/test_fetch_tool.py` **64 → 85** offline
+  tests: required end-to-end refusal in BOTH manifest orders with the
+  verified final preserved byte-for-byte, pre-mkdir refusal, refusal even
+  when every artifact verifies (static check), read-only plan typed
+  usage error, no-false-positive fetches (lone `foo.partial` final;
+  cross-directory `.partial` names), file-vs-directory refusal, and exact
+  checker parametrization. The committed 24-entry manifest contains no
+  `.partial` filenames (verified `grep -c` = 0) — the fix hardens the
+  reusable tool contract, not current data. All earlier fixes, engine
+  no-download semantics and `sandbox.yaml` (user-owned, untouched)
+  unchanged; the review2 "plan unaffected" note referred to the
+  `--models-dir` `..` refusal — manifest-content checks now gate both
+  paths identically. No network, no weights, no model load, no GPU, no
+  service change.

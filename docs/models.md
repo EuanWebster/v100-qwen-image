@@ -142,7 +142,17 @@ with `in/link` a symlink) resolves on the filesystem elsewhere than the
 the read-only offline plan is unaffected; a manifest `repo` must be
 exactly one `namespace/name` whose `[A-Za-z0-9._-]` segments are never
 exactly `.` or `..` (whole dot-segments would collapse inside the URL
-path); a bounded disk estimate (manifest
+path); a static **manifest-safety preflight** (no disk state, before any
+mkdir/network/write) refuses a manifest whose staged partial path
+`<final>.partial` for one artifact is also another artifact's final
+filename — schema-v1 accepts a manifest listing both `foo` and
+`foo.partial`, yet fetching `foo` would mistake the verified final
+`foo.partial` for its own partial, append to it and delete it on a hash
+mismatch; a filename that is simultaneously another's directory (`a` and
+`a/b`) is refused the same way (usability preflight); the read-only plan
+reports the same typed usage error without any write or socket (the
+committed 24-entry manifest contains no such names — the refusal protects
+the reusable tool contract, not just this manifest); a bounded disk estimate (manifest
 bytes + 1 MiB headroom per file) is compared with fresh free space before
 any transfer — a **disk** estimate only, no RAM/GPU fit claim (fit is M5
 calibration territory). Tool-specific exit codes are in its `--help`.
