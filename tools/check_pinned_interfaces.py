@@ -11,7 +11,11 @@ Every check carries an evidence kind:
   code    decided from real AST nodes — class/method presence, signature
           shape and defaults, real assignment expressions, forward-hook
           registration with finally-remove. Comments and docstrings can
-          NEVER satisfy a ``code`` check.
+          NEVER satisfy a ``code`` check. Caveat that applies to BOTH kinds:
+          AST structure is NOT runtime behaviour — a passing ``code`` check
+          says the surveyed code SHAPE is present in the file, not that the
+          interpreter reaches or executes it. Behavioural proof belongs to
+          adapter-level tests (M4+).
   marker  a lightweight substring tripwire over the source TEXT. A marker
           PASS is NOT proof of runtime behaviour, numerical fidelity or
           absence of network calls; it only says the surveyed textual
@@ -76,9 +80,16 @@ def read_file(path: str) -> str:
 def parse_source(src: str, key: str, rep: Report) -> ast.Module | None:
     try:
         return ast.parse(src)
-    except (SyntaxError, ValueError) as exc:
+    except SyntaxError as exc:
         rep.check("code", f"{key}: source parses", False,
                   f"{type(exc).__name__}: {exc.msg} (line {exc.lineno})")
+        return None
+    except ValueError as exc:
+        # ast.parse raises a bare ValueError for inputs a SyntaxError does not
+        # cover (e.g. a source string containing a null byte). ValueError has
+        # no .msg/.lineno — report it without touching those attributes.
+        rep.check("code", f"{key}: source parses", False,
+                  f"{type(exc).__name__}: {exc}")
         return None
 
 
@@ -291,29 +302,42 @@ def check_pipeline(src: str, rep: Report) -> None:
                       "(v1 documented limitation)", "image_pad_mask" not in names)
 
     # CFG gate: real assignments in real code — a mention in a comment or
-    # docstring must NOT satisfy this.
+    # docstring must NOT satisfy this. EXACTLY the two documented operands:
+    # extra ones are semantic drift even when both names appear
+    # (`... or True`, `... and False` must FAIL).
     h = next((v for v in assigns_named(call, "has_neg_prompt")
               if isinstance(v, ast.BoolOp) and isinstance(v.op, ast.Or)), None)
-    neg_names = ({c.left.id for c in h.values
-                  if _is_is_not_none(c, {"negative_prompt", "negative_prompt_embeds"})}
-                 if h is not None else set())
-    rep.check("code", "CFG gate: has_neg_prompt assigned from both "
-                      "negative_* 'is not None' checks (real code)",
-              neg_names == {"negative_prompt", "negative_prompt_embeds"},
-              f"found {sorted(neg_names)}")
+    neg_names = ([n for c in (h.values if h is not None else [])
+                  for n in ("negative_prompt", "negative_prompt_embeds")
+                  if _is_is_not_none(c, {n})])
+    rep.check("code", "CFG gate: has_neg_prompt assigned from EXACTLY the two "
+                      "negative_* 'is not None' checks, no extra operands "
+                      "(real code)",
+              h is not None and len(h.values) == 2
+              and sorted(neg_names) == ["negative_prompt",
+                                        "negative_prompt_embeds"],
+              f"operands={len(h.values) if h is not None else 0}, found {sorted(neg_names)}")
+
+    def _scale_gt(c: ast.expr) -> bool:
+        return (isinstance(c, ast.Compare) and len(c.ops) == 1
+                and isinstance(c.ops[0], ast.Gt)
+                and isinstance(c.left, ast.Name) and c.left.id == "true_cfg_scale"
+                and isinstance(c.comparators[0], ast.Constant)
+                and c.comparators[0].value in (1, 1.0))
+
+    def _is_hn(c: ast.expr) -> bool:
+        return isinstance(c, ast.Name) and c.id == "has_neg_prompt"
+
     d = next((v for v in assigns_named(call, "do_true_cfg")
               if isinstance(v, ast.BoolOp) and isinstance(v.op, ast.And)), None)
-    gt = any(isinstance(c, ast.Compare) and len(c.ops) == 1
-             and isinstance(c.ops[0], ast.Gt)
-             and isinstance(c.left, ast.Name) and c.left.id == "true_cfg_scale"
-             and isinstance(c.comparators[0], ast.Constant)
-             and c.comparators[0].value in (1, 1.0)
-             for c in (d.values if d is not None else []))
-    hn = any(isinstance(c, ast.Name) and c.id == "has_neg_prompt"
-             for c in (d.values if d is not None else []))
-    rep.check("code", "CFG gate: do_true_cfg assigned as "
-                      "(true_cfg_scale > 1) and has_neg_prompt (real code)",
-              d is not None and gt and hn)
+    dv = d.values if d is not None else []
+    rep.check("code", "CFG gate: do_true_cfg assigned as EXACTLY "
+                      "(true_cfg_scale > 1) and has_neg_prompt, no extra "
+                      "operands (real code)",
+              len(dv) == 2
+              and ((_scale_gt(dv[0]) and _is_hn(dv[1]))
+                   or (_scale_gt(dv[1]) and _is_hn(dv[0]))),
+              f"operands={len(dv)}")
 
     rep.check("marker", "sigmas precedence text: call sigmas > config "
                         "sample_sigmas > linspace(steps)",
@@ -333,14 +357,22 @@ def check_pipeline(src: str, rep: Report) -> None:
                   "and do_true_cfg else None" in src)
 
     # pre-RMSNorm hook: registration AND finally-remove must be real AST code
-    # (the transformers pin still ties hidden_states[-1]; removal without the
-    # transformers-side fix is drift).
-    targets = hook_targets(cls)
+    # in the ACTUAL prompt-encoding method (upstream pins it there), not just
+    # anywhere in the class — a hook parked in dead code would be structure
+    # without the surveyed call-site context. The transformers pin still ties
+    # hidden_states[-1]; removal without the transformers-side fix is drift.
+    # AST structure is NOT runtime-behaviour proof (see module docstring).
+    pem = find_func(cls, "_get_qwen_prompt_embeds")
+    rep.check("code", "pipeline: _get_qwen_prompt_embeds defined "
+                      "(norm-hook scope anchor)", pem is not None)
+    targets = hook_targets(pem) if pem is not None else set()
     rep.check("code", "pre-RMSNorm hook: forward hook returning args[0] is "
-                      "registered on the text-model norm in real code",
+                      "registered on the text-model norm in real code inside "
+                      "_get_qwen_prompt_embeds",
               bool(targets), f"targets={sorted(targets)}")
     rep.check("code", "pre-RMSNorm hook: handle.remove() inside a finally "
-                      "block in real code", finally_removes(cls, targets))
+                      "block in real code inside _get_qwen_prompt_embeds",
+              finally_removes(pem, targets) if pem is not None else False)
 
     rep.check("marker", "decode text: per-channel latents_std/latents_mean",
               "latents = latents * latents_std + latents_mean" in src
@@ -562,6 +594,9 @@ def main(argv: list[str]) -> int:
     print("NOTE: 'source marker' PASSes are lightweight textual tripwires, NOT "
           "proof of runtime behaviour, numerical fidelity or absence of network "
           "calls; behavioural proof belongs to adapter-level tests.")
+    print("NOTE: 'code' PASSes are AST-structure facts about the source files "
+          "only — this checker never executes upstream code, so no check here "
+          "proves what any interpreter would actually do at runtime.")
     print("NOTE: these are caller-provided source trees. This checker does NOT "
           "verify them against the pinned revisions in docs/interfaces.md — "
           "pinned-revision verification is a separate required step "

@@ -353,6 +353,76 @@ def test_marker_text_in_comments_docstrings_is_not_code(tmp_path):
     assert "[FAIL]" not in out2
 
 
+def test_cfg_gate_rejects_extra_boolean_operands(tmp_path):
+    """Both documented operands present is NOT enough: an extra constant
+    (`... or True`, `... and False`) changes CFG semantics and must FAIL."""
+    mod = _load_checker()
+    cases = {
+        "or_true": ("has_neg_prompt = negative_prompt is not None or "
+                    "negative_prompt_embeds is not None",
+                    "has_neg_prompt = negative_prompt is not None or "
+                    "negative_prompt_embeds is not None or True",
+                    "CFG gate: has_neg_prompt"),
+        "and_false": ("do_true_cfg = true_cfg_scale > 1 and has_neg_prompt",
+                      "do_true_cfg = true_cfg_scale > 1 and has_neg_prompt and False",
+                      "CFG gate: do_true_cfg"),
+        "and_dup": ("do_true_cfg = true_cfg_scale > 1 and has_neg_prompt",
+                    "do_true_cfg = true_cfg_scale > 1 and has_neg_prompt and has_neg_prompt",
+                    "CFG gate: do_true_cfg"),
+    }
+    for i, (label, (old, new, probe)) in enumerate(cases.items()):
+        bad = PIPELINE.replace(old, new)
+        assert bad != PIPELINE, label
+        rc, out, err = _run(mod, tmp_path / label, pipeline=bad)
+        assert rc == 1, f"{label}: rc={rc}\n{out}\n{err}"
+        fail_lines = [l for l in out.splitlines() if l.startswith("[FAIL]")]
+        assert any(probe in l for l in fail_lines), \
+            f"{label}: {probe} passed despite extra operand:\n{out}"
+
+
+def test_valueerror_on_parse_is_clean_failure_exit1(tmp_path, monkeypatch):
+    """parse_source must survive a bare ValueError from ast.parse (no
+    .msg/.lineno on ValueError) without AttributeError. On modern CPython
+    the null-byte input is reported as SyntaxError (lineno=None), so the
+    ValueError path is forced by patching ast.parse on the loaded checker."""
+    rc, out, err = _run(_load_checker(), tmp_path,
+                        pipeline="class QwenImage21Pipeline:\n    x = \x00\n")
+    assert rc == 1, out + err
+    assert "source parses" in out
+    assert "Traceback" not in err and "AttributeError" not in err, err
+
+    mod = _load_checker()
+
+    def boom(src, *a, **k):
+        raise ValueError("synthetic: no msg/lineno attributes here")
+
+    monkeypatch.setattr(mod.ast, "parse", boom)
+    rep = mod.Report()
+    mod.check_pipeline(PIPELINE, rep)  # must not raise AttributeError
+    fails = [r for r in rep.rows if r[0] == "FAIL" and "source parses" in r[2]]
+    assert len(fails) == 1, rep.rows
+    assert "ValueError" in fails[0][3], fails[0]
+
+
+def test_norm_hook_must_live_in_prompt_encoding_method(tmp_path):
+    """Hook registration + finally-remove parked in a DIFFERENT method of
+    the same class is not the surveyed contract — scoped checks must FAIL."""
+    mod = _load_checker()
+    moved = PIPELINE.replace(
+        "    def _get_qwen_prompt_embeds(self, prompt, device):\n",
+        "    def _get_qwen_prompt_embeds(self, prompt, device):\n"
+        "        return text_model(input_ids=input_ids)\n"
+        "\n"
+        "    def _dead_code(self):\n")
+    assert moved != PIPELINE
+    rc, out, err = _run(mod, tmp_path / "moved", pipeline=moved)
+    assert rc == 1, out + err
+    fail_lines = [l for l in out.splitlines() if l.startswith("[FAIL]")]
+    for name in ("forward hook returning args[0]", "finally"):
+        assert any(name in l for l in fail_lines), \
+            f"{name} passed outside _get_qwen_prompt_embeds:\n{out}"
+
+
 # --- 2. optional external pinned-tree check (explicit skip when env absent) -
 
 @pytest.mark.skipif(
