@@ -62,7 +62,9 @@ class FieldError:
 class ConfigError(ValueError):
     """Raised for any invalid/malformed configuration. Exit code 2 in the CLI."""
 
-    def __init__(self, errors: list[FieldError] | FieldError) -> None:
+    def __init__(self, errors: list[FieldError] | FieldError | str) -> None:
+        if isinstance(errors, str):
+            errors = [FieldError("config", errors)]
         if isinstance(errors, FieldError):
             errors = [errors]
         self.errors: tuple[FieldError, ...] = tuple(errors)

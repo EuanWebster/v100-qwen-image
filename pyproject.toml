@@ -10,6 +10,9 @@ requires-python = ">=3.11"
 license = "MIT"
 dependencies = []
 
+[project.scripts]
+qwen-engine = "qwen_engine.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
