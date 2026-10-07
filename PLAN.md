@@ -510,3 +510,44 @@ standing rule that executed plans stay honest.)*
   optional `prompt_tokens` added (null = unknown). No memory guard
   implemented early. 56 new tests; suite 352 on Python 3.13, fake workers
   only — no GPU/model measurements claimed.
+- 2026-10-07 second senior-review correction pass on top of `ef73df3`, three
+  scoped commits, suite 394 passed + 1 conditional skip on Python 3.13 (fake
+  workers only; no GPU/model measurements claimed; **Python 3.11 execution
+  still pending** — R7). `a5826cd`: `BenchmarkResult` snapshots
+  config/model/phases deeply (mapping proxies all the way down — mutation
+  *through* `result.phases` / `result.model[i]` now raises and cannot move
+  saved output or aggregation); `_jsonsafe.freeze_json` detects container
+  cycles by recursion-stack identity (shared acyclic subtrees still legal)
+  and bounds depth — cyclic kwargs/metadata/config become path-specific
+  typed errors, never `RecursionError`; `CalibrationLog` validates the
+  observations container before iterating and snapshots to a tuple;
+  mixed-type phase keys report `BenchSchemaError` (no pre-validation
+  `sorted()`); `10**400` timeouts / `observed_at` become typed setup/schema
+  errors via guarded float coercion; `EmbeddingCache.get` quarantine +
+  LRU touch run under the root mutex with a stat-**identity check** before
+  the move — the confirmed race where a valid entry published after a
+  stale corrupt read got quarantined is closed (event-coordinated
+  regression; no barrier inside the mutex). `579d6f9`: the real CLI refuses
+  an unconfigured `output_dir` **after** asset verification and **before**
+  adapter creation (`core.require_run_config`), so the genuinely absent M4
+  adapter can no longer mask config exit 2 with exit 1;
+  `true_cfg_scale=10**1000` is a field-level `ConfigError` (exit 2), not
+  `OverflowError` (exit 1); manifest `Path.resolve` failures (3.11 may
+  raise `RuntimeError` on symlink loops; `OSError` on permissions —
+  translated via injected-error tests, **not** an observed-3.11 claim)
+  become `ArtifactUnreadableError`/all-unreadable reports, dry-run stays
+  structured. `02f0210` (R7): `run_cpu_tests.sh` +
+  `tests/cpu_guard/sitecustomize.py` — an audit-hook + meta-path guard that
+  activates at interpreter startup in the pytest process **and every
+  subprocess fake worker**: writes outside the temp run root (incl.
+  fd-relative paths resolved through `/proc/self/fd`), all socket
+  connect/sendto/getaddrinfo and heavy ML imports (even executing stubs)
+  are refused *before* any side effect; HOME/XDG/TMPDIR/basetemp are fresh
+  temp dirs, bytecode and pytest-cache writes disabled, repo reads
+  allowed; self-tests prove each denial and that the runner passes real
+  fake-worker tests end to end (also verified: guarded full suite = 395
+  passed, no `__pycache__`/`.pytest_cache` touched). Exact fresh offline
+  command: `bash run_cpu_tests.sh` (any pytest args pass through). Limits:
+  the guard is an honest-test harness, not a security sandbox (a hostile
+  process re-execing with a stripped environment bypasses it — out of
+  scope); no runtime library behaviour changed for R7.
