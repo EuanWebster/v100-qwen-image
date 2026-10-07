@@ -1,14 +1,22 @@
-"""Task 1.2 acceptance: versioned model-manifest schema + no-download resolver (R3).
+"""Task 1.2 acceptance: versioned model-manifest schema + no-download resolver (R3),
+extended by the senior-review fix pass:
 
-The resolver verifies existence / byte size / sha256 and *never downloads*:
-tests block sockets and still expect clean structured results. Every typed
-error names repo/revision/file. No network, no GPU, no weights (R7).
+* multiple artifacts per **role** (shards/indexes/configs); unique normalized
+  **filename** identity; resolved paths grouped by role as tuples;
+* validation on **direct dataclass construction** as well as JSON parsing;
+* containment-checked, fd-single-open, change-detecting verification;
+* typed errors distinguish missing / unreadable / path-escape / non-regular.
+
+Tests block sockets and still expect clean structured results. No network, no
+GPU, no weights (R7).
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
+import stat as stat_module
 import sys
 
 import pytest
@@ -45,9 +53,10 @@ def write_manifest(tmp_path, data, name="manifest.json"):
     return path
 
 
-def materialize(tmp_path, manifest, role="dit", content=b"payload"):
-    """Write the real artifact file for one role under models_dir."""
-    art = next(a for a in manifest.artifacts if a.role == role)
+def materialize(tmp_path, manifest, role="dit", content=b"payload", index=0):
+    """Write the real artifact file for one role (optionally one shard) under models_dir."""
+    arts = [a for a in manifest.artifacts if a.role == role]
+    art = arts[index]
     target = tmp_path / art.filename
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(content)
@@ -74,8 +83,10 @@ def test_parses_valid_manifest(tmp_path):
     assert m.artifacts[0].repo == REPO
 
 
-def test_unknown_schema_version_names_field(tmp_path):
-    path = write_manifest(tmp_path, manifest_dict(schema_version=99))
+@pytest.mark.parametrize("version", [99, "1", 1.0, True, None, 0])
+def test_schema_version_must_be_exact_int_1(tmp_path, version):
+    """bools and floats are not ints here; 1.0 == 1 must not sneak through."""
+    path = write_manifest(tmp_path, manifest_dict(schema_version=version))
     with pytest.raises(mf.ManifestFormatError) as exc:
         mf.load_manifest(path)
     assert "schema_version" in str(exc.value)
@@ -88,17 +99,52 @@ def test_malformed_manifest_json_rejected(tmp_path):
         mf.load_manifest(path)
 
 
+def test_invalid_utf8_manifest_is_typed_format_error(tmp_path):
+    path = tmp_path / "manifest.json"
+    path.write_bytes(b'{"schema_version": 1, "artifacts": "\xff\xfe"}')
+    with pytest.raises(mf.ManifestFormatError) as exc:
+        mf.load_manifest(path)
+    assert "UTF-8" in str(exc.value)
+    # dry-run status stays a structured dict even for this
+    status = mf.manifest_status(path, tmp_path)
+    assert status["status"] == "manifest_invalid"
+
+
+def test_manifest_path_with_nul_is_typed_format_error(tmp_path):
+    with pytest.raises(mf.ManifestFormatError):
+        mf.load_manifest(tmp_path / "man\x00ifest.json")
+
+
 @pytest.mark.parametrize("field,bad_artifact", [
     ("sha256", lambda: {**artifact_dict(), "sha256": "nothex"}),
+    ("sha256", lambda: {**artifact_dict(), "sha256": hashlib.sha256(b"x").hexdigest() + "\n"}),
+    ("sha256", lambda: {**artifact_dict(), "sha256": hashlib.sha256(b"x").hexdigest().upper()}),
     ("bytes", lambda: {**artifact_dict(), "bytes": -5}),
+    ("bytes", lambda: {**artifact_dict(), "bytes": True}),
+    ("bytes", lambda: {**artifact_dict(), "bytes": 7.0}),
     ("repo", lambda: artifact_dict(repo="")),
-    ("revision", lambda: artifact_dict(revision="")),
+    ("revision", lambda: artifact_dict(revision="main")),
+    ("revision", lambda: artifact_dict(revision="v1.2.3")),
+    ("revision", lambda: artifact_dict(revision="0" * 39)),
+    ("filename", lambda: artifact_dict(filename="a/./b")),
+    ("filename", lambda: artifact_dict(filename="a\x00b")),
+    ("filename", lambda: artifact_dict(filename="a//b")),
+    ("filename", lambda: artifact_dict(filename=".")),
 ])
 def test_invalid_artifact_fields_name_the_field(tmp_path, field, bad_artifact):
     path = write_manifest(tmp_path, manifest_dict(bad_artifact()))
     with pytest.raises(mf.ManifestFormatError) as exc:
         mf.load_manifest(path)
     assert field in str(exc.value)
+
+
+def test_unknown_keys_rejected_manifest_and_artifact(tmp_path):
+    data = manifest_dict({**artifact_dict(), "checksum": "sha1"})
+    data["tole"] = "misc"  # typo'd top-level key
+    with pytest.raises(mf.ManifestFormatError) as exc:
+        mf.load_manifest(write_manifest(tmp_path, data))
+    text = str(exc.value)
+    assert "tole" in text and "checksum" in text
 
 
 def test_artifacts_must_be_a_list(tmp_path):
@@ -109,32 +155,86 @@ def test_artifacts_must_be_a_list(tmp_path):
     assert "artifacts" in str(exc.value)
 
 
-def test_duplicate_roles_rejected(tmp_path):
+def test_duplicate_filename_identity_rejected(tmp_path):
     path = write_manifest(tmp_path,
                           manifest_dict(artifact_dict("dit", "a/x"),
-                                        artifact_dict("dit", "b/y")))
+                                        artifact_dict("vae", "a/x")))
     with pytest.raises(mf.ManifestFormatError) as exc:
         mf.load_manifest(path)
-    assert "role" in str(exc.value)
+    assert "identity" in str(exc.value)
 
 
-@pytest.mark.parametrize("filename", ["../escape.bin", "/abs/model.bin"])
-def test_unsafe_filenames_rejected(tmp_path, filename):
-    path = write_manifest(tmp_path, manifest_dict(artifact_dict(filename=filename)))
+def test_repeated_roles_are_allowed(tmp_path):
+    m = mf.load_manifest(write_manifest(
+        tmp_path,
+        manifest_dict(artifact_dict("dit", "dit/model-00001.safetensors"),
+                      artifact_dict("dit", "dit/model-00002.safetensors"),
+                      artifact_dict("dit", "dit/index.json"))))
+    assert [a.role for a in m.artifacts] == ["dit", "dit", "dit"]
+
+
+def test_all_problems_reported_together(tmp_path):
+    path = write_manifest(tmp_path, manifest_dict(
+        {**artifact_dict(), "sha256": "bad", "bytes": 0}))
     with pytest.raises(mf.ManifestFormatError) as exc:
         mf.load_manifest(path)
-    assert "filename" in str(exc.value)
+    text = str(exc.value)
+    assert "sha256" in text and "bytes" in text
+
+
+# --- direct dataclass construction ----------------------------------------------
+
+
+def test_direct_artifact_construction_validates():
+    art = mf.ModelArtifact("dit", REPO, REV, "dit/model.bin",
+                           hashlib.sha256(b"payload").hexdigest(), 7)
+    assert art.identity == "dit/model.bin"
+    with pytest.raises(mf.ManifestFormatError):
+        mf.ModelArtifact("dit", REPO, "main", "dit/model.bin",
+                         hashlib.sha256(b"payload").hexdigest(), 7)
+    with pytest.raises(mf.ManifestFormatError):
+        mf.ModelArtifact("dit", REPO, REV, "../escape", "0" * 64, 7)
+    with pytest.raises(mf.ManifestFormatError):
+        mf.ModelArtifact("dit", REPO, REV, "a\x00b", "0" * 64, 7)
+    with pytest.raises(mf.ManifestFormatError):
+        mf.ModelArtifact("dit", REPO, REV, "a.bin", "0" * 64, True)
+
+
+def test_direct_manifest_construction_validates():
+    art = mf.ModelArtifact("dit", REPO, REV, "dit/model.bin",
+                           hashlib.sha256(b"payload").hexdigest(), 7)
+    m = mf.ModelManifest(mf.MANIFEST_SCHEMA_VERSION, (art,))
+    assert isinstance(m.artifacts, tuple)
+    with pytest.raises(mf.ManifestFormatError):
+        mf.ModelManifest(True, (art,))          # bool is not the int 1
+    with pytest.raises(mf.ManifestFormatError):
+        mf.ModelManifest(1.0, (art,))           # float is not the int 1
+    with pytest.raises(mf.ManifestFormatError):
+        mf.ModelManifest(mf.MANIFEST_SCHEMA_VERSION, ())
+    with pytest.raises(mf.ManifestFormatError):
+        mf.ModelManifest(mf.MANIFEST_SCHEMA_VERSION, [art, art])  # same identity
+    with pytest.raises(mf.ManifestFormatError):
+        mf.ModelManifest(mf.MANIFEST_SCHEMA_VERSION, ["not-an-artifact"])
+
+
+def test_manifest_immutable_and_artifacts_tuple():
+    art = mf.ModelArtifact("dit", REPO, REV, "dit/model.bin",
+                           hashlib.sha256(b"payload").hexdigest(), 7)
+    m = mf.ModelManifest(mf.MANIFEST_SCHEMA_VERSION, [art])  # list coerced to tuple
+    assert isinstance(m.artifacts, tuple)
+    with pytest.raises(Exception):
+        m.schema_version = 2  # type: ignore[misc]
 
 
 # --- resolution (verify-only, no downloads) -------------------------------------
 
 
-def test_resolve_present_artifact_returns_path(tmp_path):
+def test_resolve_present_artifact_returns_grouped_tuple(tmp_path):
     m = mf.load_manifest(write_manifest(tmp_path, manifest_dict()))
     materialize(tmp_path, m)
     result = mf.resolve_manifest(m, tmp_path)
     assert result.ok
-    assert result.resolved["dit"] == tmp_path / "dit/model.safetensors"
+    assert result.resolved["dit"] == (tmp_path / "dit/model.safetensors",)
 
 
 def test_missing_artifact_is_typed_error_naming_repo_revision_file(tmp_path, monkeypatch):
@@ -169,7 +269,127 @@ def test_hash_mismatch_is_typed_error_even_at_right_size(tmp_path):
     assert "dit/model.safetensors" in str(err) and REV in str(err)
 
 
-def test_all_bad_artifacts_reported_together(tmp_path):
+def test_file_changed_during_hashing_is_detected(tmp_path, monkeypatch):
+    """A writer appending mid-read must never be reported as 'present'."""
+    m = mf.load_manifest(write_manifest(tmp_path, manifest_dict()))
+    target = materialize(tmp_path, m)
+    real_read = os.read
+    state = {"done": False}
+
+    def read_then_mutate(fd, n):
+        if not state["done"]:
+            state["done"] = True
+            with open(target, "ab") as fh:
+                fh.write(b"mutated")
+        return real_read(fd, n)
+
+    monkeypatch.setattr(os, "read", read_then_mutate)
+    result = mf.resolve_manifest(m, tmp_path)
+    assert not result.ok
+    err = result.errors[0]
+    assert isinstance(err, mf.ArtifactSizeMismatchError)
+    assert "changed during hashing" in str(err)
+
+
+def test_unreadable_is_distinguished_from_missing(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file permissions")
+    m = mf.load_manifest(write_manifest(tmp_path, manifest_dict()))
+    target = materialize(tmp_path, m)
+    target.chmod(0o000)
+    try:
+        result = mf.resolve_manifest(m, tmp_path)
+    finally:
+        target.chmod(0o644)
+    assert not result.ok
+    err = result.errors[0]
+    assert isinstance(err, mf.ArtifactUnreadableError)
+    assert not isinstance(err, mf.ArtifactMissingError)
+    assert "errno" in str(err)
+
+
+def test_non_regular_files_never_block_hashing(tmp_path):
+    m = mf.load_manifest(write_manifest(tmp_path, manifest_dict()))
+    target = tmp_path / "dit/model.safetensors"
+    target.parent.mkdir(parents=True)
+    os.mkfifo(target)
+    result = mf.resolve_manifest(m, tmp_path)  # would hang if we opened the FIFO
+    assert isinstance(result.errors[0], mf.ArtifactUnreadableError)
+    assert "FIFO" in str(result.errors[0])
+    # a directory at the artifact path likewise never blocks
+    os.unlink(target)
+    target.mkdir()
+    result = mf.resolve_manifest(m, tmp_path)
+    assert isinstance(result.errors[0], mf.ArtifactUnreadableError)
+    assert "directory" in str(result.errors[0])
+
+
+def test_symlink_escape_rejected_with_typed_path_error(tmp_path):
+    m = mf.load_manifest(write_manifest(tmp_path, manifest_dict(
+        artifact_dict("dit", "dit/link.bin"))))
+    outside = tmp_path.parent / (tmp_path.name + "_outside_secret.bin")
+    outside.write_bytes(b"payload")
+    link = tmp_path / "dit/link.bin"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside)
+    result = mf.resolve_manifest(m, tmp_path)
+    assert not result.ok
+    err = result.errors[0]
+    assert isinstance(err, mf.ArtifactPathError)
+    assert "escapes" in str(err)
+    with pytest.raises(mf.ArtifactPathError):
+        mf.resolve_model_paths(m, tmp_path, "dit")
+
+
+def test_symlink_within_root_is_accepted(tmp_path):
+    """HF caches legitimately use in-root links — containment is what matters."""
+    m = mf.load_manifest(write_manifest(tmp_path, manifest_dict(
+        artifact_dict("dit", "dit/link.bin"))))
+    real = tmp_path / "store/blob.bin"
+    real.parent.mkdir(parents=True)
+    real.write_bytes(b"payload")
+    link = tmp_path / "dit/link.bin"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(real)
+    result = mf.resolve_manifest(m, tmp_path)
+    assert result.ok
+    assert result.resolved["dit"] == (link,)
+    assert mf.resolve_model_path(m, tmp_path, "dit") == link
+
+
+def test_shards_grouped_by_role(tmp_path):
+    specs = [(f"dit/shard-{i:05}.safetensors", f"part{i}".encode()) for i in range(3)]
+    specs.append(("dit/index.json", b"{}"))
+    parts = [artifact_dict("dit", fn, content=c) for fn, c in specs]
+    m = mf.load_manifest(write_manifest(tmp_path, manifest_dict(*parts)))
+    for fn, content in specs:
+        target = tmp_path / fn
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    result = mf.resolve_manifest(m, tmp_path)
+    assert result.ok
+    assert len(result.resolved["dit"]) == 4
+    paths = mf.resolve_model_paths(m, tmp_path, "dit")
+    assert isinstance(paths, tuple) and len(paths) == 4
+    assert all(p.is_file() for p in paths)
+
+
+def test_resolve_model_path_rejects_ambiguous_role(tmp_path):
+    specs = [("dit/shard-1", b"one"), ("dit/shard-2", b"two")]
+    m = mf.load_manifest(write_manifest(
+        tmp_path, manifest_dict(*(artifact_dict("dit", fn, content=c)
+                                 for fn, c in specs))))
+    for fn, content in specs:
+        target = tmp_path / fn
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    with pytest.raises(mf.AmbiguousRoleError) as exc:
+        mf.resolve_model_path(m, tmp_path, "dit")
+    assert "resolve_model_paths" in str(exc.value)
+    assert len(mf.resolve_model_paths(m, tmp_path, "dit")) == 2
+
+
+def test_all_bad_artifacts_reported_together_resolution(tmp_path):
     m = mf.load_manifest(write_manifest(
         tmp_path,
         manifest_dict(artifact_dict("dit"),
@@ -202,6 +422,8 @@ def test_resolve_model_path_unknown_role(tmp_path):
     with pytest.raises(mf.ManifestError) as exc:
         mf.resolve_model_path(m, tmp_path, "lora")
     assert "lora" in str(exc.value)
+    with pytest.raises(mf.ManifestError):
+        mf.resolve_model_paths(m, tmp_path, "lora")
 
 
 def test_resolution_never_touches_network(tmp_path, monkeypatch):
@@ -244,6 +466,19 @@ def test_status_reports_per_artifact_state(tmp_path):
     assert roles == sorted(roles)  # deterministic ordering
     text = json.dumps(status, sort_keys=True)
     assert json.loads(text) == status
+
+
+def test_status_reports_path_escape_state(tmp_path):
+    m = mf.load_manifest(write_manifest(tmp_path, manifest_dict(
+        artifact_dict("dit", "dit/link.bin"))))
+    outside = tmp_path.parent / (tmp_path.name + "_outside.bin")
+    outside.write_bytes(b"payload")
+    link = tmp_path / "dit/link.bin"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(outside)
+    status = mf.manifest_status(tmp_path / "manifest.json", tmp_path)
+    assert status["status"] == "incomplete"
+    assert status["artifacts"][0]["status"] == "path_escape"
 
 
 def test_status_ok_when_everything_present(tmp_path):

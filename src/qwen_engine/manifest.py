@@ -2,25 +2,38 @@
 
 Stdlib-only. The manifest (``models/manifest.json``) pins, per artifact, the
 ``repo`` / ``revision`` / ``filename`` / ``sha256`` / ``bytes`` of every model
-file a run requires. The resolver *verifies* those claims on disk and never
-downloads: a missing or mismatched artifact is a typed, structured error that
-names the repo/revision/file so the operator can fetch it deliberately
-(fetching is a separate documented action, never implicit).
+file a run requires. A *role* may cover several files (sharded weights, index
+files, configs); identity is the **unique normalized filename**, not the role.
+The resolver *verifies* those claims on disk and never downloads: a missing or
+mismatched artifact is a typed, structured error that names the
+repo/revision/file so the operator can fetch it deliberately (fetching is a
+separate documented action, never implicit).
+
+Validation runs on **direct dataclass construction as well as JSON parsing**,
+so a hand-built :class:`ModelManifest` cannot smuggle in a floating schema
+version, a branch-name "revision", or an unsafe filename.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
-from collections.abc import Mapping
+import stat as stat_module
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 #: Schema version of ``models/manifest.json`` (finalize values in task 2.1).
 MANIFEST_SCHEMA_VERSION = 1
 
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+#: A pinned revision is an exact 40-hex commit sha — never a branch or tag.
+_REVISION_RE = re.compile(r"[0-9a-f]{40}")
+
+_ARTIFACT_KEYS = frozenset({"role", "repo", "revision", "filename", "sha256", "bytes"})
+_MANIFEST_KEYS = frozenset({"schema_version", "artifacts"})
 
 #: Artifact states reported in dry-run status dicts.
 STATE_PRESENT = "present"
@@ -28,8 +41,66 @@ STATE_MISSING = "missing"
 STATE_SIZE_MISMATCH = "size_mismatch"
 STATE_HASH_MISMATCH = "hash_mismatch"
 STATE_UNREADABLE = "unreadable"
+STATE_PATH_ESCAPE = "path_escape"
 
 _HASH_CHUNK = 1 << 20
+
+
+# ---------------------------------------------------------------------------
+# Field validators (shared by JSON parsing and direct construction)
+# ---------------------------------------------------------------------------
+
+
+def _safe_filename(filename: Any) -> str | None:
+    """Return an error string if ``filename`` is not a safe relative path."""
+    if not isinstance(filename, str) or not filename:
+        return f"must be a non-empty string, got {filename!r}"
+    if "\0" in filename:
+        return f"contains a NUL byte: {filename!r}"
+    if PurePosixPath(filename).is_absolute():
+        return f"must be relative, got absolute path {filename!r}"
+    parts = filename.split("/")
+    for part in parts:
+        if part == "":
+            return f"empty path component in {filename!r}"
+        if part == ".":
+            return f"dot path component in {filename!r}"
+        if part == "..":
+            return f"parent-directory component in {filename!r}"
+    return None
+
+
+def _normalized(filename: str) -> str:
+    """Canonical identity of a validated safe relative filename."""
+    return "/".join(filename.split("/"))
+
+
+def _check_artifact_fields(art: Mapping[str, Any], at: str,
+                           errors: list[str]) -> None:
+    """Append every field-level problem with ``art`` to *errors* (all-problems
+    report: every field is checked independently)."""
+    def bad(field: str, msg: str) -> None:
+        errors.append(f"{at}.{field}: {msg}")
+
+    for field in ("role", "repo", "revision"):
+        value = art.get(field)
+        if not isinstance(value, str) or not value.strip():
+            bad(field, f"must be a non-empty string, got {value!r}")
+    revision = art.get("revision")
+    if isinstance(revision, str) and revision.strip():
+        if not _REVISION_RE.fullmatch(revision):
+            bad("revision", "must be a pinned 40-hex commit sha (not a branch "
+                            f"or tag), got {revision!r}")
+    filename = art.get("filename")
+    problem = _safe_filename(filename)
+    if problem is not None:
+        bad("filename", problem)
+    sha = art.get("sha256")
+    if not isinstance(sha, str) or not _SHA256_RE.fullmatch(sha):
+        bad("sha256", f"must be 64 lowercase hex chars, got {sha!r}")
+    size = art.get("bytes")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        bad("bytes", f"must be a positive integer, got {size!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +110,11 @@ _HASH_CHUNK = 1 << 20
 
 @dataclass(frozen=True)
 class ModelArtifact:
-    """One pinned model file: where it came from and what it must look like."""
+    """One pinned model file: where it came from and what it must look like.
+
+    Validated on *every* construction (direct or parsed) — a frozen dataclass
+    is not a validation exemption.
+    """
 
     role: str
     repo: str
@@ -47,6 +122,17 @@ class ModelArtifact:
     filename: str
     sha256: str
     bytes: int
+
+    def __post_init__(self) -> None:
+        errors: list[str] = []
+        _check_artifact_fields(self.to_dict(), "artifact", errors)
+        if errors:
+            raise ManifestFormatError("invalid model artifact: " + "; ".join(errors))
+
+    @property
+    def identity(self) -> str:
+        """Unique normalized filename identity (roles may repeat; files may not)."""
+        return _normalized(self.filename)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +149,44 @@ class ModelArtifact:
 class ModelManifest:
     schema_version: int
     artifacts: tuple[ModelArtifact, ...]
+
+    def __post_init__(self) -> None:
+        errors: list[str] = []
+        version = self.schema_version
+        if not isinstance(version, int) or isinstance(version, bool) or version != MANIFEST_SCHEMA_VERSION:
+            errors.append(
+                f"schema_version: expected exact int {MANIFEST_SCHEMA_VERSION}, "
+                f"got {version!r}"
+            )
+        raw = self.artifacts
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, Iterable):
+            errors.append(f"artifacts: must be a tuple of ModelArtifact, got {type(raw).__name__}")
+            if errors:
+                raise ManifestFormatError("invalid model manifest: " + "; ".join(errors))
+        items = list(raw)
+        if not items:
+            errors.append("artifacts: must be a non-empty collection")
+        bad_items = [a for a in items if not isinstance(a, ModelArtifact)]
+        if bad_items:
+            errors.append(
+                "artifacts: every entry must be a ModelArtifact, got "
+                + ", ".join(type(a).__name__ for a in bad_items)
+            )
+        if not errors:
+            seen: dict[str, int] = {}
+            for i, art in enumerate(items):
+                ident = art.identity
+                if ident in seen:
+                    errors.append(
+                        f"artifacts[{i}].filename: duplicate artifact identity "
+                        f"{ident!r} (also at artifacts[{seen[ident]}]; roles may "
+                        f"repeat, filenames may not)"
+                    )
+                else:
+                    seen[ident] = i
+        if errors:
+            raise ManifestFormatError("invalid model manifest: " + "; ".join(errors))
+        object.__setattr__(self, "artifacts", tuple(items))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,7 +205,12 @@ class ManifestError(Exception):
 
 
 class ManifestFormatError(ManifestError):
-    """The manifest file itself is malformed; its message names the field."""
+    """The manifest file (or object) is malformed; its message names every
+    offending field."""
+
+
+class AmbiguousRoleError(ManifestError):
+    """The role covers several files; use :func:`resolve_model_paths`."""
 
 
 class ArtifactError(ManifestError):
@@ -107,15 +236,21 @@ class ArtifactMissingError(ArtifactError):
     problem = "artifact missing on disk"
 
 
+class ArtifactPathError(ArtifactError):
+    """The artifact resolves outside the model storage root (symlink escape)."""
+
+    problem = "artifact path escapes model root"
+
+
 class ArtifactSizeMismatchError(ArtifactError):
     problem = "byte size mismatch"
 
-    def __init__(self, artifact: ModelArtifact, expected_bytes: int, actual_bytes: int) -> None:
+    def __init__(self, artifact: ModelArtifact, expected_bytes: int, actual_bytes: int,
+                 detail: str = "") -> None:
         self.expected_bytes = expected_bytes
         self.actual_bytes = actual_bytes
-        super().__init__(
-            artifact, f"expected {expected_bytes} bytes, found {actual_bytes}"
-        )
+        msg = f"expected {expected_bytes} bytes, found {actual_bytes}"
+        super().__init__(artifact, f"{msg} ({detail})" if detail else msg)
 
 
 class ArtifactHashMismatchError(ArtifactError):
@@ -128,11 +263,19 @@ class ArtifactHashMismatchError(ArtifactError):
 
 
 class ArtifactUnreadableError(ArtifactError):
+    """Exists but cannot be read/hashed (permissions, I/O, not a regular file,
+    changed mid-verification). Never blocks: FIFOs and directories are
+    identified from ``stat`` *before* any open."""
+
     problem = "artifact unreadable"
 
 
+def _os_detail(exc: OSError) -> str:
+    return f"errno {exc.errno} ({exc.strerror or type(exc).__name__}): {exc.filename or ''}".rstrip()
+
+
 # ---------------------------------------------------------------------------
-# Parsing
+# Parsing (strict known keys; all problems reported)
 # ---------------------------------------------------------------------------
 
 
@@ -144,28 +287,12 @@ def _artifact_from_dict(index: int, data: Any, errors: list[str]) -> ModelArtifa
         bad("(entry)", f"must be an object, got {type(data).__name__}")
         return None
     art: dict[str, Any] = dict(data)
-    for field in ("role", "repo", "revision", "filename"):
-        value = art.get(field)
-        if not isinstance(value, str) or not value.strip():
-            bad(field, f"must be a non-empty string, got {value!r}")
-            return None
-    filename = art["filename"]
-    fpath = Path(filename)
-    if fpath.is_absolute() or ".." in fpath.parts or not filename:
-        bad("filename", f"must be a safe relative path, got {filename!r}")
+    for key in sorted(set(art) - _ARTIFACT_KEYS):
+        bad(key, "unknown artifact key")
+    _check_artifact_fields(art, f"artifacts[{index}]", errors)
+    if any(err.startswith(f"artifacts[{index}].") for err in errors):
         return None
-    sha = art.get("sha256")
-    if not isinstance(sha, str) or not _SHA256_RE.match(sha):
-        bad("sha256", f"must be 64 lowercase hex chars, got {sha!r}")
-        return None
-    size = art.get("bytes")
-    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
-        bad("bytes", f"must be a positive integer, got {size!r}")
-        return None
-    return ModelArtifact(
-        role=art["role"], repo=art["repo"], revision=art["revision"],
-        filename=filename, sha256=sha, bytes=size,
-    )
+    return ModelArtifact(**art)
 
 
 def manifest_from_dict(data: Any) -> ModelManifest:
@@ -174,25 +301,33 @@ def manifest_from_dict(data: Any) -> ModelManifest:
     errors: list[str] = []
     if not isinstance(data, Mapping):
         raise ManifestFormatError(f"manifest: must be a JSON object, got {type(data).__name__}")
+    for key in sorted(set(data) - _MANIFEST_KEYS):
+        errors.append(f"{key}: unknown manifest key")
     version = data.get("schema_version")
-    if version != MANIFEST_SCHEMA_VERSION:
+    if (not isinstance(version, int) or isinstance(version, bool)
+            or version != MANIFEST_SCHEMA_VERSION):
         errors.append(
-            f"schema_version: expected {MANIFEST_SCHEMA_VERSION}, got {version!r}"
+            f"schema_version: expected exact int {MANIFEST_SCHEMA_VERSION}, "
+            f"got {version!r}"
         )
     raw = data.get("artifacts")
     artifacts: list[ModelArtifact] = []
     if not isinstance(raw, list) or not raw:
         errors.append("artifacts: must be a non-empty list")
     else:
-        seen: set[str] = set()
+        seen: dict[str, int] = {}
         for i, entry in enumerate(raw):
             art = _artifact_from_dict(i, entry, errors)
             if art is None:
                 continue
-            if art.role in seen:
-                errors.append(f"artifacts[{i}].role: duplicate role {art.role!r}")
+            if art.identity in seen:
+                errors.append(
+                    f"artifacts[{i}].filename: duplicate artifact identity "
+                    f"{art.identity!r} (also at artifacts[{seen[art.identity]}]; "
+                    f"roles may repeat, filenames may not)"
+                )
                 continue
-            seen.add(art.role)
+            seen[art.identity] = i
             artifacts.append(art)
     if errors:
         raise ManifestFormatError("invalid model manifest: " + "; ".join(errors))
@@ -202,9 +337,15 @@ def manifest_from_dict(data: Any) -> ModelManifest:
 def load_manifest(path: str | Path) -> ModelManifest:
     path = Path(path)
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ManifestFormatError(f"manifest file not readable: {path}: {exc}") from exc
+        raw = path.read_bytes()
+    except (OSError, ValueError) as exc:  # ValueError: embedded NUL in path
+        raise ManifestFormatError(
+            f"manifest file not readable: {path}: {exc.strerror or exc if isinstance(exc, OSError) else exc}"
+        ) from exc
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ManifestFormatError(f"manifest file is not valid UTF-8: {path}: {exc}") from exc
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -217,12 +358,103 @@ def load_manifest(path: str | Path) -> ModelManifest:
 # ---------------------------------------------------------------------------
 
 
-def _sha256_of(path: Path) -> str:
+class _FileChangedDuringHash(OSError):
+    """Internal: the open file mutated between fstat and the end of hashing."""
+
+
+def _hash_and_check(fd: int, pre: os.stat_result) -> str:
+    """Stream-hash an already-open descriptor; raise :class:`_FileChangedDuringHash`
+    if the file changed (size or mtime) while hashing."""
     digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        while chunk := fh.read(_HASH_CHUNK):
-            digest.update(chunk)
+    os.lseek(fd, 0, os.SEEK_SET)
+    while chunk := os.read(fd, _HASH_CHUNK):
+        digest.update(chunk)
+    after = os.fstat(fd)
+    if after.st_size != pre.st_size:
+        raise _FileChangedDuringHash(
+            f"file changed during verification (size {pre.st_size} -> {after.st_size})"
+        )
+    if (getattr(after, "st_mtime_ns", None) is not None
+            and after.st_mtime_ns != pre.st_mtime_ns):
+        raise _FileChangedDuringHash("file modified during verification (mtime changed)")
     return digest.hexdigest()
+
+
+def _verify_one(artifact: ModelArtifact, root: Path,
+                root_resolved: Path) -> ArtifactStatus:
+    path = root / artifact.filename
+    resolved = path.resolve()
+    if resolved != root_resolved and root_resolved not in resolved.parents:
+        # Symlink (or platform quirk) took us outside the model storage root.
+        return ArtifactStatus(
+            artifact, STATE_PATH_ESCAPE,
+            ArtifactPathError(artifact, f"resolves to {resolved}, outside {root_resolved}"),
+        )
+    try:
+        st = resolved.stat()
+    except FileNotFoundError:
+        return ArtifactStatus(artifact, STATE_MISSING, ArtifactMissingError(artifact))
+    except OSError as exc:  # permission on a path component, ELOOP, ...
+        return ArtifactStatus(artifact, STATE_UNREADABLE,
+                              ArtifactUnreadableError(artifact, _os_detail(exc)))
+    if not stat_module.S_ISREG(st.st_mode):
+        # FIFOs block on open and directories read() — never hash either.
+        kind = ("directory" if stat_module.S_ISDIR(st.st_mode)
+                else "FIFO" if stat_module.S_ISFIFO(st.st_mode)
+                else f"non-regular file (mode {oct(st.st_mode)})")
+        return ArtifactStatus(
+            artifact, STATE_UNREADABLE,
+            ArtifactUnreadableError(artifact, f"not a regular file: {kind}"),
+        )
+    if st.st_size != artifact.bytes:
+        return ArtifactStatus(
+            artifact, STATE_SIZE_MISMATCH,
+            ArtifactSizeMismatchError(artifact, artifact.bytes, st.st_size),
+        )
+    try:
+        fd = os.open(resolved, os.O_RDONLY)
+    except FileNotFoundError:
+        return ArtifactStatus(artifact, STATE_MISSING, ArtifactMissingError(artifact))
+    except OSError as exc:
+        return ArtifactStatus(artifact, STATE_UNREADABLE,
+                              ArtifactUnreadableError(artifact, _os_detail(exc)))
+    try:
+        try:
+            pre = os.fstat(fd)
+        except OSError as exc:
+            return ArtifactStatus(artifact, STATE_UNREADABLE,
+                                  ArtifactUnreadableError(artifact, _os_detail(exc)))
+        if not stat_module.S_ISREG(pre.st_mode):
+            return ArtifactStatus(
+                artifact, STATE_UNREADABLE,
+                ArtifactUnreadableError(artifact, "not a regular file (swapped after stat)"),
+            )
+        if pre.st_size != artifact.bytes:
+            return ArtifactStatus(
+                artifact, STATE_SIZE_MISMATCH,
+                ArtifactSizeMismatchError(artifact, artifact.bytes, pre.st_size),
+            )
+        try:
+            actual_sha = _hash_and_check(fd, pre)
+        except _FileChangedDuringHash as exc:
+            return ArtifactStatus(
+                artifact, STATE_SIZE_MISMATCH,
+                ArtifactSizeMismatchError(artifact, artifact.bytes,
+                                          os.fstat(fd).st_size,
+                                          detail="file changed during hashing"),
+            )
+        except OSError as exc:
+            return ArtifactStatus(artifact, STATE_UNREADABLE,
+                                  ArtifactUnreadableError(
+                                      artifact, str(exc) or _os_detail(exc)))
+    finally:
+        os.close(fd)
+    if actual_sha != artifact.sha256:
+        return ArtifactStatus(
+            artifact, STATE_HASH_MISMATCH,
+            ArtifactHashMismatchError(artifact, artifact.sha256, actual_sha),
+        )
+    return ArtifactStatus(artifact, STATE_PRESENT, path=path)
 
 
 @dataclass(frozen=True)
@@ -230,6 +462,7 @@ class ArtifactStatus:
     artifact: ModelArtifact
     state: str
     error: ArtifactError | None = None
+    path: Path | None = None
 
     def to_dict(self) -> dict[str, Any]:
         a = self.artifact
@@ -245,66 +478,79 @@ class ArtifactStatus:
 @dataclass(frozen=True)
 class ResolutionReport:
     ok: bool
-    resolved: dict[str, Path]
+    #: Verified paths grouped by role; a role may cover several files
+    #: (shards, indexes, configs), so every value is a tuple.
+    resolved: dict[str, tuple[Path, ...]]
     statuses: tuple[ArtifactStatus, ...]
     errors: tuple[ArtifactError, ...]
 
 
-def _verify(artifact: ModelArtifact, root: Path) -> ArtifactStatus:
-    path = root / artifact.filename
-    try:
-        actual_size = path.stat().st_size
-    except OSError:
-        return ArtifactStatus(artifact, STATE_MISSING, ArtifactMissingError(artifact))
-    if actual_size != artifact.bytes:
-        return ArtifactStatus(
-            artifact, STATE_SIZE_MISMATCH,
-            ArtifactSizeMismatchError(artifact, artifact.bytes, actual_size),
-        )
-    try:
-        actual_sha = _sha256_of(path)
-    except OSError as exc:
-        return ArtifactStatus(artifact, STATE_UNREADABLE,
-                              ArtifactUnreadableError(artifact, str(exc)))
-    if actual_sha != artifact.sha256:
-        return ArtifactStatus(
-            artifact, STATE_HASH_MISMATCH,
-            ArtifactHashMismatchError(artifact, artifact.sha256, actual_sha),
-        )
-    return ArtifactStatus(artifact, STATE_PRESENT)
-
-
 def resolve_manifest(manifest: ModelManifest, models_dir: str | Path) -> ResolutionReport:
     """Verify every artifact under ``models_dir``. Collects **all** problems;
-    performs **no** network access and no downloads."""
+    performs **no** network access and no downloads.
+
+    Symlinks are allowed when their *resolved* targets stay inside the model
+    storage root (HF caches legitimately use them); anything that canonicalizes
+    outside the root is a typed :class:`ArtifactPathError`.
+    """
     root = Path(models_dir)
-    statuses = tuple(_verify(a, root) for a in manifest.artifacts)
-    resolved = {
-        s.artifact.role: root / s.artifact.filename
-        for s in statuses if s.state == STATE_PRESENT
-    }
+    root_resolved = root.resolve()
+    statuses = tuple(_verify_one(a, root, root_resolved) for a in manifest.artifacts)
+    resolved: dict[str, tuple[Path, ...]] = {}
+    for s in statuses:
+        if s.state == STATE_PRESENT and s.path is not None:
+            resolved.setdefault(s.artifact.role, ())
+            resolved[s.artifact.role] += (s.path,)
     errors = tuple(s.error for s in statuses if s.error is not None)
     return ResolutionReport(
         ok=not errors, resolved=resolved, statuses=statuses, errors=errors
     )
 
 
-def resolve_model_path(manifest: ModelManifest, models_dir: str | Path, role: str) -> Path:
-    """Path for one verified artifact, or a typed :class:`ArtifactError`.
+def _role_artifacts(manifest: ModelManifest, role: str) -> tuple[ModelArtifact, ...]:
+    return tuple(a for a in manifest.artifacts if a.role == role)
 
-    Never downloads: a missing file raises :class:`ArtifactMissingError`
-    naming repo/revision/file — fetching is an explicit operator action.
-    """
-    artifact = next((a for a in manifest.artifacts if a.role == role), None)
-    if artifact is None:
+
+def resolve_model_paths(manifest: ModelManifest, models_dir: str | Path,
+                        role: str) -> tuple[Path, ...]:
+    """Verified paths for **every** artifact with ``role`` (shards included),
+    or a typed :class:`ArtifactError`. Never downloads."""
+    arts = _role_artifacts(manifest, role)
+    if not arts:
         raise ManifestError(
             f"manifest has no artifact with role {role!r} "
-            f"(known roles: {', '.join(a.role for a in manifest.artifacts)})"
+            f"(known roles: {', '.join(sorted({a.role for a in manifest.artifacts}))})"
         )
-    status = _verify(artifact, Path(models_dir))
-    if status.error is not None:
-        raise status.error
-    return Path(models_dir) / artifact.filename
+    root = Path(models_dir)
+    root_resolved = root.resolve()
+    statuses = [_verify_one(a, root, root_resolved) for a in arts]
+    for status in statuses:
+        if status.error is not None:
+            raise status.error
+    return tuple(s.path for s in statuses)
+
+
+def resolve_model_path(manifest: ModelManifest, models_dir: str | Path, role: str) -> Path:
+    """Path for a role that names exactly **one** verified artifact.
+
+    Ambiguous multi-file roles (shards/indexes) are rejected — use
+    :func:`resolve_model_paths`; silently handing back one shard of a
+    sharded model would be worse than refusing. Never downloads.
+    """
+    arts = _role_artifacts(manifest, role)
+    if not arts:
+        raise ManifestError(
+            f"manifest has no artifact with role {role!r} "
+            f"(known roles: {', '.join(sorted({a.role for a in manifest.artifacts}))})"
+        )
+    if len(arts) > 1:
+        raise AmbiguousRoleError(
+            f"role {role!r} covers {len(arts)} artifacts "
+            f"({', '.join(a.filename for a in arts)}); use resolve_model_paths()"
+        )
+    paths = resolve_model_paths(manifest, models_dir, role)
+    assert len(paths) == 1
+    return paths[0]
 
 
 # ---------------------------------------------------------------------------
@@ -321,11 +567,11 @@ def manifest_status(
         return {"configured": False, "status": "unconfigured", "artifacts": []}
     path = Path(manifest_path)
     out: dict[str, Any] = {"configured": True, "path": str(path), "artifacts": []}
-    if not path.is_file():
-        return {**out, "status": "manifest_file_missing"}
     try:
         manifest = load_manifest(path)
     except ManifestFormatError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return {**out, "status": "manifest_file_missing"}
         return {**out, "status": "manifest_invalid", "error": str(exc)}
     root = Path(models_dir) if models_dir is not None else path.parent
     report = resolve_manifest(manifest, root)
@@ -333,6 +579,6 @@ def manifest_status(
     out["status"] = "ok" if report.ok else "incomplete"
     out["artifacts"] = [
         s.to_dict()
-        for s in sorted(report.statuses, key=lambda s: s.artifact.role)
+        for s in sorted(report.statuses, key=lambda s: (s.artifact.role, s.artifact.filename))
     ]
     return out
