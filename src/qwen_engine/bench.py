@@ -5,12 +5,15 @@ every measured field is ``null`` when it was not measured — peak CUDA memory
 in particular is recorded as ``null`` on machines without CUDA (this sandbox
 included), never guessed. This module also never imports torch: the CUDA
 numbers are *provided by the adapter* at record time (heavy imports stay
-inside it); the host-RSS probe here is stdlib ``resource``.
+inside it); the host-RSS probe here is stdlib ``resource`` — and it is the
+**lifetime peak of the parent process**, not an encoder-child or per-run
+number (see :func:`host_rss_bytes`).
 
 Schemas
 -------
 * ``benchmark_result.v1`` — one run: per-phase wall times, optional step
-  count (denoise-per-step is *derived*, not invented), peak host RSS, peak
+  count (denoise-per-step is *derived*, not invented), peak host RSS
+  (lifetime peak of the parent process — see :func:`host_rss_bytes`), peak
   CUDA allocated/reserved (null when unavailable), environment identifiers,
   model identifiers from the manifest, and an echo of the config.
 * ``benchmark_aggregate.v1`` — deterministic aggregation over results
@@ -18,7 +21,10 @@ Schemas
 * ``calibration_observation.v1`` + ``qwen_engine.calibration.v1`` —
   the observation records feeding ``calibration.json``; each record carries
   the staleness key the memory policy (M5.3) matches on: schema version,
-  model revision, attention backend, quant.
+  model revision, attention backend, quant. That key is a **prefilter** —
+  matching observations still have to be matched on the conditioning
+  fields (phase/tokens/resolution/residency/CFG/VAE/prompt length) by the
+  consumer at M5.3; equivalence is *not* implied here.
 """
 from __future__ import annotations
 
@@ -27,17 +33,24 @@ import math
 import os
 import platform as platform_module
 import re
-import resource
 import socket
 import statistics
+import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from qwen_engine._jsonsafe import freeze_json, json_violations, plain_json
 from qwen_engine.manifest import ModelManifest
+
+try:
+    import resource  # POSIX-only; absent e.g. on Windows
+except ImportError:  # pragma: no cover - platform without the module
+    resource = None  # type: ignore[assignment]
 
 BENCHMARK_SCHEMA = "benchmark_result.v1"
 AGGREGATE_SCHEMA = "benchmark_aggregate.v1"
@@ -66,7 +79,14 @@ def _is_number(value: Any) -> bool:
 
 
 def _finite_nonneg(value: Any) -> bool:
-    return _is_number(value) and math.isfinite(value) and value >= 0
+    if not _is_number(value) or value < 0:
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        # A huge int is not a representable JSON/float measurement: refuse
+        # it here rather than raising OverflowError later at float().
+        return False
 
 
 def _check_optional_bytes(value: Any, name: str, errors: list[str]) -> None:
@@ -106,13 +126,18 @@ class BenchmarkEnvironment:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 _bad(errors, name, f"must be a non-empty string or null, got {value!r}")
-        if self.arch_list is not None and (
-                isinstance(self.arch_list, (str, bytes))
-                or not all(isinstance(a, str) and a.strip() for a in self.arch_list)):
-            _bad(errors, "arch_list",
-                 f"must be a list of non-empty strings or null, got {self.arch_list!r}")
+        if self.arch_list is not None:
+            if (isinstance(self.arch_list, (str, bytes))
+                    or not isinstance(self.arch_list, (list, tuple))
+                    or not all(isinstance(a, str) and a.strip()
+                               for a in self.arch_list)):
+                _bad(errors, "arch_list",
+                     f"must be a list of non-empty strings or null, "
+                     f"got {self.arch_list!r}")
         if errors:
             raise BenchSchemaError("invalid benchmark environment: " + "; ".join(errors))
+        if self.arch_list is not None and not isinstance(self.arch_list, tuple):
+            object.__setattr__(self, "arch_list", tuple(self.arch_list))
 
     def to_dict(self) -> dict[str, Any]:
         return {"python": self.python, "platform": self.platform,
@@ -171,18 +196,36 @@ def capture_environment(cuda_info: Mapping[str, Any] | None = None) -> Benchmark
     )
 
 
-def host_rss_bytes() -> int | None:
-    """Peak resident set size of *this process* in bytes (stdlib
-    ``resource``); ``None`` where the probe does not exist — never 0."""
+def host_rss_bytes(platform: str | None = None) -> int | None:
+    """Peak resident set size of **this (parent) process over its whole
+    lifetime**, in bytes — the high-water mark of ``getrusage(RUSAGE_SELF)``,
+    *not* an encoder-child measurement and *not* reset per run. ``None``
+    where the probe does not exist or its unit is unknown — never 0.
+
+    Units are a platform fact, never a guess: Linux reports **KiB** (times
+    1024), Darwin/macOS reports **bytes**; any other platform returns
+    ``None`` rather than assuming a scale.
+    """
+    if resource is None:
+        return None
     try:
-        return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     except (AttributeError, OSError, ValueError):  # pragma: no cover
         return None
+    plat = sys.platform if platform is None else platform
+    if plat.startswith("linux"):
+        return peak * 1024  # ru_maxrss is KiB on Linux
+    if plat.startswith("darwin"):
+        return peak  # ru_maxrss is already bytes on macOS
+    return None
 
 
 def model_identifiers(manifest: ModelManifest) -> tuple[dict[str, Any], ...]:
     """Repo/revision/filename/sha256 per artifact, deterministic order —
-    the model identity half of a benchmark record (R6)."""
+    the model identity half of a benchmark record (R6). These are the
+    *actual* identifiers from the manifest (identity is the unique
+    normalized filename; roles may repeat), and :func:`_check_model_list`
+    refuses duplicate entries by that same identity, not by role."""
     out = []
     for art in sorted(manifest.artifacts, key=lambda a: (a.role, a.identity)):
         out.append({"role": art.role, "repo": art.repo, "revision": art.revision,
@@ -215,6 +258,19 @@ class BenchmarkResult:
 
     def __post_init__(self) -> None:
         errors = validate_result_fields(self)
+        if not errors:
+            # Deep-freeze snapshots: the record owns its own config/model/
+            # phases structures, so mutating the caller's nested inputs (or
+            # the dicts in a model list) afterwards cannot change what this
+            # result serializes to, saves, or aggregates.
+            snap_errors: list[str] = []
+            config = freeze_json(self.config, "config", snap_errors)
+            errors.extend(snap_errors)
+            if not errors:
+                object.__setattr__(self, "config", config)
+                object.__setattr__(self, "model",
+                                   tuple(dict(m) for m in self.model))
+                object.__setattr__(self, "phases", dict(self.phases))
         if errors:
             raise BenchSchemaError("invalid benchmark result: " + "; ".join(errors))
 
@@ -231,7 +287,7 @@ class BenchmarkResult:
             "run_id": self.run_id,
             "environment": self.environment.to_dict() if self.environment else None,
             "model": [dict(m) for m in self.model],
-            "config": dict(self.config),
+            "config": plain_json(self.config),
             "phases": dict(self.phases),
             "steps": self.steps,
             "peak_host_rss_bytes": self.peak_host_rss_bytes,
@@ -250,6 +306,15 @@ class BenchmarkResult:
                 f"benchmark result: must be a JSON object, got {type(data).__name__}")
         for key in sorted(set(data) - _RESULT_KEYS):
             _bad(errors, key, "unknown benchmark result key")
+        # The explicit schema tag is REQUIRED and must be exactly v1: a
+        # missing, older or newer document is refused, never silently
+        # re-labelled as benchmark_result.v1.
+        if "schema" not in data:
+            _bad(errors, "schema",
+                 f"required (must be {BENCHMARK_SCHEMA!r}, tag is missing)")
+        elif data.get("schema") != BENCHMARK_SCHEMA:
+            _bad(errors, "schema",
+                 f"must be {BENCHMARK_SCHEMA!r}, got {data.get('schema')!r}")
         env: BenchmarkEnvironment | None = None
         raw_env = data.get("environment")
         if raw_env is None:
@@ -272,7 +337,8 @@ class BenchmarkResult:
             config = {}
         if errors:
             raise BenchSchemaError("invalid benchmark result: " + "; ".join(errors))
-        return cls(run_id=data.get("run_id", ""), environment=env,
+        return cls(schema=data.get("schema"), run_id=data.get("run_id", ""),
+                   environment=env,
                    model=tuple(model or ()), config=dict(config or {}),
                    phases=dict(phases), steps=data.get("steps"),
                    peak_host_rss_bytes=data.get("peak_host_rss_bytes"),
@@ -293,11 +359,14 @@ def _check_model_list(model: Any) -> list[str]:
     if model is None:
         model = ()
     if isinstance(model, (str, bytes, Mapping)) or not isinstance(model, (list, tuple)):
+        # Invalid direct sequence types (int, generator, set, ...) are a
+        # schema error here, never a raw TypeError from iteration.
         _bad(errors, "model", f"must be a list of artifact identifier objects, got {model!r}")
         return errors
     if not model:
         _bad(errors, "model", "must name at least the artifacts used "
                               "(from model_identifiers(manifest))")
+    seen: dict[Any, int] = {}
     for i, m in enumerate(model):
         if not isinstance(m, Mapping):
             _bad(errors, f"model[{i}]", f"must be an object, got {m!r}")
@@ -316,6 +385,20 @@ def _check_model_list(model: Any) -> list[str]:
         if not isinstance(sha, str) or not _SHA256_RE.fullmatch(sha):
             _bad(errors, f"model[{i}].sha256",
                  f"must be 64 lowercase hex chars, got {sha!r}")
+        # Duplicate identifiers (same full identity, matched on the actual
+        # identifier fields — model_identifiers' unique identity is the
+        # filename, roles may legitimately repeat) are refused.
+        ident = (m.get("repo"), m.get("revision"), m.get("filename"),
+                 m.get("sha256"))
+        try:
+            if ident in seen:
+                _bad(errors, f"model[{i}]",
+                     f"duplicate model identifier (same artifact as "
+                     f"model[{seen[ident]}])")
+            else:
+                seen[ident] = i
+        except TypeError:
+            pass  # unhashable fields were already reported above
     return errors
 
 
@@ -328,16 +411,13 @@ def validate_result_fields(res: "BenchmarkResult") -> list[str]:
     if not isinstance(res.environment, BenchmarkEnvironment):
         _bad(errors, "environment",
              f"required (nulls inside it are fine), got {res.environment!r}")
-    errors.extend(_check_model_list(list(res.model) if not isinstance(res.model,
-                                                                      (str, bytes))
-                                    else res.model))
+    errors.extend(_check_model_list(res.model))
     if not isinstance(res.config, Mapping):
         _bad(errors, "config", f"must be a mapping, got {type(res.config).__name__}")
     else:
-        try:
-            json.dumps(dict(res.config), sort_keys=True)
-        except (TypeError, ValueError) as exc:
-            _bad(errors, "config", f"config echo must be JSON-serializable: {exc}")
+        # Strict JSON echo: string keys, finite numbers (json.dumps alone
+        # would silently accept {1: ...} and NaN).
+        errors.extend(json_violations(res.config, "config"))
     if not isinstance(res.phases, Mapping):
         _bad(errors, "phases", f"must be a mapping, got {type(res.phases).__name__}")
     elif not res.phases:
@@ -488,17 +568,21 @@ class PhaseCollector:
 _OBS_KEYS = {"schema", "observed_at", "phase", "model_revision", "backend",
              "quant", "residency", "vae_tiled_decode", "cfg_duplicated",
              "tokens", "resolution", "peak_gpu_allocated_bytes",
-             "peak_gpu_reserved_bytes", "peak_host_rss_bytes"}
+             "peak_gpu_reserved_bytes", "peak_host_rss_bytes",
+             "prompt_tokens"}
 
 
 @dataclass(frozen=True)
 class CalibrationObservation:
     """One memory observation keyed for staleness (R4): the memory policy
-    matches on ``(schema, model_revision, backend, quant)`` — any mismatch
-    makes an observation stale, never interpolated across. ``residency``,
-    ``vae_tiled_decode``, ``cfg_duplicated``, ``tokens`` and ``resolution``
-    are descriptor fields the policy conditions on; the peak-memory fields
-    are the measurements (null = not measured, never 0)."""
+    matches ``(schema, model_revision, backend, quant)`` first — any
+    mismatch makes an observation stale, never interpolated across. That
+    key is a **prefilter only**: ``residency``, ``vae_tiled_decode``,
+    ``cfg_duplicated``, ``tokens``, ``resolution`` and ``prompt_tokens`` are
+    conditioning fields the M5.3 policy must match *on top of* the staleness
+    key before trusting a peak-memory number (see
+    :func:`matching_observations`). The peak-memory fields are the
+    measurements (null = not measured, never 0)."""
 
     observed_at: float
     phase: str
@@ -513,10 +597,19 @@ class CalibrationObservation:
     peak_gpu_allocated_bytes: int | None = None
     peak_gpu_reserved_bytes: int | None = None
     peak_host_rss_bytes: int | None = None
+    #: Prompt length in tokens this observation was conditioned on, or
+    #: ``null`` when it was not recorded — an honest unknown, never an
+    #: invented length. Kept so future calibration conditioning (M5.3) does
+    #: not have to re-derive prompt length from the prompt itself.
+    prompt_tokens: int | None = None
     schema: str = OBSERVATION_SCHEMA
 
     def __post_init__(self) -> None:
         errors = validate_observation_fields(self)
+        if not errors and not isinstance(self.resolution, tuple):
+            # Own an immutable snapshot: mutating the list the caller passed
+            # afterwards cannot change what this record serializes to.
+            object.__setattr__(self, "resolution", tuple(self.resolution))
         if errors:
             raise BenchSchemaError("invalid calibration observation: "
                                    + "; ".join(errors))
@@ -537,6 +630,7 @@ class CalibrationObservation:
             "peak_gpu_allocated_bytes": self.peak_gpu_allocated_bytes,
             "peak_gpu_reserved_bytes": self.peak_gpu_reserved_bytes,
             "peak_host_rss_bytes": self.peak_host_rss_bytes,
+            "prompt_tokens": self.prompt_tokens,
         }
 
     @classmethod
@@ -547,6 +641,11 @@ class CalibrationObservation:
                 f"observation: must be an object, got {type(data).__name__}")
         for key in sorted(set(data) - _OBS_KEYS):
             _bad(errors, key, "unknown observation key")
+        # The observation schema tag must be EXPLICIT on deserialization: a
+        # record without it is not silently assumed to be v1.
+        if "schema" not in data:
+            _bad(errors, "schema",
+                 f"required (must be {OBSERVATION_SCHEMA!r}, tag is missing)")
         res = data.get("resolution")
         if not isinstance(res, list) or len(res) != 2:
             _bad(errors, "resolution", f"must be [width, height], got {res!r}")
@@ -565,7 +664,8 @@ class CalibrationObservation:
                    peak_gpu_allocated_bytes=data.get("peak_gpu_allocated_bytes"),
                    peak_gpu_reserved_bytes=data.get("peak_gpu_reserved_bytes"),
                    peak_host_rss_bytes=data.get("peak_host_rss_bytes"),
-                   schema=data.get("schema", OBSERVATION_SCHEMA))
+                   prompt_tokens=data.get("prompt_tokens"),
+                   schema=data.get("schema"))
 
 
 def validate_observation_fields(obs: CalibrationObservation) -> list[str]:
@@ -589,8 +689,16 @@ def validate_observation_fields(obs: CalibrationObservation) -> list[str]:
             _bad(errors, name, f"must be a boolean, got {getattr(obs, name)!r}")
     if not isinstance(obs.tokens, int) or isinstance(obs.tokens, bool) or obs.tokens < 1:
         _bad(errors, "tokens", f"must be a positive integer, got {obs.tokens!r}")
+    if obs.prompt_tokens is not None and (
+            isinstance(obs.prompt_tokens, bool)
+            or not isinstance(obs.prompt_tokens, int) or obs.prompt_tokens < 1):
+        _bad(errors, "prompt_tokens",
+             f"must be a positive integer or null (unknown), got {obs.prompt_tokens!r}")
     res = obs.resolution
-    if (isinstance(res, (str, bytes)) or len(tuple(res)) != 2
+    # Invalid direct sequence types (int, generator, str, ...) are a schema
+    # error, never a raw TypeError from len()/iteration.
+    if (isinstance(res, (str, bytes)) or not isinstance(res, (list, tuple))
+            or len(res) != 2
             or not all(isinstance(v, int) and not isinstance(v, bool) and v >= 1
                        for v in res)):
         _bad(errors, "resolution", f"must be two positive ints, got {res!r}")
@@ -677,25 +785,60 @@ def save_calibration(log: CalibrationLog, path: str | Path) -> Path:
     return target
 
 
-def add_observation(path: str | Path, observation: CalibrationObservation) -> CalibrationLog:
-    """Load-append-atomic-save; a missing file starts a fresh log."""
+_CALIBRATION_LOCKS: dict[str, threading.Lock] = {}
+_CALIBRATION_LOCKS_GUARD = threading.Lock()
+
+
+def _calibration_lock(path: str | Path) -> threading.Lock:
+    """One in-process lock per **canonical** file path (different spellings
+    of the same file share it)."""
+    p = Path(path)
     try:
-        log = load_calibration(path)
-        observations = list(log.observations)
-    except BenchSchemaError as exc:
-        if Path(path).exists():
-            raise
-        observations = []
-    observations.append(observation)
-    log = CalibrationLog(observations=tuple(observations))
-    save_calibration(log, path)
-    return log
+        canonical = str(p.resolve())
+    except OSError:  # pragma: no cover - exotic path failures
+        canonical = str(Path(os.path.abspath(p)))
+    with _CALIBRATION_LOCKS_GUARD:
+        return _CALIBRATION_LOCKS.setdefault(canonical, threading.Lock())
+
+
+def add_observation(path: str | Path,
+                    observation: CalibrationObservation) -> CalibrationLog:
+    """Load-append-atomic-save; a missing file starts a fresh log.
+
+    The whole transaction runs under an in-process lock per canonical path,
+    so simultaneous threads cannot lose entries to a load/save interleave.
+    **Scope:** the cross-PROCESS guarantee is not required at this
+    milestone — concurrent *processes* appending to one calibration file
+    can still lose an append (documented limitation; atomic writes keep the
+    file itself intact).
+    """
+    p = Path(path)
+    with _calibration_lock(p):
+        try:
+            log = load_calibration(p)
+            observations = list(log.observations)
+        except BenchSchemaError:
+            if p.exists():
+                raise
+            observations = []
+        observations.append(observation)
+        log = CalibrationLog(observations=tuple(observations))
+        save_calibration(log, p)
+        return log
 
 
 def matching_observations(log: CalibrationLog, *, model_revision: str,
                           backend: str, quant: str) -> tuple[CalibrationObservation, ...]:
-    """Fresh-by-staleness-key selection (M5.3 consumes this): an observation
-    counts only when schema, model revision, backend and quant all match —
-    never interpolated across a mismatch."""
+    """Fresh-by-staleness-key **prefilter** (schema, model revision,
+    backend, quant): a mismatch is stale — never interpolated across — but
+    a match is only *eligible*, not equivalent.
+
+    This is **not** memory-policy equivalence: the M5.3 consumer must
+    additionally match the conditioning fields the estimate depends on —
+    phase, tokens, resolution, residency, CFG duplication
+    (``cfg_duplicated``), VAE tiled decode (``vae_tiled_decode``) and
+    prompt length (``prompt_tokens``; ``null`` means not recorded) — before
+    trusting any peak-memory number from the returned observations.
+    """
     key = (OBSERVATION_SCHEMA, model_revision, backend, quant)
     return tuple(o for o in log.observations if o.staleness_key == key)

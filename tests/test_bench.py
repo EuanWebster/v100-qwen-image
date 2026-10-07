@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
+import types
 
 import pytest
 
@@ -369,6 +371,198 @@ def test_model_identifiers_from_manifest():
     assert ids[0]["sha256"] == SHA
     r = result(model=ids)
     assert BenchmarkResult.from_dict(r.to_dict()) == r
+
+
+# ---------------------------------------------------------------------------
+# Senior-review hardening: schema tags on deserialization, immutability,
+# RSS units, concurrent appends
+# ---------------------------------------------------------------------------
+
+
+def test_from_dict_requires_exact_benchmark_schema(tmp_path):
+    doc = json.loads(result().to_json())
+    doc.pop("schema")
+    with pytest.raises(BenchSchemaError, match="schema"):
+        BenchmarkResult.from_dict(doc)
+    for tag in ("benchmark_result.v0", "benchmark_result.v2", "v1", None):
+        bad = json.loads(result().to_json())
+        bad["schema"] = tag
+        with pytest.raises(BenchSchemaError, match="schema"):
+            BenchmarkResult.from_dict(bad)
+    # Never re-labelled, either: a doc that got through stays exact.
+    assert BenchmarkResult.from_dict(json.loads(result().to_json())).schema \
+        == BENCHMARK_SCHEMA
+
+
+def test_from_json_and_load_result_reject_missing_or_future_schema(tmp_path):
+    doc = json.loads(result().to_json())
+    doc["schema"] = "benchmark_result.v2"
+    with pytest.raises(BenchSchemaError, match="schema"):
+        BenchmarkResult.from_json(json.dumps(doc))
+    doc.pop("schema")
+    p = tmp_path / "run-1.benchmark.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(BenchSchemaError, match="schema"):
+        load_result(p)
+
+
+def test_observation_from_dict_requires_explicit_schema():
+    doc = observation().to_dict()
+    doc.pop("schema")
+    with pytest.raises(BenchSchemaError, match="schema"):
+        CalibrationObservation.from_dict(doc)
+    doc["schema"] = "calibration_observation.v2"
+    with pytest.raises(BenchSchemaError, match="schema"):
+        CalibrationObservation.from_dict(doc)
+
+
+def test_result_snapshot_survives_external_mutation():
+    nested = {"scheduler": {"inner": [1, 2]}}
+    cfg = {"prompt": "a red cube", "nested": nested}
+    m = model_entry()
+    model = [m]
+    r = result(config=cfg, model=model)
+    before = json.loads(r.to_json())
+
+    nested["scheduler"]["inner"].append("poison")
+    nested["extra"] = True
+    cfg["steps"] = 999
+    m["sha256"] = "e" * 64
+    model.append(model_entry(filename="other.safetensors"))
+
+    assert json.loads(r.to_json()) == before
+    with pytest.raises(TypeError):
+        r.config["injected"] = 1  # type: ignore[index]
+
+
+def test_saved_and_aggregated_output_ignores_later_mutation(tmp_path):
+    cfg = {"prompt": "a red cube", "deep": {"list": [1]}}
+    r = result(config=cfg)
+    path = save_result(r, tmp_path)
+    cfg["deep"]["list"].append(2)
+    cfg["deep"] = "gone"
+    assert load_result(path).to_dict() == json.loads(r.to_json())
+    agg = aggregate_results([r])
+    cfg["prompt"] = "mutated"
+    assert agg["n_runs"] == 1
+    assert json.loads(path.read_text())["config"]["prompt"] == "a red cube"
+
+
+def test_observation_resolution_snapshot_survives_mutation():
+    res = [1024, 1024]
+    o = observation(resolution=res)
+    before = o.to_dict()
+    res[0] = 512
+    assert o.to_dict() == before
+    assert isinstance(o.resolution, tuple)
+
+
+@pytest.mark.parametrize("bad_model", [5, (m for m in ()), {"role": "dit"},
+                                       "dit", {1, 2}])
+def test_invalid_model_sequence_is_schema_error(bad_model):
+    with pytest.raises(BenchSchemaError, match="model"):
+        result(model=bad_model)
+
+
+@pytest.mark.parametrize("bad_resolution", [5, "1024", (i for i in (1, 2)),
+                                            {1024, 1024}, None])
+def test_invalid_resolution_sequence_is_schema_error(bad_resolution):
+    with pytest.raises(BenchSchemaError, match="resolution"):
+        observation(resolution=bad_resolution)
+
+
+@pytest.mark.parametrize("bad_config", [
+    {"x": float("nan")},
+    {"x": float("inf")},
+    {1: "int key"},
+    {"x": {1, 2}},
+])
+def test_config_rejects_invalid_json(bad_config):
+    with pytest.raises(BenchSchemaError, match="config"):
+        result(config=bad_config)
+
+
+def test_phases_reject_huge_ints_without_overflow_error():
+    with pytest.raises(BenchSchemaError, match="phases"):
+        result(phases={"load": 10 ** 400})
+
+
+def test_duplicate_model_identifiers_are_refused():
+    entry = model_entry()
+    with pytest.raises(BenchSchemaError, match="duplicate"):
+        result(model=[entry, dict(entry)])
+    # Same role with a DIFFERENT artifact file is fine (identity is the
+    # filename, roles may repeat).
+    other = model_entry(filename="transformer/diffusion_pytorch_model-2.safetensors")
+    ok = result(model=[entry, other])
+    assert len(ok.model) == 2
+
+
+def test_host_rss_platform_units_and_unavailable(monkeypatch):
+    import qwen_engine.bench as bench
+
+    class FakeResource:
+        RUSAGE_SELF = 0
+
+        def __init__(self, peak):
+            self.peak = peak
+
+        def getrusage(self, who):
+            return types.SimpleNamespace(ru_maxrss=self.peak)
+
+    monkeypatch.setattr(bench, "resource", None)
+    assert host_rss_bytes() is None, "unavailable probe must be null, not 0"
+
+    monkeypatch.setattr(bench, "resource", FakeResource(2048))
+    assert host_rss_bytes(platform="linux") == 2048 * 1024, \
+        "ru_maxrss is KiB on Linux"
+    assert host_rss_bytes(platform="darwin") == 2048, \
+        "ru_maxrss is already bytes on macOS"
+    assert host_rss_bytes(platform="sunos5") is None, \
+        "unknown unit must be null, never a guess"
+
+
+def test_add_observation_concurrent_appends_keep_all(tmp_path):
+    path = tmp_path / "calibration.json"
+    n = 8
+    barrier = threading.Barrier(n)
+
+    def go(i: int) -> None:
+        barrier.wait()
+        add_observation(path, observation(phase=f"phase-{i}"))
+
+    threads = [threading.Thread(target=go, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    log = load_calibration(path)
+    assert len(log.observations) == n, "concurrent appends lost observations"
+    assert sorted(o.phase for o in log.observations) == \
+        sorted(f"phase-{i}" for i in range(n))
+
+
+def test_prompt_tokens_optional_and_honest():
+    o = observation()
+    assert o.prompt_tokens is None, "unknown prompt length stays null"
+    assert o.to_dict()["prompt_tokens"] is None
+    assert CalibrationObservation.from_dict(o.to_dict()).prompt_tokens is None
+    o2 = observation(prompt_tokens=77)
+    assert CalibrationObservation.from_dict(o2.to_dict()) == o2
+    with pytest.raises(BenchSchemaError, match="prompt_tokens"):
+        observation(prompt_tokens=0)
+    with pytest.raises(BenchSchemaError, match="prompt_tokens"):
+        observation(prompt_tokens=True)
+    with pytest.raises(BenchSchemaError, match="prompt_tokens"):
+        observation(prompt_tokens=12.5)
+
+
+def test_calibration_roundtrip_still_lossless_with_prompt_tokens(tmp_path):
+    log = CalibrationLog(observations=(observation(),
+                                       observation(prompt_tokens=128)))
+    path = tmp_path / "calibration.json"
+    save_calibration(log, path)
+    assert load_calibration(path) == log
 
 
 # ---------------------------------------------------------------------------
