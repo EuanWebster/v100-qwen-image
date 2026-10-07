@@ -103,12 +103,20 @@ required plan corrections"); the ledger exists so nobody re-imports a dead claim
 | R6 | Benchmark output was "phase timers → benchmarks/" | **Versioned benchmark/result schemas**: per-phase wall time, peak host RSS, peak CUDA allocated/reserved *when available* (null when not — never fabricated), plus environment identifiers (torch/CUDA/driver/arch, host, python) and model identifiers (repo/revision/hash). |
 | R7 | CPU tests did not state their environment | CPU test suites must pass in a **fresh environment with no network, no GPU, no model weights** and must **write nothing outside temporary directories** (all cache/benchmark/log paths relocatable via config). |
 
-Unchanged, still-standing model facts (third-party claims — **verify at first download,
-task 2.1**): Qwen-Image-2.1, DiT 7B / 32 layers (~14.2 GB BF16); text encoder Qwen3-VL
-8B (~17.5 GB BF16); VAE ~0.7–1.4 GB; native 2K support. The draft's block-causal
-attention description is a model-card/third-party claim: read the actual attention/mask
-semantics in the pinned diffusers source (task 0.2) and build against *that*, not the
-card.
+Model facts, upgraded from card claims to **pinned upstream metadata** at the
+M2.1 manifest commit (task 2.1 *preparation* — expected sizes from the pinned
+manifest identities, **not local measurements**; the files were never
+downloaded, so first-download hash verification of the LFS identities stays
+outstanding): Qwen-Image-2.1, DiT 7B / 32 layers — expected weight shards
+14,230,315,061 B (~14.2 GB, BF16 *declared* storage); text encoder Qwen3-VL
+8B — expected 17,534,409,013 B (~17.5 GB); VAE — expected 1,350,991,591 B
+(~1.35 GB, at the top of the old 0.7–1.4 GB card range); all 24 runtime files
+33,131,601,593 B. "Native 2K support" remains a model-card claim; the draft's
+block-causal attention description is a model-card/third-party claim: the
+actual attention/mask semantics were read in the pinned diffusers source
+(task 0.2 done — `docs/interfaces.md`) and the build follows *that*, not the
+card. Declared dtypes are config metadata; actual tensor dtypes, CPU/GPU
+execution dtype and 16 GB fit stay unverified until measured (M2.2/M3/M4).
 
 ---
 
@@ -744,4 +752,43 @@ standing rule that executed plans stay honest.)*
   weights, GPU, driver, service or heavy-dependency changes; `sandbox.yaml`
   user edit still uncommitted. Awaiting root M0.2 acceptance; M2 manifest
   stays a separate assignment.
+- 2026-10-07 **M2.1 manifest PREPARATION** (this commit; sole writer Qwen, task
+  `/tmp/v100-m2-manifest-task.md`; accepted M0.2 `dad7ee0` / M1 `fd3ba15` /
+  M0.1 `315705d` untouched): committed schema-v1 `models/manifest.json` —
+  **all 24 runtime files** of `Qwen/Qwen-Image-2.1` at immutable revision
+  `d26bb61…e1ba3`, upstream subdirectory layout, deterministic filename-sorted
+  order; roles model_index.json=`pipeline`, processor/*=`processor`,
+  scheduler/*=`scheduler`, text_encoder/*=`text_encoder`, transformer/*=`dit`,
+  vae/*=`vae`; upstream README/license/.gitattributes/preview excluded from the
+  runtime set (linked from `docs/models.md`). Identities come verbatim from the
+  root-verified reference `/tmp/v100-manifest-expected.json` — 16 small regular
+  Git files hashed from bounded root fetches + 8 pinned upstream LFS file
+  identities (tokenizer.json + 7 safetensors; Git blob SHA1 ≠ file SHA256); the
+  canonical-identity digest recomputed from the committed file matches the
+  root reference `14147c16…e6ba3`, and size/sha/rename tamper probes each flip
+  it. Storage decision: gitignored `models/assets/` only (manifest itself
+  committed; config path defaults stay unset; explicit
+  `--manifest models/manifest.json --models-dir models/assets` examples are
+  dry-run/config-only, not a runnable adapter or fit-proven preset). **No
+  downloads, no weights, no network, no model load, no GPU** — expected totals
+  (24 files 33,131,601,593 B; 7 weight shards 33,115,613,408 B) are upstream
+  metadata, not local measurements; the model-facts paragraph above now carries
+  those expected sizes. `tests/test_m2_manifest.py`: 11 offline tests — strict
+  schema-v1 parse, independent committed canonical-identity **digest constant**
+  (no /tmp dependency at test runtime), exact 24-filename/role fixtures,
+  metadata byte totals, extras exclusion, multi-shard roles retained
+  (`AmbiguousRoleError` before disk access), deterministic all-missing dry-run
+  against fresh temp roots, actual-run **exit 4** naming all 24
+  files/repo/revision with no traceback, no adapter import, no network
+  (fresh-interpreter + in-process socket-poisoned). Evidence: guarded suite
+  (R7) **425 passed + 1 skip** without `QWEN_{DIFFUSERS,TRANSFORMERS}_SRC` and
+  **426 passed** with them, on both 3.11.15 and 3.13.5 (up from 414+1/415 —
+  exactly the 11 new tests); pinned-interface checker unchanged **53/53 exit
+  0** both Pythons (commits `c6df88a5`/`856157a2` re-verified via
+  `git rev-parse HEAD`). **Still pending, not done here:** explicit operator
+  download of the 33.1 GB set + local sha256/size confirmation; M2.2 CPU
+  load-path/fidelity probes; the M4 adapter; M3 GPU (card not installed); M5
+  calibration — M2 is *partially* prepared, and none of it is blocked on code
+  design solely because the GPU is absent. `sandbox.yaml` user edit still
+  uncommitted. Awaiting root review.
 
