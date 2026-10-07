@@ -494,8 +494,10 @@ def test_manifest_import_pulls_in_no_heavy_modules():
 
 # ---------------------------------------------------------------------------
 # Second senior-review pass: Path.resolve failure modes stay structured
-# (3.11 may raise RuntimeError on symlink loops / OSError on permissions;
-# that behaviour is the WHY of this guard, not an observed 3.11 run.)
+# (RuntimeError is documented for some 3.11 patch levels; OSError on
+# permissions is always possible. These tests inject the failure. Observed
+# 2026-10-07 on CPython 3.11.15 and 3.13.5: default resolve() tolerates
+# symlink loops on both — the guard is for the raising variants.)
 # ---------------------------------------------------------------------------
 
 

@@ -450,7 +450,8 @@ standing rule that executed plans stay honest.)*
   injectable `run_id`, phase stack leak-free on failed start emission, log faults
   never mask primaries. `license = "MIT"` removed (none selected); build backend
   pinned `setuptools==84.0.0`; uv lock in sync. 182 CPU tests pass on Python 3.13;
-  Python 3.11 execution still outstanding (M0/R7 fresh-env rule).
+  no Python 3.11 run had been performed **as of that pass** (R7; first exact 3.11
+  evidence is dated below under the 2026-10-07 R7 portability note).
 - 2026-10-07 task 1.4 (`encoder.py`, commit `8f1bcc4`): worker command is
   **required** (no default heavy worker at M1) with `{python}/{request}/{response}`
   placeholders; worker stdio redirects to scratch files (no pipe deadlock, output
@@ -512,8 +513,9 @@ standing rule that executed plans stay honest.)*
   only — no GPU/model measurements claimed.
 - 2026-10-07 second senior-review correction pass on top of `ef73df3`, three
   scoped commits, suite 394 passed + 1 conditional skip on Python 3.13 (fake
-  workers only; no GPU/model measurements claimed; **Python 3.11 execution
-  still pending** — R7). `a5826cd`: `BenchmarkResult` snapshots
+  workers only; no GPU/model measurements claimed; **no Python 3.11 run at the
+  time of that pass** — superseded by the 2026-10-07 R7 portability note below).
+  `a5826cd`: `BenchmarkResult` snapshots
   config/model/phases deeply (mapping proxies all the way down — mutation
   *through* `result.phases` / `result.model[i]` now raises and cannot move
   saved output or aggregation); `_jsonsafe.freeze_json` detects container
@@ -551,3 +553,34 @@ standing rule that executed plans stay honest.)*
   the guard is an honest-test harness, not a security sandbox (a hostile
   process re-execing with a stripped environment bypasses it — out of
   scope); no runtime library behaviour changed for R7.
+- 2026-10-07 R7 portability fix + exact Python 3.11 evidence: the second
+  reviewer's outer sandbox denies **socket creation itself** (plain
+  `PermissionError` at `socket()`/`socket.__new__`), so the pre-fix
+  `test_network_denied_before_any_packet` — which constructed a socket
+  outside its `try` — failed there on **both** Python 3.11.15 and 3.13.5
+  (394 passed + that 1 failure, inside that sandbox; 395 outside it). Fix:
+  the audit guard now denies **network socket construction** on the
+  `socket.__new__` (and legacy `socket`) audit event — fired *before* the
+  OS `socket()` call, so no fd exists and the guard's own `GuardViolation`
+  surfaces ahead of any outer-policy denial — for every family except
+  `AF_UNIX` (local construction allowed; connect/sendto/getaddrinfo/
+  gethostbyname remain denied for all families, no skipping, no
+  weakening). The self-test no longer depends on the OS allowing socket
+  creation: it asserts the guard's denial at construction plus **no fd
+  leak**, verifies `socket.connect`/`socket.sendto` hook rejection via
+  explicit `sys.audit` events, and exercises a real AF_UNIX `connect`
+  when the OS permits it (outer-policy denial tolerated there).
+  **Exact evidence (verified 2026-10-07, this session, *outside* the
+  reviewer's socket-denying sandbox):** interpreter
+  `/tmp/qwen-review.bIFHcI/venv311/bin/python`, `3.11.15 (main, Jul 23
+  2026, 14:43:45) [Clang 22.1.3]`, package built/installed offline in a
+  clean 3.11.15 venv (`qwen-engine --help` works, no ML deps):
+  `PYTHONPATH=/work/src PYTHON=<that python> bash run_cpu_tests.sh` →
+  **395 passed**; unguarded `PYTHONPATH=/work/src python -m pytest -q` →
+  394 passed + 1 skipped (the guarded-parent test). Same results on
+  3.13.5 (`/tmp/qwen-review.bIFHcI/venv/bin/python`): 395 guarded, 394+1
+  plain. Audit-event ordering (denial before fd creation) verified on
+  both interpreters. *Inside* the reviewer's socket-denying sandbox the
+  fixed test needs no successful socket creation — the guard fires first
+  by construction — and R7's no-network promise now holds there too; an
+  in-sandbox re-run by the reviewer remains the confirming step.

@@ -13,7 +13,12 @@ Blocked (before any side effect happens):
   mkdir/rmdir/rmtree/utime/chmod/…) whose resolved target lies outside the
   configured temp roots (``QWEN_CPU_TMP_ROOTS``, ``os.pathsep``-separated);
   reads — including all repository reads — are never touched;
-* network access: socket connect / sendto / getaddrinfo / gethostbyname;
+* network access: socket **construction** for network families (denied at
+  ``socket.__new__``, before the OS ``socket()`` call and therefore before
+  any fd exists — CPU tests need no network sockets, so this holds even
+  when an *outer* sandbox denies socket creation itself), plus connect /
+  sendto / getaddrinfo / gethostbyname; AF_UNIX construction is allowed
+  (connect/sendto on it are still denied);
 * imports of the heavy ML packages (``QWEN_CPU_DENY_IMPORT``), refused by
   a meta-path finder *before any module code executes*, even if a stub is
   on the path.
@@ -74,6 +79,12 @@ _NETWORK_EVENTS = frozenset({
     "socket.connect", "socket.connect_ex", "socket.sendto",
     "socket.getaddrinfo", "socket.gethostbyname",
 })
+#: Construction events: ``socket.__new__`` (3.11+) and the legacy ``socket``
+#: name; args are (socket, family, type, protocol) and the hook fires
+#: BEFORE the OS socket() call, so a denial leaves no fd behind.
+_SOCKET_CREATE_EVENTS = frozenset({"socket", "socket.__new__"})
+#: socket.AF_UNIX (stable constant; sitecustomize must not import socket).
+_AF_UNIX = 1
 
 
 class GuardViolation(PermissionError):
@@ -141,6 +152,14 @@ def _audit_hook(event: str, args: tuple) -> None:
         raise GuardViolation(
             f"{GUARD_NAME}: network access denied in CPU tests "
             f"(event {event!r}) — R7 requires a no-network environment")
+    elif event in _SOCKET_CREATE_EVENTS:
+        family = args[1] if len(args) > 1 else None
+        if family != _AF_UNIX:
+            raise GuardViolation(
+                f"{GUARD_NAME}: network socket construction denied in CPU "
+                f"tests (event {event!r}, family {family!r}) — denied at "
+                "socket.__new__ before any OS socket/fd exists; R7 "
+                "requires a no-network environment")
 
 
 class _DeniedImportFinder:

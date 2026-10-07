@@ -280,9 +280,13 @@ def _resolve_or_fail(path: Path) -> tuple[Path | None, str | None]:
     ``OSError`` (permission on a parent component, …) is always possible.
     No resolution failure may escape the typed boundary as a raw error —
     every one becomes a structured detail string the caller reports as an
-    :class:`ArtifactUnreadableError` / unreadable status. (Verified here on
-    Python 3.13, whose realpath tolerates loops; the 3.11 behaviour is the
-    reason this guard exists, not a claim of observed 3.11 execution.)"""
+    :class:`ArtifactUnreadableError` / unreadable status. (Observed:
+    3.13.5 tolerates symlink loops at default ``resolve()``; re-checked
+    2026-10-07 on the CPython 3.11.15 build used for the R7 evidence —
+    default ``resolve()`` tolerates loops there too, raising only
+    ``FileNotFoundError`` under ``strict=True``. The ``RuntimeError``
+    variant is documented for some 3.11 patch levels; the guard covers
+    all of it either way.)"""
     try:
         return path.resolve(), None
     except (OSError, RuntimeError, ValueError) as exc:

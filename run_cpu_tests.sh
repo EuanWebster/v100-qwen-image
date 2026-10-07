@@ -7,7 +7,10 @@
 # interpreters via sitecustomize + a sys.addaudithook audit hook):
 #   * HOME / XDG_* / TMPDIR / pytest basetemp -> fresh dirs under one
 #     mktemp run root; writes anywhere else fail BEFORE they happen;
-#   * network denied (socket connect/sendto/getaddrinfo/gethostbyname);
+#   * network denied (socket construction for network families denied at
+#     socket.__new__, before any fd exists, plus connect/sendto/
+#     getaddrinfo/gethostbyname; AF_UNIX construction allowed, its
+#     connect/sendto still denied);
 #   * heavy ML imports denied before execution (torch, diffusers,
 #     transformers) even if stubs are on the path;
 #   * bytecode writing disabled (-B / PYTHONDONTWRITEBYTECODE) and the
@@ -17,9 +20,10 @@
 # Exact fresh offline command (no network access needed at any point):
 #     bash run_cpu_tests.sh                 # full suite
 #     bash run_cpu_tests.sh -k manifest     # any pytest args pass through
-# Python 3.11 execution is still PENDING (R7): this runs the interpreter
-# found as $PYTHON, else .venv/bin/python, else python3 — the guard and the
-# suite do not claim 3.11 has been exercised.
+# Python: the interpreter found as $PYTHON, else .venv/bin/python, else
+# python3. First exact Python 3.11.15 evidence: 2026-10-07, guarded full
+# suite 395 passed (see PLAN.md R7 portability note; 3.11 was not executed
+# before that date).
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN="$(mktemp -d "${TMPDIR:-/tmp}/qwen-cpu-run-XXXXXXXX")" || exit 1

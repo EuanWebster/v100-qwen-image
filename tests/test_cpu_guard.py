@@ -5,7 +5,11 @@ Every test here runs in a *child* interpreter with the guard installed via
 ``PYTHONPATH`` (the same mechanism ``run_cpu_tests.sh`` uses for the fake
 worker subprocesses), so the guard is proven to reject outside writes,
 network access and heavy imports **before any side effect** — a stub whose
-import would write a marker never executes at all. One test additionally
+import would write a marker never executes at all. Network socket
+*construction* is denied by the guard at ``socket.__new__``, so the network
+tests never depend on the OS allowing socket creation (they hold unchanged
+in outer sandboxes that deny ``socket()`` itself with a plain
+``PermissionError``). One test additionally
 runs real fake-worker tests through ``run_cpu_tests.sh`` end to end, and
 one proves the parent-process guard live when the suite itself is guarded.
 
@@ -122,10 +126,18 @@ def test_writes_inside_the_roots_work(tmp_path):
 
 
 def test_network_denied_before_any_packet(tmp_path):
+    """Network is denied before anything reaches the OS: resolution first,
+    then **construction** — the guard rejects network socket families at
+    ``socket.__new__``, so the denial comes from the guard even when an
+    outer sandbox refuses ``socket()`` itself, and no fd is ever created.
+    ``connect``/``sendto`` hook rejection is verified through explicit
+    audit events (and a real AF_UNIX ``connect`` where the OS lets the
+    socket exist), so the test never depends on the OS *allowing* network
+    socket creation."""
     inside = tmp_path / "inside"
     inside.mkdir()
     code = (
-        "import socket, sys\n"
+        "import os, socket, sys\n"
         "for fn, args in ((socket.getaddrinfo, ('127.0.0.1', 9)),\n"
         "                 (socket.gethostbyname, ('localhost',))):\n"
         "    try:\n"
@@ -134,13 +146,41 @@ def test_network_denied_before_any_packet(tmp_path):
         "        assert 'qwen-r7-cpu-guard' in str(exc), exc\n"
         "    else:\n"
         "        sys.exit(1)\n"
-        "s = socket.socket()\n"
+        "def sock_fds():\n"
+        "    out = set()\n"
+        "    for n in os.listdir('/proc/self/fd'):\n"
+        "        try:\n"
+        "            if 'socket:' in os.readlink('/proc/self/fd/' + n):\n"
+        "                out.add(n)\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "    return out\n"
+        "before = sock_fds()\n"
         "try:\n"
-        "    s.connect(('127.0.0.1', 9))\n"
-        "except OSError as exc:\n"
+        "    socket.socket()\n"
+        "except PermissionError as exc:\n"
         "    assert 'qwen-r7-cpu-guard' in str(exc), exc\n"
         "else:\n"
         "    sys.exit(1)\n"
+        "assert sock_fds() == before, 'denied construction leaked an fd'\n"
+        "for ev in ('socket.connect', 'socket.sendto'):\n"
+        "    try:\n"
+        "        sys.audit(ev, None, ('127.0.0.1', 9))\n"
+        "    except PermissionError as exc:\n"
+        "        assert 'qwen-r7-cpu-guard' in str(exc), exc\n"
+        "    else:\n"
+        "        sys.exit(1)\n"
+        "try:\n"
+        "    u = socket.socket(socket.AF_UNIX)\n"
+        "except PermissionError as exc:\n"
+        "    assert 'qwen-r7-cpu-guard' not in str(exc), exc\n"
+        "else:\n"
+        "    try:\n"
+        "        u.connect('/qwen-r7-nonexistent-socket-path')\n"
+        "    except PermissionError as exc:\n"
+        "        assert 'qwen-r7-cpu-guard' in str(exc), exc\n"
+        "    else:\n"
+        "        sys.exit(1)\n"
     )
     proc = run_guarded(tmp_path, code, [inside])
     assert proc.returncode == 0, proc.stderr
