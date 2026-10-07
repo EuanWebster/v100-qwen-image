@@ -1,0 +1,42 @@
+# Runtime dependency inputs for the v100-qwen-image GPU stack (task M0.1).
+#
+# Target: Linux x86_64, CPython 3.11 and 3.13. The *lockfile* (requirements.lock)
+# carries the fully resolved transitive pins; this file carries only direct
+# requirements and the index assumptions.
+#
+# Index assumptions:
+#   * torch MUST come from the official cu126 wheel index. PyPI's plain
+#     `torch` and any cu13x build are wrong for this build: the cu126 series
+#     (<= 2.14) is the last publishing cu126 and the last to ship sm_70
+#     (Volta) kernels. The +cu126 local version label only exists on
+#     download.pytorch.org, so the exact pin below cannot silently fall back
+#     to a plain-PyPI or cu13 wheel.
+#   * Everything else resolves from PyPI (the default index).
+#   * diffusers is installed from the pinned git commit (no release wheel
+#     exists for it): installing a "newer PyPI diffusers instead" would change
+#     the QwenImage21Pipeline interface that docs/interfaces.md was surveyed
+#     against.
+#
+# Regenerate requirements.lock exactly as recorded at the top of that file
+# (uv pip compile, one run per supported interpreter; see docs/dependencies.md).
+
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+torch==2.14.1+cu126
+# PyPI wheel of the tagged release; its annotated tag v5.17.0 dereferences to
+# source commit 856157a2f3e9594954310df18fdccc31ffddebe9 (pinned identity for
+# audits — pinning the tag object 595ff117... would be wrong).
+transformers==5.17.0
+# Pinned main commit (verified 2026-10-07; tree d77a3e3882af758d606ca22b53f63be8764e643a).
+diffusers @ git+https://github.com/huggingface/diffusers.git@c6df88a511a98740646ee55577b590c9852650ce
+# diffusers hard deps (would be pulled transitively; explicit for auditability):
+safetensors
+Pillow
+# diffusers' torch/GGUF extras deps (device_map/offload plumbing; GGUF loader):
+accelerate
+gguf>=0.10.0
+# Transitive of diffusers and transformers, pinned for interpreter uniformity:
+# numpy 2.5.x requires Python >= 3.12, so an unpinned resolve picks 2.4.6 on
+# 3.11 but 2.5.2 on 3.13. 2.4.6 is the newest numpy supporting both supported
+# interpreters (requires-python >= 3.11), keeping one identical lock for both.
+numpy==2.4.6
