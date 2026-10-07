@@ -11,11 +11,22 @@
 #     (Volta) kernels. The +cu126 local version label only exists on
 #     download.pytorch.org, so the exact pin below cannot silently fall back
 #     to a plain-PyPI or cu13 wheel.
-#   * Everything else resolves from PyPI (the default index).
-#   * diffusers is installed from the pinned git commit (no release wheel
-#     exists for it): installing a "newer PyPI diffusers instead" would change
-#     the QwenImage21Pipeline interface that docs/interfaces.md was surveyed
-#     against.
+#   * Everything else resolves from PyPI. IMPORTANT: uv must be run with
+#     `--index-strategy unsafe-best-match` (a CLI-only flag; uv 0.12.1 does
+#     not accept it inside a requirements file). With uv's default
+#     first-index strategy the torch extra index takes precedence over PyPI
+#     and drags in the stale mirrors it hosts (certifi 2022.12.7,
+#     requests 2.28.1, urllib3 1.26.13, …). With best-match, every non-torch
+#     package resolves to exactly the pure-PyPI version set (verified 2026-10-07
+#     by diffing a PyPI-only compile), while torch itself can still only be
+#     satisfied by the cu126 index because of its local label.
+#   * diffusers AND transformers are installed from pinned git commits (per
+#     PLAN M0.1 "exact git commits"): installing a "newer PyPI release
+#     instead" would change the QwenImage21Pipeline interface that
+#     docs/interfaces.md was surveyed against. NOTE: a requirements file
+#     with VCS entries CANNOT be installed with `pip --require-hashes` —
+#     pip cannot hash git repos. Install with `uv pip sync` only, which
+#     builds the VCS wheels and enforces their recorded hashes.
 #
 # Regenerate requirements.lock exactly as recorded at the top of that file
 # (uv pip compile, one run per supported interpreter; see docs/dependencies.md).
@@ -23,10 +34,11 @@
 --extra-index-url https://download.pytorch.org/whl/cu126
 
 torch==2.14.1+cu126
-# PyPI wheel of the tagged release; its annotated tag v5.17.0 dereferences to
-# source commit 856157a2f3e9594954310df18fdccc31ffddebe9 (pinned identity for
-# audits — pinning the tag object 595ff117... would be wrong).
-transformers==5.17.0
+# Exact source commit per PLAN M0.1 (verified 2026-10-07: `git ls-remote
+# …refs/tags/v5.17.0^{}` dereferences v5.17.0 — an annotated tag object
+# 595ff117… that must NOT be pinned — to this commit; its __init__ reports
+# __version__ = "5.17.0").
+transformers @ git+https://github.com/huggingface/transformers.git@856157a2f3e9594954310df18fdccc31ffddebe9
 # Pinned main commit (verified 2026-10-07; tree d77a3e3882af758d606ca22b53f63be8764e643a).
 diffusers @ git+https://github.com/huggingface/diffusers.git@c6df88a511a98740646ee55577b590c9852650ce
 # diffusers hard deps (would be pulled transitively; explicit for auditability):
@@ -40,3 +52,7 @@ gguf>=0.10.0
 # 3.11 but 2.5.2 on 3.13. 2.4.6 is the newest numpy supporting both supported
 # interpreters (requires-python >= 3.11), keeping one identical lock for both.
 numpy==2.4.6
+# Same uniformity reason (verified from PyPI metadata): networkx 3.7 is
+# requires-python >=3.12, so an unpinned resolve picks 3.6.1 on 3.11 but 3.7
+# on 3.13. 3.6.1 (>=3.11) is the newest version supporting both.
+networkx==3.6.1

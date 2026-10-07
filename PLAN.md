@@ -584,3 +584,32 @@ standing rule that executed plans stay honest.)*
   fixed test needs no successful socket creation — the guard fires first
   by construction — and R7's no-network promise now holds there too; an
   in-sandbox re-run by the reviewer remains the confirming step.
+- 2026-10-07 M0.1 fix pass (lead review queue `/tmp/v100-m0-review.md`, on
+  baseline `8c55f3b`): the lock is recompiled from a corrected
+  `requirements.in` — (a) **transformers now installs from the exact git
+  commit** `856157a2f3e9594954310df18fdccc31ffddebe9` (what annotated tag
+  v5.17.0 dereferences to, verified via `git ls-remote …refs/tags/v5.17.0^{}`;
+  the tag object itself is never pinned), honoring M0.1's "exact git commits"
+  for *both* diffusers and transformers instead of the PyPI wheel; installed
+  `direct_url.json` records the commits. (b) **Index scoping fixed**: resolve
+  and install now run with `--index-strategy unsafe-best-match` (CLI-only
+  flag); uv's default first-index strategy let the torch extra index mask
+  PyPI and pinned its stale mirrors (certifi 2022.12.7, requests 2.28.1,
+  urllib3 1.26.13). The non-torch lock set now provably equals a pure-PyPI
+  resolve (verified by diff), torch stays `2.14.1+cu126` (identical wheel
+  hashes; `+cu126` exists only on the official cu126 index), and torch's
+  CUDA subtree stays 12.x via its own constraints (`cuda-bindings<13,>=12.9.4`).
+  (c) **networkx 3.6.1 pinned** for interpreter uniformity (3.7 is
+  requires-python ≥3.12), same rationale as numpy. The two per-interpreter
+  compiles are now byte-identical (the old markupsafe hand-merge is gone).
+  (d) All reproduction/install commands corrected (`uv pip sync --python …`,
+  no `pip --require-hashes` — pip cannot hash VCS requirements; uv enforces
+  every wheel hash and anchors the two git entries by commit SHA) and
+  re-executed verbatim in fresh `/tmp/v100_m0_ml/venv-ml311|313` envs:
+  sm_70 in `get_arch_list()` on both, `QwenImage21Pipeline` imports,
+  `uv pip check` clean (63 pkgs), `direct_url.json` commits match.
+  `/work/.venv` and the `/tmp/qwen-review.bIFHcI` audit envs remain ML-free;
+  guarded CPU suite re-run in fresh pytest-only venvs: **395 passed** on
+  3.11.15 and 3.13.5. No model weights, GPU, driver or service change; the
+  real-CUDA gate (§5 of docs/dependencies.md, M3) remains PENDING.
+
