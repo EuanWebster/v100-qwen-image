@@ -835,4 +835,50 @@ standing rule that executed plans stay honest.)*
   separate lead/operator decision after root review; download ≠ fit (M5) ≠
   GPU evidence (M3). `sandbox.yaml` user edit still uncommitted. Awaiting
   root review.
+- 2026-10-07 **M2.1 fetcher fix pass (root review corrections)** (this commit;
+  sole writer Qwen, review `/tmp/v100-m2-fetch-review.md` applied in full, on
+  top of `e21b93a`/`67cf078`): `tools/fetch_models.py` — (1) an explicit
+  `--models-dir` root that **is** a symlink, or sits under an existing
+  symlinked path component, is refused BEFORE any mkdir/network/write
+  (the resolver's resolved-root boundary can otherwise be redirected
+  outside; absent parent components are NOT refused by assumption);
+  (2) resume now requires a **numeric** `Content-Range` whose total equals
+  the manifest size exactly — wildcard `*` totals refused — and a coherent
+  `start <= end < total` span (reversed spans refused); partial untouched;
+  (3) diagnostics hardened: `_clean_url` renders only scheme + host/port +
+  path (userinfo stripped, default ports collapsed, IPv6 bracketed);
+  `HTTPError` reason, `URLError`/`OSError` reason text and untrusted
+  `Content-Range` values are never echoed (types only) — sentinel tests
+  prove a signed URL in a reason or header cannot leak; (4) partials are
+  opened `O_NOFOLLOW` (where available) after the `lstat`, new ones created
+  `O_CREAT|O_EXCL` (a concurrently appeared partial is refused, never
+  truncated; a non-regular partial path is refused), the opened FD is
+  re-verified regular at exactly the resume size before writing, and every
+  `os.write` loops until the chunk is fully written (short writes
+  completed); (5) a partial already at exactly the manifest byte length is
+  **rehashed** — valid → published with no request at all (never an
+  impossible Range from EOF), invalid → integrity failure, never published,
+  partial removed as unrecoverable; scratch `/tmp/v100-m2-fetch-task.md`
+  reference removed from the production docstring. `tests/test_fetch_tool.py`
+  **31 → 49** offline tests (injected fake streams, zero sockets, writes
+  only in `tmp_path`): symlinked root + symlinked ancestor refusals with
+  external dir untouched and transport never called, legitimate missing
+  multi-component root still created, complete-partial publish (no network)
+  and complete-partial wrong-hash integrity refusal, `O_NOFOLLOW` symlink /
+  `O_EXCL` concurrent / size-drift / non-regular `_open_partial` units,
+  `_write_all` short-write unit + end-to-end capped-`os.write` fetch,
+  wildcard + reversed `Content-Range` params, userinfo/query/reason/header
+  sentinel tests. Engine manifest/resolver/dry-run/no-download semantics and
+  the 24-entry pinned manifest **unchanged**; `docs/models.md` §4 contract
+  synced. Evidence: guarded suite (R7) **474 passed + 1 skip** without
+  `QWEN_{DIFFUSERS,TRANSFORMERS}_SRC` and **475 passed** with them, on both
+  3.11.15 (uv-cached interpreter, pytest 9.1.1 — same pytest as the 3.13
+  venv) and 3.13.5 (`/work/.venv`); pinned-interface checker unchanged
+  **53/53 exit 0** on both Pythons, both trees re-verified at
+  `c6df88a5`/`856157a2` via `git rev-parse HEAD`. **No real 33.1 GB
+  transfer, no network request, no weights, no model load, no GPU/driver/
+  service change** — `--fetch` against the live Hub stays a separate
+  lead/operator decision; download ≠ fit (M5) ≠ GPU evidence (M3).
+  `sandbox.yaml` user edit still uncommitted (deliberately untouched).
+  Awaiting root re-review.
 
