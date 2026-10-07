@@ -584,3 +584,113 @@ def test_bench_import_in_subprocess_without_heavy_modules():
         "sys.exit(1 if bad else 0)"
     )
     subprocess.run([sys.executable, "-c", code], check=True, timeout=60)
+
+
+# ---------------------------------------------------------------------------
+# Second senior-review correction pass: deep freeze, typed validation
+# ---------------------------------------------------------------------------
+
+
+def _frozen_result(**overrides) -> BenchmarkResult:
+    base = dict(run_id="run-1", environment=env(),
+                model=(model_entry(),),
+                config={"nested": {"list": [1, {"deep": 2}]}},
+                phases={"load": 10.0, "denoise": 20.0}, steps=4)
+    base.update(overrides)
+    return BenchmarkResult(**base)
+
+
+def test_result_is_frozen_all_the_way_down():
+    """Mutation must fail THROUGH result.phases and result.model[0], not
+    merely through references the caller still owns — and the saved file
+    and the aggregate must not move either."""
+    result = _frozen_result()
+
+    # Direct mutation through the record itself.
+    with pytest.raises(TypeError):
+        result.phases["load"] = 999.0  # type: ignore[index]
+    with pytest.raises(TypeError):
+        result.phases["evil"] = 1.0  # type: ignore[index]
+    with pytest.raises(TypeError):
+        result.model[0]["role"] = "evil"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        result.model[0]["extra"] = 1  # type: ignore[index]
+    with pytest.raises((TypeError, AttributeError)):
+        # Frozen all the way down: nested sequences became tuples,
+        # mappings became MappingProxyType.
+        result.config["nested"]["list"].append("poison")  # type: ignore[index]
+
+    # The caller poisoning its own references afterwards changes nothing.
+    # (Rebuild to have caller refs at all: they were snapshotted.)
+    phases = {"load": 10.0, "denoise": 20.0}
+    model = [model_entry()]
+    cfg = {"nested": {"list": [1, {"deep": 2}]}}
+    r2 = BenchmarkResult(run_id="run-1", environment=env(), model=tuple(model),
+                         config=cfg, phases=phases, steps=4)
+    phases["load"] = 0.0
+    model[0]["role"] = "evil"
+    cfg["nested"]["list"].append("poison")
+    assert r2.to_dict() == result.to_dict()
+
+    saved_a = result.to_json()
+    try:
+        result.phases["load"] = 999.0  # type: ignore[index]
+    except TypeError:
+        pass
+    assert result.to_json() == saved_a
+    assert aggregate_results([result]) == aggregate_results(
+        [BenchmarkResult.from_json(saved_a)])
+
+
+def test_saved_and_aggregated_output_stable_across_mutation_attempts(tmp_path):
+    result = _frozen_result()
+    p1 = save_result(result, tmp_path / "a")
+    p2 = save_result(result, tmp_path / "b")
+    assert p1.read_bytes() == p2.read_bytes()
+    agg_1 = aggregate_results([result])
+    for attempt in range(3):
+        try:
+            result.phases["denoise"] = attempt * 1e6  # type: ignore[index]
+            result.model[0]["sha256"] = "f" * 64  # type: ignore[index]
+        except TypeError:
+            pass
+    p3 = save_result(result, tmp_path / "c")
+    assert p3.read_bytes() == p1.read_bytes()
+    assert aggregate_results([result]) == agg_1
+
+
+def test_mixed_type_phase_keys_are_a_schema_error_not_type_error():
+    with pytest.raises(BenchSchemaError, match="phases"):
+        BenchmarkResult(run_id="run-1", environment=env(),
+                        model=(model_entry(),),
+                        phases={1: 1, "load": 1})
+
+
+def test_result_config_cycle_is_a_schema_error_not_recursion_error():
+    cfg: dict = {"a": {}}
+    cfg["a"]["back"] = cfg
+    with pytest.raises(BenchSchemaError, match="config"):
+        _frozen_result(config=cfg)
+
+
+def test_calibration_log_validates_before_iterating_and_snapshots():
+    # A non-sequence is a typed schema error, never a raw TypeError.
+    with pytest.raises(BenchSchemaError, match="observations"):
+        CalibrationLog(observations=5)
+    with pytest.raises(BenchSchemaError, match="observations"):
+        CalibrationLog(observations="obs")
+
+    obs = observation(observed_at=1700000000.0)
+    caller_list = [obs]
+    log = CalibrationLog(observations=caller_list)
+    assert isinstance(log.observations, tuple)
+    caller_list.clear()  # caller-owned list: must not empty the frozen log
+    assert log.observations == (obs,)
+    assert obs.to_dict() in log.to_dict()["observations"]
+
+
+def test_observation_observed_at_overflow_is_a_schema_error():
+    """math.isfinite(10**400) raises OverflowError; observed_at must be
+    rejected as a schema error instead."""
+    with pytest.raises(BenchSchemaError, match="observed_at"):
+        observation(observed_at=10 ** 400)

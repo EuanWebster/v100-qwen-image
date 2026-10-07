@@ -22,11 +22,27 @@ from types import MappingProxyType
 from typing import Any
 
 
-def freeze_json(value: Any, at: str, errors: list[str]) -> Any:
+#: Hard bound on nesting depth. Cyclic structures are rejected outright
+#: (see below); the bound additionally keeps a pathological but acyclic
+#: structure (e.g. 100k nested lists) from recursing until the interpreter
+#: gives up with ``RecursionError``.
+MAX_JSON_DEPTH = 200
+
+
+def freeze_json(value: Any, at: str, errors: list[str],
+                _ancestors: frozenset[int] = frozenset(),
+                _depth: int = 0) -> Any:
     """Deep-freeze a strict JSON value, appending every violation found to
     ``errors``. Valid values come back as immutable snapshots (mapping →
     ``MappingProxyType``, list/tuple → ``tuple``); invalid values append
-    errors and are not usable."""
+    errors and are not usable.
+
+    Container **cycles** are reported as a path-specific error (the identity
+    of every container on the current recursion stack is tracked — a
+    container that contains itself, not merely one that appears twice in a
+    DAG), and nesting deeper than :data:`MAX_JSON_DEPTH` along one path is
+    reported too, so neither shape can escape as ``RecursionError``.
+    Shared *acyclic* subtrees are fine and are snapshotted per occurrence."""
     if value is None or isinstance(value, (bool, str, int)):
         return value
     if isinstance(value, float):
@@ -34,17 +50,27 @@ def freeze_json(value: Any, at: str, errors: list[str]) -> Any:
             errors.append(f"{at}: must be a finite JSON number, got {value!r}")
             return None
         return value
-    if isinstance(value, Mapping):
-        out: dict[str, Any] = {}
-        for key, val in value.items():
-            if not isinstance(key, str):
-                errors.append(f"{at}: JSON object keys must be strings, "
-                              f"got {key!r}")
-                continue
-            out[key] = freeze_json(val, f"{at}.{key}", errors)
-        return MappingProxyType(out)
-    if isinstance(value, (list, tuple)):
-        return tuple(freeze_json(v, f"{at}[{i}]", errors)
+    if isinstance(value, Mapping) or isinstance(value, (list, tuple)):
+        if _depth > MAX_JSON_DEPTH:
+            errors.append(f"{at}: JSON nesting deeper than {MAX_JSON_DEPTH} "
+                          f"levels is not representable")
+            return None
+        if id(value) in _ancestors:
+            errors.append(f"{at}: cyclic reference (this container appears "
+                          f"inside itself — not a JSON document)")
+            return None
+        descend = _ancestors | {id(value)}
+        if isinstance(value, Mapping):
+            out: dict[str, Any] = {}
+            for key, val in value.items():
+                if not isinstance(key, str):
+                    errors.append(f"{at}: JSON object keys must be strings, "
+                                  f"got {key!r}")
+                    continue
+                out[key] = freeze_json(val, f"{at}.{key}", errors,
+                                       descend, _depth + 1)
+            return MappingProxyType(out)
+        return tuple(freeze_json(v, f"{at}[{i}]", errors, descend, _depth + 1)
                      for i, v in enumerate(value))
     errors.append(f"{at}: unsupported JSON type {type(value).__name__}")
     return None

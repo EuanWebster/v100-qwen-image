@@ -922,3 +922,123 @@ def test_encoder_import_in_subprocess_without_heavy_modules():
         "sys.exit(1 if bad else 0)"
     )
     subprocess.run([sys.executable, "-c", code], check=True, timeout=60)
+
+
+# ---------------------------------------------------------------------------
+# Second senior-review correction pass: cycles, overflow, quarantine race
+# ---------------------------------------------------------------------------
+
+
+def test_kwargs_cycle_is_typed_not_recursion_error():
+    inner: dict = {}
+    inner["self"] = inner
+    with pytest.raises(EncoderRequestError, match=r"kwargs.*cyclic"):
+        make_request(kwargs={"a": [inner]})
+
+
+def test_payload_metadata_cycle_is_typed_not_recursion_error():
+    loop: list = [1]
+    loop.append(loop)
+    with pytest.raises(EncoderRequestError, match=r"metadata.*cyclic"):
+        EncodedPayload(metadata={"l": loop})
+
+
+@pytest.mark.parametrize("bad", [10 ** 400, -(10 ** 400)])
+def test_overflowing_timeouts_are_setup_errors_not_overflow_error(bad):
+    """math.isfinite(10**400) raises OverflowError; the constructor must
+    report a typed setup error instead."""
+    cmd = ["prog", "{request}", "{response}"]
+    with pytest.raises(EncoderSetupError, match="timeout_s"):
+        EncoderWorker(command=cmd, timeout_s=bad)
+    with pytest.raises(EncoderSetupError, match="cancel_grace_s"):
+        EncoderWorker(command=cmd, timeout_s=5.0, cancel_grace_s=bad)
+
+
+@pytest.mark.parametrize("bad_command", [5, "not-a-list", ("ok", 7)])
+def test_command_invalid_types_are_typed_setup_errors(bad_command):
+    with pytest.raises(EncoderSetupError, match="command"):
+        EncoderWorker(command=bad_command, timeout_s=1.0)
+
+
+@pytest.mark.parametrize("bad_root", [5, None, ["a"]])
+def test_cache_root_invalid_types_are_typed(tmp_path, bad_root):
+    with pytest.raises(EncoderRequestError, match="cache root"):
+        EmbeddingCache(bad_root)
+
+
+def test_worker_python_override_must_be_a_string(tmp_path):
+    with pytest.raises(EncoderSetupError, match="python"):
+        EncoderWorker(command=["prog", "{request}", "{response}"],
+                      timeout_s=1.0, python=5)
+
+
+def test_stale_corrupt_read_cannot_quarantine_a_freshly_published_entry(
+        tmp_path, monkeypatch):
+    """Deterministic form of the confirmed get() race: the corrupt read
+    finishes its parse AFTER a valid entry was published. The quarantine
+    must identity-check under the root mutex and leave the NEW entry in
+    place. Events coordinate the interleaving; the reader holds NO lock
+    while paused, so the publisher cannot deadlock on the new mutex."""
+    import qwen_engine.encoder as encoder_mod
+
+    cache = EmbeddingCache(tmp_path / "embeds")
+    key = "a" * 64
+    path = cache.entry_path(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"corrupt-header-line\nleftover")
+
+    good = EncodedPayload(metadata={"m": 1}, blobs=(Blob("e", b"new-valid"),))
+    parsed = threading.Event()
+    published = threading.Event()
+    outcomes: list = []
+
+    real_payload_cls = EncodedPayload
+
+    class _StaleParse:
+        """Stands in for the parse of the STALE bytes only: it signals the
+        test, waits until the replacement publish is done, then reports the
+        (stale) bytes corrupt — which is when quarantine would normally
+        fire."""
+
+        @staticmethod
+        def from_entry_bytes(data, k):
+            assert data.startswith(b"corrupt-header-line"), \
+                "shim only expected to see the stale read"
+            parsed.set()
+            assert published.wait(10), "publisher never ran"
+            raise encoder_mod._EntryCorrupt("stale parse")
+
+    monkeypatch.setattr(encoder_mod, "EncodedPayload", _StaleParse)
+
+    def reader() -> None:
+        outcomes.append(cache.get(key))
+
+    t = threading.Thread(target=reader)
+    t.start()
+    assert parsed.wait(10), "reader never reached the parse"
+    cache.put(key, good)  # must not block: the reader holds no lock here
+    published.set()
+    t.join(10)
+    assert not t.is_alive()
+
+    assert outcomes == [None], "stale read must report a miss"
+    quarantine = cache.quarantine_dir
+    moved = list(quarantine.iterdir()) if quarantine.is_dir() else []
+    assert moved == [], f"the NEW entry was quarantined: {moved}"
+    assert path.is_file(), "the newly published entry must survive"
+
+    monkeypatch.undo()
+    hit = cache.get(key)
+    assert hit is not None
+    assert hit.blobs[0].data == b"new-valid"
+
+
+def test_corrupt_quarantine_still_works_after_identity_check(tmp_path):
+    """Regression guard the other way: the SAME corrupt file (nothing
+    replaced it) is still a miss AND still quarantined."""
+    cache = EmbeddingCache(tmp_path / "embeds")
+    key = "c" * 64
+    cache.entry_path(key).parent.mkdir(parents=True, exist_ok=True)
+    cache.entry_path(key).write_bytes(b"corrupt\nx")
+    assert cache.get(key) is None
+    assert len(list(cache.quarantine_dir.iterdir())) == 1

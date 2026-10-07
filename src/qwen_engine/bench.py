@@ -89,6 +89,18 @@ def _finite_nonneg(value: Any) -> bool:
         return False
 
 
+def _finite_number(value: Any) -> bool:
+    """Finite real check that never raises: ``math.isfinite()`` on a huge
+    int overflows at float conversion, which is a schema violation here,
+    not an ``OverflowError`` escaping the constructor."""
+    if not _is_number(value):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
 def _check_optional_bytes(value: Any, name: str, errors: list[str]) -> None:
     if value is None:
         return
@@ -259,18 +271,22 @@ class BenchmarkResult:
     def __post_init__(self) -> None:
         errors = validate_result_fields(self)
         if not errors:
-            # Deep-freeze snapshots: the record owns its own config/model/
-            # phases structures, so mutating the caller's nested inputs (or
-            # the dicts in a model list) afterwards cannot change what this
-            # result serializes to, saves, or aggregates.
+            # Deep-freeze snapshots: the record owns its own immutable
+            # config/model/phases structures (mappings as
+            # types.MappingProxyType), so mutating anything THROUGH the
+            # record (result.phases / result.model[i]) is impossible and
+            # mutating the caller's nested inputs afterwards cannot change
+            # what this result serializes to, saves, or aggregates.
             snap_errors: list[str] = []
             config = freeze_json(self.config, "config", snap_errors)
-            errors.extend(snap_errors)
-            if not errors:
+            model = tuple(freeze_json(m, f"model[{i}]", snap_errors)
+                          for i, m in enumerate(self.model))
+            phases = freeze_json(self.phases, "phases", snap_errors)
+            if not snap_errors:
                 object.__setattr__(self, "config", config)
-                object.__setattr__(self, "model",
-                                   tuple(dict(m) for m in self.model))
-                object.__setattr__(self, "phases", dict(self.phases))
+                object.__setattr__(self, "model", model)
+                object.__setattr__(self, "phases", phases)
+            errors.extend(snap_errors)
         if errors:
             raise BenchSchemaError("invalid benchmark result: " + "; ".join(errors))
 
@@ -423,7 +439,11 @@ def validate_result_fields(res: "BenchmarkResult") -> list[str]:
     elif not res.phases:
         _bad(errors, "phases", "must be a non-empty mapping of phase -> wall_ms")
     else:
-        for name, value in sorted(res.phases.items()):
+        # Deterministic reporting order WITHOUT sorting mixed-type keys
+        # (sorted() on {1: ..., "load": ...} raises TypeError before any
+        # key gets validated): order by repr, which exists for every key.
+        for name, value in sorted(res.phases.items(),
+                                  key=lambda item: repr(item[0])):
             if not isinstance(name, str) or not name.strip():
                 _bad(errors, "phases", f"phase name must be non-empty, got {name!r}")
             elif not _finite_nonneg(value):
@@ -672,7 +692,7 @@ def validate_observation_fields(obs: CalibrationObservation) -> list[str]:
     errors: list[str] = []
     if obs.schema != OBSERVATION_SCHEMA:
         _bad(errors, "schema", f"must be {OBSERVATION_SCHEMA!r}, got {obs.schema!r}")
-    if not _is_number(obs.observed_at) or not math.isfinite(obs.observed_at) \
+    if not _is_number(obs.observed_at) or not _finite_number(obs.observed_at) \
             or obs.observed_at <= 0:
         _bad(errors, "observed_at",
              f"must be a finite positive epoch seconds, got {obs.observed_at!r}")
@@ -715,12 +735,23 @@ class CalibrationLog:
     observations: tuple[CalibrationObservation, ...] = ()
 
     def __post_init__(self) -> None:
-        bad = [type(o).__name__ for o in self.observations
+        raw = self.observations
+        # Validate the container BEFORE iterating it: observations=5 must be
+        # a typed schema error, never a raw TypeError from iteration.
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+            raise BenchSchemaError(
+                "observations: must be a sequence of CalibrationObservation, "
+                f"got {type(raw).__name__}")
+        bad = [f"observations[{i}]: {type(o).__name__}"
+               for i, o in enumerate(raw)
                if not isinstance(o, CalibrationObservation)]
         if bad:
             raise BenchSchemaError(
                 "observations: every entry must be a CalibrationObservation, got "
-                + ", ".join(bad))
+                + "; ".join(bad))
+        # Own an immutable snapshot: clearing/mutating the caller's list
+        # afterwards cannot change what this log serializes to.
+        object.__setattr__(self, "observations", tuple(raw))
 
     def to_dict(self) -> dict[str, Any]:
         return {"schema": CALIBRATION_FILE_SCHEMA,

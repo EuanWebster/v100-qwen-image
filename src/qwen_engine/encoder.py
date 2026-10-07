@@ -541,7 +541,10 @@ class EncodedPayload:
 # ---------------------------------------------------------------------------
 
 
-def _canonicalize_dir(path: str | Path, field: str) -> Path:
+def _canonicalize_dir(path: Any, field: str) -> Path:
+    if not isinstance(path, (str, os.PathLike)):
+        raise EncoderRequestError(f"{field}: must be a path string or "
+                                  f"os.PathLike, got {type(path).__name__}")
     p = Path(path)
     if str(p) == "" or not str(p).strip():
         raise EncoderRequestError(f"{field}: must not be blank")
@@ -563,6 +566,13 @@ class _RootState:
         self.mutex = threading.RLock()   # mutations / quarantine / LRU
         self.keys_guard = threading.Lock()  # guards the key_locks table only
         self.key_locks: dict[str, threading.Lock] = {}
+
+
+def _entry_identity(st: os.stat_result) -> tuple:
+    """Identity of one on-disk entry snapshot: enough stat fields to prove a
+    later ``stat`` describes the *same* file that was read (an ``os.replace``
+    publish produces a different inode)."""
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_mode)
 
 
 def _root_state(root: Path) -> _RootState:
@@ -590,7 +600,10 @@ class EmbeddingCache:
       locks are shared the same way, so two instances on one root never
       double-encode the same key.
     * A corrupt / unreadable entry is a **miss**; the bad file is moved to
-      ``root/quarantine/``, never silently overwritten in place.
+      ``root/quarantine/``, never silently overwritten in place. The move
+      happens under the root mutex and only after an **identity check**
+      proves the file is still the exact one that read corrupt — a valid
+      entry published in the meantime is never quarantined.
     * LRU cap by mtime (hits refresh mtime); eviction is a plain delete.
     """
 
@@ -631,26 +644,36 @@ class EmbeddingCache:
 
     def get(self, key: str) -> EncodedPayload | None:
         """Return the cached payload, or ``None`` on miss. A corrupt entry is
-        a miss **and** gets quarantined."""
+        a miss **and** gets quarantined — but only *that same file*: the
+        quarantine moves the entry aside only after an identity check under
+        the cache-wide root mutex, so a valid entry published after a stale
+        corrupt read is never quarantined (a confirmed race otherwise moved
+        the NEW entry into quarantine). The LRU touch likewise runs under
+        the mutex, next to the LRU eviction it races with. Lock order stays
+        key-lock → root-mutex (never the reverse)."""
         path = self.entry_path(key)
+        read_ident: tuple | None = None
         try:
             if not path.exists():
                 return None
             if not path.is_file():
                 # A directory / FIFO squatting on the entry name: miss, and
                 # quarantine it (never overwrite or read in place).
-                return self._quarantine(path, key)
-            data = path.read_bytes()
+                return self._quarantine(path, key, read_ident=None)
+            with path.open("rb") as fh:
+                data = fh.read()
+                read_ident = _entry_identity(os.fstat(fh.fileno()))
         except OSError:
-            return self._quarantine(path, key)
+            return self._quarantine(path, key, read_ident=None)
         try:
             payload = EncodedPayload.from_entry_bytes(data, key)
         except _EntryCorrupt:
-            return self._quarantine(path, key)
-        try:
-            os.utime(path, None)  # LRU refresh; a failed touch must not lose a hit
-        except OSError:
-            pass
+            return self._quarantine(path, key, read_ident=read_ident)
+        with self._state.mutex:  # LRU touch serialised with eviction
+            try:
+                os.utime(path, None)  # LRU refresh; a failed touch must not lose a hit
+            except OSError:
+                pass
         return payload
 
     def put(self, key: str, payload: EncodedPayload) -> Path:
@@ -685,8 +708,35 @@ class EmbeddingCache:
                 keys.append(entry.name[: -len(_ENTRY_SUFFIX)])
         return keys
 
-    def _quarantine(self, path: Path, key: str) -> None:
+    def _quarantine(self, path: Path, key: str, *,
+                    read_ident: tuple | None) -> None:
+        """Move a corrupt entry aside under the cache-wide root mutex.
+
+        ``read_ident`` is the identity of the bytes that were actually read
+        and found corrupt; when it is not ``None`` the file is quarantined
+        ONLY if it still carries that identity — if a valid entry was
+        published in the meantime (different inode), the NEW entry stands
+        and this read simply reports a miss. With ``read_ident=None`` (an
+        entry-name squat, or a failed read) whatever currently sits at the
+        path is re-checked: a regular file is only quarantined after a
+        fresh parse proves it corrupt, never a freshly published valid
+        entry."""
         with self._state.mutex:  # quarantine is a mutation too
+            if read_ident is not None:
+                try:
+                    current = _entry_identity(path.stat())
+                except OSError:
+                    return None  # vanished between read and lock
+                if current != read_ident:
+                    return None  # replaced after the corrupt read
+            elif path.is_file():
+                try:
+                    with path.open("rb") as fh:
+                        data = fh.read()
+                    EncodedPayload.from_entry_bytes(data, key)
+                    return None  # parses valid after all — never quarantine it
+                except (_EntryCorrupt, OSError):
+                    pass  # corrupt / unreadable: quarantine below
             try:
                 self.quarantine_dir.mkdir(parents=True, exist_ok=True)
                 target = self.quarantine_dir / (
@@ -739,6 +789,19 @@ def embedding_cache_for(config: Any) -> EmbeddingCache | None:
 # ---------------------------------------------------------------------------
 
 
+def _finite_float(value: Any) -> float | None:
+    """Float coercion that never raises: a huge int (``10**400``) overflows
+    at conversion — a configuration error, not an ``OverflowError`` escaping
+    the constructor. Non-finite floats (NaN/Inf) are likewise rejected."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        f = float(value)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    return f if math.isfinite(f) else None
+
+
 def _excerpt(text: str) -> str:
     if len(text) <= STDERR_EXCERPT_CHARS:
         return text
@@ -784,7 +847,11 @@ class EncoderWorker:
                  cancel_grace_s: float = 5.0,
                  python: str | None = None,
                  logger: PhaseLogger | None = None) -> None:
-        cmd = list(command)
+        cmd = list(command) if (not isinstance(command, (str, bytes))
+                                and isinstance(command, Sequence)) else None
+        if cmd is None:
+            raise EncoderSetupError(
+                f"command: must be a non-empty list of non-empty strings, got {command!r}")
         if not cmd or any(not isinstance(tok, str) or not tok for tok in cmd):
             raise EncoderSetupError(
                 f"command: must be a non-empty list of non-empty strings, got {command!r}")
@@ -794,26 +861,29 @@ class EncoderWorker:
                 raise EncoderSetupError(
                     f"command: token {needed!r} is required (the worker protocol "
                     f"passes the {needed.strip('{}')} file by path)")
-        if (isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float))
-                or not math.isfinite(timeout_s) or timeout_s <= 0):
+        timeout = _finite_float(timeout_s)
+        if timeout is None or timeout <= 0:
             # NaN/Inf must not disable the timeout (a NaN deadline makes
-            # every `<= 0` check false: the poll loop would wait forever).
+            # every `<= 0` check false: the poll loop would wait forever),
+            # and a huge int overflows at float() — both typed setup errors.
             raise EncoderSetupError(
                 f"timeout_s: must be a finite number > 0, got {timeout_s!r}")
-        if (isinstance(cancel_grace_s, bool)
-                or not isinstance(cancel_grace_s, (int, float))
-                or not math.isfinite(cancel_grace_s) or cancel_grace_s < 0):
+        grace = _finite_float(cancel_grace_s)
+        if grace is None or grace < 0:
             raise EncoderSetupError(
                 f"cancel_grace_s: must be a finite number >= 0, "
                 f"got {cancel_grace_s!r}")
         self.command = cmd
-        self.timeout_s = float(timeout_s)
+        self.timeout_s = timeout
         self.cache = cache
         self.python = python if python is not None else (sys.executable or "python3")
+        if not isinstance(self.python, str) or not self.python:
+            raise EncoderSetupError(
+                f"python: must be a non-empty string or null, got {python!r}")
         self.scratch_dir = str(_canonicalize_dir(
             scratch_dir if scratch_dir is not None else tempfile.gettempdir(),
             "scratch_dir"))
-        self.cancel_grace_s = float(cancel_grace_s)
+        self.cancel_grace_s = grace
         self.logger = logger or PhaseLogger()
 
     # -- public --------------------------------------------------------------
