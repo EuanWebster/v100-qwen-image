@@ -3,10 +3,15 @@
 Hand-rolled Qwen-Image-2.1 generation pipeline for a Tesla V100 16GB, structured like
 the LTX-2.5 ROCm build (engine / front-end split, subprocess encoder, VRAM calibration).
 
-Status: **current executable plan, revised 2026-10-07.** This revision supersedes the
-original draft (committed as `df59ce7`) and incorporates every correction and confirmed
-requirement in `HANDOFF.md` (committed as `08bde4b`). The supersession ledger in
-*Corrections applied* below records what changed and why.
+Status: **current executable plan, revised 2026-10-07; senior-review fix pass on
+`f6325d0`.** This revision supersedes the original draft (committed as `df59ce7`) and
+incorporates every correction and confirmed requirement in `HANDOFF.md` (committed as
+`08bde4b`) — all of those corrections remain in force. The supersession ledger in
+*Corrections applied* below records what changed and why; the senior-review ledger
+(R1–R7) records the structural fixes applied on top of `f6325d0`: package boundaries
+instead of an engine monolith, explicit CPU-only acceptance criteria, a pinned model
+manifest contract, a memory-policy descriptor, a hardened encoder cache, versioned
+benchmark schemas, and fresh-environment test requirements.
 
 ---
 
@@ -14,7 +19,8 @@ requirement in `HANDOFF.md` (committed as `08bde4b`). The supersession ledger in
 
 Generate high-quality images with Qwen-Image-2.1 at 1024×1024 on a single 16GB Volta
 card (2K as an experimental opt-in whose feasibility is **not yet demonstrated**), with a
-headless CLI front-end and a conservative VRAM guard that refuses configs likely to OOM.
+headless CLI front-end and a conservative memory policy that refuses anything it cannot
+clear from calibration (R4/M5.3 — no uncalibrated guarantees, per C8).
 Maximum image quality takes priority; speed is improved where possible, with no
 user-specified hard generation-time limit.
 
@@ -85,6 +91,18 @@ required plan corrections"); the ledger exists so nobody re-imports a dead claim
 | C12 | Encoder validation = embedding shapes match | **Insufficient.** Validate the encoder's actual upstream **prompt formatting, hidden-state extraction and masks** against upstream behavior; shape equality alone can hide subtle conditioning errors. |
 | C13 | "2K run peak < 15.5 GB" style thresholds written into tasks | Kept only as explicit *placeholders* to be replaced by measurement (C8/C9); no milestone may claim a memory or speed number it has not measured. |
 
+### Senior-review fix ledger (on `f6325d0` — all C1–C13 corrections above stand)
+
+| # | Finding on `f6325d0` | Fix in this revision |
+|---|---|---|
+| R1 | `qwen_engine.py` was a monolith mixing config, loading, logging and CLI | Explicit **package boundaries** (see *Architecture*): immutable config/validation, manifest + no-download resolver, pipeline **adapter protocol** with heavy ML imports deferred inside the eventual `Qwen21DiffusersAdapter`, structured phase/event logging, CLI, memory policy, encoder worker/cache, benchmark schema. |
+| R2 | CPU-only milestone acceptance criteria were vague | M1 now ships **testable acceptance criteria**: config JSON round-trip + field-level validation, token math (1024² = 4096, 2048² = 16384), dimensions multiple-of-32, `import` + `--help` with no torch/models installed, deterministic JSON `--dry-run` reporting unresolved hardware/assets/calibration without importing heavy packages, malformed config → exit 2, actual-run missing assets → documented nonzero exit without traceback. |
+| R3 | Model "manifest from 2.1" was undefined | **Versioned, pinned manifest contract** (`models/manifest.json`): per-artifact repo / revision / filename / sha256 / byte-size; resolver verifies and **never silently downloads** — a missing artifact is an error naming what to fetch, not an implicit fetch. |
+| R4 | Guard was "phase/backend/conditioning-aware" but the decision inputs were undefined | **Memory-policy descriptor** with named fields (phase, tokens/resolution, prompt length, CFG duplication, attention backend, quant, residency/offload, VAE mode, model revision, current free memory + headroom), **stale-calibration invalidation**, conservative-unknown refusal, and **2K refused until calibrated** unless an explicit expert-override flag is set (logged). |
+| R5 | Cache key was (model, prompt, negative, kwargs); worker lifecycle unspecified | **Encoder cache key v2** adds processor/tokenizer/chat-template revisions or content hashes and encoder dtype (image identities + order when conditioning on images arrives); atomic cache writes; corrupt entry = miss + quarantine; concurrency-safe; worker timeout/cancel/error propagation and stderr capture; temp cleanup; **fake-worker tests** without any model. |
+| R6 | Benchmark output was "phase timers → benchmarks/" | **Versioned benchmark/result schemas**: per-phase wall time, peak host RSS, peak CUDA allocated/reserved *when available* (null when not — never fabricated), plus environment identifiers (torch/CUDA/driver/arch, host, python) and model identifiers (repo/revision/hash). |
+| R7 | CPU tests did not state their environment | CPU test suites must pass in a **fresh environment with no network, no GPU, no model weights** and must **write nothing outside temporary directories** (all cache/benchmark/log paths relocatable via config). |
+
 Unchanged, still-standing model facts (third-party claims — **verify at first download,
 task 2.1**): Qwen-Image-2.1, DiT 7B / 32 layers (~14.2 GB BF16); text encoder Qwen3-VL
 8B (~17.5 GB BF16); VAE ~0.7–1.4 GB; native 2K support. The draft's block-causal
@@ -94,18 +112,38 @@ card.
 
 ---
 
-## Architecture
+## Architecture (package boundaries — R1)
 
-`qwen_engine.py` owns the pipeline (load → encode-cache → denoise → VAE decode → save)
-and imports nothing UI-related. `cli_gen.py` is the only v1 front-end (GUI deferred,
-YAGNI).
+There is **no `qwen_engine.py` monolith**. The engine is a small package with explicit
+boundaries, so config validation, manifest resolution, dry-run planning, the CLI and all
+CPU tests never touch a heavy ML import:
+
+| Module | Responsibility | May import |
+|---|---|---|
+| `qwen_engine/config.py` | **Immutable** (frozen dataclass) generation config + field-level validation: dimensions multiple of 32, resolution→token math (1024² = 4096, 2048² = 16384 — C6), steps/seed ranges, quant/offload/backend enums, paths. Lossless JSON round-trip. | stdlib |
+| `qwen_engine/manifest.py` | **Versioned model-manifest schema + `resolve_model_path`** — pinned repo/revision/artifact/sha256/size contract, existence/size verification, **no-download policy** (R3; schema in M2.1). | stdlib |
+| `qwen_engine/adapters/base.py` | **Pipeline adapter protocol** the engine core calls (`plan`, `load`, `encode`, `denoise`, `decode`, `save`) plus plan/dry-run types. The core runs end-to-end against a fake adapter in tests. | config/manifest/memory/log types |
+| `qwen_engine/adapters/qwen21_diffusers.py` | The eventual `Qwen21DiffusersAdapter` — the **only** module that imports torch / diffusers / transformers, and those imports are deferred *inside* the adapter (lazy), executed only on an actual run. Does not exist yet; stubbing it at M1 is a boundary violation the import test catches. | torch, diffusers, transformers |
+| `qwen_engine/log.py` | Structured **phase/event logging**: JSONL events `{ts, phase, event, elapsed_ms, counters…}` to a configurable sink, plus human-readable phase lines. Shared by engine, CLI and bench. | stdlib |
+| `qwen_engine/memory.py` | **Memory-policy** descriptor + verdict logic (R4; detail in M5.3): "does this config fit *right now*?" from calibrated observations, current free memory, and headroom; conservative on unknown; stale calibration invalidated (C8). (Supersedes the draft's standalone `vramfit.py` naming.) | config/manifest/log types |
+| `qwen_engine/encoder.py` | Encoder **subprocess worker + embedding cache** (port `run_subprocess_logged`; key v2, atomic writes, quarantine, timeout/cancel, fake-worker tests — R5; detail in M1.4). | stdlib |
+| `qwen_engine/bench.py` | **Versioned benchmark/result schemas** (R6; detail in M1.5): phase timings, peak host RSS, peak CUDA memory when available, environment and model identifiers; feeds `calibration.json`. | stdlib |
+| `qwen_engine/cli.py` | The only v1 front-end (GUI deferred, YAGNI): argparse → validate config → plan via core/adapter protocol → `generate`; implements the **exit-code contract** (M1 acceptance criteria). `cli_gen.py` at the repo root stays as a thin entry-point shim. | the above only |
+
+**Boundary invariant (tested):** `python -c "import qwen_engine"` and
+`cli_gen.py --help` / `--dry-run` must succeed on a machine with **no torch, no
+diffusers, no transformers and no model weights** installed. Heavy ML imports live only
+inside `Qwen21DiffusersAdapter` and the encoder worker script, reached only by an actual
+run. The engine package imports nothing UI-related (LTX rule preserved).
 
 - **Encoder:** Qwen3-VL in a throwaway subprocess (`run_subprocess_logged` pattern) so
   it costs no VRAM; runs on host CPU; execution dtype is a measured choice (C5), with
-  the *available-RAM* budget as the constraint.
-- **Embedding cache:** keyed on (model, prompt, negative, kwargs) — port LTX's
-  `_embed_cache_key` *with* the negative-prompt key fix; measure whether the disk cache
-  is worth it (upstream KV-caches conditioning across steps anyway).
+  the *available-RAM* budget as the constraint. Worker lifecycle hardening per R5 (M1.4).
+- **Embedding cache:** key **v2** — model repo+revision, processor/tokenizer/chat-template
+  revisions or content hashes, prompt, negative prompt, all encoding kwargs, encoder dtype
+  (+ ordered image identities when image conditioning exists; R5). Port LTX's
+  `_embed_cache_key` *with* the negative-prompt key fix as the base, then extend; measure
+  whether the disk cache is worth it (upstream KV-caches conditioning across steps anyway).
 - **DiT:** resident quant chosen by measurement, expected quality default **Q8 GGUF →
   fp16 dequant**; streaming block offload (LTX pattern, incl.
   `torch._C._host_emptyCache()` on pinned-host teardown) kept as the capacity/quality
@@ -113,8 +151,9 @@ YAGNI).
 - **Attention:** backend selected by benchmark (efficient/SDPA path from upstream
   diffusers, not custom code); the dense-FP32 path is understood to be prohibitive above
   1024² (C6).
-- **Memory guard:** `vramfit.py` records phase-wise observations and answers "does this
-  config fit *right now*?" with headroom and a conservative uncalibrated policy (C8).
+- **Memory guard:** `memory.py` (R4) answers "does this config fit *right now*?" from a
+  named policy descriptor, headroom and calibrated observations, with a
+  conservative unknown-policy (C8); detail in M5.3.
 
 Source patterns ported from `ltx_engine.py` (public
 `The-Deflection-Engine/ltx-2.5-rocm-generator`, private `EuanWebster/ltx-build-archive`):
@@ -139,38 +178,111 @@ Euan to apply.
   torch from the cu126 wheel series (**≤2.14**, the last publishing cu126 — C2);
   diffusers and transformers at **exact git commits** per Qwen's documented requirement
   (Git-installed diffusers; Transformers ≥5.17 at review time — C11); pin model repo
-  revisions too. *Verify:* lockfile committed; `torch.cuda.get_arch_list()` contains
-  `sm_70` (this check needs only the wheel, not the card).
+  revisions too, recorded in the versioned `models/manifest.json` contract (R3, M2.1) —
+  never downloaded implicitly. *Verify:* lockfile committed;
+  `torch.cuda.get_arch_list()` contains `sm_70` (this check needs only the wheel, not
+  the card).
 - **0.2** Interface survey against the pinned checkouts → `docs/interfaces.md`: confirm
   `QwenImage21Pipeline` signature and `prompt_embeds`/mask contract (C1/C12), the
   attention processors incl. the non-Flex SDPA path (C6/C10), the Qwen21 single-file
   GGUF checkpoint mapping and native GGUF dequant (C10), and the real attention/mask
   semantics (supersedes the card's block-causal description).
 - **0.3** Lightweight CPU-only tests committed as the foundation lands (config
-  round-trip, token math, cache keys, CLI dry-run). No large-model smoke until a fresh
-  *available-RAM* budget check (C8: ~41 GiB available at snapshot, services running).
+  round-trip, token math, cache keys, CLI dry-run). Test rule (R7): every CPU test must
+  pass in a **fresh environment with no network, no GPU and no model weights**, and must
+  **write nothing outside temporary directories** — all cache/benchmark/log/output paths
+  are config-relocatable and tests point them at `tmp_path`. No large-model smoke until a
+  fresh *available-RAM* budget check (C8: ~41 GiB available at snapshot, services
+  running).
 
 ### M1 — Foundation without the card (executable now)
 
-- **1.1** `qwen_engine.py` skeleton: config dataclass (prompt, size, steps, seed, quant,
-  offload mode, paths), `resolve_model_path` against the manifest from 2.1, structured
-  logging. Test: config round-trips JSON. **TDD, commit.**
-- **1.2** `cli_gen.py`: argparse front-end → `engine.generate(config)`; LTX-style phase
-  log; `--dry-run` prints the resolved plan (including the guard's answer) and generates
-  nothing. **Commit.**
-- **1.3** Encoder subprocess plumbing (port `run_subprocess_logged`) + embedding cache
-  (port `_embed_cache_key`, LRU cap, **negative-key fix tested both variants**).
-  Cache dir `cache/embeds/`. Test: request round-trip and key semantics without loading
-  the full encoder. **Commit.**
-- **1.4** Benchmark harness skeleton (phase timers → `benchmarks/`, observation records
-  → `calibration.json` schema). **Commit.**
+Build the package skeleton from *Architecture*; the real adapter does not exist yet —
+everything below runs against the adapter protocol with fakes.
+
+- **1.1** `config.py` + `log.py`: frozen generation-config dataclass (prompt, negative,
+  size, steps, seed, quant, offload mode, attention backend, VAE tiling flag, paths,
+  cache/bench/log dirs) with field-level validation and lossless JSON round-trip;
+  structured phase/event logger. **Commit.**
+- **1.2** `manifest.py`: versioned manifest schema + `resolve_model_path` implementing
+  the **no-download contract** (R3, schema finalized in 2.1): artifact present & size
+  matches → path; absent/mismatch → structured error naming repo/revision/file.
+  **Commit.**
+- **1.3** `adapters/base.py` adapter protocol + engine core `generate()`/`plan()` over
+  the protocol; `cli.py` front-end: argparse, `--dry-run`, `--config`, exit-code
+  contract. Heavy imports reachable only through the (not yet written)
+  `Qwen21DiffusersAdapter`. **Commit.**
+- **1.4** `encoder.py`: subprocess worker (port `run_subprocess_logged`) + embedding
+  cache. Requirements (R5):
+  - **Key v2** (version-tagged schema): model repo+revision; processor, tokenizer and
+    chat-template revisions *or content hashes*; prompt; negative prompt; **all**
+    encoding kwargs; encoder dtype; and — once image conditioning exists — image
+    identities (content hashes) *in order*. Port `_embed_cache_key` with the
+    negative-key fix as the base; **negative-key fix tested both variants**; LRU cap.
+    Cache dir `cache/embeds/` (config-relocatable).
+  - **Atomic writes** (temp file + `os.replace`); a corrupt/unreadable entry is a **cache
+    miss**, and the bad file is **quarantined** (moved aside), never silently overwritten
+    in place.
+  - **Concurrency safety**: atomic rename means readers never see partial entries;
+    per-key in-process locking so parallel requests don't double-encode or corrupt.
+  - **Worker lifecycle**: timeout + cancel propagate to the child (terminate → kill),
+    worker error/exit status surfaces as a typed engine error, **stderr captured** into
+    the event log (not swallowed), temp files and pinned-host resources cleaned up on
+    every path.
+  - Tests use a **fake encoder worker** (a scripted stub) — no model, exercising hit,
+    miss, corrupt-entry quarantine, timeout, and error propagation. **Commit.**
+- **1.5** `bench.py`: benchmark harness skeleton (phase timers → `benchmarks/`,
+  observation records → `calibration.json`). **Versioned result schema**
+  `benchmark_result.v1` (R6): schema version; per-phase wall time (load / encode /
+  denoise-per-step / decode / save); **peak host RSS**; **peak CUDA allocated/reserved
+  when CUDA is available — recorded as `null` when it is not, never fabricated**;
+  environment identifiers (python, torch/CUDA/driver versions, `get_arch_list()`,
+  hostname); model identifiers (manifest repo/revision/sha256 per artifact); and an echo
+  of the generation config. `calibration.json` gets a matching versioned observation
+  schema whose records carry the fields the memory policy keys staleness on (M5.3).
+  **Commit.**
+
+**M1 acceptance criteria (all CPU-only, each an actual test):**
+
+1. Config **JSON round-trip is lossless**; **field-level validation** rejects each
+   invalid field individually with the field named in the error (bad enum, negative
+   seed, zero steps, …).
+2. **Token math**: 1024² → **4096** image tokens and 2048² → **16384** asserted exactly
+   (C6), plus arbitrary in-range sizes; **width and height must be multiples of 32** —
+   anything else is a validation error naming the offending dimension.
+3. **Import and `--help` without torch/models**: importing `qwen_engine` and running
+   `cli_gen.py --help` succeed with torch, diffusers, transformers and all weights
+   *absent* (test asserts none of these modules end up in `sys.modules`).
+4. **Deterministic JSON `--dry-run`**: `--dry-run` prints stable, key-sorted JSON —
+   resolved config, manifest resolution status, guard verdict — and explicitly reports
+   **unresolved hardware / assets / calibration** as such (never pretending a value was
+   measured); it must not import heavy packages and must not generate or write outside
+   temp dirs.
+5. **Malformed config → exit 2** with per-field errors on stderr, no traceback.
+6. **Actual run with missing/unverifiable assets → documented nonzero exit (4)** naming
+   the unresolved artifact and the manifest entry — no traceback, and no download
+   attempted (R3).
+
+Exit-code contract (tested): `0` success · `2` invalid/malformed config · `3` memory
+guard refusal (M5.3) · `4` missing/unverified model asset · `5` required hardware absent
+or unverified (e.g. no confirmed V100 — error names the CUDA pin, per 5.3) · `1`
+unexpected (logged with context, traceback only into the log sink).
 
 ### M2 — Weights and model-side verification (needs disk + a RAM budget check)
 
-- **2.1** Decide the in-sandbox model path (sandbox has no `~/models` mount); download
-  DiT, Qwen3-VL encoder, VAE at **pinned revisions**; verify hashes; record actual
-  filenames/sizes in `docs/models.md`, replacing the unverified model-facts table.
-  *Verify:* measured sizes vs card within ±5 %; revisions recorded.
+- **2.1** Decide the in-sandbox model path (sandbox has no `~/models` mount). Define the
+  **model manifest contract** (R3) as committed, versioned `models/manifest.json`:
+  `schema_version` plus, per artifact (DiT, Qwen3-VL encoder, VAE, any LoRA),
+  `{role, repo, revision (commit SHA), filename, sha256, bytes}`. `manifest.py` resolves
+  against it and **never silently downloads** — the resolver only verifies; fetching is a
+  separate, explicit operator action (a documented `fetch_models.py` run), and a missing
+  or mismatched artifact exits 4 naming repo/revision/file (M1 criterion 6). Manifest
+  changes are git commits, so every run's model identity is reproducible from
+  `benchmark_result.v1` model identifiers (R6). Then download DiT, Qwen3-VL encoder, VAE
+  at the **pinned revisions**; verify hashes; record actual filenames/sizes in
+  `docs/models.md` (backed by the manifest), replacing the unverified model-facts table.
+  *Verify:* manifest committed with schema version; measured sizes vs card within ±5 %;
+  revisions recorded; resolver test proves no network call on the missing-asset path.
 - **2.2** Load-path probes (CPU, small): Diffusers native GGUF loader + Qwen21
   single-file mapping loads the exact checkpoint; encoder fidelity check against
   **upstream prompt formatting / hidden-state extraction / masks**, not just shapes
@@ -219,19 +331,36 @@ Euan to apply.
   capacity; cost it against the measured link (M3.4). Equivalence test: streamed vs
   resident at fixed seed, max abs diff within fp16 tolerance — this is an *equivalent
   path* check, the legitimate use of numerical diffing (C7).
-- **5.3** `vramfit.py` guard wired into the CLI: phase/backend/conditioning-aware
-  budgets, headroom, reads currently available memory, conservative refuse for
-  uncalibrated configs, and a host-RAM budget that accounts for conversion peaks and
-  existing services (C8). Tests: fabricated 2K-resident config → refuse (exit 3);
-  missing V100 → clean error naming the CUDA pin, not a stack trace. Thresholds come
-  from calibration, never asserted (C13).
+- **5.3** `memory.py` policy wired into the CLI and the adapter (R4). Every guard query
+  carries a **policy descriptor**: phase (load / encode / denoise-step / decode / save);
+  token count + resolution (C6); prompt token length; **CFG duplication** (does the
+  negative prompt double the batch); attention backend; quant format; residency mode
+  (resident / streamed / offload); VAE mode (tiled decode on/off — decode memory only,
+  C6); pinned model revision; **current free GPU and host memory** with configured
+  headroom. Rules:
+  - **Stale-calibration invalidation:** observations are keyed by model revision,
+    backend, quant and schema version; any mismatch makes them stale — ignored, never
+    interpolated across.
+  - **Conservative unknown:** no fresh matching calibration → refuse (or offer only the
+    most conservative known-safe mode), never guess (C8).
+  - **2K refusal until calibrated:** descriptor above 1024²-class token counts → refuse
+    (exit 3) while calibration is missing/stale, unless an explicit
+    `--expert-override` flag is set — an acknowledged escape hatch for 6.1 experiments,
+    recorded in the event log and benchmark record.
+  - Host-RAM budget from *available* memory incl. conversion peaks and existing services
+    (C8). Tests: fabricated 2K-resident config with empty/stale calibration → refuse
+    (exit 3), and refuse is lifted only by matching calibration or the override flag
+    (flag is logged); stale-revision observation is ignored; missing V100 → clean error
+    naming the CUDA pin (exit 5), not a stack trace. Thresholds come from calibration,
+    never asserted (C13).
 
 ### M6 — 2K experimental and optional acceleration (after baseline)
 
 - **6.1** 2K attempt behind `--hi-res`: attention backend from 4.2 is load-bearing
   here (16384 tokens); VAE tiling (`--tiled-decode`) is offered as a *decode-memory*
   knob only (C6). No pre-asserted GB ceiling; the guard from 5.3 decides per-run from
-  calibrated data.
+  calibrated data — and while 2K calibration is still missing, each 2K experiment runs
+  explicitly under `--expert-override` (logged), per R4.
 - **6.2** Optional accelerator study — `Viggle/Qwen-Image-2.1-viggle-turbo` v0.3 (6
   steps, prescribed sigmas/scheduler; LoRA unmerged or FP32-merged pre-quantization per
   its card) — evaluated against the base recipe by human eval on the genre set; ships
@@ -250,6 +379,19 @@ Euan to apply.
 ## Tests / validation
 
 - Full: `cd /work && .venv/bin/pytest -q`; every numbered task ships a test.
+- **Fresh-environment CPU suite (R7):** the M0.3/M1 tests must pass in a clean
+  environment with **no network, no GPU and no model weights** (and torch/diffusers/
+  transformers not importable — the import test asserts this), and must **write nothing
+  outside temporary directories** — a fixture redirects cache/benchmark/log/output paths
+  to `tmp_path` and fails the run on any write elsewhere in the repo or home.
+- **CLI contract tests** (M1 acceptance criteria): JSON round-trip + field-level
+  validation; token math 1024² = 4096 and 2048² = 16384; multiple-of-32 dimension
+  validation; `import` + `--help` without torch/models; deterministic key-sorted JSON
+  `--dry-run` reporting unresolved hardware/assets/calibration; malformed config → exit
+  2; actual run with missing assets → exit 4, no traceback, no download attempt.
+- Encoder worker tests via a **fake worker**: key-v2 semantics (negative-key fix tested
+  both variants), atomic write, corrupt-entry miss + quarantine, concurrent access,
+  timeout/cancel and stderr capture, temp cleanup (R5).
 - Equivalent-path numerical diffs (resident vs streamed, quant vs reference) — sound
   use of numerical comparison. **No cross-recipe SSIM quality gates** (C7).
 - Golden regression: fixed prompts × fixed seed per **config** vs its own stored
@@ -257,9 +399,10 @@ Euan to apply.
   scoped to same-config comparison only.
 - Encoder contract test: prompt formatting, hidden-state extraction and masks match the
   pinned upstream implementation (C12).
-- Negative: 2K-resident config beyond calibrated budget → refuse, exit 3; missing V100 →
-  clean error naming the CUDA pin. BF16 inputs must **not** be rejected at the conversion
-  boundary (C5).
+- Negative: 2K-resident config with missing/stale calibration → refuse, exit 3 (only
+  matching calibration or logged `--expert-override` lifts it, R4); missing V100 →
+  clean error naming the CUDA pin, exit 5. BF16 inputs must **not** be rejected at the
+  conversion boundary (C5).
 - Quality decisions: human evaluation on the balanced genre set (requirement 4), never
   one genre, never "PNG isn't grey" (C7).
 
