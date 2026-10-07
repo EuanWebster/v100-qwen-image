@@ -105,13 +105,24 @@ required plan corrections"); the ledger exists so nobody re-imports a dead claim
 
 Model facts, upgraded from card claims to **pinned upstream metadata** at the
 M2.1 manifest commit (task 2.1 *preparation* — expected sizes from the pinned
-manifest identities, **not local measurements**; the files were never
-downloaded, so first-download hash verification of the LFS identities stays
-outstanding): Qwen-Image-2.1, DiT 7B / 32 layers — expected weight shards
+manifest identities, **not local measurements** at that time): Qwen-Image-2.1,
+DiT 7B / 32 layers — expected weight shards
 14,230,315,061 B (~14.2 GB, BF16 *declared* storage); text encoder Qwen3-VL
 8B — expected 17,534,409,013 B (~17.5 GB); VAE — expected 1,350,991,591 B
 (~1.35 GB, at the top of the old 0.7–1.4 GB card range); all 24 runtime files
-33,131,601,593 B. "Native 2K support" remains a model-card claim; the draft's
+33,131,601,593 B. **Asset status since then:** root's explicitly approved
+pinned fetch into `models/assets/` ended 2026-10-07 21:53 UTC with a timeout
+on the first transformer shard; an independent offline resolver/plan found
+**19 of 24 final files present and size+SHA256-verified, 5 missing, 0 bad**
+(processor and text-encoder groups complete; recoverable
+`transformer/diffusion_pytorch_model-00001-of-00002.safetensors.partial` =
+6,302,990,336 B; remaining expected transfer after it 9,278,315,946 B) —
+first-download hash verification of the LFS identities is therefore
+**partly done** (details: `docs/models.md` §3/§7). Separately recorded: a
+socket-denied processor-only load reached the pinned transformers code but
+failed for missing `torchvision`; a tokenizer-only local load succeeded
+(Qwen2Tokenizer, 151,669 entries, 9 tokens for root's sample); dependency
+work is a later scoped milestone. "Native 2K support" remains a model-card claim; the draft's
 block-causal attention description is a model-card/third-party claim: the
 actual attention/mask semantics were read in the pinned diffusers source
 (task 0.2 done — `docs/interfaces.md`) and the build follows *that*, not the
@@ -130,7 +141,7 @@ CPU tests never touch a heavy ML import:
 |---|---|---|
 | `qwen_engine/config.py` | **Immutable** (frozen dataclass) generation config + field-level validation: dimensions multiple of 32, resolution→token math (1024² = 4096, 2048² = 16384 — C6), steps/seed ranges, quant/offload/backend enums, paths. Lossless JSON round-trip. | stdlib |
 | `qwen_engine/manifest.py` | **Versioned model-manifest schema + `resolve_model_path`** — pinned repo/revision/artifact/sha256/size contract, existence/size verification, **no-download policy** (R3; schema in M2.1). | stdlib |
-| `qwen_engine/local_bundle.py` | **Local reference-bundle contract (M2.2a)** — projects an already `resolve_manifest`-verified local set into role-grouped adapter `assets` plus explicit component dirs under an explicit model root, publishing **absolute, CWD-stable paths** under the canonical resolved root, enforcing the committed 24-file full-reference layout table and a coherence-checked success claim (`errors`/per-status `error`/`resolved` mapping); construction-time defensive freezing of the mappings; version-tagged artifact-set fingerprints (whole bundle + encoder+processor). No content hashing, no downloads, no ML imports. | manifest types, stdlib |
+| `qwen_engine/local_bundle.py` | **Local reference-bundle contract (M2.2a)** — trusted factory `resolve_local_bundle` runs `resolve_manifest` itself (explicit full-rehash cost) before projecting into role-grouped adapter `assets` plus explicit component dirs under an explicit model root; lower-level `project_resolution_report` **trusts its caller's report** (never authenticated evidence). Enforces the committed 24-file full-reference layout table and the profile's **exact pinned repo/revision**, plus a coherence-checked success claim (`errors`/per-status `error`/`resolved` mapping); publishes **absolute, CWD-stable paths**; closed-tree `preflight_closed_tree` refuses any entry beyond the allowlist before a future `from_pretrained`; construction-time scalar invariants + defensive freezing; version-tagged artifact-set fingerprints (encoder digest = **asset component only** of the future worker cache key). No downloads, no ML imports. | manifest types, stdlib |
 | `qwen_engine/adapters/base.py` | **Pipeline adapter protocol** the engine core calls (`load`, `encode`, `denoise`, `decode`, `save`) plus dry-run status types. Deliberately **no `plan` method** — dry-run planning is adapter-independent (`core.plan()` builds the document itself). The core runs end-to-end against a fake adapter in tests. | config/manifest/memory/log types |
 | `qwen_engine/adapters/qwen21_diffusers.py` | The eventual `Qwen21DiffusersAdapter` — the **only** module that imports torch / diffusers / transformers, and those imports are deferred *inside* the adapter (lazy), executed only on an actual run. Does not exist yet; stubbing it at M1 is a boundary violation the import test catches. | torch, diffusers, transformers |
 | `qwen_engine/log.py` | Structured **phase/event logging**: JSONL events `{ts, phase, event, elapsed_ms, counters…}` to a configurable sink, plus human-readable phase lines. Shared by engine, CLI and bench. | stdlib |
@@ -1018,3 +1029,66 @@ standing rule that executed plans stay honest.)*
   `models/assets/` (root's concurrent pinned transfer), `manifest.py`,
   `models/manifest.json`, the fetcher and `sandbox.yaml` untouched; no
   network, no weights read, no model load, no GPU, no service change.
+- 2026-10-07 **M2.2a bundle review2: pinned profile identity, resolver
+  provenance, closed-tree preflight, cache-key scope, constructor
+  invariants + factual asset status** (root review
+  `/tmp/v100-m22a-bundle-review2.md`; sole writer Qwen, on `4c95ea1` +
+  `0251420`): **(1)** the named `full-reference` profile now enforces **this
+  model revision** — new constants `FULL_REFERENCE_REPO`
+  (`Qwen/Qwen-Image-2.1`) and `FULL_REFERENCE_REVISION`
+  (`d26bb61231c349cf6b7896fa83353113880e1ba3`) checked by
+  `validate_local_reference_layout`; internally consistent manifests at any
+  other repo or revision are refused (a new model revision requires a NEW
+  reviewed profile), while `artifact_set_fingerprint` stays a generic
+  identity function that demonstrably drifts on repo/revision change;
+  **(2)** honest resolver provenance as an API split — trusted factory
+  `resolve_local_bundle` (validates layout + pinned identity first, then
+  runs `resolve_manifest` itself: explicit full-rehash cost, never a silent
+  metadata call) vs lower-level `project_resolution_report`, documented as
+  **trusting its caller's report** (a public dataclass report can be
+  forged; shape checks are not authenticated evidence); both state the
+  hostile-filesystem TOCTOU limit (component load must reverify immediately
+  before library reopen); **(3)** stdlib closed-tree preflight
+  `preflight_closed_tree` (function + bundle method) enumerating every
+  entry under an explicit root and refusing extras with typed
+  `BundleTreeError` — lookalike config/weight/code files, empty dirs,
+  leftover `*.partial` debris, symlinks even inside-root — no contents
+  read; opt-in, never on an actively downloading root; **(4)** the encoder
+  fingerprint is documented as ONLY the asset component of the future
+  worker cache key (worker protocol/implementation revision + exact
+  diffusers/transformers pins required; wiring `EncoderRequest.model_sha256`
+  to the asset digest alone is a contract violation; full key = worker
+  milestone); **(5)** public direct constructors police scalar invariants
+  (profile, absolute+consistent `root`/`root_resolved`, exact pinned
+  repo/revision, 64-hex digests) with typed errors — data hygiene, not
+  resolver verification — and `artifact_set_fingerprint` rejects
+  non-ModelArtifact and duplicate identities instead of a silently
+  collapsed plausible digest. **Factual asset status** (was stale prose):
+  root's explicitly approved pinned fetch ended 2026-10-07 21:53 UTC with a
+  timeout on the first transformer shard; an independent offline
+  resolver/plan found 19 of 24 final files present and size+SHA256-verified,
+  5 missing, 0 bad; recoverable
+  `transformer/diffusion_pytorch_model-00001-of-00002.safetensors.partial`
+  = 6,302,990,336 B; remaining expected transfer after it 9,278,315,946 B;
+  processor and text-encoder groups complete. Separately: a socket-denied
+  processor-only load reached the pinned transformers code but failed for
+  missing `torchvision`; a tokenizer-only local load succeeded
+  (Qwen2Tokenizer, 151,669 entries, 9 tokens for root's sample) —
+  dependency work is a later scoped milestone. `docs/models.md` (status
+  paragraph, §2–§8) and this PLAN (model-facts paragraph + module row)
+  synced; no claim that no network transfer has ever occurred, and no full
+  load/fidelity/fit claim added. `tests/test_local_bundle.py` **39 → 57**
+  offline tiny-file tests (all six items incl. content-change factory
+  refusal vs forged lower-level report, preflight refusal classes, scalar
+  invariant matrix). Evidence: guarded suite **567 passed + 1 skip**
+  without / **568 passed** with pinned source envs on 3.11.15
+  (`/work/.venv`) and 3.13.5 (`/tmp/qwen-review.bIFHcI/venv`,
+  `PYTHONPATH=/work/src`), all rc 0; pinned-interface checker **53/53 exit
+  0** both Pythons, trees re-verified `c6df88a5`/`856157a2` via
+  `git rev-parse HEAD`. **Pending, unchanged:** the remaining 5 files +
+  transfer resume (root/operator decision; default sandbox DNS denied),
+  real-asset resolve, CPU component load, encoder fidelity, adapter,
+  RAM/VRAM fit, GPU. `models/assets/` (incl. the interrupted partial),
+  `manifest.py`, `models/manifest.json`, the fetcher, `sandbox.yaml`
+  (user-owned) and `models/` assets untouched and unread by this pass; no
+  network, no model load, no GPU, no service change.
