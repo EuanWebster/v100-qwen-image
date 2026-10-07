@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=69"]
+# Pinned exactly to the setuptools version used and tested for this build
+# (84.0.0, verified in the uv build environment), not a floating floor.
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +9,8 @@ name = "qwen-engine"
 version = "0.1.0"
 description = "Hand-rolled Qwen-Image-2.1 generation engine for a Tesla V100 16GB (CPU-only core; heavy ML imports deferred to adapters)"
 requires-python = ">=3.11"
-license = "MIT"
+# license intentionally unset: no license has been selected yet — do not
+# claim MIT (or anything else) until the human chooses one.
 dependencies = []
 
 [project.scripts]

@@ -13,8 +13,13 @@ import pytest
 from qwen_engine import cli, manifest as mf
 from qwen_engine.adapters.base import GenerationAdapter
 from qwen_engine.config import GenerationConfig
-from qwen_engine.core import GenerationResult, generate, plan
-from qwen_engine.errors import HardwareAbsentError, MemoryGuardError
+from qwen_engine.core import (
+    OutputError,
+    GenerationResult,
+    generate,
+    plan,
+)
+from qwen_engine.errors import EngineError, HardwareAbsentError, MemoryGuardError
 
 REPO = "Qwen/Qwen-Image-2.1"
 REV = "0" * 40
@@ -26,19 +31,25 @@ HEAVY = ("torch", "diffusers", "transformers")
 
 
 class FakeAdapter:
-    """In-process stand-in for the eventual Qwen21DiffusersAdapter."""
+    """In-process stand-in for the eventual Qwen21DiffusersAdapter.
+
+    ``save`` writes a **real** regular file under ``config.output_dir`` so the
+    core's post-save verification proves something; ``saved_to`` overrides the
+    reported path (to test missing/escaped output claims), and ``fail_save``
+    models a save that blows up.
+    """
 
     name = "fake"
 
-    def __init__(self, calls=None):
+    def __init__(self, calls=None, saved_to=None, fail_save=False):
         self.calls = calls if calls is not None else []
+        self.assets: dict = {}
+        self.saved_to = saved_to
+        self.fail_save = fail_save
 
-    def plan(self, config):
-        self.calls.append("plan")
-        return {"adapter": self.name}
-
-    def load(self):
+    def load(self, config, assets):
         self.calls.append("load")
+        self.assets = dict(assets)
 
     def encode(self, config):
         self.calls.append("encode")
@@ -54,7 +65,13 @@ class FakeAdapter:
 
     def save(self, image, config):
         self.calls.append("save")
-        return Path(config.output_dir or ".") / "out.png"
+        if self.fail_save:
+            raise RuntimeError("save exploded")
+        out_dir = Path(config.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        real = out_dir / "out.png"
+        real.write_bytes(b"\x89PNG fake")
+        return Path(self.saved_to) if self.saved_to is not None else real
 
 
 def write_manifest(tmp_path, role="dit", content=b"payload"):
@@ -95,10 +112,66 @@ def test_fake_adapter_satisfies_protocol():
 
 def test_generate_calls_adapter_in_phase_order(tmp_path, base_config):
     calls: list[str] = []
-    result = generate(base_config, FakeAdapter(calls))
+    result = generate(base_config, FakeAdapter(calls), {})
     assert calls == ["load", "encode", "denoise", "decode", "save"]
     assert isinstance(result, GenerationResult)
     assert result.output_path.endswith("out.png")
+
+
+def test_generate_passes_config_and_grouped_assets_into_load(tmp_path, base_config):
+    adapter = FakeAdapter()
+    assets = {"dit": (tmp_path / "dit-1.bin", tmp_path / "dit-2.bin"),
+              "vae": (tmp_path / "vae.bin",)}
+    generate(base_config, adapter, assets)
+    assert adapter.assets == assets  # verbatim, role-grouped tuples
+
+
+def test_generate_refuses_unconfigured_output_before_loading_adapter(base_config):
+    calls: list[str] = []
+    cfg = GenerationConfig(prompt="p", output_dir=None)
+    with pytest.raises(Exception) as exc:  # ConfigError -> CLI exit 2
+        generate(cfg, FakeAdapter(calls), {})
+    assert calls == []  # nothing loaded, nothing touched
+    from qwen_engine.config import ConfigError
+    assert isinstance(exc.value, ConfigError)
+
+
+def test_save_that_fails_cannot_claim_success(tmp_path, base_config):
+    with pytest.raises(RuntimeError):
+        generate(base_config, FakeAdapter(fail_save=True), {})
+
+
+def test_missing_saved_file_cannot_claim_success(tmp_path, base_config):
+    adapter = FakeAdapter(saved_to=tmp_path / "output" / "never_written.png")
+    with pytest.raises(OutputError) as exc:
+        generate(base_config, adapter, {})
+    assert "no regular file" in str(exc.value)
+
+
+def test_escaped_saved_file_cannot_claim_success(tmp_path, base_config):
+    sneaky = tmp_path / "elsewhere.png"
+    sneaky.write_bytes(b"data")  # real file, but outside output_dir
+    adapter = FakeAdapter(saved_to=sneaky)
+    with pytest.raises(OutputError) as exc:
+        generate(base_config, adapter, {})
+    assert "outside" in str(exc.value)
+
+
+def test_saved_symlink_escaping_output_dir_is_rejected(tmp_path, base_config):
+    out_dir = tmp_path / "output"
+    out_dir.mkdir(parents=True)
+    sneaky = tmp_path / "elsewhere.png"
+    sneaky.write_bytes(b"data")
+    link = out_dir / "out.png"
+    link.symlink_to(sneaky)
+
+    class LinkSaver(FakeAdapter):
+        def save(self, image, config):
+            self.calls.append("save")
+            return link
+
+    with pytest.raises(OutputError):
+        generate(base_config, LinkSaver(), {})
 
 
 def test_plan_is_deterministic_and_free_of_heavy_state(base_config):
@@ -111,12 +184,55 @@ def test_plan_is_deterministic_and_free_of_heavy_state(base_config):
     assert doc1["hardware"]["status"] == "unknown"
     assert doc1["calibration"]["status"] == "unknown"
     assert doc1["manifest"]["status"] == "unconfigured"
+    assert doc1["cfg_active"] is False  # default scale 1.0 -> CFG off
 
 
-def test_qwen21_diffusers_module_must_not_exist_yet():
-    # Stubbing the real adapter at M1 is a boundary violation (PLAN R1).
-    assert not (ROOT / "src" / "qwen_engine" / "adapters" /
-                "qwen21_diffusers.py").exists()
+def test_plan_has_no_dead_phases_constant():
+    import qwen_engine.core as core
+    assert not hasattr(core, "PHASES")
+
+
+def test_cpu_surface_imports_no_heavy_modules():
+    """Boundary is behavioural, not file-existence: importing the whole CPU
+    surface (config/manifest/log/core/CLI/adapter protocol) must never drag
+    in torch/diffusers/transformers, whatever else exists on disk."""
+    import importlib
+    for mod in ("qwen_engine.config", "qwen_engine.manifest", "qwen_engine.log",
+                "qwen_engine.core", "qwen_engine.cli", "qwen_engine.errors",
+                "qwen_engine.adapters.base"):
+        importlib.import_module(mod)
+    assert not set(HEAVY) & set(sys.modules)
+
+
+def test_make_adapter_names_the_absent_adapter_module(monkeypatch):
+    """The known M1 boundary: ModuleNotFoundError whose .name is exactly the
+    adapter module becomes a clear EngineError."""
+    import importlib
+
+    def fake_import(name):
+        raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+    with pytest.raises(EngineError) as exc:
+        cli._make_adapter()
+    assert "not implemented" in str(exc.value)
+
+
+def test_make_adapter_internal_dependency_error_keeps_identity(monkeypatch):
+    """A ModuleNotFoundError from *inside* a (future) adapter — e.g. torch
+    missing — must propagate unchanged, never be laundered into 'M1
+    boundary'."""
+    import importlib
+
+    def fake_import(name):
+        if name == "qwen_engine.adapters.qwen21_diffusers":
+            raise ModuleNotFoundError("No module named 'torch'", name="torch")
+        raise AssertionError("unexpected import")
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+    with pytest.raises(ModuleNotFoundError) as exc:
+        cli._make_adapter()
+    assert exc.value.name == "torch"
 
 
 # --- import / --help boundary (subprocess = true fresh interpreter) ------------
@@ -184,6 +300,7 @@ def test_dry_run_reports_required_fields(tmp_path, capsys):
     assert run_cli(tmp_path, ["--dry-run", "--config", config_file(tmp_path)]) == 0
     doc = json.loads(capsys.readouterr().out)
     assert doc["config"]["width"] == 1024 and doc["config"]["seed"] == 7
+    assert doc["config"]["steps"] == 40  # official Qwen example default
     assert doc["latent_tokens"] == 4096
     assert doc["manifest"]["status"] in ("unconfigured", "incomplete",
                                          "manifest_file_missing")
@@ -242,6 +359,34 @@ def test_bad_cli_override_exits_2(tmp_path, capsys):
     assert "width" in capsys.readouterr().err
 
 
+def test_true_cfg_scale_flag_reaches_config(tmp_path, capsys):
+    cfg = config_file(tmp_path, negative_prompt="blurry")
+    assert run_cli(tmp_path, ["--dry-run", "--config", cfg,
+                              "--true-cfg-scale", "3.5"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["config"]["true_cfg_scale"] == 3.5
+    assert doc["cfg_active"] is True
+
+
+def test_true_cfg_scale_below_one_exits_2(tmp_path, capsys):
+    assert run_cli(tmp_path, ["--dry-run", "--true-cfg-scale", "0.5"]) == 2
+    assert "true_cfg_scale" in capsys.readouterr().err
+
+
+def test_run_and_dry_run_are_mutually_exclusive(tmp_path, capsys):
+    assert run_cli(tmp_path, ["--dry-run", "--run"]) == 2
+    err = capsys.readouterr().err
+    assert "mutually exclusive" in err and "Traceback" not in err
+
+
+def test_invalid_utf8_config_file_exits_2(tmp_path, capsys):
+    bad = tmp_path / "config.json"
+    bad.write_bytes(b'{"prompt": "caf\xe9 invalid \xff"}')
+    assert run_cli(tmp_path, ["--config", bad, "--dry-run"]) == 2
+    err = capsys.readouterr().err
+    assert "UTF-8" in err and "Traceback" not in err
+
+
 def test_run_with_missing_assets_exits_4_and_names_artifact(tmp_path, capsys, monkeypatch):
     import socket
     monkeypatch.setattr(socket, "create_connection",
@@ -289,16 +434,74 @@ def test_unexpected_error_exits_1_without_traceback(tmp_path, capsys, monkeypatc
     assert "Traceback" not in err and "kaboom" in err
 
 
-def test_success_path_returns_zero(tmp_path, capsys, monkeypatch):
+def test_success_path_returns_zero_and_passes_verified_assets(tmp_path, capsys, monkeypatch):
     calls: list[str] = []
+    adapter = FakeAdapter(calls)
     mpath = write_manifest(tmp_path)
     (tmp_path / "models" / "dit" / "model.bin").parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / "models" / "dit" / "model.bin").write_bytes(b"payload")
-    monkeypatch.setattr(cli, "_make_adapter", lambda: FakeAdapter(calls))
+    monkeypatch.setattr(cli, "_make_adapter", lambda: adapter)
     cfg = config_file(tmp_path, output_dir=str(tmp_path / "output"),
                       manifest_path=str(mpath), models_dir=str(tmp_path / "models"))
     assert run_cli(tmp_path, ["--config", cfg, "--run"]) == 0
     assert calls == ["load", "encode", "denoise", "decode", "save"]
+    assert adapter.assets == {"dit": (tmp_path / "models" / "dit" / "model.bin",)}
+    out = json.loads(capsys.readouterr().out)
+    assert Path(out["output_path"]).is_file()
+
+
+def test_actual_run_without_output_dir_exits_2_without_loading(tmp_path, capsys, monkeypatch):
+    """Assets verified but output unconfigured: config error 2, the adapter
+    never loads and nothing is written (no implicit output targets)."""
+    calls: list[str] = []
+    adapter = FakeAdapter(calls)
+    mpath = write_manifest(tmp_path)
+    (tmp_path / "models" / "dit" / "model.bin").parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "models" / "dit" / "model.bin").write_bytes(b"payload")
+    monkeypatch.setattr(cli, "_make_adapter", lambda: adapter)
+    cfg = config_file(tmp_path, manifest_path=str(mpath),
+                      models_dir=str(tmp_path / "models"))
+    cfg = json.loads(Path(cfg).read_text())
+    cfg.pop("output_dir", None)
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg))
+    assert run_cli(tmp_path, ["--config", cfg_path, "--run"]) == 2
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "output_dir" in err and "Traceback" not in err
+
+
+def test_asset_errors_take_precedence_over_missing_output(tmp_path, capsys):
+    """Missing assets keep exit 4 even when output_dir is *also* unset."""
+    mpath = write_manifest(tmp_path)  # nothing materialized
+    cfg = json.dumps({"prompt": "p", "manifest_path": str(mpath),
+                      "models_dir": str(tmp_path / "models")})
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(cfg)
+    assert run_cli(tmp_path, ["--config", cfg_path, "--run"]) == 4
+    err = capsys.readouterr().err
+    assert "asset error" in err
+
+
+def test_unwritable_log_target_keeps_intended_exit_code(tmp_path, capsys, monkeypatch):
+    """A log sink that cannot write must never change the exit code or print
+    a traceback — only a short secondary diagnostic."""
+    log_dir = tmp_path / "logdir"
+    log_dir.mkdir()
+    (log_dir / "engine.jsonl").mkdir()  # blocks the sink's append target
+    mpath = write_manifest(tmp_path)
+    (tmp_path / "models" / "dit" / "model.bin").parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "models" / "dit" / "model.bin").write_bytes(b"payload")
+    monkeypatch.setattr(cli, "_run_generate",
+                        lambda *a, **k: (_ for _ in ()).throw(EngineError("planned failure")))
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps({
+        "prompt": "p", "log_dir": str(log_dir), "output_dir": str(tmp_path / "out"),
+        "manifest_path": str(mpath), "models_dir": str(tmp_path / "models")}))
+    assert run_cli(tmp_path, ["--config", cfg_path, "--run"]) == 1
+    err = capsys.readouterr().err
+    assert "planned failure" in err and "Traceback" not in err
+    assert "log sink failed" in err
 
 
 def test_cli_module_entry_point_declared():

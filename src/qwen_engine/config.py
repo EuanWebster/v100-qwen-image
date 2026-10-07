@@ -1,8 +1,10 @@
 """Immutable generation config + field-level validation (plan R1/R2, task 1.1).
 
-Stdlib-only. No I/O at import or construction time; every runtime path is a
-config-relocatable string field (R7) — ``None`` means *not configured*, and
-then nothing is written there (there are no implicit default write targets).
+Stdlib-only. No I/O at *import* time; construction performs only lightweight
+``exists``/``isdir`` checks on configured paths (never creates anything).
+Every runtime path is a config-relocatable string field (R7) — ``None`` means
+*not configured*, and then nothing is written there (there are no implicit
+default write targets).
 
 Latent token math follows the confirmed /16 spatial compression (C6):
 1024² -> 4096 tokens, 2048² -> 16384 tokens. Width and height must be
@@ -11,6 +13,8 @@ multiples of 32.
 from __future__ import annotations
 
 import json
+import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from enum import StrEnum
@@ -27,6 +31,16 @@ DIM_MULTIPLE = 32
 DIM_MIN, DIM_MAX = 64, 4096
 STEPS_MIN, STEPS_MAX = 1, 1000
 SEED_MIN, SEED_MAX = 0, 2**64 - 1
+#: true-CFG scale: finite and >= 1.0; 1.0 means CFG is off regardless of the
+#: negative prompt (official Qwen example runs 40 steps — the default).
+CFG_SCALE_MIN = 1.0
+DEFAULT_STEPS = 40
+
+#: Fields that must name an existing *directory* when they exist on disk.
+_DIR_FIELDS = ("output_dir", "cache_dir", "log_dir", "benchmarks_dir",
+               "models_dir")
+#: Fields that must name an existing *file* when they exist on disk.
+_FILE_FIELDS = ("manifest_path",)
 
 
 class Quant(StrEnum):
@@ -111,7 +125,8 @@ class GenerationConfig:
     negative_prompt: str = ""
     width: int = 1024
     height: int = 1024
-    steps: int = 30
+    steps: int = DEFAULT_STEPS
+    true_cfg_scale: float = CFG_SCALE_MIN
     seed: int | None = 0
     quant: Quant = Quant.FP16
     offload: OffloadMode = OffloadMode.RESIDENT
@@ -160,10 +175,7 @@ class GenerationConfig:
                         + f", got {value!r}",
                     )
                 )
-        for name in (
-            "output_dir", "cache_dir", "log_dir", "benchmarks_dir",
-            "models_dir", "manifest_path",
-        ):
+        for name in (*_DIR_FIELDS, *_FILE_FIELDS):
             value = getattr(self, name)
             if isinstance(value, Path):
                 object.__setattr__(self, name, str(value))
@@ -171,6 +183,24 @@ class GenerationConfig:
                 errors.append(
                     FieldError(name, f"must be a path string or null, got {value!r}")
                 )
+                continue
+            if value is None:
+                continue
+            if not value.strip():
+                errors.append(FieldError(name, f"must not be blank, got {value!r}"))
+            elif "\0" in value:
+                errors.append(FieldError(name, "must not contain a NUL byte"))
+            elif os.path.exists(value):
+                # Known file/directory mismatch — validated, never repaired:
+                # validation never creates directories or files.
+                if name in _DIR_FIELDS and not os.path.isdir(value):
+                    errors.append(
+                        FieldError(name, f"path exists but is not a directory: {value!r}")
+                    )
+                elif name in _FILE_FIELDS and not os.path.isfile(value):
+                    errors.append(
+                        FieldError(name, f"path exists but is not a file: {value!r}")
+                    )
 
         if not isinstance(self.prompt, str) or not self.prompt.strip():
             errors.append(FieldError("prompt", "must be a non-empty string"))
@@ -181,6 +211,19 @@ class GenerationConfig:
         _check_dim("width", self.width, errors)
         _check_dim("height", self.height, errors)
         _check_int("steps", self.steps, STEPS_MIN, STEPS_MAX, errors)
+        if isinstance(self.true_cfg_scale, bool) or not isinstance(
+                self.true_cfg_scale, (int, float)):
+            errors.append(
+                FieldError("true_cfg_scale",
+                           f"must be a finite number >= {CFG_SCALE_MIN}, "
+                           f"got {self.true_cfg_scale!r}")
+            )
+        elif not math.isfinite(self.true_cfg_scale) or self.true_cfg_scale < CFG_SCALE_MIN:
+            errors.append(
+                FieldError("true_cfg_scale",
+                           f"must be a finite number >= {CFG_SCALE_MIN}, "
+                           f"got {self.true_cfg_scale!r}")
+            )
         if self.seed is not None:
             if not _is_int(self.seed):
                 errors.append(FieldError("seed", f"must be an integer or null, got {self.seed!r}"))
@@ -208,6 +251,19 @@ class GenerationConfig:
         Validated configs guarantee multiples of 32, so the division is exact.
         """
         return (self.width // SPATIAL_COMPRESSION) * (self.height // SPATIAL_COMPRESSION)
+
+    @property
+    def cfg_active(self) -> bool:
+        """True-CFG semantics: guidance is active only when a negative prompt
+        is present **and** ``true_cfg_scale > 1``.
+
+        With the scale at exactly 1.0 the negative prompt is not consulted at
+        all (batch duplication would be wasted work); with no negative prompt
+        a scale above 1 is meaningless. Both conditions must hold — this is
+        the single source of truth for the adapter and the memory policy
+        (CFG duplication in the R4 descriptor keys off it).
+        """
+        return bool(self.negative_prompt.strip()) and self.true_cfg_scale > 1.0
 
     # --- JSON / dict round-trip -----------------------------------------------
 

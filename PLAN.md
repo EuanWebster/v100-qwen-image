@@ -431,3 +431,23 @@ unexpected (logged with context, traceback only into the log sink).
 
 *(empty — appended during the build, one line per deviation from this plan, per the
 standing rule that executed plans stay honest.)*
+
+- 2026-10-07 senior-review fix pass (manifest commit `36abafc` + config/core/CLI/log
+  commit): multi-artifact roles with filename identity + `resolve_model_paths`;
+  construction-time manifest validation; containment-checked single-fd resolver with
+  regular-file and change detection (missing ≠ unreadable, typed path escapes).
+- Same pass: default `steps=40` (official Qwen example); `true_cfg_scale` (finite
+  ≥1.0, default 1.0), CFG active only when negative prompt present AND scale > 1;
+  CLI `--true-cfg-scale`; path fields reject blank/NUL/file-dir mismatches without
+  creating anything; invalid-UTF-8 config → exit 2.
+- Same pass: adapter `load(config, assets)` receives verified role-grouped paths;
+  core refuses unconfigured `output_dir` before load and verifies the saved regular
+  file stays inside `output_dir`; adapter `plan` method + dead `PHASES` removed
+  (core planning adapter-independent this milestone).
+- Same pass: `--run`/`--dry-run` exclusive (2); asset errors keep exit 4 (checked
+  first); `_make_adapter` maps only the exact absent-adapter ModuleNotFoundError;
+  CLI handlers survive dead log sinks; logger records carry `schema_version` +
+  injectable `run_id`, phase stack leak-free on failed start emission, log faults
+  never mask primaries. `license = "MIT"` removed (none selected); build backend
+  pinned `setuptools==84.0.0`; uv lock in sync. 182 CPU tests pass on Python 3.13;
+  Python 3.11 execution still outstanding (M0/R7 fresh-env rule).

@@ -36,7 +36,27 @@ def test_event_emits_one_jsonl_line_with_core_fields():
     logger.event("done")
     assert len(sink.lines) == 1
     rec = sink.records()[0]
-    assert rec == {"ts": 1.0, "phase": "engine", "event": "done", "elapsed_ms": None}
+    assert rec == {"schema_version": 1, "run_id": None, "ts": 1.0,
+                   "phase": "engine", "event": "done", "elapsed_ms": None}
+
+
+def test_run_id_is_injectable_and_appears_on_every_record():
+    sink = ListSink()
+    logger = PhaseLogger(sink=sink, clock=lambda: 0.0, wall_clock=lambda: 1.0,
+                         run_id="run-42")
+    with logger.phase("load"):
+        logger.event("tick")
+    for rec in sink.records():
+        assert rec["run_id"] == "run-42"
+        assert rec["schema_version"] == 1
+
+
+def test_reserved_keys_cover_attribution_fields():
+    _, logger = make_logger()
+    with pytest.raises(ValueError):
+        logger.event("done", run_id="forged")
+    with pytest.raises(ValueError):
+        logger.event("done", schema_version=99)
 
 
 def test_extra_fields_merge_into_record_and_are_sorted():
@@ -98,6 +118,44 @@ def test_nested_phases_restore_outer_phase():
     recs = sink.records()
     assert recs[2]["phase"] == "inner"
     assert recs[-1]["phase"] == "outer"
+
+
+class ExplodingSink:
+    """Raises whenever a record whose event is in *fail_on* is emitted."""
+
+    def __init__(self, fail_on, inner=None):
+        self.fail_on = set(fail_on)
+        self.inner = inner or ListSink()
+
+    def __call__(self, line: str) -> None:
+        rec = json.loads(line)
+        if rec["event"] in self.fail_on:
+            raise OSError("log sink exploded")
+        self.inner(line)
+
+    def records(self):
+        return self.inner.records()
+
+
+def test_phase_stack_survives_failed_start_emission():
+    """A sink that dies at phase_start must not leak a stack entry: the
+    logger keeps working afterwards with a clean phase context."""
+    sink = ExplodingSink({"phase_start"})
+    logger = PhaseLogger(sink=sink, clock=lambda: 0.0, wall_clock=lambda: 1.0)
+    with logger.phase("load"):
+        pass
+    assert logger._stack == []
+    logger.event("after")  # must report the default phase, not "load"
+    assert sink.records()[-1]["phase"] == "engine"
+
+
+def test_failed_phase_error_emission_does_not_mask_primary_exception():
+    sink = ExplodingSink({"phase_error"})
+    logger = PhaseLogger(sink=sink, clock=lambda: 0.0, wall_clock=lambda: 1.0)
+    with pytest.raises(RuntimeError):  # not OSError from the sink
+        with logger.phase("load"):
+            raise RuntimeError("boom")
+    assert logger._stack == []
 
 
 def test_default_logger_writes_nothing_anywhere(tmp_path, monkeypatch):

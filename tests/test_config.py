@@ -134,6 +134,83 @@ def test_seed_none_is_valid():
     assert GenerationConfig(prompt="p", seed=None).seed is None
 
 
+# --- steps / true-CFG defaults and semantics --------------------------------------
+
+
+def test_default_steps_is_40_official_qwen_example():
+    assert GenerationConfig().steps == 40
+    assert json.loads(GenerationConfig().to_json())["steps"] == 40
+
+
+def test_true_cfg_scale_defaults_to_1():
+    assert GenerationConfig().true_cfg_scale == 1.0
+    assert GenerationConfig.from_json(GenerationConfig().to_json()).true_cfg_scale == 1.0
+
+
+@pytest.mark.parametrize("value", [0.5, -1.0, 0, True, "2.0", float("inf"),
+                                  float("nan"), None])
+def test_invalid_true_cfg_scale_names_field(value):
+    with pytest.raises(ConfigError) as exc:
+        GenerationConfig(prompt="p", true_cfg_scale=value)
+    assert "true_cfg_scale" in _err_fields(exc)
+
+
+@pytest.mark.parametrize("value", [1, 1.0, 2.5, 1000.0])
+def test_valid_true_cfg_scale_accepted(value):
+    assert GenerationConfig(prompt="p", true_cfg_scale=value).true_cfg_scale == value
+
+
+@pytest.mark.parametrize("negative,scale,active", [
+    ("", 1.0, False),
+    ("ugly", 1.0, False),        # scale 1.0 -> CFG off, negative unused
+    ("   ", 2.0, False),         # blank negative prompt counts as absent
+    ("", 2.0, False),           # no negative -> nothing to guide against
+    ("ugly", 1.01, True),
+    ("ugly", 4.5, True),
+])
+def test_cfg_active_requires_negative_and_scale_above_1(negative, scale, active):
+    cfg = GenerationConfig(prompt="p", negative_prompt=negative,
+                           true_cfg_scale=scale)
+    assert cfg.cfg_active is active
+
+
+# --- path field validation ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("field", ["output_dir", "cache_dir", "log_dir",
+                                   "benchmarks_dir", "models_dir", "manifest_path"])
+@pytest.mark.parametrize("value", ["", "   ", "a\x00b"])
+def test_path_fields_reject_blank_whitespace_and_nul(field, value):
+    with pytest.raises(ConfigError) as exc:
+        GenerationConfig(prompt="p", **{field: value})
+    assert field in _err_fields(exc)
+
+
+def test_dir_field_existing_as_file_is_rejected(tmp_path):
+    as_file = tmp_path / "not_a_dir"
+    as_file.write_text("x")
+    with pytest.raises(ConfigError) as exc:
+        GenerationConfig(prompt="p", output_dir=str(as_file))
+    assert "output_dir" in _err_fields(exc)
+    assert "directory" in str(exc.value)
+
+
+def test_manifest_path_existing_as_dir_is_rejected(tmp_path):
+    with pytest.raises(ConfigError) as exc:
+        GenerationConfig(prompt="p", manifest_path=str(tmp_path))
+    assert "manifest_path" in _err_fields(exc)
+    assert "file" in str(exc.value)
+
+
+def test_path_validation_never_creates_anything(tmp_path):
+    target = tmp_path / "would_be_created"
+    GenerationConfig(prompt="p", output_dir=str(target),
+                     cache_dir=str(tmp_path / "cache"))
+    assert not target.exists()
+    assert not (tmp_path / "cache").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
 # --- latent token math (C6: /16 spatial compression) ---------------------------
 
 

@@ -7,7 +7,9 @@ import test catches. Heavy imports stay deferred inside that future adapter.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from qwen_engine.config import (
@@ -25,15 +27,18 @@ ATTENTION_BACKEND_CHOICES = [m.value for m in AttentionBackend]
 
 @runtime_checkable
 class GenerationAdapter(Protocol):
-    """What the engine core calls, in order: plan/load/encode/denoise/decode/save."""
+    """What the engine core calls, in order: load/encode/denoise/decode/save.
 
-    def plan(self, config: GenerationConfig) -> dict[str, Any]:
-        """Adapter-side plan information (safe: no heavy imports required
-        for the fake adapters used in tests)."""
-        ...
+    (Dry-run planning is adapter-independent at this milestone — the core
+    builds the plan document itself; there is deliberately no ``plan`` here.)
+    """
 
-    def load(self) -> None:
-        """Load/attach model components (the heavy step; deferred imports live here)."""
+    def load(self, config: GenerationConfig,
+             assets: Mapping[str, tuple[Path, ...]]) -> None:
+        """Load/attach the verified model components (the heavy step; deferred
+        imports live here). ``assets`` are the resolver's verified paths
+        grouped by role — the adapter must take its weights from there, never
+        from a repo id or an ambient HF cache."""
         ...
 
     def encode(self, config: GenerationConfig) -> Any:

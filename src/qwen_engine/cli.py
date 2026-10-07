@@ -46,6 +46,7 @@ _OVERRIDES = {
     "width": "width",
     "height": "height",
     "steps": "steps",
+    "true_cfg_scale": "true_cfg_scale",
     "seed": "seed",
     "quant": "quant",
     "offload": "offload",
@@ -84,6 +85,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--width", type=int)
     p.add_argument("--height", type=int)
     p.add_argument("--steps", type=int)
+    p.add_argument("--true-cfg-scale", dest="true_cfg_scale", type=float, default=None,
+                   help="true CFG scale (>= 1.0; guidance active only with a "
+                        "negative prompt AND scale > 1)")
     p.add_argument("--seed", type=int)
     p.add_argument("--quant", choices=QUANT_CHOICES)
     p.add_argument("--offload", choices=OFFLOAD_CHOICES)
@@ -102,10 +106,18 @@ def _load_config(args: argparse.Namespace) -> GenerationConfig:
     data: dict[str, Any] = {}
     if args.config is not None:
         try:
-            text = args.config.read_text(encoding="utf-8")
+            raw = args.config.read_bytes()
         except OSError as exc:
             raise ConfigError(
                 f'config: config file not readable: {args.config}: {exc.strerror or exc}'
+            ) from exc
+        except ValueError as exc:  # embedded NUL in path
+            raise ConfigError(f"config: config path invalid: {args.config}: {exc}") from exc
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ConfigError(
+                f"config: config file is not valid UTF-8: {args.config}: {exc}"
             ) from exc
         try:
             loaded = json.loads(text)
@@ -129,8 +141,10 @@ def _logger_for(config: GenerationConfig) -> PhaseLogger:
     return PhaseLogger()  # nothing configured -> nothing written
 
 
-def _verify_assets(config: GenerationConfig) -> None:
-    """No-download contract (R3): refuse to run on any unresolved asset."""
+def _verify_assets(config: GenerationConfig):
+    """No-download contract (R3): refuse to run on any unresolved asset.
+    Returns the :class:`ResolutionReport` so the caller can hand the verified,
+    role-grouped paths to the adapter."""
     if config.manifest_path is None:
         raise ManifestError(
             "no model manifest configured (manifest_path is null): assets are "
@@ -148,16 +162,26 @@ def _verify_assets(config: GenerationConfig) -> None:
             f"{len(report.errors)} model artifact(s) unresolved; nothing "
             f"downloaded (fetching is a separate operator action)"
         )
+    return report
 
 
 def _make_adapter() -> Any:
     """Instantiate the real adapter. Absent at M1 — importing a heavy
-    adapter is the *only* path to torch/diffusers/transformers."""
+    adapter is the *only* path to torch/diffusers/transformers.
+
+    Only the *absence of the adapter module itself* is the known M1
+    boundary; a :class:`ModuleNotFoundError` for anything else (e.g. torch
+    missing *inside* a future adapter) keeps its own identity — an
+    unimplemented milestone must never masquerade as a missing dependency,
+    and vice versa.
+    """
     import importlib
 
     try:
         module = importlib.import_module("qwen_engine.adapters.qwen21_diffusers")
-    except ImportError as exc:
+    except ModuleNotFoundError as exc:
+        if exc.name != "qwen_engine.adapters.qwen21_diffusers":
+            raise
         raise EngineError(
             "no pipeline adapter available: Qwen21DiffusersAdapter is not "
             "implemented yet (M4+); heavy ML imports are reachable only "
@@ -167,16 +191,30 @@ def _make_adapter() -> Any:
 
 
 def _run_generate(config: GenerationConfig, logger: PhaseLogger,
-                  adapter: Any = None) -> int:
+                  assets: Any = None, adapter: Any = None) -> int:
     adapter = adapter if adapter is not None else _make_adapter()
-    result = generate(config, adapter, logger)
+    result = generate(config, adapter, assets or {}, logger)
     print(json.dumps(result.to_dict(), sort_keys=True))
     return int(ExitCode.OK)
+
+
+def _safe_log(logger: PhaseLogger, name: str, **fields: Any) -> None:
+    """Log an event without ever changing the CLI's exit path: a broken log
+    sink gets one short diagnostic line and is otherwise ignored."""
+    try:
+        logger.event(name, **fields)
+    except Exception as log_exc:
+        print(f"warning: log sink failed: {type(log_exc).__name__}: {log_exc}",
+              file=sys.stderr)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)  # usage errors: argparse prints + exit 2
+    if args.run and args.dry_run:
+        print("error: --run and --dry-run are mutually exclusive", file=sys.stderr)
+        parser.print_usage(sys.stderr)
+        return int(ExitCode.CONFIG)
     logger = PhaseLogger()
     try:
         config = _load_config(args)
@@ -189,8 +227,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.run:
             parser.print_help()
             return int(ExitCode.OK)
-        _verify_assets(config)  # -> ManifestError -> exit 4
-        return _run_generate(config, logger)
+        # Asset problems are checked first and keep exit 4 even when the
+        # config is *also* incomplete (missing output_dir is a config error 2
+        # raised inside generate, before the adapter loads).
+        report = _verify_assets(config)  # -> ManifestError -> exit 4
+        return _run_generate(config, logger, assets=report.resolved)
     except ConfigError as exc:
         for err in exc.errors:
             print(f"config error: {err}", file=sys.stderr)
@@ -205,13 +246,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"asset error: {exc}", file=sys.stderr)
         return int(ExitCode.ASSET)
     except EngineError as exc:
-        logger.event("engine_error", error=str(exc))
+        _safe_log(logger, "engine_error", error=str(exc))
         print(f"error: {exc}", file=sys.stderr)
         return int(ExitCode.UNEXPECTED)
     except Exception:
         tb = traceback.format_exc()
-        logger.event("unexpected_error", error=tb.splitlines()[-1],
-                     traceback=tb)
+        _safe_log(logger, "unexpected_error", error=tb.splitlines()[-1],
+                  traceback=tb)
         print(f"error: unexpected {sys.exc_info()[0].__name__}: "
               f"{sys.exc_info()[1]}", file=sys.stderr)
         return int(ExitCode.UNEXPECTED)

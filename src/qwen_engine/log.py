@@ -16,7 +16,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 #: Record keys that events may not shadow with extra fields.
-RESERVED_KEYS = frozenset({"ts", "phase", "event", "elapsed_ms"})
+RESERVED_KEYS = frozenset({"ts", "phase", "event", "elapsed_ms",
+                           "schema_version", "run_id"})
+
+#: Schema version of a log record (future readers dispatch on it).
+LOG_SCHEMA_VERSION = 1
 
 #: Phase name reported when an event arrives outside any active phase.
 DEFAULT_PHASE = "engine"
@@ -59,6 +63,12 @@ class PhaseLogger:
     human_sink: Sink | None = None
     clock: Callable[[], float] = time.monotonic
     wall_clock: Callable[[], float] = time.time
+    #: Record schema version — every record carries it.
+    schema_version: int = LOG_SCHEMA_VERSION
+    #: Injectable run identifier so logs from concurrent runs stay
+    #: attributable. Default ``None``: single-run logs need no attribution;
+    #: there are still **no default file writes** anywhere.
+    run_id: str | None = None
     _stack: list[tuple[str, float]] = field(default_factory=list, repr=False)
 
     # --- emitting ---------------------------------------------------------
@@ -76,6 +86,8 @@ class PhaseLogger:
         if active is not None and current == active[0]:
             elapsed_ms = (self.clock() - active[1]) * 1000.0
         record: dict[str, Any] = {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
             "ts": self.wall_clock(),
             "phase": current,
             "event": name,
@@ -91,24 +103,42 @@ class PhaseLogger:
 
     @contextmanager
     def phase(self, name: str):
-        """Context manager timing one engine phase (load/encode/denoise/...)."""
+        """Context manager timing one engine phase (load/encode/denoise/...).
+
+        The stack entry is popped on **every** exit path, including a sink
+        that fails while the ``phase_start`` record is emitted, and a failing
+        ``phase_error`` emission never masks the primary exception.
+        """
         start = self.clock()
         self._stack.append((name, start))
-        self._emit({"ts": self.wall_clock(), "phase": name,
-                    "event": "phase_start", "elapsed_ms": 0.0})
         try:
-            yield self
-        except BaseException as exc:
-            elapsed_ms = (self.clock() - start) * 1000.0
-            self._emit({"ts": self.wall_clock(), "phase": name,
-                        "event": "phase_error", "elapsed_ms": elapsed_ms,
-                        "error": type(exc).__name__})
-            raise
-        else:
-            elapsed_ms = (self.clock() - start) * 1000.0
-            self._emit({"ts": self.wall_clock(), "phase": name,
-                        "event": "phase_end", "elapsed_ms": elapsed_ms})
-            if self.human_sink is not None:
-                self.human_sink(f"[{name}] done in {elapsed_ms:.0f} ms")
+            try:
+                self._emit({"schema_version": self.schema_version,
+                            "run_id": self.run_id,
+                            "ts": self.wall_clock(), "phase": name,
+                            "event": "phase_start", "elapsed_ms": 0.0})
+            except Exception:
+                pass  # a dead sink must not abort the phase itself
+            try:
+                yield self
+            except BaseException as exc:
+                elapsed_ms = (self.clock() - start) * 1000.0
+                try:
+                    self._emit({"schema_version": self.schema_version,
+                                "run_id": self.run_id,
+                                "ts": self.wall_clock(), "phase": name,
+                                "event": "phase_error", "elapsed_ms": elapsed_ms,
+                                "error": type(exc).__name__})
+                except Exception:
+                    pass  # never mask the primary exception with a log fault
+                raise
+            else:
+                elapsed_ms = (self.clock() - start) * 1000.0
+                self._emit({"schema_version": self.schema_version,
+                            "run_id": self.run_id,
+                            "ts": self.wall_clock(), "phase": name,
+                            "event": "phase_end", "elapsed_ms": elapsed_ms})
+                if self.human_sink is not None:
+                    self.human_sink(f"[{name}] done in {elapsed_ms:.0f} ms")
         finally:
             self._stack.pop()
