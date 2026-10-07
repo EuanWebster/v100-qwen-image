@@ -43,6 +43,18 @@ any ML import:
    whole-bundle digest and an encoder+processor digest for future cache keys.
    A digest is *identity metadata*: it changes exactly when one of those
    identities changes, and proves nothing about tensor load or quality.
+   The encoder digest is only the **asset component** of a future encoder
+   worker cache key — the production worker key must additionally carry the
+   worker protocol/implementation revision and the exact
+   diffusers/transformers pins (the worker milestone owns that; see
+   :class:`ArtifactSetFingerprints`).
+5. A future ``from_pretrained(component_dir)`` may open files the manifest
+   never listed. :func:`preflight_closed_tree` (also a method on the bundle)
+   enumerates the *whole* tree under an explicit root and refuses any entry
+   outside the 24-file allowlist and its required directories — extra
+   config/weight/code files, leftover ``*.partial`` fetch debris and
+   symlinks included — reading no contents. It is opt-in for the future
+   probe and must not be run on a root with a fetch in progress.
 
 Paths come only from the explicit ``models_dir`` root plus manifest filenames
 — never from a repo id, never from an ambient Hugging Face cache. Everything
@@ -186,6 +198,16 @@ class BundlePathError(LocalBundleError):
     """A projected path failed the cheap structural probe: missing, escaped
     the model root (symlink), or is not a regular file (directory/FIFO swap).
     Never re-hashes content — the resolver owns byte-level verification."""
+
+
+class BundleTreeError(LocalBundleError):
+    """The *closed tree* under an explicit model root deviates from the
+    profile: an extra or unexpected entry (file, symlink or directory —
+    including leftover ``*.partial`` fetch debris and extra config/weight/
+    code files), an allowlisted path occupied by a symlink or the wrong
+    entry kind, or a missing allowlisted entry. Raised by
+    :func:`preflight_closed_tree` before any ML import; contents are never
+    read or re-hashed."""
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +439,15 @@ class LocalReferenceBundle:
         """Target for a future ``from_pretrained(<dir>, local_files_only=True)``."""
         return self.root
 
+    def preflight_closed_tree(self) -> tuple[str, ...]:
+        """Closed-tree check of this bundle's published ``root`` before a
+        future ``from_pretrained`` probe may open it: every entry under the
+        root must be part of the profile tree (see
+        :func:`preflight_closed_tree`). Contents are not read. Never run
+        this on a root whose fetch is still in progress — an in-flight
+        ``*.partial`` is refused here by design."""
+        return preflight_closed_tree(self.root)
+
     def to_dict(self) -> dict[str, Any]:
         """Deterministic, timestamp-free description for status/logging.
         Metadata about identities — no claim that anything was loaded."""
@@ -431,6 +462,115 @@ class LocalReferenceBundle:
                                for role, d in self.component_dirs.items()},
             "fingerprints": self.fingerprints.to_dict(),
         }
+
+
+# ---------------------------------------------------------------------------
+# Closed-tree preflight (review item 3): a future from_pretrained(component_dir)
+# may read files BEYOND the manifest — enumerate the whole tree first
+# ---------------------------------------------------------------------------
+
+
+def _closed_tree_entries() -> dict[str, str]:
+    """relative path -> ``"file"`` or ``"dir"``, from the layout table: the
+    24 allowlisted files plus the required directory tree leading to them."""
+    entries: dict[str, str] = {}
+    for filenames in LOCAL_REFERENCE_LAYOUT.values():
+        for filename in filenames:
+            entries[filename] = "file"
+            parent = os.path.dirname(filename)
+            while parent:
+                entries.setdefault(parent, "dir")
+                parent = os.path.dirname(parent)
+    return entries
+
+
+def preflight_closed_tree(root: str | Path) -> tuple[str, ...]:
+    """Enumerate EVERY entry under the explicit model ``root`` and refuse
+    anything that is not part of the closed profile tree (the 24 allowlisted
+    files, the required component directories, and nothing else).
+
+    A future ``from_pretrained(component_dir)`` may open files the manifest
+    never listed (leftover ``*.partial`` fetch debris, extra
+    config/weight/code files, shadowing ``*.py``); this stdlib preflight is
+    what a future local probe calls BEFORE any ML import so the "we load
+    exactly the pinned 24 files" claim stays true of the *directory*, not
+    just of the manifest. Contents are never read or re-hashed — entries
+    are classified by their directory-entry kind only (no symlink
+    following: symlinks are refused even at allowlisted paths, deliberately
+    *stricter* than the resolver's inside-root symlink tolerance, because a
+    link redirects whatever the future loader opens).
+
+    Do **not** run this on a root with an in-progress fetch: a legitimate
+    in-flight ``*.partial`` is refused here by design — the preflight is for
+    the *settled* tree. Performs no network access, no mkdir, no writes;
+    refusals are typed :class:`BundleTreeError` before any ML import.
+    Returns the sorted tuple of all checked relative paths.
+    """
+    root_path = Path(root)
+    root_resolved, root_fail = _resolve_or_fail(root_path)
+    if root_resolved is None:
+        raise BundleTreeError(
+            f"model root cannot be resolved: {root_path} ({root_fail})")
+    if not root_resolved.is_dir():
+        raise BundleTreeError(
+            f"model root is not a directory: {root_resolved}")
+    expected = _closed_tree_entries()
+    seen: set[str] = set()
+    stack: list[Path] = [root_resolved]
+    while stack:
+        directory = stack.pop()
+        try:
+            entries = sorted(os.scandir(directory), key=lambda e: e.name)
+        except OSError as exc:
+            raise BundleTreeError(
+                f"cannot enumerate directory "
+                f"{os.path.relpath(directory, root_resolved) or '.'} under "
+                f"the model root: errno {exc.errno} "
+                f"({exc.strerror or type(exc).__name__})") from exc
+        for entry in entries:
+            rel = os.path.relpath(entry.path, root_resolved)
+            rel = rel.replace(os.sep, "/")
+            is_link = entry.is_symlink()
+            is_dir = entry.is_dir(follow_symlinks=False)
+            kind = expected.get(rel)
+            if kind is None:
+                what = ("a symlink (even one pointing inside the root — "
+                        "closed-tree policy refuses links outright)"
+                        if is_link else "a directory" if is_dir
+                        else "a regular file"
+                        if entry.is_file(follow_symlinks=False)
+                        else "another entry type (special file)")
+                raise BundleTreeError(
+                    f"{rel}: found {what}, but it is NOT part of the closed "
+                    f"{LOCAL_REFERENCE_PROFILE} tree (the {LAYOUT_FILE_COUNT}"
+                    f"-file allowlist and its required directories only) — "
+                    "a future from_pretrained() over this root could open "
+                    "it; remove the stray entry (fetch debris like "
+                    "'*.partial' counts) before any ML import")
+            if is_link:
+                raise BundleTreeError(
+                    f"{rel}: an allowlisted path is a symlink; the closed "
+                    "tree requires the real entry, not a pointer elsewhere "
+                    "(stricter than the resolver by design)")
+            if kind == "dir":
+                if not is_dir:
+                    raise BundleTreeError(
+                        f"{rel}: the required component directory is a "
+                        f"regular file or special entry, not a directory")
+                stack.append(Path(entry.path))
+            else:
+                if is_dir or not entry.is_file(follow_symlinks=False):
+                    raise BundleTreeError(
+                        f"{rel}: an allowlisted file path is a "
+                        f"{'directory' if is_dir else 'non-regular entry'}, "
+                        "not a regular file")
+            seen.add(rel)
+    missing = sorted(set(expected) - seen)
+    if missing:
+        raise BundleTreeError(
+            "missing from the closed tree under "
+            f"{root_resolved}: " + ", ".join(missing))
+    return tuple(sorted(expected))
 
 
 # ---------------------------------------------------------------------------

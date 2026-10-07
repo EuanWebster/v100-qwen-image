@@ -924,3 +924,99 @@ def test_module_import_is_ml_free():
                          capture_output=True, text=True, timeout=120)
     assert out.returncode == 0, out.stderr
     assert "ML-FREE-OK" in out.stdout
+
+
+# ---------------------------------------------------------------------------
+# Closed-tree preflight (review item 3): a from_pretrained(component_dir)
+# must never meet a file that the manifest never listed
+# ---------------------------------------------------------------------------
+
+#: Recognized-LOOKING extras: config-style, weight-style and code-style
+#: names a future loader could plausibly open even though the manifest does
+#: not list them (review item 3).
+EXTRA_LOOKALIKE_FILES = [
+    "model_index.json.bak",              # stray backup at the root
+    "pipeline.py",                       # shadowing code file
+    "scheduler/extra_scheduler.json",    # extra config-style file
+    "transformer/model.safetensors",     # extra weight-style file
+    "vae/diffusion_pytorch_model-00002-of-00002.safetensors",  # fake shard
+    "text_encoder/extra/generation_config.json",  # extra directory + file
+]
+
+
+def test_preflight_accepts_the_exact_fake_tree(tmp_path):
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    bundle = _project(manifest, root)
+    checked = bundle.preflight_closed_tree()
+    # Every layout file plus every required component directory was checked.
+    flat = {fn for fns in lb.LOCAL_REFERENCE_LAYOUT.values() for fn in fns}
+    dirs = {d for d in lb.ROLE_DIRECTORIES.values() if d != "."}
+    assert set(checked) == flat | dirs
+    assert len(checked) == len(flat) + len(dirs)
+    # And the module-level function agrees on the same root.
+    assert lb.preflight_closed_tree(root) == checked
+
+
+def test_preflight_refuses_extra_recognized_looking_files(tmp_path):
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    for rel in EXTRA_LOOKALIKE_FILES:
+        stray = root / rel
+        stray.parent.mkdir(parents=True, exist_ok=True)
+        stray.write_bytes(b"not in the manifest")
+        with pytest.raises(lb.BundleTreeError,
+                           match="NOT part of the closed"):
+            lb.preflight_closed_tree(root)
+
+
+def test_preflight_refuses_leftover_partial_before_any_ml_import(tmp_path):
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    debris = (root / "transformer"
+              / "diffusion_pytorch_model-00001-of-00002.safetensors.partial")
+    debris.write_bytes(b"interrupted fetch debris")
+    with pytest.raises(lb.BundleTreeError, match="NOT part of the closed"):
+        lb.preflight_closed_tree(root)
+
+
+def test_preflight_refuses_symlink_even_inside_root(tmp_path):
+    """Deliberately stricter than the resolver/projection: an allowlisted
+    path reached through a symlink redirects whatever from_pretrained
+    opens, so the closed tree refuses links outright."""
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    link = root / "processor" / "merges.txt"
+    target = root / "processor" / "vocab.json"
+    link.unlink()
+    link.symlink_to(target)  # target stays INSIDE the root
+    with pytest.raises(lb.BundleTreeError, match="is a symlink"):
+        lb.preflight_closed_tree(root)
+
+
+def test_preflight_refuses_extra_directory_even_when_empty(tmp_path):
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    (root / "vae" / "cache").mkdir()
+    with pytest.raises(lb.BundleTreeError, match="NOT part of the closed"):
+        lb.preflight_closed_tree(root)
+
+
+def test_preflight_refuses_wrong_entry_kind_and_missing_entry(tmp_path):
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    victim = root / "vae" / "config.json"
+    victim.unlink()
+    victim.mkdir()  # directory where an allowlisted file belongs
+    with pytest.raises(lb.BundleTreeError, match="not a regular file"):
+        lb.preflight_closed_tree(root)
+    victim.rmdir()
+    victim.write_bytes(b"x" * 3)
+    (root / "scheduler" / "scheduler_config.json").unlink()
+    with pytest.raises(lb.BundleTreeError, match="missing from the closed"):
+        lb.preflight_closed_tree(root)
+
+
+def test_preflight_missing_root_refused(tmp_path):
+    with pytest.raises(lb.BundleTreeError, match="not a directory"):
+        lb.preflight_closed_tree(tmp_path / "nowhere")
