@@ -791,4 +791,48 @@ standing rule that executed plans stay honest.)*
   calibration — M2 is *partially* prepared, and none of it is blocked on code
   design solely because the GPU is absent. `sandbox.yaml` user edit still
   uncommitted. Awaiting root review.
+- 2026-10-07 **M2.1 fetch tool: CODE + OFFLINE TESTS only** (this commit; sole
+  writer Qwen, task `/tmp/v100-m2-fetch-task.md`, root acceptance `511e282`
+  respected as the starting point; accepted M1 `fd3ba15` / M0.1 `315705d` /
+  M0.2 `dad7ee0` untouched): committed `tools/fetch_models.py` — the explicit
+  operator asset fetcher for the committed schema-v1 manifest. Pure stdlib
+  (plus the pure-stdlib `qwen_engine.manifest` parser); default/`--help`/plan
+  paths are read-only and **socket-free**; the ONLY network/write path is an
+  explicit `--fetch` with explicit `--manifest`/`--models-dir` (no implicit
+  defaults, no ambient HF cache, no branch fallback — the manifest's pinned
+  40-hex revision is the only one the parser accepts). Fixed HTTPS official
+  Hub (`https://huggingface.co/<repo>/resolve/<rev>/<file>`, host constant,
+  URL-safe repo segments, non-HTTPS redirects refused, signed redirect
+  queries stripped from every message); bounded 1 MiB streaming with the
+  manifest byte count enforced as an upper bound *while reading*; publish
+  only on exact size+SHA256 via atomic **no-clobber** `os.link` of
+  `<file>.partial` (never rename/replace over an existing final); honest
+  Range resume (append only on 206 + `Content-Range` proven to start at the
+  requested offset; Range ignored/misstated → refused, partial untouched;
+  final verification always rehashes the whole file from disk, so a corrupt
+  partial can never publish); existing verified finals skipped, existing
+  bad-identity finals refused never-deleted/overwritten; symlinked paths on
+  the write path refused; bounded disk estimate vs fresh `statvfs` free
+  printed before any transfer (disk only — **no RAM/GPU fit claim**);
+  tool-specific exit codes (0/2/3/4/5/6, documented in `--help` and distinct
+  from the engine contract). `tests/test_fetch_tool.py`: **31** offline
+  fake-stream tests (injected transport — zero sockets, zero real weights,
+  writes only in `tmp_path`): happy path incl. >1 MiB stream, already-good
+  skip, mismatched-final never-touched, truncated/oversized/bad-hash/
+  gzip-encoded refusals, interrupt→resume with real Range headers, ignored
+  Range and four forged/wrong `Content-Range` shapes refused untouched,
+  oversized partial, symlinked partial / symlinked write-path dir /
+  symlinked final refusals, disk-space refusal before any action,
+  publish-no-clobber unit, signed-query error sanitation, manifest branch
+  + multi-segment-repo refusals, fresh-child offline plan/help, no-heavy-
+  import checks. Engine manifest/resolver/dry-run/no-download semantics and
+  the 24-entry pinned manifest are **unchanged**. Evidence: guarded suite
+  (R7) **456 passed + 1 skip** without `QWEN_{DIFFUSERS,TRANSFORMERS}_SRC`
+  and **457 passed** with them, on both 3.11.15 and 3.13.5 (425+1/426 + the
+  31 new tests); pinned-interface checker unchanged **53/53 exit 0**. **No
+  real 33.1 GB transfer, no network request, no weights, no model load, no
+  GPU/driver/service change** — running `--fetch` against the live Hub is a
+  separate lead/operator decision after root review; download ≠ fit (M5) ≠
+  GPU evidence (M3). `sandbox.yaml` user edit still uncommitted. Awaiting
+  root review.
 

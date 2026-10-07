@@ -1,6 +1,8 @@
-# Model assets (M2.1 manifest preparation)
+# Model assets (M2.1 manifest preparation + explicit fetch tool, code/tests only)
 
-Status: the **manifest is committed; the assets are not**. No model *weight*
+Status: the **manifest is committed; the assets are not**; the explicit
+operator **fetch tool exists (code + offline tests only) and has never been
+run against the network**. No model *weight*
 has ever been downloaded into this environment, nothing is installed under
 `models/assets/`, no checkpoint has been loaded, no inference has run, and no
 GPU is installed. What *has* happened: root fetched **bounded bytes of the 16
@@ -93,17 +95,56 @@ Assets, when an operator deliberately fetches them, live under
 **`models/assets/`** (gitignored; the *manifest itself* is committed under
 `models/`). The fetch preserves the manifest `filename` layout verbatim under
 that root (`models/assets/transformer/config.json`, …). No asset directory or
-file is created by this task.
+file exists yet: neither the manifest task nor the fetch-tool task created
+one (the tool creates paths only when an operator actually runs `--fetch`,
+which has not happened).
 
 Config path defaults for `manifest_path`/`models_dir` stay **unset** — a run
 without an explicit manifest refuses (exit 4) rather than guessing, and the
 resolver **never** downloads, mirrors or "auto-fixes": local loading verifies
-or fails. An explicit operator download is a *separate*, future, documented
-action (PLAN M2.1: a `fetch_models.py`-style step) and does not exist yet;
-this assignment shipped no fetch tool and made no network request.
+or fails.
 
-Operator-facing examples — **dry-run / config-only examples, not a runnable
-complete adapter and not a proven-fit preset**:
+**Fetch tool: ready (code + offline tests) — assets still NOT downloaded.**
+`tools/fetch_models.py` now exists as the separate, explicit operator step
+(stdlib-only; no engine import side effects; the resolver/CLI/generation
+paths remain no-download and network-free). Its contract: the default and
+`--help` paths are **read-only and offline** (a deterministic JSON plan);
+the only network/write path is an unmistakable `--fetch` with explicit
+`--manifest` and `--models-dir`. Downloads are pinned to
+`https://huggingface.co/<repo>/resolve/<pinned-commit>/<filename>` (host is
+a constant; non-HTTPS redirects refused; signed redirect queries are
+stripped from every message), stream in bounded 1 MiB chunks with the
+manifest byte count enforced as an upper bound while reading, and publish
+**only** on exact size + SHA256 match via an atomic no-clobber link of the
+`<file>.partial` in the same asset directory. Interrupted downloads resume
+in that partial **only** against a 206 response whose `Content-Range`
+proves the server resumed at the requested offset (Range ignored or
+misstated → refused, partial untouched); final verification always rehashes
+the whole assembled file from disk, so a corrupt partial can never publish.
+An existing file that verifies is skipped; an existing file whose identity
+does **not** match is refused, never deleted or overwritten; symlinked
+paths on the write path are refused; a bounded disk estimate (manifest
+bytes + 1 MiB headroom per file) is compared with fresh free space before
+any transfer — a **disk** estimate only, no RAM/GPU fit claim (fit is M5
+calibration territory). Tool-specific exit codes are in its `--help`.
+
+What has **not** happened: this assignment shipped code and offline
+fake-stream tests only — **no real 33.1 GB transfer has been executed**, no
+network request was made for it, and running it against the live Hub is a
+separate lead/operator decision after root review. Operator-facing
+examples:
+
+```bash
+# Read-only, offline plan against the committed manifest (no writes, no
+# socket, exit 0; deterministic JSON):
+python tools/fetch_models.py --manifest models/manifest.json --models-dir models/assets
+
+# EXPLICIT operator download + verify (this assignment has NOT run it):
+python tools/fetch_models.py --manifest models/manifest.json --models-dir models/assets --fetch
+```
+
+Engine examples — **dry-run / config-only examples, not a runnable complete
+adapter and not a proven-fit preset**:
 
 ```bash
 # From the repo root. Deterministic JSON plan; verifies nothing exists yet,
@@ -156,7 +197,8 @@ a local measurement of installed assets.
 |---|---|
 | Manifest committed, schema v1, 24 entries, roles, deterministic order | **done (this task)** |
 | Offline tests: identity digest, roles/shards, dry-run all-missing, run→exit 4 | **done (this task)** — the *fresh-child* no-network / no-heavy-import evidence is a property of the **guarded runner** (`bash run_cpu_tests.sh`, both Pythons, audit hook riding into children); plain `pytest` proves only the exit-code/output contract, and acceptance is recorded on the guarded runs |
-| Operator download of 33.1 GB + local sha256/size confirmation | pending (explicit future step; disk/RAM budget needed) |
+| Operator fetch **tool** (`tools/fetch_models.py`): code + offline fake-stream tests | **done, awaiting root review** — plan/help read-only and socket-free; `--fetch` only with explicit paths; resume/publish/escape rules above; **no real download executed** |
+| Operator download of 33.1 GB + local sha256/size confirmation | pending (the tool exists but has never touched the network; a lead/operator decision after review; disk budget needed — the tool prints a bounded disk estimate, nothing about RAM/GPU fit) |
 | M2.2 CPU load-path probes / encoder fidelity | pending |
 | M4 adapter (`qwen21_diffusers`) | pending — `--run` reaches it only after assets verify |
 | M3 GPU bring-up | gated on physical V100 installation (confirmed not installed) |
