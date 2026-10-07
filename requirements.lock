@@ -35,7 +35,10 @@
 # c6df88a511a98740646ee55577b590c9852650ce. Consequence: install this file
 # with `uv pip sync` (it validates the wheel hashes it has and accepts the VCS
 # entries); `pip install --require-hashes -r requirements.lock` does NOT
-# support VCS requirements and must not be advertised.
+# support VCS requirements and must not be advertised. The commit SHAs anchor
+# SOURCE identity only: uv builds those wheels in an isolated environment
+# whose build tooling is not captured by this runtime lock (unless separately
+# constrained), so these installs are not bit-reproducible builds.
 #
 # Install (temporary ML audit venv, explicit operator action — never on
 # import/dry-run, NEVER into /work/.venv):

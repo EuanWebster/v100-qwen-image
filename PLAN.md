@@ -57,7 +57,7 @@ host table; host observations do not prove container state):
 | Fact | Evidence |
 |---|---|
 | GPU **not visible in this sandbox**; availability unknown, not assumed | no `nvidia-smi`/`lspci` binaries; container has no GPU device access configured yet |
-| V100 physical install **not confirmed** | Euan expected it on 2026-10-07 via M.2→PCIe 4.0 x4 adapter; unverified at handoff |
+| V100 physical install **confirmed NOT installed** (user, 2026-10-07) | supersedes the earlier "expected today / unverified at handoff" row: the M.2→PCIe 4.0 x4 adapter install has not happened — all GPU-gated milestones (M3+) stay closed |
 | Python 3.13.5, **no torch installed** | `python3 --version`; `import torch` → ModuleNotFoundError |
 | RAM 122 GiB total, **~41 GiB available**; existing services run on this host | `free -h` — budget against *available*, not installed |
 | ~944 GB free on `/work` | `df -h` |
@@ -122,13 +122,13 @@ CPU tests never touch a heavy ML import:
 |---|---|---|
 | `qwen_engine/config.py` | **Immutable** (frozen dataclass) generation config + field-level validation: dimensions multiple of 32, resolution→token math (1024² = 4096, 2048² = 16384 — C6), steps/seed ranges, quant/offload/backend enums, paths. Lossless JSON round-trip. | stdlib |
 | `qwen_engine/manifest.py` | **Versioned model-manifest schema + `resolve_model_path`** — pinned repo/revision/artifact/sha256/size contract, existence/size verification, **no-download policy** (R3; schema in M2.1). | stdlib |
-| `qwen_engine/adapters/base.py` | **Pipeline adapter protocol** the engine core calls (`plan`, `load`, `encode`, `denoise`, `decode`, `save`) plus plan/dry-run types. The core runs end-to-end against a fake adapter in tests. | config/manifest/memory/log types |
+| `qwen_engine/adapters/base.py` | **Pipeline adapter protocol** the engine core calls (`load`, `encode`, `denoise`, `decode`, `save`) plus dry-run status types. Deliberately **no `plan` method** — dry-run planning is adapter-independent (`core.plan()` builds the document itself). The core runs end-to-end against a fake adapter in tests. | config/manifest/memory/log types |
 | `qwen_engine/adapters/qwen21_diffusers.py` | The eventual `Qwen21DiffusersAdapter` — the **only** module that imports torch / diffusers / transformers, and those imports are deferred *inside* the adapter (lazy), executed only on an actual run. Does not exist yet; stubbing it at M1 is a boundary violation the import test catches. | torch, diffusers, transformers |
 | `qwen_engine/log.py` | Structured **phase/event logging**: JSONL events `{ts, phase, event, elapsed_ms, counters…}` to a configurable sink, plus human-readable phase lines. Shared by engine, CLI and bench. | stdlib |
 | `qwen_engine/memory.py` | **Memory-policy** descriptor + verdict logic (R4; detail in M5.3): "does this config fit *right now*?" from calibrated observations, current free memory, and headroom; conservative on unknown; stale calibration invalidated (C8). (Supersedes the draft's standalone `vramfit.py` naming.) | config/manifest/log types |
 | `qwen_engine/encoder.py` | Encoder **subprocess worker + embedding cache** (port `run_subprocess_logged`; key v2, atomic writes, quarantine, timeout/cancel, fake-worker tests — R5; detail in M1.4). | stdlib |
 | `qwen_engine/bench.py` | **Versioned benchmark/result schemas** (R6; detail in M1.5): phase timings, peak host RSS, peak CUDA memory when available, environment and model identifiers; feeds `calibration.json`. | stdlib |
-| `qwen_engine/cli.py` | The only v1 front-end (GUI deferred, YAGNI): argparse → validate config → plan via core/adapter protocol → `generate`; implements the **exit-code contract** (M1 acceptance criteria). `cli_gen.py` at the repo root stays as a thin entry-point shim. | the above only |
+| `qwen_engine/cli.py` | The only v1 front-end (GUI deferred, YAGNI): argparse → validate config → plan via `core.plan()` (adapter-independent) → `generate`; implements the **exit-code contract** (M1 acceptance criteria). `cli_gen.py` at the repo root stays as a thin entry-point shim. | the above only |
 
 **Boundary invariant (tested):** `python -c "import qwen_engine"` and
 `cli_gen.py --help` / `--dry-run` must succeed on a machine with **no torch, no
@@ -291,7 +291,8 @@ unexpected (logged with context, traceback only into the log sink).
 
 ### M3 — GPU bring-up (gated: blocked until the V100 install is confirmed)
 
-> Gate: physical installation, cooling and power are Euan's; not confirmed at handoff.
+> Gate: physical installation, cooling and power are Euan's. **Confirmed not
+> installed** (user, 2026-10-07 — consistent with the host `lspci` observation).
 > Software only once the card is confirmed present on the host.
 
 - **3.1** Pre-flight: Secure Boot state (`mokutil --sb-state`), kernel version; decide
@@ -612,4 +613,29 @@ standing rule that executed plans stay honest.)*
   guarded CPU suite re-run in fresh pytest-only venvs: **395 passed** on
   3.11.15 and 3.13.5. No model weights, GPU, driver or service change; the
   real-CUDA gate (§5 of docs/dependencies.md, M3) remains PENDING.
+- 2026-10-07 **M0.2 interface survey** (this commit, on baseline `315705d`):
+  `docs/interfaces.md` surveys the exact pinned interfaces (pipeline
+  ctor/`encode_prompt`/`__call__`, raw templates + `_drop_idx` + pre-RMSNorm
+  hook + masks, CFG-inactive `None` semantics, sigmas precedence, VAE/latent
+  scales, local-only loading, default segmented processor vs. Flex and real
+  dispatch-backend selection, singlefile Qwen21 mapping + GGUF native fallback
+  vs. opt-in remote kernels at capability **≥7**, per-call KV lifecycle and
+  shared-pipeline call serialization). v1 stays T2I, one image per call; the
+  unfixed upstream `image_pad_mask` × `num_images_per_prompt` replication
+  hazard is **documented, not patched** (no upstream patch). Added
+  `tools/check_pinned_interfaces.py` (stdlib-only AST source-signature
+  contract checker, offline, no ML imports): 36/36 contracts pass against the
+  verified pinned trees and it fails loudly on deliberate signature drift
+  (defaults, CFG gate, ≥7 gate, default processor swap, `tie_last_hidden_states`
+  arrival); missing input trees exit 2 = "not run", never a silent pass — the
+  optional `tests/test_pinned_interfaces.py` skips explicitly without the
+  env-provided trees. PLAN fixes: stale `adapter.plan` references corrected
+  (protocol has no `plan`; `core.plan()` is adapter-independent — matches the
+  shipped code) and the V100 install row now records the user-confirmed fact
+  **card NOT installed** (all pre-existing decisions/corrections preserved).
+  Dependency docs honesty fix: `requirements.in` no longer claims uv "builds
+  the VCS wheels and enforces their recorded hashes" — VCS entries carry **no
+  hash** (commit-SHA source anchor; registry wheels carry the hashes), and the
+  isolated VCS *build* tooling is not captured by the runtime lock, so installs
+  are not advertised as bit-reproducible builds.
 

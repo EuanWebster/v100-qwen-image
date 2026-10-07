@@ -28,6 +28,11 @@ huggingface-hub 1.33.0, cuda-bindings 12.9.9, …) are in
 `--hash` line for the two git requirements — a repository build cannot be
 content-hashed at compile time — so there the immutable commit SHA *is* the
 integrity anchor; every other package's wheel hash is enforced at install.
+Those commit SHAs anchor **source identity, not build reproducibility**: uv
+builds the git wheels in an isolated environment whose build tooling is not
+recorded in the runtime lock (unless separately constrained), so an install
+is not a bit-reproducible *build* — the resolved artifacts and their source
+commits are what is guaranteed identical.
 That mix is precisely why the lock installs with `uv pip sync` only:
 `pip install --require-hashes -r requirements.lock` cannot handle VCS
 requirements at all and is **not** a supported path here. `torchvision`

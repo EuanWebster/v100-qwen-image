@@ -23,10 +23,20 @@
 #   * diffusers AND transformers are installed from pinned git commits (per
 #     PLAN M0.1 "exact git commits"): installing a "newer PyPI release
 #     instead" would change the QwenImage21Pipeline interface that
-#     docs/interfaces.md was surveyed against. NOTE: a requirements file
-#     with VCS entries CANNOT be installed with `pip --require-hashes` —
-#     pip cannot hash git repos. Install with `uv pip sync` only, which
-#     builds the VCS wheels and enforces their recorded hashes.
+#     docs/interfaces.md was surveyed against. Source-identity semantics,
+#     precisely: every *registry* wheel in requirements.lock is pinned by its
+#     recorded sha256 hashes (enforced at install), while a VCS requirement
+#     has NO hash — uv emits none for git entries because a repository build
+#     cannot be content-hashed at compile time — so those two entries are
+#     anchored ONLY by their immutable commit SHAs. `pip --require-hashes`
+#     cannot process VCS requirements at all; install with `uv pip sync`
+#     (it enforces the wheel hashes it has and accepts the VCS entries).
+#     Honesty bound: uv builds the two git wheels in an isolated build
+#     environment whose tooling (pip/setuptools/build backends it fetches at
+#     build time) is NOT captured by this runtime lock unless separately
+#     constrained — the commit fixes the *source*, not the *build*, so do not
+#     advertise these installs as bit-reproducible; reproducibility anchors
+#     here are source identity plus hashed registry artifacts.
 #
 # Regenerate requirements.lock exactly as recorded at the top of that file
 # (uv pip compile, one run per supported interpreter; see docs/dependencies.md).
