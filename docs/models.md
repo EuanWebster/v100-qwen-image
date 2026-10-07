@@ -231,7 +231,7 @@ a local measurement of installed assets.
 | Offline tests: identity digest, roles/shards, dry-run all-missing, run→exit 4 | **done (this task)** — the *fresh-child* no-network / no-heavy-import evidence is a property of the **guarded runner** (`bash run_cpu_tests.sh`, both Pythons, audit hook riding into children); plain `pytest` proves only the exit-code/output contract, and acceptance is recorded on the guarded runs |
 | Operator fetch **tool** (`tools/fetch_models.py`): code + offline fake-stream tests | **done (root-review fix pass applied), awaiting root re-review** — plan/help read-only and socket-free; `--fetch` only with explicit paths; resume/publish/escape rules above; **no real download executed** |
 | Operator download of 33.1 GB + local sha256/size confirmation | pending (the tool exists but has never touched the network; a lead/operator decision after review; disk budget needed — the tool prints a bounded disk estimate, nothing about RAM/GPU fit) |
-| Local reference-bundle contract (`qwen_engine/local_bundle.py`, M2.2a part 1) | **implemented and offline-tested** — projects a successful `resolve_manifest` report into role-grouped adapter `assets` + explicit component dirs under an explicit root, against the committed 24-file layout table, with version-tagged bundle and encoder+processor artifact-set fingerprints; **offline-tested only**: real-file hash verification, CPU component load and everything after them remain pending |
+| Local reference-bundle contract (`qwen_engine/local_bundle.py`, M2.2a part 1) | **implemented and offline-tested** (root-review fix pass applied) — projects a successful `resolve_manifest` report into role-grouped adapter `assets` + explicit component dirs under an explicit root, against the committed 24-file layout table, publishing **absolute, CWD-stable paths** under the canonical resolved root, refusing internally inconsistent success claims (`errors`, per-status `error`, `resolved` mapping), with version-tagged bundle and encoder+processor artifact-set fingerprints and construction-time defensive freezing of the mappings; **offline-tested only**: real-file hash verification, CPU component load and everything after them remain pending |
 | M2.2 CPU load-path probes / encoder fidelity | pending |
 | M4 adapter (`qwen21_diffusers`) | pending — `--run` reaches it only after assets verify |
 | M3 GPU bring-up | gated on physical V100 installation (confirmed not installed) |
@@ -244,16 +244,32 @@ plus the same schema-v1 manifest into the `GenerationAdapter.load(config,
 assets)` shape: verified paths grouped by role (manifest order, immutable)
 and explicit component directories under the **explicit** model root, ready
 for future `local_files_only=True` probes (pipeline dir = root; the `dit`
-role's files live under `transformer/`). It is a projection, not a second
-verifier: content is never re-hashed (the resolver already did that), and
-paths come only from `root/filename` — never repo ids, never an ambient HF
+role's files live under `transformer/`). Everything the bundle publishes
+(root, `assets`, `component_dirs`) is an **absolute** path under the
+canonical resolved root — a worker started from a different working
+directory loads the same files even when `models_dir` was given relative —
+while the report itself is still matched against the caller's lexical
+`root/filename`. It is a projection, not a second verifier: content is never
+re-hashed (the resolver already did that), and paths come only from
+`root/filename` — never repo ids, never an ambient HF
 cache. The committed full-reference set is an explicit immutable table
 (24 files; pipeline 1, processor 9, scheduler 1, text_encoder 7, dit 4, vae
 2; one pinned repo/revision); no GGUF/LoRA/single-file in this profile —
 future variants are separate profiles, not fallbacks. Incomplete, reordered,
 padded or field-forged reports, escaped symlinks and file-vs-directory
 layouts are refused with typed errors (exit-4 channel) before any ML import.
-Version-tagged **artifact-set fingerprints** (SHA256 over sorted
+So are reports whose success claim is internally inconsistent: nonempty
+`errors` despite `ok=True`, a present status carrying an `error`, or a
+`resolved` mapping that does not equal the role-grouped status paths (keys
+and tuples, manifest order). These checks police the *shape* of the success
+claim, not the bytes — a caller who hand-forges manifest and report can
+still produce a bundle; only running the trusted resolver over the real
+files is verification, and this projection is not cryptographic
+re-verification. The bundle's mappings and path tuples are snapshotted and
+frozen at construction, so mutable containers passed to the public
+constructor cannot alter the "immutable" bundle afterwards; direct
+construction only shapes and freezes — it performs no resolver
+verification. Version-tagged **artifact-set fingerprints** (SHA256 over sorted
 repo/revision/filename/sha256/bytes rows) give a whole-bundle digest and an
 encoder+processor digest for future cache keys — a change to any encoder
 shard, index/config, tokenizer or chat template flips the encoder digest.

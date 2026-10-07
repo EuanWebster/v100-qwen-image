@@ -130,7 +130,7 @@ CPU tests never touch a heavy ML import:
 |---|---|---|
 | `qwen_engine/config.py` | **Immutable** (frozen dataclass) generation config + field-level validation: dimensions multiple of 32, resolution→token math (1024² = 4096, 2048² = 16384 — C6), steps/seed ranges, quant/offload/backend enums, paths. Lossless JSON round-trip. | stdlib |
 | `qwen_engine/manifest.py` | **Versioned model-manifest schema + `resolve_model_path`** — pinned repo/revision/artifact/sha256/size contract, existence/size verification, **no-download policy** (R3; schema in M2.1). | stdlib |
-| `qwen_engine/local_bundle.py` | **Local reference-bundle contract (M2.2a)** — projects an already `resolve_manifest`-verified local set into role-grouped adapter `assets` plus explicit component dirs under an explicit model root, enforcing the committed 24-file full-reference layout table; version-tagged artifact-set fingerprints (whole bundle + encoder+processor). No content hashing, no downloads, no ML imports. | manifest types, stdlib |
+| `qwen_engine/local_bundle.py` | **Local reference-bundle contract (M2.2a)** — projects an already `resolve_manifest`-verified local set into role-grouped adapter `assets` plus explicit component dirs under an explicit model root, publishing **absolute, CWD-stable paths** under the canonical resolved root, enforcing the committed 24-file full-reference layout table and a coherence-checked success claim (`errors`/per-status `error`/`resolved` mapping); construction-time defensive freezing of the mappings; version-tagged artifact-set fingerprints (whole bundle + encoder+processor). No content hashing, no downloads, no ML imports. | manifest types, stdlib |
 | `qwen_engine/adapters/base.py` | **Pipeline adapter protocol** the engine core calls (`load`, `encode`, `denoise`, `decode`, `save`) plus dry-run status types. Deliberately **no `plan` method** — dry-run planning is adapter-independent (`core.plan()` builds the document itself). The core runs end-to-end against a fake adapter in tests. | config/manifest/memory/log types |
 | `qwen_engine/adapters/qwen21_diffusers.py` | The eventual `Qwen21DiffusersAdapter` — the **only** module that imports torch / diffusers / transformers, and those imports are deferred *inside* the adapter (lazy), executed only on an actual run. Does not exist yet; stubbing it at M1 is a boundary violation the import test catches. | torch, diffusers, transformers |
 | `qwen_engine/log.py` | Structured **phase/event logging**: JSONL events `{ts, phase, event, elapsed_ms, counters…}` to a configurable sink, plus human-readable phase lines. Shared by engine, CLI and bench. | stdlib |
@@ -977,3 +977,44 @@ standing rule that executed plans stay honest.)*
   remain unverified until measured. `manifest.py`, `models/manifest.json`,
   fetcher, engine no-download semantics and `sandbox.yaml` untouched; no
   network, no model load, no GPU, no service change.
+- 2026-10-07 **M2.2a review-fix pass: local reference-bundle contract — three
+  scoped corrections** (root review `/tmp/v100-m22a-bundle-review.md`; sole
+  writer Qwen, on `9f3d0d6`): **(1) CWD-stable paths** — status paths are
+  still matched against the caller's *lexical* `root/filename`, but every
+  path the bundle **publishes** (`root`, `assets`, `component_dirs`,
+  `pipeline_dir`) is absolute under the canonical resolved root, so a
+  relative `models_dir` no longer hands a worker launched from another CWD
+  unloadable relative paths (evidence: in-process CWD change + fresh child
+  interpreter started in a different directory stats all 24 files and 6
+  component dirs); absolute-root fixtures unchanged. **(2) Coherent success
+  claim** — a report is accepted only when `errors` is empty, every present
+  status carries `error is None`, and `report.resolved` equals the
+  role-grouped status paths (keys and tuples, manifest order); the
+  hand-built `ok=True + errors=(e,) + resolved={}` shape and every
+  missing/extra/empty-group/reordered/wrong-path `resolved` variant are
+  refused with typed `BundleReportError` — documented honestly as *shape*
+  checks, not cryptographic re-verification (forging bytes still means
+  defeating the trusted resolver itself). **(3) Defensive immutability** —
+  `LocalReferenceBundle.__post_init__` snapshots and freezes `assets` /
+  `component_dirs` and their nested path tuples, so mutable containers
+  passed to the public frozen dataclass cannot mutate the "immutable"
+  bundle afterwards; the class docstring states plainly that direct
+  construction performs **no** resolver verification.
+  `tests/test_local_bundle.py` **31 → 39** offline tests (relative root +
+  CWD change + fresh child from another CWD; absolute-root regression;
+  forged `errors` / per-status `error` / `resolved`-mapping classes incl.
+  the review example; direct-construction mutation); the forged-report
+  fixture is now internally consistent so the probe tests actually probe.
+  `docs/models.md` (gates row + section 8) and this PLAN module row synced
+  to the same contract-only precision — no load/fidelity claims added.
+  Evidence: guarded suite **549 passed + 1 skip** without / **550 passed**
+  with pinned source envs, on 3.11.15 (`/work/.venv`) and 3.13.5
+  (`/tmp/qwen-review.bIFHcI/venv`, `PYTHONPATH=/work/src`), all rc 0;
+  pinned-interface checker **53/53 exit 0** both Pythons, trees re-verified
+  `c6df88a5`/`856157a2` via `git rev-parse HEAD`. **Pending, unchanged:**
+  24 real-file hash verification, CPU component load, encoder fidelity,
+  adapter generation, RAM/VRAM fit and GPU remain unverified until
+  measured; asset-download status stays root's to confirm.
+  `models/assets/` (root's concurrent pinned transfer), `manifest.py`,
+  `models/manifest.json`, the fetcher and `sandbox.yaml` untouched; no
+  network, no weights read, no model load, no GPU, no service change.
