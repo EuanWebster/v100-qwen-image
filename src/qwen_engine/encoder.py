@@ -26,14 +26,20 @@ Pieces
   cache ever importing torch itself.
 
 * **EmbeddingCache**: atomic writes (temp file + ``os.replace``), corrupt
-  entry = **miss + quarantine** (never overwritten in place), per-key
-  in-process locking, LRU cap by mtime, configurable root (R7 — the caller
-  decides where it lives; unconfigured = nothing written).
+  entry = **miss + quarantine** (never overwritten in place), LRU cap by
+  mtime, configurable root (R7 — the caller decides where it lives;
+  unconfigured = nothing written). All mutations run under a cache-wide
+  in-process mutex associated with the **canonical root**, and per-key locks
+  are shared the same way: instances on one root cannot race the LRU into
+  emptying the cache, and cannot double-encode the same key.
 
 * **EncoderWorker**: configurable ``command`` with ``{python}`` /
   ``{request}`` / ``{response}`` placeholders, timeout and cooperative
   cancellation (terminate → kill), **stderr captured** into events and typed
-  errors (never swallowed), scratch temp dir removed on **every** path.
+  errors (never swallowed; excerpts are read with a bounded tail read), a
+  terminal event on **every** failure branch, and **every exit path reaps a
+  live child before the scratch temp dir is removed** — including
+  interrupted waiting; setup failures are typed and clean up.
 
 Conservative stdlib-only choices, documented per the task brief: the worker
 command is required (there is no default heavy worker at M1); both
@@ -45,6 +51,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -59,6 +66,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from qwen_engine._jsonsafe import (
+    freeze_json,
+    json_violations,
+    plain_json,
+    reject_constant,
+)
 from qwen_engine.errors import EngineError
 from qwen_engine.log import PhaseLogger
 
@@ -89,7 +102,13 @@ _ENTRY_NAME_RE = re.compile(r"^[0-9a-f]{64}\.embed$")
 
 
 class EncoderError(EngineError):
-    """Base for encoder worker/cache failures (exit 1 via the CLI contract)."""
+    """Base for encoder worker/cache failures (exit 1 via the CLI contract).
+    Every typed failure carries the captured worker ``stderr`` excerpt (empty
+    when nothing was captured) so diagnostics survive into the CLI/log."""
+
+    def __init__(self, message: str = "", *, stderr: str = "") -> None:
+        self.stderr = stderr
+        super().__init__(message)
 
 
 class EncoderRequestError(EncoderError):
@@ -117,9 +136,8 @@ class EncoderWorkerError(EncoderError):
                  stderr: str = "", worker_error: Mapping[str, Any] | None = None,
                  ) -> None:
         self.exit_code = exit_code
-        self.stderr = stderr
         self.worker_error = dict(worker_error) if worker_error else None
-        super().__init__(message)
+        super().__init__(message, stderr=stderr)
 
 
 class EncoderProtocolError(EncoderError):
@@ -192,7 +210,11 @@ def validate_identity_fields(revision: Any, sha: Any, at: str,
 class EncoderRequest:
     """Everything that determines an encoding — the cache-key inputs live
     here, so an identical *result* is impossible from requests that differ in
-    any of them (:func:`cache_key` hashes the whole document)."""
+    any of them (:func:`cache_key` hashes the whole document). Validated
+    JSON values (``kwargs``) are deep-frozen snapshots taken at
+    construction: the caller mutating its own (nested) mapping afterwards
+    changes neither the cache key nor the wire document — they are computed
+    from the same immutable snapshot."""
 
     prompt: str
     dtype: str
@@ -209,6 +231,13 @@ class EncoderRequest:
 
     def __post_init__(self) -> None:
         errors: list[str] = validate_request_fields(self)
+        # Deep-freeze the kwargs snapshot *after* validation: the record owns
+        # its own immutable copy, so mutating the caller's (possibly nested)
+        # mapping afterwards can never change the cache key or the wire
+        # document — one request, one key, one request file.
+        if not errors:
+            object.__setattr__(self, "kwargs",
+                               freeze_json(self.kwargs, "kwargs", errors))
         if errors:
             raise EncoderRequestError("invalid encoder request: " + "; ".join(errors))
 
@@ -224,7 +253,7 @@ class EncoderRequest:
             "prompt": self.prompt,
             "negative_prompt": self.negative_prompt,
             "dtype": self.dtype,
-            "kwargs": dict(self.kwargs),
+            "kwargs": plain_json(self.kwargs),
             "images": list(self.images),
         }
 
@@ -331,15 +360,18 @@ def validate_request_fields(req: EncoderRequest) -> list[str]:
         _err_list(errors, "dtype", f"must not have surrounding whitespace, got {req.dtype!r}")
     _nonempty(errors, "model_repo", req.model_repo)
     validate_identity_fields(req.model_revision, req.model_sha256, "model", errors)
+    for comp in ("processor", "tokenizer", "chat_template"):
+        value = getattr(req, comp)
+        if not isinstance(value, ComponentIdentity):
+            _err_list(errors, comp, f"must be a ComponentIdentity, got "
+                                    f"{type(value).__name__}")
     if not isinstance(req.kwargs, Mapping):
         _err_list(errors, "kwargs",
                   f"must be a mapping, got {type(req.kwargs).__name__}")
     else:
-        try:
-            json.dumps(dict(req.kwargs), sort_keys=True)
-        except (TypeError, ValueError) as exc:
-            _err_list(errors, "kwargs",
-                      f"must be JSON-serializable (cache key + wire format): {exc}")
+        # Strict JSON: string keys, finite numbers, supported types only —
+        # json.dumps alone would silently accept NaN and int keys.
+        errors.extend(json_violations(req.kwargs, "kwargs"))
     if isinstance(req.images, (str, bytes)) or not isinstance(req.images, tuple):
         _err_list(errors, "images", f"must be a tuple of sha256 strings, got {req.images!r}")
     else:
@@ -380,7 +412,11 @@ class Blob:
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
             raise EncoderRequestError(f"blob name: must be non-empty, got {self.name!r}")
-        if not isinstance(self.data, (bytes, bytearray)):
+        if isinstance(self.data, bytearray):
+            # Immutable snapshot: mutating the caller's bytearray afterwards
+            # must not change the blob's bytes, sha256 or entry layout.
+            object.__setattr__(self, "data", bytes(self.data))
+        if not isinstance(self.data, bytes):
             raise EncoderRequestError(
                 f"blob {self.name!r} data: must be bytes, got {type(self.data).__name__}")
 
@@ -398,22 +434,34 @@ class EncodedPayload:
 
     def __post_init__(self) -> None:
         if not isinstance(self.metadata, Mapping):
-            raise EncoderRequestError("payload metadata must be a mapping")
-        try:
-            json.dumps(dict(self.metadata), sort_keys=True)
-        except (TypeError, ValueError) as exc:
-            raise EncoderRequestError(f"payload metadata must be JSON-serializable: {exc}")
-        names = [b.name for b in self.blobs]
-        dupes = sorted({n for n in names if names.count(n) > 1})
-        if dupes:
-            raise EncoderRequestError(f"duplicate blob names: {', '.join(dupes)}")
+            raise EncoderRequestError(
+                f"payload metadata must be a mapping, got "
+                f"{type(self.metadata).__name__}")
+        errors: list[str] = []
+        snapshot = freeze_json(self.metadata, "metadata", errors)
+        if isinstance(self.blobs, (str, bytes)) or not isinstance(self.blobs, tuple):
+            _err_list(errors, "blobs", f"must be a tuple of Blob, got "
+                                       f"{type(self.blobs).__name__}")
+        else:
+            bad = [f"blobs[{i}]: {type(b).__name__}"
+                   for i, b in enumerate(self.blobs) if not isinstance(b, Blob)]
+            errors.extend(bad)
+            names = [b.name for b in self.blobs if isinstance(b, Blob)]
+            dupes = sorted({n for n in names if names.count(n) > 1})
+            if dupes:
+                _err_list(errors, "blobs",
+                          f"duplicate blob names: {', '.join(dupes)}")
+        if errors:
+            raise EncoderRequestError("invalid encoded payload: "
+                                      + "; ".join(errors))
+        object.__setattr__(self, "metadata", snapshot)
 
     def to_entry_bytes(self, key: str) -> bytes:
         """Canonical entry bytes: one JSON header line + raw blob payloads."""
         header = {
             "schema": ENTRY_SCHEMA,
             "key": key,
-            "metadata": dict(self.metadata),
+            "metadata": plain_json(self.metadata),
             "blobs": [{"name": b.name, "bytes": len(b.data), "sha256": b.sha256}
                       for b in self.blobs],
         }
@@ -431,11 +479,19 @@ class EncodedPayload:
         if not sep:
             raise _EntryCorrupt("no header line terminator")
         try:
-            header = json.loads(head.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            header = json.loads(head.decode("utf-8"),
+                                parse_constant=reject_constant)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise _EntryCorrupt(f"bad header: {exc}") from exc
         if not isinstance(header, Mapping):
             raise _EntryCorrupt(f"header must be an object, got {type(header).__name__}")
+        unknown = sorted(k for k in header if not isinstance(k, str))
+        unknown += sorted(str(k) for k in set(header) - {"schema", "key",
+                                                         "metadata", "blobs"}
+                          if isinstance(k, str))
+        if unknown:
+            raise _EntryCorrupt(
+                f"unknown entry header keys: {', '.join(unknown)}")
         if header.get("schema") != ENTRY_SCHEMA:
             raise _EntryCorrupt(f"unknown entry schema {header.get('schema')!r}")
         if header.get("key") != key:
@@ -454,6 +510,10 @@ class EncodedPayload:
                     or not isinstance(spec.get("sha256"), str)
                     or not _SHA256_RE.fullmatch(spec["sha256"])):
                 raise _EntryCorrupt(f"blob[{i}] descriptor is malformed: {spec!r}")
+            extra = sorted(str(k) for k in set(spec) - {"name", "bytes", "sha256"})
+            if extra:
+                raise _EntryCorrupt(
+                    f"blob[{i}] descriptor has unknown keys: {', '.join(extra)}")
             end = offset + spec["bytes"]
             chunk = bytes(body[offset:end])
             if len(chunk) != spec["bytes"]:
@@ -490,12 +550,45 @@ def _canonicalize_dir(path: str | Path, field: str) -> Path:
     return p
 
 
+_REGISTRY_GUARD = threading.Lock()
+_ROOT_STATES: dict[str, "_RootState"] = {}
+
+
+class _RootState:
+    """In-process state shared by **every** cache instance pointing at one
+    canonical root: a cache-wide mutex covering all mutations (publish,
+    quarantine, LRU) and the per-key encode locks."""
+
+    def __init__(self) -> None:
+        self.mutex = threading.RLock()   # mutations / quarantine / LRU
+        self.keys_guard = threading.Lock()  # guards the key_locks table only
+        self.key_locks: dict[str, threading.Lock] = {}
+
+
+def _root_state(root: Path) -> _RootState:
+    try:
+        canonical = str(root.resolve())
+    except OSError:  # pragma: no cover - exotic path failures
+        canonical = str(Path(os.path.abspath(root)))
+    with _REGISTRY_GUARD:
+        state = _ROOT_STATES.get(canonical)
+        if state is None:
+            state = _ROOT_STATES[canonical] = _RootState()
+        return state
+
+
 class EmbeddingCache:
     """Disk cache of :class:`EncodedPayload` under ``root``.
 
     * Atomic publish (temp file + ``os.replace``) — readers never see partial
       entries, which is also the cross-process concurrency story; within one
       process :meth:`lock_for` serialises same-key work.
+    * All mutations (publish, quarantine, LRU) run under a **cache-wide
+      in-process mutex shared by every instance on the same canonical root**
+      — two instances (or two concurrent puts) cannot interleave an LRU
+      snapshot with another eviction and empty the cache. Per-key encode
+      locks are shared the same way, so two instances on one root never
+      double-encode the same key.
     * A corrupt / unreadable entry is a **miss**; the bad file is moved to
       ``root/quarantine/``, never silently overwritten in place.
     * LRU cap by mtime (hits refresh mtime); eviction is a plain delete.
@@ -508,8 +601,7 @@ class EmbeddingCache:
             raise EncoderRequestError(
                 f"max_entries: must be a positive integer, got {max_entries!r}")
         self.max_entries = max_entries
-        self._locks: dict[str, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
+        self._state = _root_state(self.root)
 
     # -- paths ---------------------------------------------------------------
 
@@ -529,8 +621,11 @@ class EmbeddingCache:
     def lock_for(self, key: str) -> threading.Lock:
         if not isinstance(key, str) or not _SHA256_RE.fullmatch(key):
             raise EncoderRequestError(f"cache key: must be 64 lowercase hex chars, got {key!r}")
-        with self._locks_guard:
-            return self._locks.setdefault(key, threading.Lock())
+        # Shared across every instance on this canonical root: two caches on
+        # one root serialise on the same lock, so the same key is never
+        # encoded twice in one process.
+        with self._state.keys_guard:
+            return self._state.key_locks.setdefault(key, threading.Lock())
 
     # -- ops -----------------------------------------------------------------
 
@@ -560,21 +655,24 @@ class EmbeddingCache:
 
     def put(self, key: str, payload: EncodedPayload) -> Path:
         """Atomically publish ``payload`` under ``key``, then enforce the LRU
-        cap (the just-written entry is protected)."""
+        cap (the just-written entry is protected). Publish and eviction are
+        one transaction under the cache-wide root mutex: concurrent puts can
+        never snapshot an entry list and then evict each other's entries."""
         path = self.entry_path(key)
         data = payload.to_entry_bytes(key)
-        self.root.mkdir(parents=True, exist_ok=True)
-        tmp = self.root / f".{key}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        try:
-            with tmp.open("xb") as fh:
-                fh.write(data)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-        except OSError as exc:
-            tmp.unlink(missing_ok=True)
-            raise EncoderError(f"cache write failed for {key}: {exc}") from exc
-        self._enforce_lru(protect=key)
+        with self._state.mutex:
+            self.root.mkdir(parents=True, exist_ok=True)
+            tmp = self.root / f".{key}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            try:
+                with tmp.open("xb") as fh:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
+            except OSError as exc:
+                tmp.unlink(missing_ok=True)
+                raise EncoderError(f"cache write failed for {key}: {exc}") from exc
+            self._enforce_lru(protect=key)
         return path
 
     def entries(self) -> list[str]:
@@ -588,14 +686,17 @@ class EmbeddingCache:
         return keys
 
     def _quarantine(self, path: Path, key: str) -> None:
-        try:
-            self.quarantine_dir.mkdir(parents=True, exist_ok=True)
-            target = self.quarantine_dir / f"{key}.{os.getpid()}.{time.time_ns()}.corrupt"
-            os.replace(path, target)
-        except OSError:
-            # Quarantine itself failed: still a miss; leave the file for the
-            # next reader rather than deleting operator-visible evidence.
-            pass
+        with self._state.mutex:  # quarantine is a mutation too
+            try:
+                self.quarantine_dir.mkdir(parents=True, exist_ok=True)
+                target = self.quarantine_dir / (
+                    f"{key}.{os.getpid()}.{time.time_ns()}.corrupt")
+                os.replace(path, target)
+            except OSError:
+                # Quarantine itself failed: still a miss; leave the file for
+                # the next reader rather than deleting operator-visible
+                # evidence.
+                pass
         return None
 
     def _enforce_lru(self, protect: str) -> None:
@@ -644,11 +745,24 @@ def _excerpt(text: str) -> str:
     return "...(truncated)...\n" + text[-STDERR_EXCERPT_CHARS:]
 
 
+#: Upper bound on bytes *read* per log file: the tail of a huge log is read
+#: by seeking, so an arbitrarily large log never lands in RAM.
+_EXCERPT_READ_BYTES = 4 * STDERR_EXCERPT_CHARS
+
+
 def _read_excerpt(path: Path) -> str:
     try:
-        return _excerpt(path.read_text(encoding="utf-8", errors="replace"))
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            if size > _EXCERPT_READ_BYTES:
+                fh.seek(size - _EXCERPT_READ_BYTES)
+            else:
+                fh.seek(0)
+            data = fh.read()
     except OSError:
         return ""
+    return _excerpt(data.decode("utf-8", errors="replace"))
 
 
 class EncoderWorker:
@@ -681,12 +795,17 @@ class EncoderWorker:
                     f"command: token {needed!r} is required (the worker protocol "
                     f"passes the {needed.strip('{}')} file by path)")
         if (isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float))
-                or timeout_s <= 0):
-            raise EncoderSetupError(f"timeout_s: must be > 0, got {timeout_s!r}")
-        if (isinstance(cancel_grace_s, bool)
-                or not isinstance(cancel_grace_s, (int, float)) or cancel_grace_s < 0):
+                or not math.isfinite(timeout_s) or timeout_s <= 0):
+            # NaN/Inf must not disable the timeout (a NaN deadline makes
+            # every `<= 0` check false: the poll loop would wait forever).
             raise EncoderSetupError(
-                f"cancel_grace_s: must be >= 0, got {cancel_grace_s!r}")
+                f"timeout_s: must be a finite number > 0, got {timeout_s!r}")
+        if (isinstance(cancel_grace_s, bool)
+                or not isinstance(cancel_grace_s, (int, float))
+                or not math.isfinite(cancel_grace_s) or cancel_grace_s < 0):
+            raise EncoderSetupError(
+                f"cancel_grace_s: must be a finite number >= 0, "
+                f"got {cancel_grace_s!r}")
         self.command = cmd
         self.timeout_s = float(timeout_s)
         self.cache = cache
@@ -702,17 +821,19 @@ class EncoderWorker:
     def encode(self, request: EncoderRequest, *, request_id: str | None = None,
                cancel_event: threading.Event | None = None) -> EncodedPayload:
         """Cache-first encode. Same-key callers within one process serialise
-        on the key lock, so a miss cannot double-encode; cross-process safety
-        comes from atomic publishing."""
+        on the (root-shared) key lock, so a miss cannot double-encode;
+        cross-process safety comes from atomic publishing. The request is
+        immutable from construction, so this key and the request file
+        :meth:`run` writes describe exactly the same request."""
         key = cache_key(request)
         if self.cache is None:
             return self.run(request, request_id=request_id, cancel_event=cancel_event)
         with self.cache.lock_for(key):
             hit = self.cache.get(key)
             if hit is not None:
-                self.logger.event("encoder_cache_hit", cache_key=key)
+                self._event("encoder_cache_hit", cache_key=key)
                 return hit
-            self.logger.event("encoder_cache_miss", cache_key=key)
+            self._event("encoder_cache_miss", cache_key=key)
             payload = self.run(request, request_id=request_id,
                                cancel_event=cancel_event)
             self.cache.put(key, payload)
@@ -721,27 +842,50 @@ class EncoderWorker:
     def run(self, request: EncoderRequest, *, request_id: str | None = None,
             cancel_event: threading.Event | None = None) -> EncodedPayload:
         """One worker process, no cache. Raises a typed :class:`EncoderError`
-        subclass on every failure path; cleans up its scratch dir always."""
+        subclass on every failure path; **every exit path** — success, typed
+        failure, unexpected exception, ``KeyboardInterrupt`` — reaps a live
+        child before the scratch dir is removed."""
         rid = request_id or uuid.uuid4().hex
         key = cache_key(request)
-        scratch = Path(tempfile.mkdtemp(prefix="qwen-enc-", dir=self.scratch_dir))
+        try:
+            scratch = Path(tempfile.mkdtemp(prefix="qwen-enc-",
+                                            dir=self.scratch_dir))
+        except OSError as exc:
+            raise EncoderSetupError(
+                f"failed to create scratch dir in {self.scratch_dir!r}: {exc}"
+            ) from exc
         req_path = scratch / "request.json"
         resp_path = scratch / "response.json"
         try:
-            req_path.write_bytes(
-                (json.dumps(request.to_request_dict(rid), sort_keys=True,
-                            ensure_ascii=True) + "\n").encode("utf-8"))
+            try:
+                req_path.write_bytes(
+                    (json.dumps(request.to_request_dict(rid), sort_keys=True,
+                                ensure_ascii=True) + "\n").encode("utf-8"))
+            except OSError as exc:
+                raise EncoderSetupError(
+                    f"failed to write worker request file: {exc}") from exc
             cmd = [tok.replace("{python}", self.python)
                    .replace("{request}", str(req_path))
                    .replace("{response}", str(resp_path))
                    for tok in self.command]
-            self.logger.event("encoder_worker_start", cache_key=key, request_id=rid,
-                              command=cmd)
+            self._event("encoder_worker_start", cache_key=key, request_id=rid,
+                        command=cmd)
             # stdio goes to scratch *files*: repeated polling can never lose
             # output and a chatty worker can never deadlock on a full pipe.
             out_path = scratch / "stdout.log"
             err_path = scratch / "stderr.log"
-            with out_path.open("wb") as out_fh, err_path.open("wb") as err_fh:
+            try:
+                out_fh = out_path.open("wb")
+            except OSError as exc:
+                raise EncoderSetupError(
+                    f"failed to open worker stdout log: {exc}") from exc
+            try:
+                err_fh = err_path.open("wb")
+            except OSError as exc:
+                out_fh.close()
+                raise EncoderSetupError(
+                    f"failed to open worker stderr log: {exc}") from exc
+            try:
                 try:
                     proc = subprocess.Popen(  # noqa: S603 - operator-configured command
                         cmd, stdin=subprocess.DEVNULL,
@@ -749,12 +893,32 @@ class EncoderWorker:
                 except OSError as exc:
                     raise EncoderSetupError(
                         f"failed to launch encoder worker: {exc}") from exc
-                return self._await(proc, resp_path, out_path, err_path, key, rid,
-                                   cancel_event)
+                try:
+                    return self._await(proc, resp_path, out_path, err_path,
+                                       key, rid, cancel_event)
+                finally:
+                    # Any exception escaping the wait (unexpected error,
+                    # KeyboardInterrupt, ...) must never orphan the child.
+                    if proc.poll() is None:
+                        self._terminate(proc)
+            finally:
+                for fh in (out_fh, err_fh):
+                    try:
+                        fh.close()
+                    except OSError:  # pragma: no cover - close on scratch fs
+                        pass
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
 
     # -- internals -----------------------------------------------------------
+
+    def _event(self, name: str, **fields: Any) -> None:
+        """Log an event, tolerating a dead sink: a broken log must never
+        mask a typed encoder outcome or kill the run next to a live child."""
+        try:
+            self.logger.event(name, **fields)
+        except Exception:
+            pass
 
     def _await(self, proc: subprocess.Popen, resp_path: Path, out_path: Path,
                err_path: Path, key: str, rid: str,
@@ -774,55 +938,73 @@ class EncoderWorker:
             self._terminate(proc)
             err_x = _read_excerpt(err_path)
             kind = "timed out" if timed_out else "cancelled"
-            self.logger.event("encoder_worker_timeout" if timed_out
-                              else "encoder_worker_cancelled",
-                              cache_key=key, request_id=rid,
-                              timeout_s=self.timeout_s, stderr=err_x)
+            self._event("encoder_worker_timeout" if timed_out
+                        else "encoder_worker_cancelled",
+                        cache_key=key, request_id=rid,
+                        timeout_s=self.timeout_s, stderr=err_x)
             message = (f"encoder worker {kind} after {self.timeout_s:.3f}s "
                        f"(terminated, then killed if needed); captured stderr:\n{err_x}")
             if timed_out:
-                raise EncoderTimeoutError(message)
-            raise EncoderCancelledError(message)
+                raise EncoderTimeoutError(message, stderr=err_x)
+            raise EncoderCancelledError(message, stderr=err_x)
 
         out_x = _read_excerpt(out_path)
         err_x = _read_excerpt(err_path)
         try:
-            raw = resp_path.read_bytes()
-        except FileNotFoundError:
-            raw = None
-        except OSError as exc:
-            raise EncoderProtocolError(f"response file unreadable: {exc}") from exc
+            payload = self._result_from_files(proc, resp_path, err_x, key, rid)
+        except EncoderError as exc:
+            # Every failure branch is terminal and gets an event carrying
+            # the captured stderr; a dead sink cannot hide it or hide this.
+            self._event("encoder_worker_failed", cache_key=key, request_id=rid,
+                        exit_code=proc.returncode, error=type(exc).__name__,
+                        stderr=getattr(exc, "stderr", "") or err_x)
+            raise
+        self._event("encoder_worker_ok", cache_key=key, request_id=rid,
+                    exit_code=proc.returncode, stderr=err_x or None,
+                    stdout=out_x or None)
+        return payload
+
+    def _result_from_files(self, proc: subprocess.Popen, resp_path: Path,
+                           err_x: str, key: str, rid: str) -> EncodedPayload:
+        # Returncode is checked BEFORE any response read: a nonzero exit is
+        # a worker failure whatever (or however valid) the leftover file is.
         if proc.returncode != 0:
-            self.logger.event("encoder_worker_failed", cache_key=key,
-                              request_id=rid, exit_code=proc.returncode,
-                              stderr=err_x)
             raise EncoderWorkerError(
                 f"encoder worker exited {proc.returncode}; captured stderr:\n{err_x}",
                 exit_code=proc.returncode, stderr=err_x)
-        if raw is None:
+        try:
+            raw = resp_path.read_bytes()
+        except FileNotFoundError as exc:
             raise EncoderProtocolError(
                 f"encoder worker exited 0 but wrote no response file; "
-                f"captured stderr:\n{err_x}")
-        try:
-            doc = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                f"captured stderr:\n{err_x}", stderr=err_x) from exc
+        except OSError as exc:
             raise EncoderProtocolError(
-                f"worker response is not valid UTF-8 JSON: {exc}; "
-                f"captured stderr:\n{err_x}") from exc
-        payload = self._payload_from_result(doc, rid, err_x, key)
-        self.logger.event("encoder_worker_ok", cache_key=key, request_id=rid,
-                          exit_code=proc.returncode, stderr=err_x or None,
-                          stdout=out_x or None)
-        return payload
+                f"response file unreadable: {exc}; "
+                f"captured stderr:\n{err_x}", stderr=err_x) from exc
+        try:
+            doc = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise EncoderProtocolError(
+                f"worker response is not valid UTF-8 JSON with only finite "
+                f"numbers: {exc}; captured stderr:\n{err_x}",
+                stderr=err_x) from exc
+        return self._payload_from_result(doc, rid, err_x, key)
 
     def _payload_from_result(self, doc: Any, rid: str, err_x: str,
                              key: str) -> EncodedPayload:
         def proto(msg: str) -> EncoderProtocolError:
             return EncoderProtocolError(
-                f"{msg}; captured stderr:\n{err_x}" if err_x else msg)
+                f"{msg}; captured stderr:\n{err_x}" if err_x else msg,
+                stderr=err_x)
 
         if not isinstance(doc, Mapping):
             raise proto(f"result must be a JSON object, got {type(doc).__name__}")
+        extra = sorted(str(k) for k in set(doc) - {"schema", "request_id",
+                                                   "status", "metadata",
+                                                   "blobs", "error"})
+        if extra:
+            raise proto(f"result has unknown fields: {', '.join(extra)}")
         if doc.get("schema") != RESULT_SCHEMA:
             raise proto(f"result schema must be {RESULT_SCHEMA!r}, "
                         f"got {doc.get('schema')!r}")
@@ -832,15 +1014,25 @@ class EncoderWorker:
         status = doc.get("status")
         if status == "error":
             info = doc.get("error")
-            if not isinstance(info, Mapping) or not isinstance(info.get("message"), str):
+            if not isinstance(info, Mapping):
                 raise proto("error result requires an object {type?, message}")
+            bad = sorted(str(k) for k in set(info) - {"type", "message"})
+            if bad:
+                raise proto(f"error descriptor has unknown fields: "
+                            f"{', '.join(bad)}")
+            message = info.get("message")
+            if not isinstance(message, str) or not message.strip():
+                raise proto(f"error descriptor requires a non-empty string "
+                            f"'message', got {message!r}")
+            etype = info.get("type", "WorkerError")
+            if not isinstance(etype, str) or not etype.strip():
+                raise proto(f"error descriptor 'type' must be a non-empty "
+                            f"string when present, got {etype!r}")
             raise EncoderWorkerError(
-                f"encoder worker reported error "
-                f"{info.get('type', 'WorkerError')}: {info['message']}; "
+                f"encoder worker reported error {etype}: {message}; "
                 f"captured stderr:\n{err_x}" if err_x else
-                f"encoder worker reported error "
-                f"{info.get('type', 'WorkerError')}: {info['message']}",
-                exit_code=0, stderr=err_x, worker_error=info)
+                f"encoder worker reported error {etype}: {message}",
+                exit_code=0, stderr=err_x, worker_error=dict(info))
         if status != "ok":
             raise proto(f"unknown result status {status!r}")
         metadata = doc.get("metadata", {})
@@ -854,6 +1046,10 @@ class EncoderWorker:
             if (not isinstance(b, Mapping) or not isinstance(b.get("name"), str)
                     or not b["name"].strip() or not isinstance(b.get("data_b64"), str)):
                 raise proto(f"blob[{i}] must be {{name, data_b64}}, got {b!r}")
+            extra_b = sorted(str(k) for k in set(b) - {"name", "data_b64"})
+            if extra_b:
+                raise proto(f"blob[{i}] descriptor has unknown fields: "
+                            f"{', '.join(extra_b)}")
             try:
                 data = base64.b64decode(b["data_b64"], validate=True)
             except (ValueError, TypeError) as exc:
@@ -868,24 +1064,38 @@ class EncoderWorker:
             raise proto(str(exc)) from exc
 
     def _terminate(self, proc: subprocess.Popen) -> None:
-        """terminate → wait(grace) → kill; never leaves an orphan."""
-        if proc.poll() is not None:
-            return
+        """terminate → wait(grace) → kill; never leaves an orphan, even if
+        the teardown itself is interrupted (best-effort kill on any raise)."""
         try:
-            proc.terminate()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=self.cancel_grace_s)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:  # pragma: no cover - unkillable child
-            pass
+            if proc.poll() is not None:
+                return
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=self.cancel_grace_s)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:  # pragma: no cover - unkillable child
+                pass
+        except BaseException:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                # Blocking reap that cannot itself be interrupted by a
+                # patched/blocked sleep: kill already ended the child.
+                os.waitpid(proc.pid, 0)
+            except (ChildProcessError, OSError):
+                pass  # already reaped by Popen.wait
+            raise
 

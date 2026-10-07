@@ -8,6 +8,7 @@ boundary.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -555,6 +556,351 @@ def test_failed_encode_is_not_cached(tmp_path):
         worker.encode(make_request(kwargs=kwargs))
     assert cache.entries() == []
     assert_scratch_clean(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Senior-review hardening: immutability, typed validation, lifecycle, wire
+# ---------------------------------------------------------------------------
+
+
+def test_request_snapshot_survives_external_mutation():
+    """Mutating the caller's (nested) kwargs after construction must not
+    move the cache key, the wire document, or their agreement."""
+    inner = {"deep": [1, {"deeper": 2}]}
+    kwargs = {"a": inner, "b": [1, 2]}
+    req = make_request(kwargs=kwargs)
+    key_before = cache_key(req)
+    wire_kwargs = req.to_request_dict("rid")["kwargs"]
+
+    inner["deep"].append("poison")
+    inner["added"] = True
+    kwargs["c"] = [3]
+    kwargs["a"] = "rebound"
+
+    assert cache_key(req) == key_before, "cache key drifted after mutation"
+    assert req.to_request_dict("rid")["kwargs"] == wire_kwargs
+
+    # Key and wire document describe exactly the same request.
+    doc = req.to_request_dict("rid-9")
+    key_doc = req.key_document()
+    assert doc["schema"] == REQUEST_SCHEMA
+    assert {k: v for k, v in doc.items()
+            if k not in ("schema", "request_id")} == \
+           {k: v for k, v in key_doc.items() if k != "schema"}
+    assert cache_key(req) == hashlib.sha256(json.dumps(
+        key_doc, sort_keys=True, ensure_ascii=True,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    # The snapshot is frozen all the way down.
+    with pytest.raises(TypeError):
+        req.kwargs["x"] = 1  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        req.kwargs["b"].append(4)  # type: ignore[union-attr]
+
+
+def test_payload_metadata_snapshot_survives_mutation():
+    meta = {"nested": {"list": [1, {"x": 2}]}}
+    key = cache_key(make_request())
+    payload = EncodedPayload(metadata=meta, blobs=(Blob("e", b"1"),))
+    before = payload.to_entry_bytes(key)
+    meta["nested"]["list"].append("poison")
+    meta["top"] = 1
+    assert payload.to_entry_bytes(key) == before
+    with pytest.raises(TypeError):
+        payload.metadata["top"] = 2  # type: ignore[index]
+
+
+def test_blob_bytearray_snapshot_is_immutable():
+    ba = bytearray(b"embed-bytes")
+    blob = Blob("e", ba)
+    assert isinstance(blob.data, bytes)
+    sha_before = blob.sha256
+    entry = EncodedPayload(blobs=(blob,)).to_entry_bytes("a" * 64)
+    ba[0] = ba[0] ^ 0xFF
+    ba.append(9)
+    assert blob.sha256 == sha_before
+    assert EncodedPayload(blobs=(blob,)).to_entry_bytes("a" * 64) == entry
+
+
+@pytest.mark.parametrize("overrides", [
+    {"processor": "gpt2"}, {"tokenizer": {}}, {"chat_template": None},
+])
+def test_components_must_be_component_identity(overrides):
+    with pytest.raises(EncoderRequestError):
+        make_request(**overrides)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {1: "int key"},
+    {"n": float("nan")},
+    {"i": float("inf")},
+    {"c": 1 + 2j},
+    {"o": object()},
+])
+def test_kwargs_reject_invalid_json_values(kwargs):
+    with pytest.raises(EncoderRequestError, match="kwargs"):
+        make_request(kwargs=kwargs)
+
+
+@pytest.mark.parametrize("meta", [
+    {"n": float("nan")},
+    {5: "v"},
+    {"s": {1, 2}},
+])
+def test_payload_metadata_rejects_invalid_json(meta):
+    with pytest.raises(EncoderRequestError, match="metadata"):
+        EncodedPayload(metadata=meta)
+
+
+def test_payload_rejects_non_blob_entries():
+    with pytest.raises(EncoderRequestError, match="blobs"):
+        EncodedPayload(blobs=(Blob("a", b"0"), "not-a-blob"))
+    with pytest.raises(EncoderRequestError, match="blobs"):
+        EncodedPayload(blobs=("not-a-blob",))
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_nonfinite_timeouts_are_rejected(bad):
+    cmd = ["prog", "{request}", "{response}"]
+    with pytest.raises(EncoderSetupError, match="timeout_s"):
+        EncoderWorker(command=cmd, timeout_s=bad)
+    with pytest.raises(EncoderSetupError, match="cancel_grace_s"):
+        EncoderWorker(command=cmd, timeout_s=5.0, cancel_grace_s=bad)
+
+
+def test_concurrent_puts_never_empty_the_cache(tmp_path):
+    """max_entries=1, concurrent puts: every publish+evict is one
+    transaction, so the LRU can never evict the whole cache away."""
+    cache = EmbeddingCache(tmp_path / "embeds", max_entries=1)
+    keys = [cache_key(make_request(prompt=f"p-{i}")) for i in range(4)]
+    barrier = threading.Barrier(len(keys))
+
+    def go(k: str) -> None:
+        barrier.wait()
+        cache.put(k, EncodedPayload(blobs=(Blob("e", k.encode()),)))
+
+    threads = [threading.Thread(target=go, args=(k,)) for k in keys]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    entries = cache.entries()
+    assert len(entries) == 1, "LRU race emptied the cache or exceeded the cap"
+    assert entries[0] in keys
+
+
+def test_instances_on_same_root_share_locks(tmp_path):
+    root = tmp_path / "embeds"
+    c1 = EmbeddingCache(root)
+    c2 = EmbeddingCache(root / ".")  # same canonical path, different spelling
+    c3 = EmbeddingCache(tmp_path / "other")
+    assert c1.lock_for("a" * 64) is c2.lock_for("a" * 64), \
+        "same canonical root must share per-key locks"
+    assert c1.lock_for("a" * 64) is not c3.lock_for("a" * 64)
+
+
+def test_two_cache_instances_same_root_encode_once(tmp_path):
+    counter = tmp_path / "encodes.log"
+    root = tmp_path / "embeds"
+    kwargs = {"_counter_file": str(counter), "_sleep": 0.4}
+    req = make_request(kwargs=kwargs)
+    workers = []
+    for i in (1, 2):
+        scratch = tmp_path / f"scratch{i}"
+        scratch.mkdir()
+        workers.append(EncoderWorker(
+            command=[sys.executable, str(FAKE_WORKER), "--request", "{request}",
+                     "--response", "{response}"],
+            timeout_s=20.0, cache=EmbeddingCache(root), scratch_dir=scratch))
+    results: list = []
+    errors: list = []
+    barrier = threading.Barrier(2)
+
+    def go(w):
+        try:
+            barrier.wait()
+            results.append(w.encode(req))
+        except BaseException as exc:  # noqa: BLE001 - surfaced below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=go, args=(w,)) for w in workers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert not errors
+    assert len(counter.read_text().splitlines()) == 1, \
+        "two cache instances on one root double-encoded"
+    assert len(results) == 2
+    for i in (1, 2):
+        assert list((tmp_path / f"scratch{i}").iterdir()) == []
+
+
+def test_keyboard_interrupt_during_wait_reaps_child(tmp_path, monkeypatch):
+    """An interrupted poll loop must still terminate/reap the live child
+    before the scratch dir disappears."""
+    pid_file = tmp_path / "worker.pid"
+    worker, kwargs = make_worker(tmp_path, timeout_s=30.0,
+                                 extra_kwargs={"_sleep": 30,
+                                               "_pid_file": str(pid_file)})
+    calls: list = []
+    real_sleep = time.sleep
+
+    def boom(_seconds):
+        calls.append(_seconds)
+        # Let the child actually start (and record its pid) before the
+        # simulated interrupt, so the reap is verified against a live child.
+        end = time.monotonic() + 5.0
+        while not pid_file.exists() and time.monotonic() < end:
+            real_sleep(0.02)
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as m:
+        m.setattr("qwen_engine.encoder.time.sleep", boom)
+        with pytest.raises(KeyboardInterrupt):
+            worker.run(make_request(kwargs=kwargs))
+    assert calls, "the wait was not actually interrupted"
+    pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("worker child still alive after interrupted wait")
+    assert_scratch_clean(tmp_path)
+
+
+def test_setup_failures_are_typed_and_clean_up(tmp_path, monkeypatch):
+    import qwen_engine.encoder as enc
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    worker = EncoderWorker(
+        command=[sys.executable, str(FAKE_WORKER), "--request", "{request}",
+                 "--response", "{response}"],
+        timeout_s=10.0, scratch_dir=scratch)
+
+    def boom_mkdtemp(*a, **k):
+        raise OSError("no space left on device")
+
+    with monkeypatch.context() as m:
+        m.setattr(enc.tempfile, "mkdtemp", boom_mkdtemp)
+        with pytest.raises(EncoderSetupError, match="scratch"):
+            worker.run(make_request())
+
+    def boom_write(self, data):
+        raise OSError("read-only file system")
+
+    with monkeypatch.context() as m:
+        m.setattr(Path, "write_bytes", boom_write)
+        with pytest.raises(EncoderSetupError, match="request file"):
+            worker.run(make_request())
+
+    real_mkdtemp = enc.tempfile.mkdtemp
+
+    def squat_mkdtemp(*a, **k):  # a directory squatting on the stdout log
+        d = real_mkdtemp(*a, **k)
+        (Path(d) / "stdout.log").mkdir()
+        return d
+
+    with monkeypatch.context() as m:
+        m.setattr(enc.tempfile, "mkdtemp", squat_mkdtemp)
+        with pytest.raises(EncoderSetupError, match="stdout"):
+            worker.run(make_request())
+    assert list(scratch.iterdir()) == [], "setup failures must clean scratch"
+
+
+def test_protocol_failure_event_carries_stderr(tmp_path):
+    events = []
+    from qwen_engine.log import PhaseLogger
+    worker, kwargs = make_worker(
+        tmp_path, logger=PhaseLogger(sink=events.append),
+        extra_kwargs={"_no_response": True, "_stderr": "died quietly"})
+    with pytest.raises(EncoderProtocolError) as exc:
+        worker.run(make_request(kwargs=kwargs))
+    assert "died quietly" in exc.value.stderr, "typed failure must keep stderr"
+    failed = [json.loads(line) for line in events
+              if json.loads(line)["event"] == "encoder_worker_failed"]
+    assert failed, "a failure branch must emit a terminal event"
+    assert "died quietly" in failed[0]["stderr"]
+    assert failed[0]["error"] == "EncoderProtocolError"
+    assert_scratch_clean(tmp_path)
+
+
+def test_error_result_emits_terminal_event(tmp_path):
+    events = []
+    from qwen_engine.log import PhaseLogger
+    worker, kwargs = make_worker(
+        tmp_path, logger=PhaseLogger(sink=events.append),
+        extra_kwargs={"_worker_error": {"type": "OOM", "message": "vram gone"},
+                      "_stderr": "note from stderr"})
+    with pytest.raises(EncoderWorkerError):
+        worker.run(make_request(kwargs=kwargs))
+    failed = [json.loads(line) for line in events
+              if json.loads(line)["event"] == "encoder_worker_failed"]
+    assert failed and "note from stderr" in failed[0]["stderr"]
+
+
+def test_dead_log_sink_does_not_mask_failure(tmp_path):
+    from qwen_engine.log import PhaseLogger
+
+    def dead_sink(line):
+        raise RuntimeError("the log sink is dead")
+
+    worker, kwargs = make_worker(
+        tmp_path, logger=PhaseLogger(sink=dead_sink),
+        extra_kwargs={"_fail_exit": 4, "_stderr": "real problem"})
+    with pytest.raises(EncoderWorkerError) as exc:
+        worker.run(make_request(kwargs=kwargs))
+    assert "real problem" in exc.value.stderr
+    assert_scratch_clean(tmp_path)
+
+    worker2, kwargs2 = make_worker(
+        tmp_path, cache=EmbeddingCache(tmp_path / "embeds"),
+        logger=PhaseLogger(sink=dead_sink))
+    payload = worker2.encode(make_request(kwargs=kwargs2))
+    assert payload.blobs[0].data.startswith(b"FAKEEMBED:"), \
+        "dead cache hit/miss events must not break encode"
+
+
+@pytest.mark.parametrize("patch", [
+    {"surprise": 1},
+    {"status": "error", "error": {"message": "boom", "surprise": 2}},
+    {"blobs": [{"name": "b", "data_b64": "AA==", "surprise": True}]},
+])
+def test_unknown_result_fields_are_protocol_errors(tmp_path, patch):
+    worker, kwargs = make_worker(tmp_path, extra_kwargs={"_result_patch": patch})
+    with pytest.raises(EncoderProtocolError, match="unknown"):
+        worker.run(make_request(kwargs=kwargs))
+    assert_scratch_clean(tmp_path)
+
+
+def test_nonfinite_metadata_in_response_is_protocol_error(tmp_path):
+    worker, kwargs = make_worker(tmp_path, extra_kwargs={"_nan_metadata": True})
+    with pytest.raises(EncoderProtocolError, match="finite"):
+        worker.run(make_request(kwargs=kwargs))
+    assert_scratch_clean(tmp_path)
+
+
+def test_entry_nonfinite_or_unknown_key_is_miss_and_quarantined(tmp_path):
+    cache = EmbeddingCache(tmp_path / "embeds")
+    key = cache_key(make_request())
+    cache.entry_path(key).parent.mkdir(parents=True, exist_ok=True)
+    nan_header = json.dumps({"schema": ENTRY_SCHEMA, "key": key,
+                             "metadata": {"n": float("nan")}, "blobs": []},
+                            sort_keys=True)
+    cache.entry_path(key).write_bytes(nan_header.encode("utf-8") + b"\n")
+    assert cache.get(key) is None
+    assert len(list(cache.quarantine_dir.iterdir())) == 1
+    extra_header = json.dumps({"schema": ENTRY_SCHEMA, "key": key,
+                               "metadata": {}, "blobs": [], "surprise": True},
+                              sort_keys=True)
+    cache.entry_path(key).write_bytes(extra_header.encode("utf-8") + b"\n")
+    assert cache.get(key) is None
+    assert len(list(cache.quarantine_dir.iterdir())) == 2
 
 
 # ---------------------------------------------------------------------------

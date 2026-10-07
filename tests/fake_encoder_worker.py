@@ -10,6 +10,10 @@ Driven entirely by underscore-prefixed keys in the request ``kwargs``:
 * ``_garbage_response``: true — write non-JSON, exit 0
 * ``_no_response``: true — exit 0 without writing anything
 * ``_bad_status``: true — write an unknown status
+* ``_result_patch``: object — merged into the result document (wire
+  violations: unknown fields, NaN metadata, malformed descriptors). NaN
+  arrives as the literal ``NaN`` token because the writer uses ``allow_nan``
+  exactly like a sloppy worker would.
 * ``_counter_file``: path — append one line per *encode* (double-encode detector)
 * ``_pid_file``: path — record the worker pid (kill-path verification)
 
@@ -73,16 +77,20 @@ def main() -> int:
         prompt = req["prompt"]
         negative = req.get("negative_prompt", "")
         blob = b"FAKEEMBED:" + prompt.encode("utf-8") + b"|" + negative.encode("utf-8")
+        metadata = {
+            "dtype": req["dtype"],
+            "prompt_chars": len(prompt),
+            "source": "fake-worker",
+        }
+        if kwargs.get("_nan_metadata"):
+            metadata["nan_field"] = float("nan")  # sloppy worker: NaN literal
         doc.update({
             "status": "ok",
-            "metadata": {
-                "dtype": req["dtype"],
-                "prompt_chars": len(prompt),
-                "source": "fake-worker",
-            },
+            "metadata": metadata,
             "blobs": [{"name": "prompt_embeds",
                        "data_b64": base64.b64encode(blob).decode("ascii")}],
         })
+    doc.update(kwargs.get("_result_patch") or {})
     tmp = args.response + f".tmp{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, sort_keys=True)
