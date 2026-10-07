@@ -147,7 +147,7 @@ def _forged_report(manifest: ModelManifest, root: Path,
 def _project(manifest: ModelManifest, root: Path) -> lb.LocalReferenceBundle:
     report = resolve_manifest(manifest, root)
     assert report.ok, [s.to_dict() for s in report.statuses if not s.error is None]
-    return lb.local_bundle_from_resolution(manifest, report, root)
+    return lb.project_resolution_report(manifest, report, root)
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +249,7 @@ def test_relative_root_publishes_absolute_paths(tmp_path, monkeypatch):
     # The resolver's own report stays lexical — the factory still matches
     # status paths against the caller's root/filename spelling...
     assert all(not s.path.is_absolute() for s in report.statuses)
-    bundle = lb.local_bundle_from_resolution(manifest, report, models_dir)
+    bundle = lb.project_resolution_report(manifest, report, models_dir)
     # ...but everything the bundle publishes is absolute and canonical.
     assert bundle.root == real_root.resolve() == bundle.root_resolved
     assert bundle.root.is_absolute()
@@ -286,7 +286,7 @@ def test_relative_root_paths_valid_in_fresh_child(tmp_path):
         os.chdir(project_dir)
         report = resolve_manifest(manifest, "models/assets")
         assert report.ok
-        bundle = lb.local_bundle_from_resolution(manifest, report,
+        bundle = lb.project_resolution_report(manifest, report,
                                                  "models/assets")
     finally:
         os.chdir(previous_cwd)
@@ -490,7 +490,7 @@ def test_incomplete_resolver_report_refused(tmp_path):
     report = resolve_manifest(manifest, root)
     assert not report.ok
     with pytest.raises(lb.BundleReportError, match="not successful"):
-        lb.local_bundle_from_resolution(manifest, report, root)
+        lb.project_resolution_report(manifest, report, root)
 
 
 def test_empty_root_report_refused(tmp_path):
@@ -500,7 +500,7 @@ def test_empty_root_report_refused(tmp_path):
         (root / fn).unlink()
     report = resolve_manifest(manifest, root)
     with pytest.raises(lb.BundleReportError, match="not successful"):
-        lb.local_bundle_from_resolution(manifest, report, root)
+        lb.project_resolution_report(manifest, report, root)
 
 
 def test_missing_root_refused(tmp_path):
@@ -508,7 +508,7 @@ def test_missing_root_refused(tmp_path):
     manifest = _manifest_with()
     report = _forged_report(manifest, root)
     with pytest.raises(lb.BundlePathError, match="not a directory"):
-        lb.local_bundle_from_resolution(manifest, report, root)
+        lb.project_resolution_report(manifest, report, root)
 
 
 def test_reordered_statuses_refused(tmp_path):
@@ -519,7 +519,7 @@ def test_reordered_statuses_refused(tmp_path):
         ok=True, resolved=report.resolved,
         statuses=report.statuses[1:] + report.statuses[:1], errors=())
     with pytest.raises(lb.BundleReportError, match="does not match"):
-        lb.local_bundle_from_resolution(manifest, reordered, root)
+        lb.project_resolution_report(manifest, reordered, root)
 
 
 def test_extra_and_short_status_lists_refused(tmp_path):
@@ -528,11 +528,11 @@ def test_extra_and_short_status_lists_refused(tmp_path):
     report = resolve_manifest(manifest, root)
     pad = report.statuses[0]
     with pytest.raises(lb.BundleReportError, match="statuses but the manifest"):
-        lb.local_bundle_from_resolution(manifest, ResolutionReport(
+        lb.project_resolution_report(manifest, ResolutionReport(
             ok=True, resolved=report.resolved,
             statuses=report.statuses + (pad,), errors=()), root)
     with pytest.raises(lb.BundleReportError, match="statuses but the manifest"):
-        lb.local_bundle_from_resolution(manifest, ResolutionReport(
+        lb.project_resolution_report(manifest, ResolutionReport(
             ok=True, resolved=report.resolved,
             statuses=report.statuses[:-1], errors=()), root)
 
@@ -547,7 +547,7 @@ def test_forged_status_fields_refused(tmp_path):
                                   "sha256": "0" * 64})
     statuses[7] = ArtifactStatus(forged_art, STATE_PRESENT, path=victim.path)
     with pytest.raises(lb.BundleReportError, match="forged"):
-        lb.local_bundle_from_resolution(manifest, ResolutionReport(
+        lb.project_resolution_report(manifest, ResolutionReport(
             ok=True, resolved=report.resolved,
             statuses=tuple(statuses), errors=()), root)
 
@@ -559,7 +559,7 @@ def test_forged_status_with_non_present_state_refused(tmp_path):
     statuses = list(report.statuses)
     statuses[13] = ArtifactStatus(statuses[13].artifact, STATE_MISSING)
     with pytest.raises(lb.BundleReportError, match="state"):
-        lb.local_bundle_from_resolution(manifest, ResolutionReport(
+        lb.project_resolution_report(manifest, ResolutionReport(
             ok=True, resolved=report.resolved,
             statuses=tuple(statuses), errors=()), root)
 
@@ -572,7 +572,7 @@ def test_status_path_not_matching_root_refused(tmp_path):
     statuses[2] = ArtifactStatus(statuses[2].artifact, STATE_PRESENT,
                                  path=root.parent / "elsewhere" / "x")
     with pytest.raises(lb.BundleReportError, match="is not the expected"):
-        lb.local_bundle_from_resolution(manifest, ResolutionReport(
+        lb.project_resolution_report(manifest, ResolutionReport(
             ok=True, resolved=report.resolved,
             statuses=tuple(statuses), errors=()), root)
 
@@ -584,7 +584,7 @@ def test_report_from_a_different_root_refused(tmp_path):
     manifest = build_tiny_tree(root_a)
     report = resolve_manifest(manifest, root_a)
     with pytest.raises(lb.BundleReportError, match="is not the expected"):
-        lb.local_bundle_from_resolution(manifest, report, root_b)
+        lb.project_resolution_report(manifest, report, root_b)
 
 
 def test_status_from_other_manifest_reordered_within_same_fileset(tmp_path):
@@ -596,7 +596,7 @@ def test_status_from_other_manifest_reordered_within_same_fileset(tmp_path):
         reversed(manifest.artifacts)))
     report = resolve_manifest(other, root)
     with pytest.raises(lb.BundleReportError, match="does not match|statuses but"):
-        lb.local_bundle_from_resolution(manifest, report, root)
+        lb.project_resolution_report(manifest, report, root)
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +611,7 @@ def test_nonempty_errors_despite_ok_refused(tmp_path):
     victim = manifest.artifacts[3]
     err = ArtifactError(victim, "hand-forged contradiction")
     with pytest.raises(lb.BundleReportError, match="no errors"):
-        lb.local_bundle_from_resolution(
+        lb.project_resolution_report(
             manifest, _forged_report(manifest, root, errors=(err,)), root)
 
 
@@ -622,7 +622,7 @@ def test_review_example_ok_with_errors_and_empty_resolved_refused(tmp_path):
     manifest = build_tiny_tree(root)
     err = ArtifactError(manifest.artifacts[0], "example")
     with pytest.raises(lb.BundleReportError):
-        lb.local_bundle_from_resolution(manifest, ResolutionReport(
+        lb.project_resolution_report(manifest, ResolutionReport(
             ok=True,
             statuses=tuple(ArtifactStatus(a, STATE_PRESENT,
                                           path=root / a.identity)
@@ -639,7 +639,7 @@ def test_present_status_carrying_error_refused(tmp_path):
                                  error=ArtifactError(victim.artifact, "forged"),
                                  path=victim.path)
     with pytest.raises(lb.BundleReportError, match="carries error"):
-        lb.local_bundle_from_resolution(
+        lb.project_resolution_report(
             manifest,
             _forged_report(manifest, root, statuses=tuple(statuses)), root)
 
@@ -654,7 +654,7 @@ def test_resolved_mapping_must_equal_grouped_status_paths(tmp_path):
         broken = dict(good.resolved)
         mutate(broken)
         with pytest.raises(lb.BundleReportError, match=match):
-            lb.local_bundle_from_resolution(
+            lb.project_resolution_report(
                 manifest, _forged_report(manifest, root, resolved=broken),
                 root)
 
@@ -669,7 +669,72 @@ def test_resolved_mapping_must_equal_grouped_status_paths(tmp_path):
     # And the real resolver's report for the same root trivially matches —
     # the check polices hand-built reports, not honest ones.
     honest = resolve_manifest(manifest, root)
-    assert lb.local_bundle_from_resolution(manifest, honest, root).assets
+    assert lb.project_resolution_report(manifest, honest, root).assets
+
+
+# ---------------------------------------------------------------------------
+# Trusted factory vs trusted-caller projection (review item 2): resolver
+# provenance is an explicit API split, not an implied property of the
+# projection
+# ---------------------------------------------------------------------------
+
+
+def test_trusted_factory_positive_projection(tmp_path):
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    bundle = lb.resolve_local_bundle(manifest, root)
+    honest = _project(manifest, root)
+    assert bundle.to_dict() == honest.to_dict()
+
+
+def test_trusted_factory_refuses_changed_content_and_projection_is_not_proof(tmp_path):
+    """Content changes AFTER the tree was built: the trusted factory runs
+    resolve_manifest itself and REFUSES (the rehash sees the tamper), while
+    the lower-level projection — which openly trusts its caller's report —
+    still projects. That asymmetry IS the contract: a forged shape-
+    consistent report is NOT verified evidence (review item 2)."""
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    (root / "vae" / "diffusion_pytorch_model.safetensors").write_bytes(
+        b"tampered-after-the-original-bytes")
+    with pytest.raises(lb.BundleReportError, match="not successful"):
+        lb.resolve_local_bundle(manifest, root)
+    # A hand-built ok=True report says nothing about bytes; the cheap
+    # structural probes pass (file exists, regular, inside root) because the
+    # projection never rehashes. Honest, documented, NOT authenticated.
+    bundle = lb.project_resolution_report(
+        manifest, _forged_report(manifest, root), root)
+    assert bundle.assets["vae"]
+    tamper = hashlib.sha256(b"tampered-after-the-original-bytes").hexdigest()
+    assert not any(a.sha256 == tamper for a in manifest.artifacts)
+
+
+def test_trusted_factory_refuses_missing_file(tmp_path):
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    (root / "processor" / "tokenizer.json").unlink()
+    with pytest.raises(lb.BundleReportError, match="not successful"):
+        lb.resolve_local_bundle(manifest, root)
+
+
+def test_trusted_factory_refuses_off_profile_manifest_before_any_hash(tmp_path):
+    """Layout validation runs BEFORE resolve_manifest, so an off-profile
+    manifest never triggers the (tiny: per-file) hash walk at all."""
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root, revision="e" * 40)  # consistent, wrong
+    with pytest.raises(lb.BundleLayoutError, match="pinned to revision"):
+        lb.resolve_local_bundle(manifest, root)
+
+
+def test_api_docstrings_state_the_provenance_split():
+    """The lower-level projection must not describe itself as authenticated:
+    its contract says it trusts the caller; the factory says it runs the
+    trusted resolver itself (and names the TOCTOU limit)."""
+    proj_doc = lb.project_resolution_report.__doc__ or ""
+    factory_doc = lb.resolve_local_bundle.__doc__ or ""
+    assert "TRUSTS ITS CALLER" in proj_doc
+    assert "resolve_manifest" in factory_doc
+    assert "TOCTOU" in factory_doc and "TOCTOU" in proj_doc
 
 
 # ---------------------------------------------------------------------------
@@ -690,9 +755,9 @@ def test_escaped_symlink_file_refused_despite_forged_ok(tmp_path):
     report = resolve_manifest(manifest, root)
     assert not report.ok
     with pytest.raises(lb.BundleReportError):
-        lb.local_bundle_from_resolution(manifest, report, root)
+        lb.project_resolution_report(manifest, report, root)
     with pytest.raises(lb.BundlePathError, match="outside the model root"):
-        lb.local_bundle_from_resolution(
+        lb.project_resolution_report(
             manifest, _forged_report(manifest, root), root)
 
 
@@ -703,7 +768,7 @@ def test_directory_swapped_for_file_refused_despite_forged_ok(tmp_path):
     victim.unlink()
     victim.mkdir()
     with pytest.raises(lb.BundlePathError, match="not a regular file"):
-        lb.local_bundle_from_resolution(
+        lb.project_resolution_report(
             manifest, _forged_report(manifest, root), root)
 
 
@@ -712,7 +777,7 @@ def test_deleted_file_refused_despite_forged_ok(tmp_path):
     manifest = build_tiny_tree(root)
     (root / "text_encoder" / "model-00003-of-00004.safetensors").unlink()
     with pytest.raises(lb.BundlePathError, match="does not exist"):
-        lb.local_bundle_from_resolution(
+        lb.project_resolution_report(
             manifest, _forged_report(manifest, root), root)
 
 
@@ -721,7 +786,7 @@ def test_root_itself_a_regular_file_refused(tmp_path):
     root.write_bytes(b"x")
     manifest = _manifest_with()
     with pytest.raises(lb.BundlePathError, match="not a directory"):
-        lb.local_bundle_from_resolution(
+        lb.project_resolution_report(
             manifest, _forged_report(manifest, root), root)
 
 
@@ -741,7 +806,7 @@ def test_within_root_symlink_allowed_like_the_resolver(tmp_path):
     # probe alone (forged ok report, same root/manifest) accepts the
     # inside-root symlink — consistency with resolver symlink semantics.
     assert not resolve_manifest(manifest, root).ok
-    bundle = lb.local_bundle_from_resolution(
+    bundle = lb.project_resolution_report(
         manifest, _forged_report(manifest, root), root)
     assert bundle.assets["processor"]
 

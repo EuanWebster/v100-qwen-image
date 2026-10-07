@@ -1,11 +1,15 @@
-"""Local reference-bundle contract (M2.2a, part 1) — stdlib-only, no ML imports.
+"""Local reference-bundle contract (M2.2a) — stdlib-only, no ML imports.
 
-This module **projects** an already resolver-verified local file set into the
-shape a future adapter's ``load(config, assets)`` expects. It is deliberately
-NOT a second downloader, NOT a second verifier pass, and NOT a fake successful
-load: :func:`resolve_manifest` (``manifest.py``) has already hashed and sized
-every byte; re-opening or re-hashing 33 GB merely to project paths would be
-worse than useless. What happens here, all of it before any ML import:
+This module **projects** a local file set into the shape a future adapter's
+``load(config, assets)`` expects, in two honestly separated APIs:
+:func:`resolve_local_bundle` (the *trusted factory*: runs the trusted
+resolver itself — full byte re-verification, expensive on the real 33 GB
+set) and :func:`project_resolution_report` (the lower-level projection,
+which **trusts its caller's** :class:`~qwen_engine.manifest.ResolutionReport`
+and rehashes nothing). It is deliberately NOT a second downloader, NOT a
+fake successful load, and — in the metadata-only projection path — NOT a
+second verification pass. What happens in the projection, all of it before
+any ML import:
 
 1. The supplied schema-v1 :class:`~qwen_engine.manifest.ModelManifest` must
    match the :data:`LOCAL_REFERENCE_LAYOUT` table exactly — the committed
@@ -68,6 +72,7 @@ from qwen_engine.manifest import (
     ModelManifest,
     ManifestError,
     ResolutionReport,
+    resolve_manifest,
 )
 
 #: Name of the one profile this module knows. Future variants (GGUF ladder,
@@ -368,8 +373,12 @@ class LocalReferenceBundle:
     ids, never an ambient HF cache.
 
     **Direct construction performs no resolver verification.** It only
-    shapes and freezes whatever it is given; use
-    :func:`local_bundle_from_resolution` for the checked projection.
+    shapes and freezes whatever it is given (scalar invariants — profile,
+    root/root_resolved consistency, exact pinned repo/revision, 64-hex
+    digests — are checked defensively; that is data hygiene, not
+    verification). Use :func:`resolve_local_bundle` for the trusted path
+    and :func:`project_resolution_report` when a fresh resolver report is
+    already in hand.
     """
 
     profile: str
@@ -425,7 +434,8 @@ class LocalReferenceBundle:
 
 
 # ---------------------------------------------------------------------------
-# Projection
+# The bundle APIs: trusted factory (resolve_manifest itself) + trusted-caller
+# projection (documented as trusting its report)
 # ---------------------------------------------------------------------------
 
 
@@ -471,28 +481,68 @@ def _probe_regular_file_under_root(expected: Path, role: str,
             "file (unexpected layout)")
 
 
-def local_bundle_from_resolution(manifest: ModelManifest,
-                                 report: ResolutionReport,
-                                 models_dir: str | Path) -> LocalReferenceBundle:
-    """Project a successful :func:`~qwen_engine.manifest.resolve_manifest`
-    report into a :class:`LocalReferenceBundle`.
+def resolve_local_bundle(manifest: ModelManifest,
+                         models_dir: str | Path) -> LocalReferenceBundle:
+    """**The trusted factory**: run the trusted resolver over the real bytes
+    under ``models_dir``, then project the resulting report.
 
-    ``manifest`` must satisfy :data:`LOCAL_REFERENCE_LAYOUT` (exact filenames,
-    role mapping, single repo+revision); ``report`` must be the complete,
-    ``ok`` report *for that manifest* — statuses align positionally, every
-    field of every status artifact equals the manifest's, every state is
-    ``present`` with ``error is None`` and path exactly ``root/filename``
-    (the caller's lexical root), ``report.errors`` is empty, and
-    ``report.resolved`` equals the role-grouped status paths (keys and
-    tuples, manifest order). The bundle **publishes absolute paths under the
-    canonical resolved root** so a future worker started from a different
-    working directory can load them even when ``models_dir`` was relative.
-    Published paths are probed (regular file, under the root) without
-    re-reading content. These checks police the *shape* of the success
-    claim — they are not cryptographic re-verification: forging bytes still
-    requires defeating the trusted resolver itself. All refusal happens with
-    typed errors before any ML import. Performs no network access, no mkdir,
-    no writes.
+    This is the API to call when no prior resolver run is in hand. Because
+    :func:`~qwen_engine.manifest.resolve_manifest` re-reads and re-hashes
+    every artifact, this call is deliberately **not** metadata-only: for the
+    real 33 GB reference set its cost is a full byte re-verification of that
+    set (the same cost as any honest resolve). Callers that already hold a
+    fresh resolver report use :func:`project_resolution_report` (which
+    *trusts that report*) and avoid the rehash.
+
+    The manifest layout (including the profile's exact pinned repo/revision)
+    is validated BEFORE the resolver runs, so an off-profile manifest never
+    triggers a 33 GB hash. Refusals are typed and happen before any ML
+    import; no network access, no mkdir, no writes.
+
+    Honest limits: re-hashing happens *now*, at this call — it does not
+    protect bytes changed afterwards, and this does not close a hostile
+    concurrent-filesystem TOCTOU. Actual component load must reverify
+    immediately before the library reopens the files.
+    """
+    validate_local_reference_layout(manifest)
+    report = resolve_manifest(manifest, models_dir)
+    # project_resolution_report re-checks ok/coherence (the resolver's own
+    # negative verdict must never project, whoever built the report).
+    return project_resolution_report(manifest, report, models_dir)
+
+
+def project_resolution_report(manifest: ModelManifest,
+                              report: ResolutionReport,
+                              models_dir: str | Path) -> LocalReferenceBundle:
+    """Project a resolver-shaped report into a :class:`LocalReferenceBundle`.
+
+    **This lower-level API TRUSTS ITS CALLER.** A public
+    :class:`~qwen_engine.manifest.ResolutionReport` is a plain dataclass: a
+    shape-consistent ``ok=True`` report can be hand-forged, and nothing here
+    — positional/field equality with the manifest, coherence checks on
+    ``errors``/per-status ``error``/``resolved``, and the cheap regular-file/
+    inside-root probes — is cryptographic proof of the file bytes. This
+    projection is honestly *not* authenticated evidence; the verification
+    lives in :func:`~qwen_engine.manifest.resolve_manifest` (run over real
+    bytes — see :func:`resolve_local_bundle`), and a caller using this
+    function is asserting "I ran the trusted resolver and this is its
+    report". It does not close a hostile concurrent-filesystem TOCTOU:
+    actual component load must reverify immediately before the library
+    reopens the files.
+
+    What is enforced here: ``manifest`` must satisfy
+    :data:`LOCAL_REFERENCE_LAYOUT` and the profile's exact pinned
+    repo/revision; ``report`` must be the complete, ``ok``, *internally
+    coherent* success claim for that manifest — statuses align positionally,
+    every status artifact equals the manifest's, every state is ``present``
+    with ``error is None`` and path exactly ``root/filename`` (the caller's
+    lexical root), ``report.errors`` is empty, and ``report.resolved``
+    equals the role-grouped status paths (keys and tuples, manifest order).
+    The bundle **publishes absolute paths under the canonical resolved
+    root**, so a future worker started from a different working directory
+    can load them even when ``models_dir`` was relative. All refusals are
+    typed errors raised before any ML import. No network, no mkdir, no
+    writes, no content hashing.
     """
     repo, revision = validate_local_reference_layout(manifest)
 
