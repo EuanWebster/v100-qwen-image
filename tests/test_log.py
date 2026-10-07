@@ -1,0 +1,133 @@
+"""Task 1.1 acceptance: structured JSONL phase/event logger with injectable
+clock/sink, and *no* default writes outside configured paths."""
+from __future__ import annotations
+
+import itertools
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+from qwen_engine.log import PhaseLogger, file_sink
+
+HEAVY_MODULES = ("torch", "diffusers", "transformers")
+
+
+class ListSink:
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def __call__(self, line: str) -> None:
+        self.lines.append(line)
+
+    def records(self) -> list[dict]:
+        return [json.loads(line) for line in self.lines]
+
+
+def make_logger(**kw):
+    sink = ListSink()
+    logger = PhaseLogger(sink=sink, clock=lambda: 123.456, wall_clock=lambda: 1.0, **kw)
+    return sink, logger
+
+
+def test_event_emits_one_jsonl_line_with_core_fields():
+    sink, logger = make_logger()
+    logger.event("done")
+    assert len(sink.lines) == 1
+    rec = sink.records()[0]
+    assert rec == {"ts": 1.0, "phase": "engine", "event": "done", "elapsed_ms": None}
+
+
+def test_extra_fields_merge_into_record_and_are_sorted():
+    sink, logger = make_logger()
+    logger.event("cached", tokens=4096, hits=1)
+    line = sink.lines[0]
+    assert line == json.dumps(json.loads(line), sort_keys=True)
+    rec = sink.records()[0]
+    assert rec["tokens"] == 4096 and rec["hits"] == 1
+
+
+def test_reserved_keys_are_rejected_in_extras():
+    _, logger = make_logger()
+    with pytest.raises(ValueError):
+        logger.event("done", ts=99)
+
+
+def test_phase_context_emits_start_and_end_with_elapsed():
+    ticks = iter([0.0, 0.5])  # start, end
+    sink = ListSink()
+    logger = PhaseLogger(sink=sink, clock=lambda: next(ticks), wall_clock=lambda: 1.0)
+    with logger.phase("denoise"):
+        pass
+    starts, ends = sink.records()
+    assert starts["event"] == "phase_start" and starts["phase"] == "denoise"
+    assert starts["elapsed_ms"] == 0.0
+    assert ends["event"] == "phase_end" and ends["phase"] == "denoise"
+    assert ends["elapsed_ms"] == pytest.approx(500.0)
+
+
+def test_events_inside_phase_inherit_phase_and_elapsed():
+    ticks = itertools.count(0, 1)  # 0, 1, 2 ... seconds
+    sink = ListSink()
+    logger = PhaseLogger(sink=sink, clock=lambda: float(next(ticks)), wall_clock=lambda: 1.0)
+    with logger.phase("denoise"):
+        logger.event("step")
+    rec = sink.records()[1]
+    assert rec["phase"] == "denoise"
+    assert rec["event"] == "step"
+    assert rec["elapsed_ms"] == pytest.approx(1000.0)
+
+
+def test_phase_error_is_logged_and_raised():
+    sink, logger = make_logger()
+    with pytest.raises(RuntimeError):
+        with logger.phase("load"):
+            raise RuntimeError("boom")
+    events = [r["event"] for r in sink.records()]
+    assert events == ["phase_start", "phase_error"]
+    assert sink.records()[1]["error"] == "RuntimeError"
+
+
+def test_nested_phases_restore_outer_phase():
+    sink, logger = make_logger()
+    with logger.phase("outer"):
+        with logger.phase("inner"):
+            logger.event("deep")
+        logger.event("back-out")
+    recs = sink.records()
+    assert recs[2]["phase"] == "inner"
+    assert recs[-1]["phase"] == "outer"
+
+
+def test_default_logger_writes_nothing_anywhere(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    logger = PhaseLogger()  # no sink configured
+    with logger.phase("load"):
+        logger.event("tick")
+    assert list(tmp_path.iterdir()) == []  # zero files created by default
+
+
+def test_file_sink_writes_only_to_configured_path(tmp_path):
+    target = tmp_path / "logs" / "engine.jsonl"
+    sink = file_sink(target)
+    sink('{"a": 1}')
+    sink('{"a": 2}')
+    assert target.read_text().splitlines() == ['{"a": 1}', '{"a": 2}']
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == [target]
+
+
+def test_human_sink_gets_readable_phase_lines(tmp_path):
+    human = ListSink()
+    ticks = iter([0.0, 2.0])
+    logger = PhaseLogger(sink=ListSink(), human_sink=human,
+                         clock=lambda: next(ticks), wall_clock=lambda: 1.0)
+    with logger.phase("decode"):
+        pass
+    assert len(human.lines) == 1
+    assert "decode" in human.lines[0] and "2000" in human.lines[0]
+
+
+def test_log_import_pulls_in_no_heavy_modules():
+    import qwen_engine.log  # noqa: F401
+    assert not set(HEAVY_MODULES) & set(sys.modules)

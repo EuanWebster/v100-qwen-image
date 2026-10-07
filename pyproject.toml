@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-engine"
+version = "0.1.0"
+description = "Hand-rolled Qwen-Image-2.1 generation engine for a Tesla V100 16GB (CPU-only core; heavy ML imports deferred to adapters)"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+]

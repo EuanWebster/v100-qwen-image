@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtualenv (project venv lives at /work/.venv — never committed)
+.venv/
+
+# Test / tool caches
+.pytest_cache/
+.coverage
+
+# Engine runtime artifacts (all config-relocatable; must never land in the repo)
+output/
+cache/
+benchmarks/
+logs/
