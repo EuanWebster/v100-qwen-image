@@ -93,6 +93,16 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _is_finite_number(value: Any) -> bool:
+    """Finite real check that never raises: ``math.isfinite(10**1000)``
+    overflows at float conversion — a config error, not an OverflowError
+    escaping the constructor (and escaping the CLI's exit-2 path)."""
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError, TypeError):
+        return False
+
+
 def _check_int(name: str, value: Any, lo: int, hi: int, errors: list[FieldError]) -> None:
     if not _is_int(value):
         errors.append(FieldError(name, f"must be an integer, got {value!r}"))
@@ -218,7 +228,8 @@ class GenerationConfig:
                            f"must be a finite number >= {CFG_SCALE_MIN}, "
                            f"got {self.true_cfg_scale!r}")
             )
-        elif not math.isfinite(self.true_cfg_scale) or self.true_cfg_scale < CFG_SCALE_MIN:
+        elif not _is_finite_number(self.true_cfg_scale) \
+                or self.true_cfg_scale < CFG_SCALE_MIN:
             errors.append(
                 FieldError("true_cfg_scale",
                            f"must be a finite number >= {CFG_SCALE_MIN}, "

@@ -30,7 +30,7 @@ from qwen_engine.adapters.base import (
     QUANT_CHOICES,
 )
 from qwen_engine.config import ConfigError, GenerationConfig
-from qwen_engine.core import generate, plan
+from qwen_engine.core import generate, plan, require_run_config
 from qwen_engine.errors import (
     EngineError,
     ExitCode,
@@ -192,6 +192,10 @@ def _make_adapter() -> Any:
 
 def _run_generate(config: GenerationConfig, logger: PhaseLogger,
                   assets: Any = None, adapter: Any = None) -> int:
+    # Refuse an unconfigured output BEFORE the adapter exists at all: the
+    # absent M4 adapter is an exit-1 boundary and must not mask the
+    # config-error-2 for a run with nowhere to save.
+    require_run_config(config)
     adapter = adapter if adapter is not None else _make_adapter()
     result = generate(config, adapter, assets or {}, logger)
     print(json.dumps(result.to_dict(), sort_keys=True))
@@ -228,8 +232,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.print_help()
             return int(ExitCode.OK)
         # Asset problems are checked first and keep exit 4 even when the
-        # config is *also* incomplete (missing output_dir is a config error 2
-        # raised inside generate, before the adapter loads).
+        # config is *also* incomplete. A missing output_dir is then a
+        # config error (2), checked BEFORE the adapter is created/imported
+        # — the absent M4 adapter must not turn it into exit 1.
         report = _verify_assets(config)  # -> ManifestError -> exit 4
         return _run_generate(config, logger, assets=report.resolved)
     except ConfigError as exc:

@@ -509,3 +509,55 @@ def test_cli_module_entry_point_declared():
     with open(ROOT / "pyproject.toml", "rb") as fh:
         data = tomllib.load(fh)
     assert data["project"]["scripts"]["qwen-engine"] == "qwen_engine.cli:main"
+
+
+# --- second senior-review pass: ordering + overflow at the CLI ---------------
+
+
+def test_verified_assets_no_output_dir_real_absent_adapter_exits_2(
+        tmp_path, capsys):
+    """THE real M1 CLI path, no monkeypatched adapter anywhere.
+
+    The Qwen21DiffusersAdapter module is genuinely absent; an actual run
+    whose assets verify but whose output is unconfigured must be a CONFIG
+    error (exit 2), not the adapter-absent boundary (exit 1): the config
+    check runs after asset verification (missing assets keep exit 4) and
+    BEFORE any adapter creation/import."""
+    import importlib.util
+
+    assert importlib.util.find_spec(
+        "qwen_engine.adapters.qwen21_diffusers") is None, \
+        "this test is only meaningful with the real adapter genuinely absent"
+
+    mpath = write_manifest(tmp_path)
+    (tmp_path / "models" / "dit").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "models" / "dit" / "model.bin").write_bytes(b"payload")
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps({
+        "prompt": "a red cube", "manifest_path": str(mpath),
+        "models_dir": str(tmp_path / "models"),
+    }))  # deliberately no output_dir
+    assert run_cli(tmp_path, ["--config", cfg_path, "--run"]) == 2
+    err = capsys.readouterr().err
+    assert "output_dir" in err and "Traceback" not in err
+    assert "adapter" not in err.lower(), \
+        "the config error must not be masked by the M4 adapter boundary"
+    assert not (tmp_path / "output").exists()
+
+
+def test_config_file_true_cfg_scale_overflow_exits_2(tmp_path, capsys):
+    """A 10**1000 int literal in the config file: OverflowError from
+    math.isfinite would exit 1 with a generic unexpected-error line; the
+    field must be refused as config error 2."""
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text('{"true_cfg_scale": ' + "1" + "0" * 1000 + "}")
+    assert run_cli(tmp_path, ["--config", cfg, "--dry-run"]) == 2
+    err = capsys.readouterr().err
+    assert "true_cfg_scale" in err and "Traceback" not in err
+
+
+def test_cli_flag_true_cfg_scale_infinite_exits_2(tmp_path, capsys):
+    """argparse float('1e1000') is +inf — also a field-level config error."""
+    assert run_cli(tmp_path, ["--dry-run", "--true-cfg-scale", "1e1000"]) == 2
+    err = capsys.readouterr().err
+    assert "true_cfg_scale" in err and "Traceback" not in err

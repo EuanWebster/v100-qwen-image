@@ -80,6 +80,20 @@ def _validate_output(output: Any, config: GenerationConfig) -> Path:
     return resolved
 
 
+def require_run_config(config: GenerationConfig) -> None:
+    """Config that must be present before an adapter is even *created*.
+
+    The CLI calls this after asset verification and before adapter import:
+    an absent output setting is a config error (exit 2) and must never be
+    masked by the M4 adapter boundary failing first (exit 1)."""
+    if config.output_dir is None:
+        raise ConfigError(FieldError(
+            "output_dir",
+            "an actual run requires output_dir (nowhere to save); set it in "
+            "the config or pass --output-dir",
+        ))
+
+
 def generate(
     config: GenerationConfig,
     adapter: GenerationAdapter,
@@ -94,12 +108,7 @@ def generate(
     loads, so a missing output setting cannot cost a model load or touch the
     filesystem.
     """
-    if config.output_dir is None:
-        raise ConfigError(FieldError(
-            "output_dir",
-            "an actual run requires output_dir (nowhere to save); set it in "
-            "the config or pass --output-dir",
-        ))
+    require_run_config(config)
     logger = logger or PhaseLogger()
     conditioning: Any = None
     latents: Any = None

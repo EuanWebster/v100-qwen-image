@@ -239,3 +239,17 @@ def test_token_math_2048_squared_is_exactly_16384():
 def test_config_import_pulls_in_no_heavy_modules():
     import qwen_engine.config  # noqa: F401
     assert not set(HEAVY_MODULES) & set(sys.modules)
+
+
+# --- second senior-review pass: overflow-proof numerics ----------------------
+
+
+@pytest.mark.parametrize("bad", [10 ** 1000, 10 ** 400, -(10 ** 400)])
+def test_true_cfg_scale_huge_int_is_config_error_not_overflow(bad):
+    """math.isfinite(10**1000) raises OverflowError at float conversion;
+    it must surface as a field-level ConfigError (CLI exit 2), never as
+    OverflowError (CLI exit 1)."""
+    with pytest.raises(ConfigError, match="true_cfg_scale"):
+        GenerationConfig(true_cfg_scale=bad)
+    with pytest.raises(ConfigError, match="true_cfg_scale"):
+        GenerationConfig.from_dict({"true_cfg_scale": bad})

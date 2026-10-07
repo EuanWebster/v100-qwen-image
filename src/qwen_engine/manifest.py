@@ -274,6 +274,24 @@ def _os_detail(exc: OSError) -> str:
     return f"errno {exc.errno} ({exc.strerror or type(exc).__name__}): {exc.filename or ''}".rstrip()
 
 
+def _resolve_or_fail(path: Path) -> tuple[Path | None, str | None]:
+    """``Path.resolve`` is NOT exception-free on supported interpreters:
+    CPython 3.11 may raise ``RuntimeError`` on a symlink loop and an
+    ``OSError`` (permission on a parent component, …) is always possible.
+    No resolution failure may escape the typed boundary as a raw error —
+    every one becomes a structured detail string the caller reports as an
+    :class:`ArtifactUnreadableError` / unreadable status. (Verified here on
+    Python 3.13, whose realpath tolerates loops; the 3.11 behaviour is the
+    reason this guard exists, not a claim of observed 3.11 execution.)"""
+    try:
+        return path.resolve(), None
+    except (OSError, RuntimeError, ValueError) as exc:
+        detail = (f"{type(exc).__name__}: {exc}"
+                  + (f" [{exc.strerror}]" if isinstance(exc, OSError)
+                     and exc.strerror else ""))
+        return None, detail
+
+
 # ---------------------------------------------------------------------------
 # Parsing (strict known keys; all problems reported)
 # ---------------------------------------------------------------------------
@@ -383,7 +401,11 @@ def _hash_and_check(fd: int, pre: os.stat_result) -> str:
 def _verify_one(artifact: ModelArtifact, root: Path,
                 root_resolved: Path) -> ArtifactStatus:
     path = root / artifact.filename
-    resolved = path.resolve()
+    resolved, fail = _resolve_or_fail(path)
+    if resolved is None:  # resolution itself failed: typed, never raw
+        return ArtifactStatus(artifact, STATE_UNREADABLE,
+                              ArtifactUnreadableError(
+                                  artifact, f"cannot resolve {path}: {fail}"))
     if resolved != root_resolved and root_resolved not in resolved.parents:
         # Symlink (or platform quirk) took us outside the model storage root.
         return ArtifactStatus(
@@ -494,7 +516,18 @@ def resolve_manifest(manifest: ModelManifest, models_dir: str | Path) -> Resolut
     outside the root is a typed :class:`ArtifactPathError`.
     """
     root = Path(models_dir)
-    root_resolved = root.resolve()
+    root_resolved, root_fail = _resolve_or_fail(root)
+    if root_resolved is None:
+        # The storage root itself cannot be canonicalized: every artifact
+        # is reported unreadable through the same structured channel —
+        # resolve_manifest never lets a raw resolve error escape.
+        detail = f"model root cannot be resolved: {root} ({root_fail})"
+        statuses = tuple(
+            ArtifactStatus(a, STATE_UNREADABLE,
+                           ArtifactUnreadableError(a, detail))
+            for a in manifest.artifacts)
+        return ResolutionReport(ok=False, resolved={}, statuses=statuses,
+                                errors=tuple(s.error for s in statuses))
     statuses = tuple(_verify_one(a, root, root_resolved) for a in manifest.artifacts)
     resolved: dict[str, tuple[Path, ...]] = {}
     for s in statuses:
@@ -522,7 +555,10 @@ def resolve_model_paths(manifest: ModelManifest, models_dir: str | Path,
             f"(known roles: {', '.join(sorted({a.role for a in manifest.artifacts}))})"
         )
     root = Path(models_dir)
-    root_resolved = root.resolve()
+    root_resolved, root_fail = _resolve_or_fail(root)
+    if root_resolved is None:
+        raise ArtifactUnreadableError(
+            arts[0], f"model root cannot be resolved: {root} ({root_fail})")
     statuses = [_verify_one(a, root, root_resolved) for a in arts]
     for status in statuses:
         if status.error is not None:

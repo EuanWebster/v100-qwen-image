@@ -490,3 +490,85 @@ def test_status_ok_when_everything_present(tmp_path):
 def test_manifest_import_pulls_in_no_heavy_modules():
     import qwen_engine.manifest  # noqa: F401
     assert not set(HEAVY_MODULES) & set(sys.modules)
+
+
+# ---------------------------------------------------------------------------
+# Second senior-review pass: Path.resolve failure modes stay structured
+# (3.11 may raise RuntimeError on symlink loops / OSError on permissions;
+# that behaviour is the WHY of this guard, not an observed 3.11 run.)
+# ---------------------------------------------------------------------------
+
+
+def test_symlink_loop_artifact_is_structured_unreadable(tmp_path):
+    root = tmp_path / "models"
+    root.mkdir()
+    loop = root / "dit" / "loop.bin"
+    loop.parent.mkdir(parents=True)
+    os.symlink("loop.bin", loop)  # resolves to itself on any interpreter
+    man = mf.manifest_from_dict(manifest_dict(artifact_dict(
+        filename="dit/loop.bin")))
+    report = mf.resolve_manifest(man, root)  # must not raise
+    assert not report.ok
+    assert len(report.statuses) == 1
+    st = report.statuses[0]
+    assert st.state == mf.STATE_UNREADABLE
+    assert isinstance(st.error, mf.ArtifactUnreadableError)
+    # dry-run stays structured too:
+    (root / "manifest.json").write_text(json.dumps(man.to_dict()))
+    status = mf.manifest_status(str(root / "manifest.json"), str(root))
+    assert status["status"] == "incomplete"
+    assert status["artifacts"][0]["status"] == mf.STATE_UNREADABLE
+
+
+def test_injected_resolve_runtimeerror_artifact_is_unreadable(tmp_path,
+                                                             monkeypatch):
+    """CPython 3.11-style RuntimeError from Path.resolve on a symlink loop,
+    injected — translated to the typed unreadable channel, never raw."""
+    root = tmp_path / "models"
+    (root / "dit").mkdir(parents=True)
+    (root / "dit" / "model.bin").write_bytes(b"payload")
+    man = mf.manifest_from_dict(manifest_dict(artifact_dict(
+        filename="dit/model.bin")))
+    real_resolve = mf.Path.resolve
+
+    def fake_resolve(self):
+        if self.name == "model.bin":
+            raise RuntimeError("Symlink loop from 'model.bin'")
+        return real_resolve(self)
+
+    monkeypatch.setattr(mf.Path, "resolve", fake_resolve)
+    report = mf.resolve_manifest(man, root)
+    assert not report.ok
+    st = report.statuses[0]
+    assert st.state == mf.STATE_UNREADABLE
+    assert isinstance(st.error, mf.ArtifactUnreadableError)
+    assert "RuntimeError" in str(st.error)
+
+
+def test_injected_root_resolve_oserror_is_structured_everywhere(tmp_path,
+                                                               monkeypatch):
+    """A permission-style OSError canonicalizing the ROOT reports every
+    artifact unreadable through the report — resolve_manifest and
+    manifest_status never raise; resolve_model_paths raises the typed
+    ArtifactUnreadableError."""
+    root = tmp_path / "models"
+    root.mkdir()
+    (root / "dit").mkdir()
+    (root / "dit" / "model.bin").write_bytes(b"payload")
+    man = mf.manifest_from_dict(manifest_dict(artifact_dict(
+        filename="dit/model.bin")))
+    real_resolve = mf.Path.resolve
+
+    def fake_resolve(self):
+        if self == root:
+            raise OSError(13, "Permission denied", str(root))
+        return real_resolve(self)
+
+    monkeypatch.setattr(mf.Path, "resolve", fake_resolve)
+    report = mf.resolve_manifest(man, root)
+    assert not report.ok and not report.resolved
+    assert all(s.state == mf.STATE_UNREADABLE for s in report.statuses)
+    status = mf.manifest_status(None, None)  # unrelated smoke: still typed
+    assert status["status"] == "unconfigured"
+    with pytest.raises(mf.ArtifactUnreadableError):
+        mf.resolve_model_paths(man, root, "dit")
