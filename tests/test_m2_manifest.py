@@ -32,6 +32,7 @@ from qwen_engine import cli
 from qwen_engine.manifest import (
     AmbiguousRoleError,
     load_manifest,
+    resolve_manifest,
     resolve_model_path,
 )
 
@@ -82,6 +83,15 @@ EXPECTED_TOTAL_BYTES = 33_131_601_593          # all 24 files
 EXPECTED_WEIGHT_BYTES = 33_115_613_408         # the 7 .safetensors weight files
 
 HEAVY_MODULES = ("torch", "diffusers", "transformers")
+
+#: True only under the guarded runner (``bash run_cpu_tests.sh`` exports
+#: QWEN_CPU_TEST_GUARD=1 and rides the R7 audit-hook guard into every child
+#: interpreter via PYTHONPATH sitecustomize). Fresh-subprocess no-network /
+#: no-heavy-import evidence is a property of the GUARDED run: plain ``pytest``
+#: alone launches unguarded children and proves only the exit-code/output
+#: contract below — never infer child module or socket state from the parent
+#: process's ``sys.modules``.
+GUARDED_RUN = os.environ.get("QWEN_CPU_TEST_GUARD") == "1"
 
 
 def _load_committed():
@@ -155,14 +165,23 @@ def test_role_mapping_exact():
     assert dict(Counter(a.role for a in m.artifacts)) == EXPECTED_ROLE_COUNTS
 
 
-def test_expected_byte_totals_are_metadata_not_measurements():
+def test_expected_byte_totals_are_metadata_not_measurements(tmp_path):
     m = _load_committed()
     assert sum(a.bytes for a in m.artifacts) == EXPECTED_TOTAL_BYTES
     assert sum(a.bytes for a in m.artifacts
                if a.filename.endswith(".safetensors")) == EXPECTED_WEIGHT_BYTES
-    # No asset exists locally: nothing here may be reported as a measured total.
-    assert not (ROOT / "models" / "assets").exists() or \
-        not any((ROOT / "models" / "assets").rglob("*"))
+    # These totals are committed metadata read straight out of the manifest —
+    # never local measurements. The "nothing is installed yet" state is an
+    # incidental property of TODAY's disk, not a test invariant: an operator
+    # who later fetches legitimate, hash-matching weights must not break the
+    # CPU suite. So the absence/state check runs against an isolated
+    # tmp_path root that is guaranteed never to exist, not against the live
+    # models/assets directory (which this test neither reads nor requires).
+    never_created_root = tmp_path / "assets-root-that-was-never-created"
+    assert not never_created_root.exists()
+    report = resolve_manifest(m, never_created_root)
+    assert not report.ok and len(report.errors) == 24
+    assert [s.state for s in report.statuses] == ["missing"] * 24
 
 
 def test_excludes_non_runtime_extras():
@@ -217,9 +236,19 @@ def test_dry_run_all_missing_is_deterministic(tmp_path, capsys):
 
 def test_run_all_missing_exits_4_naming_every_file(tmp_path, monkeypatch, capsys):
     """Fresh-interpreter actual run against a fresh missing root: exit 4, all
-    24 files + repo + revision named, no traceback, no adapter/ML imports, no
-    network. (Sockets are additionally poisoned in-process for the in-process
-    variant; the R7 guard denies them for the subprocess.)"""
+    24 files + repo + revision named, no traceback. (Sockets are
+    additionally poisoned in-process for the in-process variant.)
+
+    Child-process evidence is *conditional on the runner*: under
+    ``bash run_cpu_tests.sh`` (QWEN_CPU_TEST_GUARD=1) the R7 guard rides into
+    this fresh interpreter via PYTHONPATH sitecustomize + audit hook, so no
+    network socket and no torch/diffusers/transformers import can even be
+    attempted there — that is the guarded acceptance run on both
+    interpreters. Under ordinary pytest the child is unguarded and this test
+    proves only the exit-code/output contract below; the no-network /
+    no-heavy-import property of the *child* is then asserted nowhere (the
+    parent's sys.modules says nothing about it, and no hostile-code proof is
+    invented)."""
     proc = _run_cli(["--run", "--manifest", MANIFEST_PATH,
                      "--models-dir", tmp_path / "fresh-root"])
     assert proc.returncode == 4, proc.stderr
@@ -235,22 +264,44 @@ def test_run_all_missing_exits_4_naming_every_file(tmp_path, monkeypatch, capsys
 
 def test_run_all_missing_in_process_no_heavy_imports_no_network(tmp_path, monkeypatch, capsys):
     block_network(monkeypatch)
+
+    def exploding_make_adapter(*args, **kwargs):
+        raise AssertionError("adapter creation was reached; missing assets "
+                             "must fail with exit 4 before any adapter exists")
+    monkeypatch.setattr(cli, "_make_adapter", exploding_make_adapter)
+
     rc = cli.main(["--run", "--manifest", str(MANIFEST_PATH),
                    "--models-dir", str(tmp_path / "fresh-root")])
     assert rc == 4
     err = capsys.readouterr().err
     assert "Traceback" not in err and err.count("asset error:") >= 24
+    # The exploding sentinel proves the adapter-creation call site was never
+    # reached (reaching it would surface as AssertionError -> exit 1, not the
+    # exit 4 asserted above); the sys.modules checks are valid here because
+    # this variant runs the CLI *in this process*.
+    assert "AssertionError" not in err
     assert "qwen_engine.adapters.qwen21_diffusers" not in sys.modules
     assert not set(HEAVY_MODULES) & set(sys.modules)
 
 
 def test_run_missing_assets_keep_exit4_even_without_output_dir(tmp_path, capsys):
     """Asset verification precedes the output-dir config check: the operator
-    learns what to fetch, not a config nag."""
+    learns what to fetch, not a config nag. Exit 4 with all 24 missing files
+    is the contract; "no config nag" is asserted on the *diagnostic line
+    shape* (a ``config error:`` message, e.g. the missing-output_dir
+    refusal), NOT on an arbitrary substring of stderr — a perfectly valid
+    temporary path may legitimately contain the word ``output``, so
+    substring-gating on path text would be brittle."""
     proc = _run_cli(["--run", "--manifest", MANIFEST_PATH,
                      "--models-dir", tmp_path / "fresh-root"])
     assert proc.returncode == 4
-    assert "output" not in (proc.stdout + proc.stderr).lower()
+    combined = proc.stdout + proc.stderr
+    # The output_dir refusal is emitted as "config error: output_dir: ..."
+    # (see cli.main / core.require_run_config): its diagnostic class is
+    # absent, whatever the temp path happens to be spelled like.
+    assert "config error:" not in combined
+    assert sum(1 for line in proc.stderr.splitlines()
+               if line.startswith("asset error:")) >= 24
 
 
 def block_network(monkeypatch):
