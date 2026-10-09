@@ -108,6 +108,11 @@ class PhaseLogger:
         The stack entry is popped on **every** exit path, including a sink
         that fails while the ``phase_start`` record is emitted, and a failing
         ``phase_error`` emission never masks the primary exception.
+        Completion logging is equally nonfatal: a sink that dies while the
+        ``phase_end`` record or the ``human_sink`` line is emitted on an
+        otherwise-successful body does **not** fail the phase — an image
+        saved successfully must still exit 0, not report a log fault.  Only
+        the body's own exceptions propagate.
         """
         start = self.clock()
         self._stack.append((name, start))
@@ -134,11 +139,19 @@ class PhaseLogger:
                 raise
             else:
                 elapsed_ms = (self.clock() - start) * 1000.0
-                self._emit({"schema_version": self.schema_version,
-                            "run_id": self.run_id,
-                            "ts": self.wall_clock(), "phase": name,
-                            "event": "phase_end", "elapsed_ms": elapsed_ms})
+                try:
+                    self._emit({"schema_version": self.schema_version,
+                                "run_id": self.run_id,
+                                "ts": self.wall_clock(), "phase": name,
+                                "event": "phase_end",
+                                "elapsed_ms": elapsed_ms})
+                except Exception:
+                    pass  # a completed phase stays completed despite a log fault
                 if self.human_sink is not None:
-                    self.human_sink(f"[{name}] done in {elapsed_ms:.0f} ms")
+                    try:
+                        self.human_sink(
+                            f"[{name}] done in {elapsed_ms:.0f} ms")
+                    except Exception:
+                        pass  # likewise for the human-readable completion line
         finally:
             self._stack.pop()

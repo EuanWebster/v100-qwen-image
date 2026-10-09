@@ -158,6 +158,55 @@ def test_failed_phase_error_emission_does_not_mask_primary_exception():
     assert logger._stack == []
 
 
+# --- review fix: completion logging is nonfatal ----------------------------
+# phase_start/phase_error sink failures were already guarded; phase_end and
+# the human completion line must be guarded the same way, or a successful
+# save would exit 1 on a log fault.
+
+
+def test_failing_phase_end_sink_does_not_fail_completed_phase():
+    sink = ExplodingSink({"phase_end"})
+    logger = PhaseLogger(sink=sink, clock=lambda: 0.0, wall_clock=lambda: 1.0)
+    with logger.phase("save"):  # must NOT raise OSError from the sink
+        pass
+    assert logger._stack == []  # stack still cleaned up
+    logger.event("after")  # logger keeps working afterwards
+    assert sink.records()[-1]["phase"] == "engine"
+
+
+def test_failing_human_completion_sink_does_not_fail_completed_phase():
+    class ExplodingHuman:
+        def __call__(self, line: str) -> None:
+            raise OSError("human sink exploded")
+
+    jsonl = ListSink()
+    logger = PhaseLogger(sink=jsonl, human_sink=ExplodingHuman(),
+                         clock=lambda: 0.0, wall_clock=lambda: 1.0)
+    with logger.phase("save"):  # must NOT raise
+        pass
+    assert logger._stack == []
+    # The machine-readable record was still emitted before the human fault.
+    assert [r["event"] for r in jsonl.records()] == ["phase_start", "phase_end"]
+
+
+def test_body_exception_propagates_despite_failing_completion_sinks():
+    """Guards must not swallow the body: with EVERY completion event failing
+    at the sink, the primary exception still propagates unchanged and the
+    stack is cleaned."""
+    sink = ExplodingSink({"phase_end", "phase_error"})
+
+    class ExplodingHuman:
+        def __call__(self, line: str) -> None:
+            raise OSError("human sink exploded")
+
+    logger = PhaseLogger(sink=sink, human_sink=ExplodingHuman(),
+                         clock=lambda: 0.0, wall_clock=lambda: 1.0)
+    with pytest.raises(RuntimeError):
+        with logger.phase("load"):
+            raise RuntimeError("boom")
+    assert logger._stack == []
+
+
 def test_default_logger_writes_nothing_anywhere(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     logger = PhaseLogger()  # no sink configured

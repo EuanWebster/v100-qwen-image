@@ -118,6 +118,49 @@ def test_generate_calls_adapter_in_phase_order(tmp_path, base_config):
     assert result.output_path.endswith("out.png")
 
 
+def test_generate_save_succeeds_when_completion_sink_fails(tmp_path, base_config):
+    """Review fix: a sink that dies on phase_end (and a human sink that
+    always fails) must not turn a successful save into a failed run — the
+    image is on disk and the CLI still exits 0."""
+    import json as _json
+
+    from qwen_engine.log import PhaseLogger
+
+    class CompletionFailingSink:
+        def __init__(self):
+            self.lines: list[str] = []
+
+        def __call__(self, line: str) -> None:
+            if _json.loads(line)["event"] == "phase_end":
+                raise OSError("log sink exploded at completion")
+            self.lines.append(line)
+
+    def angry_human(line: str) -> None:
+        raise OSError("human sink exploded")
+
+    logger = PhaseLogger(sink=CompletionFailingSink(), human_sink=angry_human)
+    calls: list[str] = []
+    code = cli._run_generate(base_config, logger, assets={},
+                             adapter=FakeAdapter(calls))
+    assert code == 0
+    assert calls == ["load", "encode", "denoise", "decode", "save"]
+    assert (tmp_path / "output" / "out.png").is_file()
+
+
+def test_generate_reports_body_exception_despite_completion_sink_faults(base_config):
+    """The guard is completion-only: a failing save still fails the run even
+    when every completion sink also explodes."""
+    from qwen_engine.log import PhaseLogger
+
+    class AllFailSink:
+        def __call__(self, line: str) -> None:
+            raise OSError("sink exploded")
+
+    logger = PhaseLogger(sink=AllFailSink())
+    with pytest.raises(RuntimeError):
+        generate(base_config, FakeAdapter(fail_save=True), {}, logger)
+
+
 def test_generate_passes_config_and_grouped_assets_into_load(tmp_path, base_config):
     adapter = FakeAdapter()
     assets = {"dit": (tmp_path / "dit-1.bin", tmp_path / "dit-2.bin"),
