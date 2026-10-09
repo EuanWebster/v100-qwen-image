@@ -466,7 +466,9 @@ def save_result(result: BenchmarkResult, directory: str | Path,
     rid = run_id if run_id is not None else result.run_id
     if not isinstance(rid, str) or not rid.strip():
         raise BenchSchemaError(f"run_id for file name: must be non-empty, got {rid!r}")
-    if "/" in rid or "\0" in rid or rid.startswith("."):
+    # Supported target is Linux; rejecting backslash too keeps a future
+    # Windows path reinterpretation from turning "a\\b" into a path here.
+    if "/" in rid or "\\" in rid or "\0" in rid or rid.startswith("."):
         raise BenchSchemaError(f"run_id for file name: unsafe, got {rid!r}")
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{rid}.benchmark.json"

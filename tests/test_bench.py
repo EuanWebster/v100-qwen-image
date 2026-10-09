@@ -213,6 +213,34 @@ def test_result_save_and_load_roundtrip(tmp_path):
         load_result(tmp_path / "bad.json")
 
 
+@pytest.mark.parametrize("bad", [
+    "a/b",          # forward slash
+    "a\\b",         # backslash (future Windows reinterpretation; Linux target)
+    "a\0b",         # NUL
+    "../evil",      # traversal
+    "..evil",       # leading-dot traversal spelling
+    "/", "\\",
+])
+def test_save_result_refuses_unsafe_run_ids_before_filesystem(tmp_path, bad):
+    """save_result refuses slash, backslash, NUL and traversal spellings
+    BEFORE creating any directory or file (review fix 4; Linux remains the
+    supported target — the backslash refusal is defensive, not a claimed
+    Windows platform expansion)."""
+    r = result(run_id="run-42")
+    target = tmp_path / "benchmarks"
+    with pytest.raises(BenchSchemaError, match="unsafe"):
+        save_result(r, target, run_id=bad)
+    assert not target.exists(), "refusal must precede any filesystem creation"
+
+
+def test_save_result_accepts_normal_run_id(tmp_path):
+    """A normal run id still saves after the unsafe-id guard."""
+    r = result(run_id="run-7")
+    path = save_result(r, tmp_path / "benchmarks", run_id="run-7")
+    assert path.name == "run-7.benchmark.json"
+    assert load_result(path).run_id == "run-7"
+
+
 def synthetic_runs():
     a = result(run_id="a", phases={"load": 1000.0, "denoise": 40000.0},
                steps=40, peak_host_rss_bytes=2_000_000_000)
