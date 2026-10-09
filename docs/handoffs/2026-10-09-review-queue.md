@@ -196,6 +196,28 @@ promptdump. Fresh /tmp/v100-finish-small-docs-task.md only completes doc
 claims+handoff, then cachepublication task, then fixJSON. Never accept0
 alone or repeat the already-finished3 code commits.
 
+10:47 UTC: finish-small docs2531a92 complete; root inspected source changes,
+no control-flow change. Qwen own-context normal memctl STATE/handoff locally
+succeeded, root directly read updated STATE (remote push failed; no retry).
+Fresh cachepublication exec78776 active. Its brief now includes root-file
+mkdir rawFileExistsError and temp-cleanup masking check, plus tiny fetch
+directional-prose correction (reverse order makes DIR where stage FILE
+needed, not opposite). Root independently pinnedML313 upstream synthetic
+probe passed same [2,3,2]/mask/hook assertions as previousML311, socket
+denied/-B/offline, no actual processor/model/weights. New durable repo
+next-worker-contract.md captures future scope if /tmp briefs disappear.
+Commit this admin note/contract with next docs milestone when safe.
+
+10:50 UTC: current publication draft fixes original6probes, but root added
+tiny static exclusive-temp collision case: failed xb open unconditionally
+unlinks somebody else's PREEXISTING temp name. Required fix is now explicit
+in /tmp/v100-fix-cache-publish-task.md (read updated extra invariant): cleanup
+only a temp THIS CALL actually created, small created flag; preserve original
+typed error if cleanupfails. Not a hostile race or new architecture. Root
+probe newcase name/bytes false until corrected. Do not accept whole cache
+or call full probe green until this last ownership invariant passes. Include
+root next-worker-contract.md adminhand off with docs commit when read/ready.
+
 10:5x UTC finish-small-docs writer completion (docs/comments only, baseline
 3ba1150; the three accepted code commits NOT redone): (1) dependencies.md
 now states missing torchvision as a KNOWN runtime blocker (clean imports
@@ -217,3 +239,25 @@ cpu_guard+cli 53 passed; guarded full 3.11.15 suite 742 passed+1skip rc0
 and models/assets untouched/unstaged. Local handoff
 2026-10-09-finish-small-docs-done.md; vault untouched (read-only local
 fallback). Awaiting root independent review before acceptance.
+
+11:1x UTC cachepublication writer completion (baseline 2531a92, code commit
+7e0456d): put lstats the target under the root mutex before any temp exists
+(absent = new publish; replace only regular/singly-linked/current-user-owned;
+foreign any-link, own multi, symlink, nonregular refused typed with
+name/bytes/inode/mtime/nlink preserved, no temp/quarantine/unlink — ordinary
+owned overwrite, publish+LRU transaction, size-prealloc refusal and all
+race protections unchanged, single-writer-hygiene scope only); mkdir and
+target-lstat failures typed (file-as-root no longer raw FileExistsError, not
+deleted/repaired); cleanup only unlinks a temp THIS call created (root's 10:50
+O_EXCL invariant, created flag) and cleanup OSError cannot mask the primary
+typed failure; _quarantine regular-file UID refusal now runs BEFORE the
+read_ident branch (identity tuple omits uid), replaced-entry identity
+protections unchanged. Fetch direction prose corrected to 'creates a
+staging-file/directory conflict' (docstrings/rationale/test comment only, no
+behaviour change) with this docs milestone; root admin note +
+next-worker-contract.md committed as found. Evidence: root publish/ownership/
+review probes read-only all green incl. failed_exclusive_open row (false
+pre-fix); guarded focused encoder 197; guarded full 3.11.15 753 passed+1skip
+rc0; 3.13 pytest absent in-sandbox. sandbox.yaml untouched/unstaged. Local
+handoff 2026-10-09-cache-publish-done.md; vault local fallback. Awaiting root
+independent re-review before cache acceptance; fix-json next.

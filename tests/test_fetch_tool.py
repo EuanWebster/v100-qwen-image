@@ -1292,7 +1292,7 @@ def test_normal_publish_temporary_second_link_still_valid(tmp_path):
 # verified partial then os.unlink of the staging name, never
 # os.replace/rename), removing 'a/x.partial' so 'a/x.partial/y' can then
 # download; the reverse order, or a repair while the staging file still
-# occupies the path, hits a file where the other artifact must mkdir.
+# occupies the path, creates a staging-file/directory conflict.
 
 _STAGING_ANCESTOR_ENTRIES = lambda: [art(b"K" * 8, "a/x"),
                                      art(b"L" * 16, "a/x.partial/y")]

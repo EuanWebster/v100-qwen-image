@@ -81,8 +81,8 @@ Contract (see ``docs/models.md`` §4):
   ``os.unlink`` of the staging name (never ``os.replace``/``os.rename``),
   so an ``a/x``-first run removes that name and ``a/x.partial/y`` can
   then download; the reverse order — or a repair while the staging file
-  still occupies the path — hits a file where the other artifact must
-  mkdir). The read-only offline
+  still occupies the path — creates a staging-file/directory
+  conflict). The read-only offline
   plan reports this typed usage error too — never a write, never a socket.
 * Before any transfer, a bounded disk estimate (remaining manifest bytes plus
   a 1 MiB headroom per pending file) is compared with fresh ``statvfs`` free
@@ -797,8 +797,8 @@ def _check_manifest_filename_collisions(manifest: ModelManifest) -> None:
       ``os.replace``/``os.rename``), so an ``a/x``-first run removes the
       ``a/x.partial`` name and ``a/x.partial/y`` can then download; the
       reverse order — or any later repair while a staging file still
-      occupies that path — hits a file where the other artifact must
-      mkdir. Refusing the static pair (either order) up front keeps every
+      occupies that path — creates a staging-file/directory conflict.
+      Refusing the static pair (either order) up front keeps every
       order, resume and rerun safe: any manifest whose artifact's staged
       partial path is a proper ancestor directory of another artifact's
       final is refused here, before mkdir/network/write.
@@ -844,8 +844,8 @@ def _check_manifest_filename_collisions(manifest: ModelManifest) -> None:
                     "independent reorder/repair safety refusal (a "
                     "published first artifact unlinks its staging name, "
                     "but the reverse order or a repair with the staging "
-                    "file still present hits a file where the other must "
-                    "mkdir); fix the manifest")
+                    "file still present creates a staging-file/directory "
+                    "conflict); fix the manifest")
 
 
 def load_manifest_checked(path: str) -> ModelManifest:
