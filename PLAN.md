@@ -147,6 +147,7 @@ CPU tests never touch a heavy ML import:
 | `qwen_engine/log.py` | Structured **phase/event logging**: JSONL events `{ts, phase, event, elapsed_ms, counters…}` to a configurable sink, plus human-readable phase lines. Shared by engine, CLI and bench. | stdlib |
 | `qwen_engine/memory.py` | **Memory-policy** descriptor + verdict logic (R4; detail in M5.3): "does this config fit *right now*?" from calibrated observations, current free memory, and headroom; conservative on unknown; stale calibration invalidated (C8). (Supersedes the draft's standalone `vramfit.py` naming.) | config/manifest/log types |
 | `qwen_engine/encoder.py` | Encoder **subprocess worker + embedding cache** (port `run_subprocess_logged`; key **v3** — v2 plus the optional immutable `EncoderImplementationIdentity` (M2.2b foundation): encoder artifact-set digest (**asset component only**, never the whole key), worker protocol/implementation + prompt-extraction revisions, exact diffusers/transformer commits, torch build/version, safetensors/torchvision versions; generic fake requests may carry none, a production worker must require one; atomic writes, quarantine, timeout/cancel, bounded worker responses, fake-worker tests — R5; detail in M1.4/M2.2b). | stdlib |
+| `qwen_engine/mem_preflight.py` | **Host-memory preflight for the forthcoming CPU encoder child (M2.2b)**: conservative stdlib check, before any ML import/weight read/loader call, that checkpoint bytes + explicit dtype expansion + explicit runtime headroom fit the **tighter** of host `MemAvailable` and this process's cgroup v2 (`memory.max - memory.current`, deepest-existing on the walk-up); a finite cap is never substituted away by host RAM; unknown/unreadable constrained state **refuses** (never asserts safety); passing is a conservative prerequisite, **not measured model-fit evidence**; scoped to Linux cgroup v2 — not the M5.3 `memory.py` policy and not a general resource framework. | stdlib |
 | `qwen_engine/bench.py` | **Versioned benchmark/result schemas** (R6; detail in M1.5): phase timings, peak host RSS, peak CUDA memory when available, environment and model identifiers; feeds `calibration.json`. | stdlib |
 | `qwen_engine/cli.py` | The only v1 front-end (GUI deferred, YAGNI): argparse → validate config → plan via `core.plan()` (adapter-independent) → `generate`; implements the **exit-code contract** (M1 acceptance criteria). `cli_gen.py` at the repo root stays as a thin entry-point shim. | the above only |
 
@@ -1166,3 +1167,43 @@ standing rule that executed plans stay honest.)*
   real encoder load, payload and fidelity remain pending. No network, no
   GPU, no model load, no permission request; `models/assets/`, manifest,
   fetcher and `sandbox.yaml` untouched.
+- 2026-10-09 **M2.2b stage 1 item 3: host-memory preflight for the CPU
+  encoder child — foundation implemented and offline-tested** (sole writer
+  Qwen, same task): new stdlib-only `qwen_engine/mem_preflight.py`, scoped
+  to the documented Linux cgroup v2 target (NOT the future M5.3 `memory.py`
+  policy, NOT a general resource framework). Reads host `MemAvailable` and
+  this process's cgroup v2 `memory.max`/`memory.current` (deepest-existing
+  `memory.max` on the walk to the cgroup root; `max` = unlimited; no `0::`
+  line = **unknown**, never assumed unlimited), applies the **tighter
+  applicable budget** — with a finite cap the decision is bounded by
+  `max - current` even when host RAM looks plentiful (the cap is never
+  substituted away), while an unknown constrained state **refuses**:
+  unreadable/unparseable/negative counters, a cap without its usage
+  counter, missing `MemAvailable` under an unlimited cap → refusal, never
+  a safety assertion. Required bytes = checkpoint total × explicit
+  dtype-expansion ratio (rounded up, shrink clamped to the checkpoint
+  total) + explicit non-defaulted runtime headroom. `require_encoder_memory_fit`
+  raises typed `MemoryPreflightError` (memory-refusal exit-3 family)
+  **before any ML import, weight read or loader call**. Passing is stated
+  — module, report field `conservative_precondition` and reason text — as
+  a **conservative prerequisite, not measured model-fit evidence**; it
+  alone never proves a load fits. `tests/test_mem_preflight.py`: **40**
+  offline tests on injected tiny proc/cgroup fixtures only — the real
+  sandbox scenario (17,534,339,488 B checkpoint vs the 17,179,869,184 B
+  16 GiB cap refuses both with fp32 expansion and bare bf16), tighter-host
+  and tighter-cgroup selection, unlimited `max`, exact budget boundary,
+  current-at-cap zero room, nested-cgroup walk (deepest wins, fallback to
+  root), every invalid-counter/unknown-state class, dtype arithmetic
+  (ceil-doubling, shrink clamp), input validation matrix, snapshot
+  injection that never touches the paths, JSON-safe tagged report, no
+  real proc reads, no asset reads, ML-free import. Real-sandbox read-only
+  diagnostic (2026-10-09, stdlib only, no model or asset reads): snapshot
+  `host 32,903,032,832 B / finite cap 17,179,869,184 B / current
+  10,792,022,016 B` → **refuse** (budget 6,387,847,168 B ≪ required
+  37,216,162,624 B) — the preflight now says the known-out-loud verdict
+  before anything heavy would run. Evidence: guarded suite **653 passed +
+  1 skip** without / **654 passed** with pinned source envs on 3.11.15 and
+  3.13.5, rc 0. Real encoder load, safetensors payload, numeric parity,
+  adapter, measured RAM/VRAM fit and GPU remain pending their actual
+  dependencies; no network, no GPU, no model load, no permission request;
+  `models/assets/`, manifest, fetcher and `sandbox.yaml` untouched.
