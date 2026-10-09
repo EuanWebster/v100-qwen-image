@@ -8,10 +8,12 @@ violations, scratch cleanup on every path, and the no-heavy-imports boundary.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -678,7 +680,8 @@ class _ExitedChild:
     returncode = 0
 
 
-@pytest.mark.parametrize("bad", [True, False, 0, -1, 1.5, "1024", None, 2.0])
+@pytest.mark.parametrize("bad", [True, False, 0, -1, 1.5, "1024", None, 2.0,
+                                 sys.maxsize, 10 ** 100])
 def test_bad_max_response_caps_are_setup_errors(tmp_path, bad):
     with pytest.raises(EncoderSetupError, match="max_response_bytes"):
         EncoderWorker(
@@ -689,6 +692,29 @@ def test_bad_max_response_caps_are_setup_errors(tmp_path, bad):
     assert EncoderWorker(
         command=["x", "{request}", "{response}"], timeout_s=5.0,
         scratch_dir=tmp_path).max_response_bytes == DEFAULT_MAX_RESPONSE_BYTES
+
+
+def test_representable_high_cap_validates_tiny_response_normally(tmp_path):
+    """cap = sys.maxsize - 1 is representable (cap + 1 == sys.maxsize), so
+    the constructor accepts it — but a one-shot buffered read of cap + 1
+    would raise a raw OverflowError / speculative-allocate the cap. The
+    chunked bounded read must instead read only the bytes that exist:
+    normal tiny-file protocol validation (direct probe) and a normal
+    end-to-end success (fake worker), never a raw OverflowError /
+    MemoryError. No huge fixture is allocated anywhere."""
+    worker = EncoderWorker(
+        command=["x", "{request}", "{response}"], timeout_s=1,
+        scratch_dir=tmp_path, max_response_bytes=sys.maxsize - 1)
+    resp = tmp_path / "response.json"
+    resp.write_bytes(b"{}")
+    with pytest.raises(EncoderProtocolError) as exc:
+        worker._result_from_files(_ExitedChild(), resp, "", "0" * 64, "rid")
+    assert type(exc.value) is EncoderProtocolError
+    assert "schema" in str(exc.value)
+
+    real, kwargs = make_worker(tmp_path, max_response_bytes=sys.maxsize - 1)
+    payload = real.run(make_request(kwargs=kwargs))
+    assert payload.blobs[0].data.startswith(b"FAKEEMBED:")
 
 
 def test_small_cap_refuses_before_json_decode(tmp_path):
@@ -731,9 +757,10 @@ def test_exact_boundary_response_is_accepted(tmp_path):
     assert_scratch_clean(tmp_path)
 
 
-def test_oversized_response_refused_at_stat_before_open(tmp_path):
-    """A pre-existing oversized file is refused on the stat pre-check: the
-    message reports the stat size, and nothing is decoded."""
+def test_oversized_response_refused_on_the_opened_descriptor(tmp_path):
+    """A pre-existing oversized file is refused on the fstat of the OPENED
+    descriptor before any byte is read: the message reports the sized
+    size, and nothing is decoded."""
     resp = tmp_path / "response.json"
     resp.write_bytes(b'{"schema": ' + b"x" * 4096)
     size = resp.stat().st_size
@@ -744,16 +771,178 @@ def test_oversized_response_refused_at_stat_before_open(tmp_path):
 
 
 def test_growing_response_file_is_refused_by_the_bounded_read(tmp_path):
-    """Deterministic growth simulation: a procfs file stats as 0 bytes (so
-    the pre-read stat check passes) but reads back far more — exactly the
-    stat-vs-read race shape. The bounded read (cap + 1) must refuse it as a
-    grown file rather than decode an unbounded amount."""
+    """Deterministic growth simulation: a procfs file fstats as 0 bytes (so
+    the opened-descriptor pre-size check passes) but reads back far more —
+    exactly the sizing-vs-read race shape. The chunked bounded read (cap +
+    1 bytes total) must refuse it as a grown file rather than decode an
+    unbounded amount."""
     status = Path("/proc/self/status")
     if not status.exists() or os.stat(status).st_size != 0:
         pytest.skip("needs Linux procfs (st_size == 0, non-empty read)")
     worker, _ = make_worker(tmp_path, max_response_bytes=256)
     with pytest.raises(EncoderProtocolError, match="grew past"):
         worker._result_from_files(_ExitedChild(), status, "", "0" * 64, "rid")
+
+
+class _BlockedByWatchdog(Exception):
+    """Raised by the test's SIGALRM watchdog when a guarded call blocks."""
+
+
+@contextlib.contextmanager
+def _hang_guard(seconds=5.0):
+    """Turn a would-hang read into a loud test failure instead of a hung
+    suite: the SIGALRM watchdog interrupts the blocked call after
+    ``seconds`` (external/process-style time bound, tiny fixtures only)."""
+    if not hasattr(signal, "SIGALRM"):  # pragma: no cover - non-POSIX
+        yield
+        return
+
+    def _fire(signum, frame):
+        raise _BlockedByWatchdog(f"call blocked for more than {seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_fifo_response_after_exit_is_refused_not_blocking(tmp_path):
+    """Item-10 shape, direct probe: an exited child left a FIFO at the
+    response path. Its st_size of 0 would pass a path-only cap check and a
+    plain open() would hang forever (no worker timeout applies any more),
+    so the no-follow/nonblocking OPENED descriptor plus fstat must refuse
+    it as a typed protocol error immediately — the FIFO is left in place."""
+    resp = tmp_path / "response.json"
+    os.mkfifo(resp)
+    worker, _ = make_worker(tmp_path)
+    with _hang_guard():
+        with pytest.raises(EncoderProtocolError, match="not a regular file"):
+            worker._result_from_files(_ExitedChild(), resp, "", "0" * 64,
+                                      "rid")
+    assert os.path.exists(resp)
+
+
+def test_directory_and_symlink_responses_are_refused(tmp_path):
+    """Nonregular responses never reach the decoder: a directory is
+    refused on the fstat (mode in the message), a symlink is refused
+    without being followed (ELOOP) and its target is untouched."""
+    worker, _ = make_worker(tmp_path)
+    resp_dir = tmp_path / "dir.json"
+    resp_dir.mkdir()
+    with pytest.raises(EncoderProtocolError, match="not a regular file"):
+        worker._result_from_files(_ExitedChild(), resp_dir, "", "0" * 64,
+                                  "rid")
+    target = tmp_path / "target.json"
+    target.write_bytes(b"{}")
+    link = tmp_path / "link.json"
+    link.symlink_to(target)
+    with pytest.raises(EncoderProtocolError, match="symlink"):
+        worker._result_from_files(_ExitedChild(), link, "", "0" * 64, "rid")
+    assert target.read_bytes() == b"{}"
+
+
+def test_worker_left_fifo_at_response_path_typed_refusal_no_hang(tmp_path):
+    """End-to-end item-10 reproduction: a real child mkfifo's the response
+    path and exits 0. The parent must reap it, refuse the nonregular
+    response with a typed protocol error (watchdog-guarded, so a
+    regression fails instead of hanging the suite), and clean the scratch
+    dir."""
+    worker, kwargs = make_worker(
+        tmp_path, timeout_s=15.0, extra_kwargs={"_fifo_response": True})
+    with _hang_guard(seconds=10.0):
+        with pytest.raises(EncoderProtocolError, match="not a regular file"):
+            worker.run(make_request(kwargs=kwargs))
+    assert_scratch_clean(tmp_path)
+
+
+def test_valid_response_swapped_to_fifo_before_parent_reads(tmp_path):
+    """Replacement race, made deterministic: the child writes a perfectly
+    valid response, then unlinks it and leaves a FIFO on the path before
+    exiting 0. A path-only pre-stat of the valid file can no longer be
+    turned into a blocking FIFO open — the single opened descriptor is
+    validated BEFORE reading, so this is the same typed refusal. The
+    response bytes are never decoded."""
+    worker, kwargs = make_worker(
+        tmp_path, timeout_s=15.0,
+        extra_kwargs={"_swap_response_to_fifo": True})
+    with _hang_guard(seconds=10.0):
+        with pytest.raises(EncoderProtocolError, match="not a regular file"):
+            worker.run(make_request(kwargs=kwargs))
+    assert_scratch_clean(tmp_path)
+
+
+def test_fifo_at_stderr_log_path_falls_back_to_empty_excerpt(tmp_path):
+    """End-to-end post-exit log-boundary reproduction: the child unlinks
+    the scratch stderr.log and leaves a FIFO there. The excerpt read must
+    neither block (watchdog-guarded) nor follow anything — it yields the
+    empty fallback — and the missing response stays the typed error it
+    was, with stderr empty rather than a hang or a new failure."""
+    worker, kwargs = make_worker(
+        tmp_path, timeout_s=15.0,
+        extra_kwargs={"_fifo_stderr_log": True, "_no_response": True,
+                      "_stderr": "written before the swap"})
+    with _hang_guard(seconds=10.0):
+        with pytest.raises(EncoderProtocolError, match="no response file") as exc:
+            worker.run(make_request(kwargs=kwargs))
+    assert exc.value.stderr == ""
+    assert_scratch_clean(tmp_path)
+
+
+def test_excerpt_nonregular_and_symlink_paths_fall_back_empty(tmp_path):
+    """Direct _read_excerpt probe: a leftover FIFO, directory or symlink
+    at the log path yields the empty fallback immediately (no block, no
+    follow); an ordinary regular file keeps full diagnostics and a
+    missing file stays empty."""
+    import qwen_engine.encoder as encoder_mod
+
+    fifo = tmp_path / "stderr.log"
+    os.mkfifo(fifo)
+    with _hang_guard():
+        assert encoder_mod._read_excerpt(fifo) == ""
+    log_dir = tmp_path / "dir.log"
+    log_dir.mkdir()
+    assert encoder_mod._read_excerpt(log_dir) == ""
+    real = tmp_path / "real.log"
+    real.write_bytes(b"boom\n")
+    link = tmp_path / "link.log"
+    link.symlink_to(real)
+    assert encoder_mod._read_excerpt(link) == ""
+    assert encoder_mod._read_excerpt(real) == "boom\n"
+    assert encoder_mod._read_excerpt(tmp_path / "missing.log") == ""
+
+
+def test_excerpt_read_is_bounded_when_the_file_grows_at_read(tmp_path,
+                                                             monkeypatch):
+    """Growth-at-read regression for the log boundary: every os.read is
+    chunk-bounded and the TOTAL bytes read are bounded by
+    _EXCERPT_READ_BYTES even though the file grows by a megabyte before
+    each read — the documented tail bound is a READ bound, not a
+    hope-the-file-still-has-that-size read()."""
+    import qwen_engine.encoder as encoder_mod
+
+    path = tmp_path / "stderr.log"
+    path.write_bytes(b"a" * 4096)
+    real_read = os.read
+    calls = []
+
+    def growing_read(fd, count):
+        with open(path, "ab") as fh:
+            fh.write(b"x" * (1 << 20))
+        data = real_read(fd, count)
+        calls.append((count, len(data)))
+        return data
+
+    monkeypatch.setattr(encoder_mod.os, "read", growing_read)
+    text = encoder_mod._read_excerpt(path)
+    assert calls, "the excerpt must actually read"
+    assert all(count <= (1 << 20) for count, _ in calls), \
+        "excerpt reads must be chunk bounded"
+    assert sum(n for _, n in calls) <= encoder_mod._EXCERPT_READ_BYTES, \
+        "total bytes read must stay at or under the documented bound"
+    assert len(text) <= encoder_mod.STDERR_EXCERPT_CHARS + 20
 
 
 # ---------------------------------------------------------------------------

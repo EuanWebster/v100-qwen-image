@@ -9,6 +9,15 @@ Driven entirely by underscore-prefixed keys in the request ``kwargs``:
 * ``_worker_error``: {type?, message} — write an ``error`` result, exit 0
 * ``_garbage_response``: true — write non-JSON, exit 0
 * ``_no_response``: true — exit 0 without writing anything
+* ``_fifo_response``: true — leave a static FIFO at the response path and
+  exit 0 (the post-exit blocking-read shape; the parent must refuse it as
+  a nonregular response without ever blocking)
+* ``_swap_response_to_fifo``: true — write a normal valid response, then
+  unlink it and replace the path with a FIFO before exit 0 (a
+  deterministic regular-to-FIFO path replacement)
+* ``_fifo_stderr_log``: true — unlink the scratch ``stderr.log`` and leave
+  a FIFO at its path (the parent's excerpt read must fall back to empty
+  instead of blocking; derives the scratch dir from the request path)
 * ``_bad_status``: true — write an unknown status
 * ``_result_patch``: object — merged into the result document (wire
   violations: unknown fields, NaN metadata, malformed descriptors). NaN
@@ -33,11 +42,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import signal
 import sys
 import time
+from pathlib import Path
 
 
 def main() -> int:
@@ -60,6 +71,11 @@ def main() -> int:
     if counter := kwargs.get("_counter_file"):
         with open(counter, "a", encoding="utf-8") as fh:
             fh.write(f"encode {req['request_id']}\n")
+    if kwargs.get("_fifo_stderr_log"):
+        log = Path(args.request).resolve().parent / "stderr.log"
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(log)
+        os.mkfifo(log)
     if (sleep := kwargs.get("_sleep")) is not None:
         deadline = time.monotonic() + sleep
         while time.monotonic() < deadline:
@@ -72,6 +88,11 @@ def main() -> int:
             fh.write(b"\xff\xfe not json at all")
         return 0
     if kwargs.get("_no_response"):
+        return 0
+    if kwargs.get("_fifo_response"):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(args.response)
+        os.mkfifo(args.response)
         return 0
 
     doc = {
@@ -108,6 +129,9 @@ def main() -> int:
     with open(tmp, "wb") as fh:
         fh.write(data)
     os.replace(tmp, args.response)
+    if kwargs.get("_swap_response_to_fifo"):
+        os.unlink(args.response)
+        os.mkfifo(args.response)
     return 0
 
 

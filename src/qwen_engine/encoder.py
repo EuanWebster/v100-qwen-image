@@ -54,12 +54,17 @@ Pieces
 
 * **EncoderWorker**: configurable ``command`` with ``{python}`` /
   ``{request}`` / ``{response}`` placeholders, timeout and cooperative
-  cancellation (terminate → kill), **bounded response reads** (a configured
-  ``max_response_bytes`` cap is enforced on a pre-read ``stat`` AND by a
-  bounded read, so a huge or growing response file is refused with a typed
-  protocol error before any unbounded read/JSON/base64), **stderr captured**
-  into events and typed errors (never swallowed; excerpts are read with a
-  bounded tail read), a terminal event on **every** failure branch, and
+  cancellation (terminate → kill), **bounded, nonblocking response reads**
+  (a configured ``max_response_bytes`` cap is enforced on the ONE opened
+  descriptor — opened without following a symlink or blocking on a FIFO,
+  fstat-validated as a regular file, pre-sized, then read in chunks of at
+  most ``cap + 1`` bytes total — so a huge, swapped or growing response
+  file is refused with a typed protocol error before any unbounded
+  read/JSON/base64 and can never block after the child exited), **stderr
+  captured** into events and typed errors (never swallowed; excerpts are
+  read with a bounded, no-follow tail read from the opened descriptor,
+  with an empty fallback on a nonregular leftover log path), a terminal
+  event on **every** failure branch, and
   **every exit path reaps a live child before the scratch temp dir is
   removed** — including interrupted waiting; setup failures are typed and
   clean up.
@@ -72,6 +77,7 @@ explicit; cancel is cooperative via an injected :class:`threading.Event`.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import json
 import math
@@ -128,10 +134,15 @@ STDERR_EXCERPT_CHARS = 4000
 #: realistic shapes (e.g. 1024×8192 fp16 ≈ 16.8 MB → ≈ 22.4 MB as base64) —
 #: so 256 MiB leaves several orders of magnitude of headroom while still
 #: bounding what a runaway or hostile child can push into the engine's RAM
-#: through one response file. The cap is enforced twice: a pre-read
-#: ``stat`` refuses an already-oversized file before opening it, and the
-#: read itself is bounded to ``cap + 1`` bytes, so a file that was small at
-#: ``stat`` time but grows while read still cannot evade the limit.
+#: through one response file. The cap is enforced on the opened descriptor
+#: (opened with ``O_NOFOLLOW | O_NONBLOCK``, fstat-validated as a regular
+#: file BEFORE any read, so a leftover FIFO/symlink cannot block after the
+#: child exited) and by a chunked read of at most ``cap + 1`` bytes total,
+#: so a file that was small when sized but grows while read still cannot
+#: evade the limit. A cap must additionally keep ``cap + 1`` representable
+#: as an index (``<= sys.maxsize``) — the same representability rule as
+#: :data:`DEFAULT_MAX_ENTRY_BYTES`; the read is chunked, so an accepted
+#: high cap on a tiny file allocates only the bytes that actually exist.
 DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024 * 1024
 
 #: Default cap on the bytes of one cache **entry file** the cache will read
@@ -1284,23 +1295,77 @@ def _excerpt(text: str) -> str:
     return "...(truncated)...\n" + text[-STDERR_EXCERPT_CHARS:]
 
 
-#: Upper bound on bytes *read* per log file: the tail of a huge log is read
-#: by seeking, so an arbitrarily large log never lands in RAM.
+#: Upper bound on bytes *read* per log file: the tail of a huge log is
+#: located from the opened descriptor and read with a bounded size, so an
+#: arbitrarily large log — or one that grows during the read — never lands
+#: in RAM beyond this bound.
 _EXCERPT_READ_BYTES = 4 * STDERR_EXCERPT_CHARS
+
+#: Flags for opening a file the engine does not control: never follow a
+#: final-component symlink, never block on a FIFO. The supported target is
+#: Linux, where both flags exist; where one is absent the honest fallback
+#: below is an lstat pre-check, which narrows but cannot close a swap race
+#: (no hostile-concurrent-filesystem guarantee is claimed).
+_SAFE_RDONLY_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                      | getattr(os, "O_NONBLOCK", 0))
+
+
+def _open_read_no_follow(path: Path) -> int:
+    """Open ``path`` read-only without following a final-component symlink
+    (ELOOP instead) and without blocking on a FIFO. The caller must fstat
+    the descriptor and refuse nonregular files before reading. Raises the
+    usual :class:`OSError` (ENOENT / ELOOP / ...) on failure."""
+    if not getattr(os, "O_NOFOLLOW", 0):  # pragma: no cover - non-Linux
+        st = os.lstat(str(path))
+        if stat.S_ISLNK(st.st_mode):
+            raise OSError(errno.ELOOP, "symlink refused (no O_NOFOLLOW)",
+                          str(path))
+    return os.open(str(path), _SAFE_RDONLY_FLAGS)
+
+
+def _read_bounded(fd: int, limit: int) -> bytes:
+    """Read at most ``limit`` bytes from an opened descriptor in <= 1 MiB
+    chunks: an accepted cap larger than the file allocates only the bytes
+    that exist — no speculative buffer sized by the cap, and no
+    index-sized read count that could raise a raw OverflowError when the
+    cap sits near ``sys.maxsize``."""
+    chunks: list[bytes] = []
+    got = 0
+    while got < limit:
+        chunk = os.read(fd, min(limit - got, 1 << 20))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        got += len(chunk)
+    return b"".join(chunks)
 
 
 def _read_excerpt(path: Path) -> str:
+    """Safe bounded tail excerpt of a captured worker log. The file is
+    opened no-follow/nonblocking and validated as a *regular* file on the
+    OPENED descriptor; the tail seek and the read are both bounded, so a
+    leftover FIFO or symlink on the path can neither block (after the
+    child exited, when no worker timeout applies any more) nor pull an
+    unbounded or growing file into RAM. Any unreadable or nonregular path
+    yields the empty fallback — excerpt capture must never replace a typed
+    worker outcome with a new failure — while ordinary regular logs keep
+    full stderr diagnostics."""
     try:
-        with path.open("rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            if size > _EXCERPT_READ_BYTES:
-                fh.seek(size - _EXCERPT_READ_BYTES)
-            else:
-                fh.seek(0)
-            data = fh.read()
+        fd = _open_read_no_follow(path)
     except OSError:
         return ""
+    try:
+        try:
+            st = os.fstat(fd)
+            if stat.S_IFMT(st.st_mode) != stat.S_IFREG:
+                return ""
+            if st.st_size > _EXCERPT_READ_BYTES:
+                os.lseek(fd, st.st_size - _EXCERPT_READ_BYTES, os.SEEK_SET)
+            data = _read_bounded(fd, _EXCERPT_READ_BYTES)
+        except OSError:
+            return ""
+    finally:
+        os.close(fd)
     return _excerpt(data.decode("utf-8", errors="replace"))
 
 
@@ -1313,10 +1378,14 @@ class EncoderWorker:
     timeout or cancellation the child gets ``terminate()`` then, after
     ``cancel_grace_s``, ``kill()`` — never an orphaned worker. Captured stderr
     goes into events and into every typed failure; scratch files are removed
-    on every path. The response file is read only under the explicit
-    :attr:`max_response_bytes` cap (stat pre-check + bounded read; oversized
-    or growing files raise :class:`EncoderProtocolError` before any
-    unbounded read/JSON/base64 — no new transport, no pickle).
+    on every path. The response file is read only through one safely
+    opened descriptor (no-follow/nonblocking, fstat-validated as a regular
+    file before any read) under the explicit
+    :attr:`max_response_bytes` cap (descriptor pre-size + chunked bounded
+    read; symlink/FIFO/device, oversized or growing files raise
+    :class:`EncoderProtocolError` before any unbounded read/JSON/base64,
+    and none of them can block once the child exited — no new transport,
+    no pickle).
     (Pinned-host resources are an M4 concern of the real worker; this runner
     owns only its temp files.)
     """
@@ -1373,6 +1442,16 @@ class EncoderWorker:
             raise EncoderSetupError(
                 f"max_response_bytes: must be a positive integer, got "
                 f"{max_response_bytes!r}")
+        if max_response_bytes + 1 > sys.maxsize:
+            # read-side representability (the same rule
+            # EmbeddingCache.max_entry_bytes follows): an unrepresentable
+            # cap is a broken configuration whatever the read strategy —
+            # 10**100 is a typed setup refusal, never a raw OverflowError
+            # or a speculative cap-sized allocation at the bounded read.
+            raise EncoderSetupError(
+                f"max_response_bytes: {max_response_bytes!r} is not a "
+                f"representable bound (cap + 1 must be <= sys.maxsize = "
+                f"{sys.maxsize})")
         self.max_response_bytes = max_response_bytes
         self.logger = logger or PhaseLogger()
 
@@ -1533,44 +1612,60 @@ class EncoderWorker:
                 f"encoder worker exited {proc.returncode}; captured stderr:\n{err_x}",
                 exit_code=proc.returncode, stderr=err_x)
         cap = self.max_response_bytes
-        # BOUNDED response handling: a size cap (validated positive at
-        # construction) is checked on stat BEFORE the file is opened, and
-        # the read itself never reads more than cap + 1 bytes — so neither
-        # an already-huge response nor one that grows after the stat can
-        # land in memory unbounded. Refusal is a typed protocol error; no
-        # JSON/base64 is ever attempted on oversized content.
+        # BOUNDED, NONBLOCKING response handling on ONE opened descriptor:
+        # the file is opened without following a symlink and without ever
+        # blocking on a FIFO (O_NOFOLLOW | O_NONBLOCK), validated on the
+        # OPENED descriptor as a regular file BEFORE any read, pre-sized
+        # against the cap, then read in chunks totalling at most cap + 1
+        # bytes. A path swap after the check cannot turn the validated
+        # descriptor into a blocking or unbounded read (the fd still names
+        # the file that was checked), and neither an already-huge nor a
+        # growing response file can land in memory unbounded. Refusal is a
+        # typed protocol error; no JSON/base64 is ever attempted on
+        # refused content.
         try:
-            size = os.stat(resp_path).st_size
+            fd = _open_read_no_follow(resp_path)
         except FileNotFoundError as exc:
             raise EncoderProtocolError(
                 f"encoder worker exited 0 but wrote no response file; "
                 f"captured stderr:\n{err_x}", stderr=err_x) from exc
         except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise EncoderProtocolError(
+                    f"response file is a symlink; refused without "
+                    f"following it; captured stderr:\n{err_x}",
+                    stderr=err_x) from exc
             raise EncoderProtocolError(
                 f"response file unreadable: {exc}; "
                 f"captured stderr:\n{err_x}", stderr=err_x) from exc
-        if size > cap:
-            raise EncoderProtocolError(
-                f"response file is {size} bytes, over max_response_bytes={cap}; "
-                f"refusing to read it (configured cap, not a worker verdict); "
-                f"captured stderr:\n{err_x}", stderr=err_x)
         try:
-            with open(resp_path, "rb") as fh:
-                raw = fh.read(cap + 1)
-        except FileNotFoundError as exc:
-            raise EncoderProtocolError(
-                f"encoder worker exited 0 but wrote no response file; "
-                f"captured stderr:\n{err_x}", stderr=err_x) from exc
-        except OSError as exc:
-            raise EncoderProtocolError(
-                f"response file unreadable: {exc}; "
-                f"captured stderr:\n{err_x}", stderr=err_x) from exc
+            try:
+                st = os.fstat(fd)
+                if stat.S_IFMT(st.st_mode) != stat.S_IFREG:
+                    raise EncoderProtocolError(
+                        f"response file is not a regular file "
+                        f"(mode {stat.filemode(st.st_mode)}); refusing to "
+                        f"read it; captured stderr:\n{err_x}", stderr=err_x)
+                size = st.st_size
+                if size > cap:
+                    raise EncoderProtocolError(
+                        f"response file is {size} bytes, over "
+                        f"max_response_bytes={cap}; refusing to read it "
+                        f"(configured cap, not a worker verdict); "
+                        f"captured stderr:\n{err_x}", stderr=err_x)
+                raw = _read_bounded(fd, cap + 1)
+            except OSError as exc:
+                raise EncoderProtocolError(
+                    f"response file unreadable: {exc}; "
+                    f"captured stderr:\n{err_x}", stderr=err_x) from exc
+        finally:
+            os.close(fd)
         if len(raw) > cap:
             raise EncoderProtocolError(
                 f"response file grew past max_response_bytes={cap} between "
-                f"stat and read (file was {size} bytes at stat); refusing to "
-                f"decode a bounded-prefix guess; captured stderr:\n{err_x}",
-                stderr=err_x)
+                f"sizing and read (file was {size} bytes when sized); "
+                f"refusing to decode a bounded-prefix guess; captured "
+                f"stderr:\n{err_x}", stderr=err_x)
         try:
             doc = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
