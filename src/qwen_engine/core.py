@@ -106,7 +106,10 @@ def generate(
     are handed to ``adapter.load`` verbatim. Nothing is written when the
     output is unconfigured: ``output_dir`` is refused **before** the adapter
     loads, so a missing output setting cannot cost a model load or touch the
-    filesystem.
+    filesystem.  After a verified save, the final ``complete`` emission is
+    nonfatal like the phase completion lines: a broken log sink must never
+    fail (or traceback) a run whose image is already on disk — only primary
+    pipeline failures propagate.
     """
     require_run_config(config)
     logger = logger or PhaseLogger()
@@ -124,6 +127,16 @@ def generate(
     with logger.phase("save"):
         output = adapter.save(image, config)
         output_path = _validate_output(output, config)
-    logger.event("complete", latent_tokens=config.latent_tokens,
-                 steps=config.steps)
+    try:
+        logger.event("complete", latent_tokens=config.latent_tokens,
+                     steps=config.steps)
+    except Exception:
+        pass  # The save is done and verified: a sink that dies on this
+        # ordinary completion emission must not turn a successful run into
+        # a failure (review fix 11 — the phase guards do not cover it).
+        # The emitted field names are fixed literals that shadow no
+        # reserved key, so the only exceptions reachable here come from
+        # the logging plumbing itself; every primary pipeline, save and
+        # config failure was raised *before* this point and propagates
+        # unchanged.
     return GenerationResult(output_path=str(output_path))

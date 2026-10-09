@@ -161,6 +161,69 @@ def test_generate_reports_body_exception_despite_completion_sink_faults(base_con
         generate(base_config, FakeAdapter(fail_save=True), {}, logger)
 
 
+# --- review fix 11: the FINAL complete event after a verified save ----------
+# Phase-end guards do not cover generate's trailing logger.event("complete"):
+# root's /tmp/v100-complete-log-review.py showed a sink failing ONLY on
+# complete saved out.png and then raised OSError (CLI reported failure).
+
+
+def test_generate_succeeds_when_sink_fails_only_on_complete(tmp_path, base_config):
+    """Direct generate, mirroring root's probe: the image is saved and the
+    result is returned even though the sink explodes on the complete record;
+    the machine records emitted before it are intact and the stack is clean."""
+    from qwen_engine.log import PhaseLogger
+
+    class CompleteFailingSink:
+        def __init__(self):
+            self.lines: list[str] = []
+
+        def __call__(self, line: str) -> None:
+            if json.loads(line)["event"] == "complete":
+                raise OSError("completion sink failed")
+            self.lines.append(line)
+
+    sink = CompleteFailingSink()
+    logger = PhaseLogger(sink=sink)
+    calls: list[str] = []
+    result = generate(base_config, FakeAdapter(calls), {}, logger)  # no raise
+    assert calls == ["load", "encode", "denoise", "decode", "save"]
+    assert Path(result.output_path).is_file()
+    assert (tmp_path / "output" / "out.png").is_file()
+    events = [json.loads(line)["event"] for line in sink.lines]
+    assert "phase_end" in events and "complete" not in events  # failed record
+    assert logger._stack == []
+
+
+def test_cli_run_exits_zero_when_sink_fails_only_on_complete(
+        tmp_path, capsys, monkeypatch):
+    """End-to-end CLI successful save with a complete-only failing sink:
+    exit 0, the file on disk, the result JSON printed, no traceback — a log
+    fault after a successful save must never report a failed run."""
+    from qwen_engine.log import PhaseLogger
+
+    class CompleteFailingSink:
+        def __call__(self, line: str) -> None:
+            if json.loads(line)["event"] == "complete":
+                raise OSError("completion sink failed")
+
+    monkeypatch.setattr(cli, "_logger_for",
+                        lambda config: PhaseLogger(sink=CompleteFailingSink()))
+    calls: list[str] = []
+    adapter = FakeAdapter(calls)
+    mpath = write_manifest(tmp_path)
+    (tmp_path / "models" / "dit" / "model.bin").parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "models" / "dit" / "model.bin").write_bytes(b"payload")
+    monkeypatch.setattr(cli, "_make_adapter", lambda: adapter)
+    cfg = config_file(tmp_path, output_dir=str(tmp_path / "output"),
+                      manifest_path=str(mpath), models_dir=str(tmp_path / "models"))
+    assert run_cli(tmp_path, ["--config", cfg, "--run"]) == 0
+    assert calls == ["load", "encode", "denoise", "decode", "save"]
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert Path(out["output_path"]).is_file()
+    assert "Traceback" not in captured.err
+
+
 def test_generate_passes_config_and_grouped_assets_into_load(tmp_path, base_config):
     adapter = FakeAdapter()
     assets = {"dit": (tmp_path / "dit-1.bin", tmp_path / "dit-2.bin"),
