@@ -106,11 +106,20 @@ _HOST_UNKNOWN_REASON = (
     "host MemAvailable is unknown: host pressure cannot be ruled out, so "
     "safety cannot be asserted (even alongside a finite cgroup cap)")
 
-#: Scope disclaimer reported with an all-unlimited visible hierarchy.
-_VISIBLE_SCOPE_REASON = (
-    "no finite cap was found in the VISIBLE cgroup hierarchy: this is a "
-    "scoped visibility claim only — a namespace '/' may hide capped "
-    "ancestors, so whole-host/root absence of constraints is not proven")
+#: Scope disclaimer reported with a trusted caller-supplied UNLIMITED
+#: cgroup state. Such a state only ever arrives via an explicit snapshot
+#: injection — real autodiscovery is fail-closed unknown under the scope
+#: gate below and never reports unlimited — so this wording makes no
+#: discovery claim ("no finite cap was found"): no hierarchy was walked,
+#: the unlimited evidence is the caller's, not independently verified by
+#: this module.
+_TRUSTED_UNLIMITED_REASON = (
+    "unlimited cgroup state from an explicitly injected trusted snapshot: "
+    "trusted caller-supplied complete evidence for pure budget arithmetic, "
+    "NOT independently verified by this module (no autodiscovery ran on "
+    "this path; real discovery stays unknown/refuse under the visible-"
+    "root completeness gate, so whole-host/root absence of constraints "
+    "is not proven here either way)")
 
 #: Scope gate: a completed visible walk still cannot prove the visible
 #: root is the TRUE hierarchy root (a namespace '/' can be a non-root
@@ -231,9 +240,11 @@ class MemorySnapshot:
                     f"substituted away by the host number")
             return min(self.host_available_bytes, cgroup_available), \
                 tuple(reasons)
-        # unlimited visible hierarchy: only the host number can decide
-        if _VISIBLE_SCOPE_REASON not in reasons:
-            reasons.append(_VISIBLE_SCOPE_REASON)
+        # Trusted caller-supplied UNLIMITED evidence (injected snapshot —
+        # real autodiscovery never reaches this branch): only the host
+        # number can decide, with the honest trusted-evidence note.
+        if _TRUSTED_UNLIMITED_REASON not in reasons:
+            reasons.append(_TRUSTED_UNLIMITED_REASON)
         return self.host_available_bytes, tuple(reasons)
 
 

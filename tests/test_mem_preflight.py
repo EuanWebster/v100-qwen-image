@@ -294,8 +294,9 @@ def test_unproven_namespace_root_refuses_whatever_root_file_says(tmp_path,
 
 def test_trusted_unlimited_snapshot_proceeds_with_scope_note():
     """An explicitly injected unlimited snapshot is TRUSTED caller
-    evidence for pure budget arithmetic (documented) — the visible-scope
-    disclaimer still rides along honestly."""
+    evidence for pure budget arithmetic (documented) — the honest
+    trusted-evidence note (not a discovery or whole-host/root claim)
+    still rides along."""
     snap = MemorySnapshot(host_available_bytes=64 * GIB,
                           cgroup_state=CGROUP_UNLIMITED)
     report = encoder_memory_preflight(GIB, checkpoint_dtype="bf16",
@@ -304,8 +305,8 @@ def test_trusted_unlimited_snapshot_proceeds_with_scope_note():
     assert report.decision == "proceed"
     assert report.budget_bytes == 64 * GIB
     reasons = " ".join(report.reasons)
-    assert "VISIBLE cgroup hierarchy" in reasons
-    assert "whole-host/root absence of constraints is not proven" in reasons
+    assert "trusted caller-supplied complete evidence" in reasons
+    assert "NOT independently verified by this module" in reasons
 
 
 @pytest.mark.parametrize("child_max", ["max", 8 * GIB])
