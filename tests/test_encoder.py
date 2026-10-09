@@ -14,10 +14,12 @@ import hashlib
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -1686,6 +1688,255 @@ def test_lru_linked_name_preserved_and_valid_entries_still_evicted(tmp_path):
     assert cache.get("b" * 64) is None, "the older valid entry is evicted"
     assert link.exists() and outside.stat().st_nlink == 2, \
         "the linked name and external nlink survive ordinary eviction too"
+
+
+# ---------------------------------------------------------------------------
+# Cache publication: put validates the EXISTING TARGET shape before writing
+# ---------------------------------------------------------------------------
+
+
+def _fake_foreign(monkeypatch, flag=None):
+    """Make the module see the current user as one uid away (fake UID only —
+    no privileged chown). With ``flag`` the switch is deferred until the
+    flag dict sets ``flag['foreign']``."""
+    import qwen_engine.encoder as encoder_mod
+
+    real_geteuid = os.geteuid
+    if flag is None:
+        monkeypatch.setattr(encoder_mod.os, "geteuid",
+                            lambda: real_geteuid() + 1000)
+    else:
+        monkeypatch.setattr(encoder_mod.os, "geteuid",
+                            lambda: real_geteuid()
+                            + (1000 if flag.get("foreign") else 0))
+
+
+def _assert_target_preserved(entry, before, nlink=None):
+    after = entry.lstat()
+    assert (after.st_ino, after.st_mtime_ns, after.st_nlink) == \
+        (before.st_ino, before.st_mtime_ns,
+         before.st_nlink if nlink is None else nlink), \
+        "a refused publish must preserve the target's inode / mtime / nlink"
+
+
+def _assert_no_new_artifacts(cache, allowed_names):
+    names = sorted(p.name for p in cache.root.iterdir())
+    assert names == sorted(allowed_names), \
+        "a refused publish must create no temp file and no quarantine dir"
+
+
+@pytest.mark.parametrize("shape", ["foreign_single", "foreign_multi",
+                                   "own_multi", "symlink", "fifo"])
+def test_put_refuses_unsafe_target_shapes_preserving_everything(
+        tmp_path, monkeypatch, shape):
+    """Publication defect (root's /tmp/v100-cache-publish-review.py): an
+    unconditional ``os.replace`` destroyed preserved foreign names and
+    decremented external inodes' nlink on the ordinary get-miss-then-put
+    path. Now ``put`` lstats the target under the root mutex BEFORE any
+    temp file exists and refuses every unsafe shape (foreign-owned at any
+    link count, own multiply linked, symlink, nonregular) with a typed
+    EncoderError — name, bytes, inode, mtime and links preserved, no temp,
+    no quarantine move, no unlink."""
+    import qwen_engine.encoder as encoder_mod
+
+    cache = EmbeddingCache(tmp_path / "embeds")
+    cache.root.mkdir()
+    key = "d4" * 32
+    entry = cache.entry_path(key)
+    if shape in ("foreign_single", "own_multi"):
+        entry.write_bytes(b"target-bytes-do-not-destroy")
+        if shape == "own_multi":
+            os.link(entry, tmp_path / "twin")
+    elif shape == "foreign_multi":
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"target-bytes-do-not-destroy")
+        os.link(outside, entry)
+    elif shape == "symlink":
+        external = tmp_path / "external.bin"
+        _touch_fixed_mtime(external)
+        entry.symlink_to(external)
+    else:
+        os.mkfifo(entry)
+    os.utime(entry, (1234, 5678), follow_symlinks=False)
+    before = entry.lstat()
+    if shape.startswith("foreign"):
+        _fake_foreign(monkeypatch)
+    with pytest.raises(EncoderError, match="refusing to publish"):
+        cache.put(key, EncodedPayload(blobs=(Blob("x", b"new"),)))
+    monkeypatch.undo()
+    if shape == "fifo":
+        assert stat.S_ISFIFO(entry.lstat().st_mode), \
+            "the refused nonregular squat stays exactly where it is"
+    elif shape == "symlink":
+        assert entry.is_symlink(), "the refused symlink stays in place"
+        external = tmp_path / "external.bin"
+        assert external.read_bytes() == b"EXTERNAL-BYTES-do-not-touch", \
+            "the symlink's external target must be untouched"
+    else:
+        assert entry.is_file() and entry.read_bytes() == \
+            b"target-bytes-do-not-destroy"
+        if "multi" in shape:
+            twin = (tmp_path / "twin" if shape == "own_multi"
+                    else tmp_path / "outside.bin")
+            assert twin.stat().st_nlink == 2, \
+                "a refused publish must not decrement an external link"
+    _assert_target_preserved(entry, before)
+    _assert_no_new_artifacts(cache, [entry.name])
+
+
+def test_put_replaces_safe_owned_entry_and_publishes_when_absent(tmp_path):
+    """Ordinary overwrite is UNCHANGED: an owned, regular, singly linked
+    target is replaced atomically, and an absent target is a normal new
+    publish."""
+    cache = EmbeddingCache(tmp_path / "embeds")
+    key = "d5" * 32
+    cache.put(key, EncodedPayload(blobs=(Blob("x", b"first"),)))
+    entry = cache.entry_path(key)
+    assert cache.get(key).blobs[0].data == b"first"
+    cache.put(key, EncodedPayload(blobs=(Blob("x", b"second"),)))
+    hit = cache.get(key)
+    assert hit is not None and hit.blobs[0].data == b"second", \
+        "owned single-link overwrite stays ordinary"
+    assert entry.stat().st_nlink == 1
+    other = "d6" * 32
+    cache.put(other, EncodedPayload(blobs=(Blob("x", b"new"),)))
+    assert cache.get(other) is not None, "absent target: normal new publish"
+
+
+def test_worker_get_miss_then_put_refuses_to_destroy_foreign_entry(
+        tmp_path, monkeypatch):
+    """The actual normal-workflow defect: ``get()`` correctly preserved a
+    foreign regular name on miss, but the encode path then ran the worker
+    and its ``put()`` replaced that same preserved name. Through the fake
+    worker's get→miss→put path the publication now ends in a typed
+    refusal with the foreign entry fully preserved and no temp or
+    quarantine artifacts."""
+    import qwen_engine.encoder as encoder_mod
+
+    cache = EmbeddingCache(tmp_path / "embeds")
+    request = make_request()
+    key = cache_key(request)
+    entry = cache.entry_path(key)
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_bytes(b"someone-elses-entry")
+    os.utime(entry, (1234, 5678))
+    before = entry.stat()
+
+    class _FakeWorker(encoder_mod.EncoderWorker):
+        def run(self, *args, **kwargs):  # fake transport: no child
+            return EncodedPayload(blobs=(Blob("x", b"fresh"),))
+
+    worker = _FakeWorker(command=["{python}", "{request}", "{response}"],
+                         timeout_s=15.0, cache=cache)
+    _fake_foreign(monkeypatch)
+    with pytest.raises(EncoderError, match="refusing to publish"):
+        worker.encode(request)
+    monkeypatch.undo()
+    assert entry.read_bytes() == b"someone-elses-entry"
+    _assert_target_preserved(entry, before)
+    _assert_no_new_artifacts(cache, [entry.name])
+
+
+def test_corrupt_read_that_became_foreign_after_read_is_not_moved(
+        tmp_path, monkeypatch):
+    """Quarantine boundary: the verified-read identity tuple omits the uid,
+    so the regular-file ownership refusal must run BEFORE the
+    ``read_ident`` branch — a regular file that became foreign-owned after
+    the corrupt read is preserved even though the identity still matches.
+    (Fake UID change at parse time; no privileged chown.)"""
+    import qwen_engine.encoder as encoder_mod
+
+    cache = EmbeddingCache(tmp_path / "embeds")
+    key = "d7" * 32
+    entry = cache.entry_path(key)
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_bytes(b"corrupt-header\njunk")
+    os.utime(entry, (1234, 5678))
+    before = entry.stat()
+
+    flag = {"foreign": False}
+    _fake_foreign(monkeypatch, flag)
+    real_from = encoder_mod.EncodedPayload.from_entry_bytes
+
+    def parse_then_ownership_flips(data, k):
+        try:
+            return real_from(data, k)  # raises _EntryCorrupt on these bytes
+        finally:
+            flag["foreign"] = True  # after the verified read completes
+
+    monkeypatch.setattr(encoder_mod.EncodedPayload, "from_entry_bytes",
+                        staticmethod(parse_then_ownership_flips))
+    assert cache.get(key) is None, "a corrupt read is still a miss"
+    assert entry.is_file(), \
+        "the verified-identity path must never move a now-foreign regular file"
+    assert entry.read_bytes() == b"corrupt-header\njunk"
+    _assert_target_preserved(entry, before, nlink=1)
+    assert not cache.quarantine_dir.exists() or \
+        list(cache.quarantine_dir.iterdir()) == [], \
+        "the refused quarantine move must not have happened"
+
+
+def test_put_with_file_as_root_is_typed_not_raw_file_exists_error(tmp_path):
+    """Persistence boundary: root creation failures surface as typed
+    EncoderError; the ordinary file squatting on the root path is NOT
+    deleted or mkdir-repaired."""
+    root = tmp_path / "embeds"
+    root.write_bytes(b"i-am-a-file-not-a-dir")
+    cache = EmbeddingCache(root)
+    with pytest.raises(EncoderError, match="cache root creation failed"):
+        cache.put("a" * 64, EncodedPayload(blobs=(Blob("x", b"1"),)))
+    assert root.is_file() and root.read_bytes() == b"i-am-a-file-not-a-dir", \
+        "the refusal must not delete or repair user data"
+
+
+def test_failed_temp_cleanup_does_not_replace_publish_failure(tmp_path,
+                                                              monkeypatch):
+    """Persistence boundary: when the temp cleanup ALSO raises, the primary
+    typed publish failure (and its OSError cause) is what surfaces."""
+    import qwen_engine.encoder as encoder_mod
+
+    cache = EmbeddingCache(tmp_path / "embeds")
+    cache.root.mkdir()
+
+    def replace_boom(*args, **kwargs):
+        raise OSError("injected publish failure")
+
+    def unlink_boom(self, missing_ok=False):
+        raise OSError("injected cleanup failure")
+
+    monkeypatch.setattr(encoder_mod.os, "replace", replace_boom)
+    monkeypatch.setattr(Path, "unlink", unlink_boom)
+    with pytest.raises(EncoderError, match="cache write failed") as excinfo:
+        cache.put("a" * 64, EncodedPayload(blobs=(Blob("x", b"1"),)))
+    assert isinstance(excinfo.value.__cause__, OSError)
+    assert "injected publish failure" in str(excinfo.value.__cause__), \
+        "the cleanup error must not mask the publish failure"
+
+
+def test_failed_exclusive_temp_open_preserves_preexisting_temp(tmp_path,
+                                                               monkeypatch):
+    """Cleanup invariant: if the exclusive ``xb`` open fails because the
+    selected temp NAME already exists, that pre-existing file is somebody
+    else's — the typed publish failure must not unlink it. Cleanup touches
+    only a temp this call actually created. (Deterministic name collision
+    via a tiny fake uuid4; static fixture, no concurrent writer.)"""
+    import qwen_engine.encoder as encoder_mod
+
+    cache = EmbeddingCache(tmp_path / "embeds")
+    cache.root.mkdir()
+    key = "d8" * 32
+    existing_temp = cache.root / f".{key}.{os.getpid()}.collision.tmp"
+    existing_temp.write_bytes(b"keep-existing-temp")
+    monkeypatch.setattr(
+        encoder_mod.uuid, "uuid4",
+        lambda: types.SimpleNamespace(hex="collision"))
+    with pytest.raises(EncoderError, match="cache write failed"):
+        cache.put(key, EncodedPayload(blobs=(Blob("x", b"new"),)))
+    assert existing_temp.is_file() and \
+        existing_temp.read_bytes() == b"keep-existing-temp", \
+        "a failed O_EXCL open must not unlink the pre-existing temp name"
+    assert not cache.entry_path(key).exists(), \
+        "the failed publish published nothing"
 
 
 # ---------------------------------------------------------------------------

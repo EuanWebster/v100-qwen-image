@@ -897,7 +897,13 @@ class EmbeddingCache:
       path — and its name and bytes are **preserved**: never read,
       touched or renamed (ownership is
       rechecked on the lstat and on the opened descriptor, so generic
-      OSError routing cannot undo that refusal).
+      OSError routing cannot undo that refusal). The same rule applies at
+      :meth:`put`: under the root mutex and before any temp file is
+      written, an existing target is ``lstat``-ed and replaced only if it
+      is a regular, singly linked, current-user-owned file (ordinary
+      owned overwrite); every other target shape is refused typed with
+      name, bytes, inode, mtime and links preserved — no temp file, no
+      quarantine move, no unlink.
       Quarantine is refused unless ``root/quarantine`` is a real directory
       contained under the canonical root; a refused move leaves the
       evidence exactly where it is and still reports a miss. The LRU touch
@@ -922,9 +928,13 @@ class EmbeddingCache:
       double-encode the same key.
     * A corrupt / unreadable entry is a **miss**; the bad file is moved to
       ``root/quarantine/``, never silently overwritten in place. The move
-      happens under the root mutex and only after an **identity check**
-      proves the file is still the exact one that read corrupt — a valid
-      entry published in the meantime is never quarantined.
+      happens under the root mutex, only after the current-user ownership
+      of a regular file has been re-checked on the fresh lstat (the
+      identity tuple omits the uid, so this runs before the identity
+      comparison), and only after an **identity check** proves the file is
+      still the exact one that read corrupt — a valid entry published in
+      the meantime is never quarantined, and neither is a regular file
+      that became foreign-owned after the read.
     * LRU cap by mtime (hits refresh mtime); eviction is a plain delete.
       Only regular, singly linked, current-user-owned entries are counted
       toward the cap or evicted — counted, ordered and re-checked by a
@@ -1061,20 +1071,75 @@ class EmbeddingCache:
         The size bound is enforced on the *declared* size (header line plus
         blob lengths) BEFORE the combined buffer is constructed, so a put
         that exceeds ``max_entry_bytes`` fails typed without ever building
-        the huge payload buffer."""
+        the huge payload buffer.
+
+        **Target ownership at publish**: under the cache-wide root mutex and
+        BEFORE the temp file is created or written, the target is examined
+        with ``lstat``. An absent target is a normal new publish; an existing
+        target may be replaced only when it is a regular, singly linked file
+        owned by the current user — exactly the shape this cache publishes
+        (an ordinary owned overwrite, including replacing a corrupt entry
+        with a fresh valid one). Every other target shape (foreign-owned at
+        any link count, own multiply linked, symlink, nonregular) is
+        refused with a typed :class:`EncoderError`: the target's name,
+        bytes, inode, mtime and link count are preserved and no temp,
+        quarantine move or unlink happens (an unconditional ``os.replace``
+        would destroy a preserved foreign name or decrement an external
+        inode's nlink). Root-creation and target-``lstat`` filesystem
+        failures are likewise typed :class:`EncoderError` failures; cleanup
+        removes only a temp this call actually created (a failed O_EXCL
+        open leaves the pre-existing name untouched) and a failed cleanup
+        never replaces the primary publish failure. Ordinary
+        single-writer hygiene: no hostile-concurrent-filesystem security is
+        claimed, and the check runs once near the publish point."""
         path = self.entry_path(key)
         data = self._entry_bytes_bounded(payload, key)
         with self._state.mutex:
-            self.root.mkdir(parents=True, exist_ok=True)
+            try:
+                self.root.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                # e.g. the root path is an ordinary file: typed persistence
+                # failure, never a raw FileExistsError.
+                raise EncoderError(
+                    f"cache root creation failed for {key}: {exc}") from exc
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                pass  # absent target: ordinary new publish
+            except OSError as exc:
+                raise EncoderError(
+                    f"cache target check failed for {key}: {exc}") from exc
+            else:
+                if (stat.S_IFMT(st.st_mode) != stat.S_IFREG
+                        or st.st_nlink != 1
+                        or not _owned_by_current_user(st)):
+                    raise EncoderError(
+                        f"refusing to publish entry {key} over {path}: an "
+                        f"existing target must be a regular, singly linked "
+                        f"file owned by this user to be replaced; the "
+                        f"target's name, bytes, inode, mtime and links are "
+                        f"preserved (no temp file, no quarantine move, no "
+                        f"unlink)")
             tmp = self.root / f".{key}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            created = False
             try:
                 with tmp.open("xb") as fh:
+                    created = True
                     fh.write(data)
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp, path)
             except OSError as exc:
-                tmp.unlink(missing_ok=True)
+                # Clean up ONLY a temp this call actually created: a failed
+                # O_EXCL open means the name was somebody else's file —
+                # it stays untouched with its bytes.
+                if created:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        # A failed temp cleanup must not mask the actual
+                        # publish failure that is being reported.
+                        pass
                 raise EncoderError(f"cache write failed for {key}: {exc}") from exc
             self._enforce_lru(protect=key)
         return path
@@ -1173,7 +1238,12 @@ class EmbeddingCache:
         corrupt; when it is not ``None`` the file is quarantined ONLY if it
         still carries that identity — if a valid entry was published in the
         meantime (different inode), the NEW entry stands and this read
-        simply reports a miss. With
+        simply reports a miss. The identity tuple carries device / inode /
+        size / mtime / mode but NOT the file's uid, so the ownership
+        refusal runs FIRST, before any branching on ``read_ident``: a
+        regular file that became foreign-owned after the corrupt read is
+        preserved and never moved whether or not the identity still
+        matches. With
         ``read_ident=None`` (an ownership refusal, an entry-name squat, or
         a failed read) whatever currently sits at the path is re-checked: a
         FOREIGN-owned regular file is preserved at ANY link count — never
@@ -1194,17 +1264,21 @@ class EmbeddingCache:
                 return None  # vanished: miss, nothing to move
             except OSError:
                 return None
+            if stat.S_IFMT(st.st_mode) == stat.S_IFREG and \
+                    not _owned_by_current_user(st):
+                # Foreign-owned regular entry AT ANY LINK COUNT, checked
+                # BEFORE the read_ident branch: the identity tuple omits
+                # the uid, so a file that became foreign-owned after the
+                # corrupt read would otherwise still match the verified
+                # identity and be moved. The ownership guarantee holds
+                # before ANY move of a regular file, not only on the
+                # read_ident=None path.
+                return None
             if read_ident is not None:
                 if _entry_identity(st) != read_ident:
                     return None  # replaced after the corrupt read
             elif stat.S_IFMT(st.st_mode) == stat.S_IFREG:
-                if not _owned_by_current_user(st):
-                    # Foreign-owned regular entry AT ANY LINK COUNT: the
-                    # evidence and the name are PRESERVED, never moved —
-                    # the ownership refusal is never undone on this path
-                    # either, so the check comes before the link-shape
-                    # branch and before any move of a regular file.
-                    return None
+                # Own regular file (foreign ownership refused above):
                 if st.st_nlink == 1:
                     # Re-check the CURRENT bytes before quarantining,
                     # bounded: only content that is actually corrupt (or
