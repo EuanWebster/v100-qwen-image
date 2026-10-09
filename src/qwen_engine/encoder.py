@@ -39,11 +39,15 @@ Pieces
 
 * **EncoderWorker**: configurable ``command`` with ``{python}`` /
   ``{request}`` / ``{response}`` placeholders, timeout and cooperative
-  cancellation (terminate → kill), **stderr captured** into events and typed
-  errors (never swallowed; excerpts are read with a bounded tail read), a
-  terminal event on **every** failure branch, and **every exit path reaps a
-  live child before the scratch temp dir is removed** — including
-  interrupted waiting; setup failures are typed and clean up.
+  cancellation (terminate → kill), **bounded response reads** (a configured
+  ``max_response_bytes`` cap is enforced on a pre-read ``stat`` AND by a
+  bounded read, so a huge or growing response file is refused with a typed
+  protocol error before any unbounded read/JSON/base64), **stderr captured**
+  into events and typed errors (never swallowed; excerpts are read with a
+  bounded tail read), a terminal event on **every** failure branch, and
+  **every exit path reaps a live child before the scratch temp dir is
+  removed** — including interrupted waiting; setup failures are typed and
+  clean up.
 
 Conservative stdlib-only choices, documented per the task brief: the worker
 command is required (there is no default heavy worker at M1); both
@@ -101,6 +105,18 @@ DEFAULT_MAX_ENTRIES = 128
 
 #: How much captured worker stderr is kept in error messages / events.
 STDERR_EXCERPT_CHARS = 4000
+
+#: Default cap on the bytes of a worker **response file** the runner will
+#: read (:attr:`EncoderWorker.max_response_bytes`). A real result is one
+#: JSON document whose base64 blobs are embedding tensors — a few MiB at
+#: realistic shapes (e.g. 1024×8192 fp16 ≈ 16.8 MB → ≈ 22.4 MB as base64) —
+#: so 256 MiB leaves several orders of magnitude of headroom while still
+#: bounding what a runaway or hostile child can push into the engine's RAM
+#: through one response file. The cap is enforced twice: a pre-read
+#: ``stat`` refuses an already-oversized file before opening it, and the
+#: read itself is bounded to ``cap + 1`` bytes, so a file that was small at
+#: ``stat`` time but grows while read still cannot evade the limit.
+DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024 * 1024
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _REVISION_RE = re.compile(r"[0-9a-f]{40}")
@@ -1025,8 +1041,12 @@ class EncoderWorker:
     timeout or cancellation the child gets ``terminate()`` then, after
     ``cancel_grace_s``, ``kill()`` — never an orphaned worker. Captured stderr
     goes into events and into every typed failure; scratch files are removed
-    on every path. (Pinned-host resources are an M4 concern of the real
-    worker; this runner owns only its temp files.)
+    on every path. The response file is read only under the explicit
+    :attr:`max_response_bytes` cap (stat pre-check + bounded read; oversized
+    or growing files raise :class:`EncoderProtocolError` before any
+    unbounded read/JSON/base64 — no new transport, no pickle).
+    (Pinned-host resources are an M4 concern of the real worker; this runner
+    owns only its temp files.)
     """
 
     def __init__(self, *, command: Sequence[str], timeout_s: float,
@@ -1034,6 +1054,7 @@ class EncoderWorker:
                  scratch_dir: str | Path | None = None,
                  cancel_grace_s: float = 5.0,
                  python: str | None = None,
+                 max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
                  logger: PhaseLogger | None = None) -> None:
         cmd = list(command) if (not isinstance(command, (str, bytes))
                                 and isinstance(command, Sequence)) else None
@@ -1072,6 +1093,15 @@ class EncoderWorker:
             scratch_dir if scratch_dir is not None else tempfile.gettempdir(),
             "scratch_dir"))
         self.cancel_grace_s = grace
+        if isinstance(max_response_bytes, bool) or not isinstance(
+                max_response_bytes, int) or max_response_bytes < 1:
+            # A float/bool/zero/negative cap would silently disable or break
+            # the response-size bound (and 1<<64 is a legitimate int); only a
+            # positive int is a meaningful byte count.
+            raise EncoderSetupError(
+                f"max_response_bytes: must be a positive integer, got "
+                f"{max_response_bytes!r}")
+        self.max_response_bytes = max_response_bytes
         self.logger = logger or PhaseLogger()
 
     # -- public --------------------------------------------------------------
@@ -1230,8 +1260,15 @@ class EncoderWorker:
             raise EncoderWorkerError(
                 f"encoder worker exited {proc.returncode}; captured stderr:\n{err_x}",
                 exit_code=proc.returncode, stderr=err_x)
+        cap = self.max_response_bytes
+        # BOUNDED response handling: a size cap (validated positive at
+        # construction) is checked on stat BEFORE the file is opened, and
+        # the read itself never reads more than cap + 1 bytes — so neither
+        # an already-huge response nor one that grows after the stat can
+        # land in memory unbounded. Refusal is a typed protocol error; no
+        # JSON/base64 is ever attempted on oversized content.
         try:
-            raw = resp_path.read_bytes()
+            size = os.stat(resp_path).st_size
         except FileNotFoundError as exc:
             raise EncoderProtocolError(
                 f"encoder worker exited 0 but wrote no response file; "
@@ -1240,6 +1277,28 @@ class EncoderWorker:
             raise EncoderProtocolError(
                 f"response file unreadable: {exc}; "
                 f"captured stderr:\n{err_x}", stderr=err_x) from exc
+        if size > cap:
+            raise EncoderProtocolError(
+                f"response file is {size} bytes, over max_response_bytes={cap}; "
+                f"refusing to read it (configured cap, not a worker verdict); "
+                f"captured stderr:\n{err_x}", stderr=err_x)
+        try:
+            with open(resp_path, "rb") as fh:
+                raw = fh.read(cap + 1)
+        except FileNotFoundError as exc:
+            raise EncoderProtocolError(
+                f"encoder worker exited 0 but wrote no response file; "
+                f"captured stderr:\n{err_x}", stderr=err_x) from exc
+        except OSError as exc:
+            raise EncoderProtocolError(
+                f"response file unreadable: {exc}; "
+                f"captured stderr:\n{err_x}", stderr=err_x) from exc
+        if len(raw) > cap:
+            raise EncoderProtocolError(
+                f"response file grew past max_response_bytes={cap} between "
+                f"stat and read (file was {size} bytes at stat); refusing to "
+                f"decode a bounded-prefix guess; captured stderr:\n{err_x}",
+                stderr=err_x)
         try:
             doc = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:

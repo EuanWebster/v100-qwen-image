@@ -1121,7 +1121,7 @@ standing rule that executed plans stay honest.)*
   **plumbing**, not any claim that a production encoder ran. Parsing is
   strict through the existing typed errors (unknown keys, missing fields,
   explicit nulls, non-hex commits/digest, blank/whitespace/non-string
-  revisions, non-mapping). `tests/test_encoder.py` **108 → 142** offline
+  revisions, non-mapping). `tests/test_encoder.py` **107 → 141** offline
   tests (schema tags + pin constants anchored; exact wire/key roundtrip;
   every one of the 10 fields changes the key; 17-class malformed-value
   matrix; strict identity and request-level parsing refusals; frozen-record
@@ -1135,3 +1135,34 @@ standing rule that executed plans stay honest.)*
   nothing about real loads:** encoder load, safetensors payload, numeric
   parity, torchvision dependency, adapter and GPU stay pending; no network,
   no GPU, no model load, no permission request.
+- 2026-10-09 **M2.2b stage 1 item 2: bounded worker responses — foundation
+  implemented and offline-tested** (sole writer Qwen, same task; corrects
+  the item-1 entry's encoder test count to **107 → 141**):
+  `EncoderWorker` gained the validated **`max_response_bytes`** (positive
+  int, not bool; typed `EncoderSetupError`; documented default
+  `DEFAULT_MAX_RESPONSE_BYTES = 256 MiB` — a real result's base64 blobs are
+  a few MiB, so the bound leaves orders of magnitude of headroom while
+  hard-capping what a child can push into engine RAM through one response
+  file). Enforcement is double by design: a **pre-read `stat`** refuses an
+  already-oversized file **before opening it** (typed
+  `EncoderProtocolError` naming actual size and cap — no read, no JSON, no
+  base64), and the read itself is **bounded to `cap + 1` bytes**, so a file
+  that was small at stat time but **grows before/during the read** is
+  refused as "grew past" the cap rather than decoded unbounded. No new
+  transport, no pickle; child reaping, terminal failure events and stderr
+  diagnostics on every failure branch are untouched. `tests/test_encoder.py`
+  **141 → 153** (typed cap matrix incl. bool/float/zero/negative/None;
+  default constant anchored; end-to-end tiny-cap refusal with a perfectly
+  valid but oversized fake response; **exact byte boundary** accepted via a
+  new fake-worker `_response_bytes_file` recorder — same request and
+  request_id yield byte-identical responses, so cap == size passes and
+  size-1 refuses; stat-path refusal on a pre-created oversized file with the
+  exact size in the message; deterministic stat-vs-read growth simulation
+  through a procfs file that stats 0 bytes but reads longer than the cap,
+  no race, no sleep). Evidence: guarded suite **613 passed + 1 skip**
+  without / **614 passed** with pinned source envs on 3.11.15 and 3.13.5,
+  rc 0; ordinary fake-worker behaviour unchanged (full prior suite intact).
+  This bounds one file's size — it is **not** a memory-fit or load claim;
+  real encoder load, payload and fidelity remain pending. No network, no
+  GPU, no model load, no permission request; `models/assets/`, manifest,
+  fetcher and `sandbox.yaml` untouched.

@@ -14,6 +14,11 @@ Driven entirely by underscore-prefixed keys in the request ``kwargs``:
   violations: unknown fields, NaN metadata, malformed descriptors). NaN
   arrives as the literal ``NaN`` token because the writer uses ``allow_nan``
   exactly like a sloppy worker would.
+* ``_response_bytes_file``: path — also write the exact response *bytes*
+  there (outside the scratch dir), so tests can set a
+  ``max_response_bytes`` cap at the byte-exact boundary. The document is
+  deterministic apart from the 32-hex ``request_id`` (fixed length), so
+  repeated runs of the same request produce same-LENGTH responses.
 * ``_counter_file``: path — append one line per *encode* (double-encode detector)
 * ``_pid_file``: path — record the worker pid (kill-path verification)
 
@@ -95,9 +100,13 @@ def main() -> int:
                        "data_b64": base64.b64encode(blob).decode("ascii")}],
         })
     doc.update(kwargs.get("_result_patch") or {})
+    data = json.dumps(doc, sort_keys=True).encode("utf-8")
+    if record := kwargs.get("_response_bytes_file"):
+        with open(record, "wb") as fh:
+            fh.write(data)
     tmp = args.response + f".tmp{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, sort_keys=True)
+    with open(tmp, "wb") as fh:
+        fh.write(data)
     os.replace(tmp, args.response)
     return 0
 

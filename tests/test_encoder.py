@@ -22,6 +22,7 @@ import pytest
 
 from qwen_engine.encoder import (
     CACHE_KEY_SCHEMA,
+    DEFAULT_MAX_RESPONSE_BYTES,
     ENTRY_SCHEMA,
     PINNED_DIFFUSERS_COMMIT,
     PINNED_TRANSFORMERS_COMMIT,
@@ -69,7 +70,8 @@ def make_request(**overrides) -> EncoderRequest:
 
 
 def make_worker(tmp_path, *, timeout_s=15.0, cache=None, logger=None,
-                grace=None, extra_kwargs=None) -> tuple[EncoderWorker, dict]:
+                grace=None, extra_kwargs=None,
+                max_response_bytes=None) -> tuple[EncoderWorker, dict]:
     """Worker wired to the fake script; ``extra_kwargs`` drive the fake."""
     scratch = tmp_path / "scratch"
     scratch.mkdir(exist_ok=True)
@@ -83,6 +85,8 @@ def make_worker(tmp_path, *, timeout_s=15.0, cache=None, logger=None,
         cache=cache,
         scratch_dir=scratch,
         **({"cancel_grace_s": grace} if grace is not None else {}),
+        **({"max_response_bytes": max_response_bytes}
+           if max_response_bytes is not None else {}),
         logger=logger,
     )
     return worker, kwargs
@@ -661,6 +665,94 @@ def test_worker_protocol_violations_are_typed(tmp_path, mode):
     with pytest.raises(EncoderProtocolError):
         worker.run(make_request(kwargs=kwargs))
     assert_scratch_clean(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Bounded worker responses (max_response_bytes)
+# ---------------------------------------------------------------------------
+
+
+class _ExitedChild:
+    """Stand-in for a finished Popen in direct `_result_from_files` probes."""
+    returncode = 0
+
+
+@pytest.mark.parametrize("bad", [True, False, 0, -1, 1.5, "1024", None, 2.0])
+def test_bad_max_response_caps_are_setup_errors(tmp_path, bad):
+    with pytest.raises(EncoderSetupError, match="max_response_bytes"):
+        EncoderWorker(
+            command=[sys.executable, str(FAKE_WORKER), "--request", "{request}",
+                     "--response", "{response}"],
+            timeout_s=5.0, scratch_dir=tmp_path, max_response_bytes=bad)
+    # The default is the documented practical bound.
+    assert EncoderWorker(
+        command=["x", "{request}", "{response}"], timeout_s=5.0,
+        scratch_dir=tmp_path).max_response_bytes == DEFAULT_MAX_RESPONSE_BYTES
+
+
+def test_small_cap_refuses_before_json_decode(tmp_path):
+    """End to end: the fake writes a perfectly valid response, but it is
+    bigger than the tiny configured cap — a typed protocol error naming the
+    cap and sizes, scratch cleaned, child reaped, stderr intact."""
+    worker, kwargs = make_worker(tmp_path, max_response_bytes=256)
+    with pytest.raises(EncoderProtocolError) as exc:
+        worker.run(make_request(kwargs=kwargs))
+    msg = str(exc.value)
+    assert "max_response_bytes=256" in msg and "refusing to read" in msg
+    assert exc.value.stderr == "" or isinstance(exc.value.stderr, str)
+    assert_scratch_clean(tmp_path)
+
+
+def test_exact_boundary_response_is_accepted(tmp_path):
+    """cap == response size: valid (the bound is inclusive at the cap);
+    cap == size - 1: refused. Same request + request_id → byte-identical
+    fake responses, so the boundary is exact, not estimated."""
+    rec = tmp_path / "response.bytes"
+    worker, kwargs = make_worker(
+        tmp_path, extra_kwargs={"_response_bytes_file": str(rec)})
+    req = make_request(kwargs=kwargs)
+    payload = worker.run(req, request_id="boundary-rid")
+    assert payload.blobs[0].data.startswith(b"FAKEEMBED:")
+    size = rec.stat().st_size
+    assert size > 64
+
+    exact, kwargs_exact = make_worker(
+        tmp_path, max_response_bytes=size,
+        extra_kwargs={"_response_bytes_file": str(tmp_path / "rec2")})
+    again = exact.run(make_request(kwargs=kwargs_exact),
+                      request_id="boundary-rid")
+    assert again.to_entry_bytes("0" * 64) == payload.to_entry_bytes("0" * 64)
+
+    over, kwargs_over = make_worker(
+        tmp_path, max_response_bytes=size - 1)
+    with pytest.raises(EncoderProtocolError, match="over max_response_bytes"):
+        over.run(make_request(kwargs=kwargs_over), request_id="boundary-rid")
+    assert_scratch_clean(tmp_path)
+
+
+def test_oversized_response_refused_at_stat_before_open(tmp_path):
+    """A pre-existing oversized file is refused on the stat pre-check: the
+    message reports the stat size, and nothing is decoded."""
+    resp = tmp_path / "response.json"
+    resp.write_bytes(b'{"schema": ' + b"x" * 4096)
+    size = resp.stat().st_size
+    worker, _ = make_worker(tmp_path, max_response_bytes=1024)
+    with pytest.raises(EncoderProtocolError,
+                       match=rf"is {size} bytes, over max_response_bytes=1024"):
+        worker._result_from_files(_ExitedChild(), resp, "", "0" * 64, "rid")
+
+
+def test_growing_response_file_is_refused_by_the_bounded_read(tmp_path):
+    """Deterministic growth simulation: a procfs file stats as 0 bytes (so
+    the pre-read stat check passes) but reads back far more — exactly the
+    stat-vs-read race shape. The bounded read (cap + 1) must refuse it as a
+    grown file rather than decode an unbounded amount."""
+    status = Path("/proc/self/status")
+    if not status.exists() or os.stat(status).st_size != 0:
+        pytest.skip("needs Linux procfs (st_size == 0, non-empty read)")
+    worker, _ = make_worker(tmp_path, max_response_bytes=256)
+    with pytest.raises(EncoderProtocolError, match="grew past"):
+        worker._result_from_files(_ExitedChild(), status, "", "0" * 64, "rid")
 
 
 # ---------------------------------------------------------------------------
