@@ -75,8 +75,14 @@ Contract (see ``docs/models.md`` §4):
   filename that is simultaneously another's directory (``a`` and ``a/b``)
   is refused the same way as a usability preflight, and so is an artifact's
   STAGED path being another artifact's ancestor directory (``a/x`` stages
-  at ``a/x.partial``, which ``a/x.partial/y`` needs as a directory —
-  neither manifest order can ever download both). The read-only offline
+  at ``a/x.partial``, which ``a/x.partial/y`` needs as a directory — an
+  order-independent reorder/repair safety refusal, not an impossibility
+  claim: publishing ``a/x`` is ``os.link`` of the verified partial then
+  ``os.unlink`` of the staging name (never ``os.replace``/``os.rename``),
+  so an ``a/x``-first run removes that name and ``a/x.partial/y`` can
+  then download; the reverse order — or a repair while the staging file
+  still occupies the path — hits a file where the other artifact must
+  mkdir). The read-only offline
   plan reports this typed usage error too — never a write, never a socket.
 * Before any transfer, a bounded disk estimate (remaining manifest bytes plus
   a 1 MiB headroom per pending file) is compared with fresh ``statvfs`` free
@@ -784,11 +790,18 @@ def _check_manifest_filename_collisions(manifest: ModelManifest) -> None:
       while nothing has happened yet.
     * **Staged-path-versus-directory collision (same preflight, static):**
       ``a/x`` stages at ``a/x.partial``; an artifact ``a/x.partial/y`` needs
-      ``a/x.partial`` to be a DIRECTORY. Neither order can ever download
-      both — the first leaves a file where the second must mkdir — so any
-      manifest whose artifact's staged partial path is a proper ancestor
-      directory of another artifact's final (either order) is refused here,
-      before mkdir/network/write.
+      ``a/x.partial`` to be a DIRECTORY. This is an order-independent
+      REORDER/REPAIR SAFETY refusal, not a claim that no order can ever
+      download both: publishing ``a/x`` is ``os.link`` of the verified
+      partial then ``os.unlink`` of the staging name (this tool never uses
+      ``os.replace``/``os.rename``), so an ``a/x``-first run removes the
+      ``a/x.partial`` name and ``a/x.partial/y`` can then download; the
+      reverse order — or any later repair while a staging file still
+      occupies that path — hits a file where the other artifact must
+      mkdir. Refusing the static pair (either order) up front keeps every
+      order, resume and rerun safe: any manifest whose artifact's staged
+      partial path is a proper ancestor directory of another artifact's
+      final is refused here, before mkdir/network/write.
     """
     identities = [art.identity for art in manifest.artifacts]
     # Schema-v1 guarantees uniqueness, so the identity -> index map is exact.
@@ -827,8 +840,12 @@ def _check_manifest_filename_collisions(manifest: ModelManifest) -> None:
                     f"manifest filename collision: artifacts[{i}] "
                     f"'{ident}' needs '{ancestor}' as a directory, but "
                     f"fetching artifacts[{k}] '{identities[k]}' stages its "
-                    f"resume partial at exactly that path — the two can "
-                    "never both download; fix the manifest")
+                    f"resume partial at exactly that path — an order-"
+                    "independent reorder/repair safety refusal (a "
+                    "published first artifact unlinks its staging name, "
+                    "but the reverse order or a repair with the staging "
+                    "file still present hits a file where the other must "
+                    "mkdir); fix the manifest")
 
 
 def load_manifest_checked(path: str) -> ModelManifest:

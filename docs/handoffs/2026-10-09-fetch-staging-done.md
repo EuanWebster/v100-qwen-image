@@ -41,3 +41,19 @@ preserved.
 
 Next: root independent review/reproduction before acceptance; queue item 4
 (memory preflight cgroup hierarchy) follows per root's queue.
+
+## Correction appended 2026-10-09 (docs-only, finish-small-docs task)
+
+The staged-path ancestor explanation (this handoff's context, `docs/models.md`
+preflight paragraph, the `_check_manifest_filename_collisions` docstring +
+UsageError rationale, the module docstring and the test comment) claimed
+"neither manifest order can ever download both" for `a/x` + `a/x.partial/y`.
+That claim was FALSE: publish is `os.link` of the verified partial followed
+by `os.unlink` of the staging name (this fetcher never uses
+`os.replace`/`os.rename`), so an `a/x`-first run removes the `a/x.partial`
+name and `a/x.partial/y` can then download; the reverse order — or a later
+repair while a staging file still occupies that path — conflicts with the
+directory. The conservative both-order static refusal is KEPT and is now
+described as an order-independent REORDER/REPAIR SAFETY policy. Wording-only
+change; no control-flow, manifest, or asset changes; all tests unchanged and
+green.

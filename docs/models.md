@@ -186,8 +186,13 @@ filename — schema-v1 accepts a manifest listing both `foo` and
 mismatch; a filename that is simultaneously another's directory (`a` and
 `a/b`) is refused the same way (usability preflight), as is a staged path
 that lands on another artifact's **directory** (`a/x` stages at `a/x.partial`
-while `a/x.partial/y` needs that exact path as a directory — neither manifest
-order can ever download both); the read-only plan
+while `a/x.partial/y` needs that exact path as a directory — an
+order-independent REORDER/REPAIR SAFETY refusal, not an impossibility
+claim: publishing `a/x` is `os.link` of the verified partial then
+`os.unlink` of the staging name (never `os.replace`/`os.rename`), so an
+`a/x`-first run removes that name and `a/x.partial/y` can then download,
+while the reverse order or a repair with the staging file still present
+conflicts with the directory); the read-only plan
 reports the same typed usage error without any write or socket (the
 committed 24-entry manifest contains no such names — the refusal protects
 the reusable tool contract, not just this manifest); a bounded disk estimate (manifest

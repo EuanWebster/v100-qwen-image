@@ -162,3 +162,58 @@ diagnostic refuses with unknown state + advisory availability +
 guaranteed-refusal reason. sandbox.yaml and models/assets untouched.
 Awaiting root independent review before acceptance; queue otherwise
 unchanged.
+
+10:33 UTC root acceptance: memory9c89e7a/docs59a3542 inspected; peer accepts
+safety, actual bounds terminology fixed before amend. Root independently
+reran full FINAL committed tree732+1skip3.11 /733pinned3.13, both rc0, and
+both original/scope probes green. Review2 writer50296 exited0. Strict default
+real-memory discovery refuses until trusted complete evidence exists; this
+is an additional honest runtime gate, not a V100-only blocker. One harmless
+trusted-unlimited diagnostic misclassification queued in fix-small task.
+Remaining order: fix-small (including fetch policy explanation), fix-json,
+independent all-corrections review, worker-tensors, split identity/factory
+and production-worker wiring milestones. Root note may be committed with
+next docs milestone. User sandbox.yaml only pre-existing dirty product file.
+
+10:39 UTC root/peer found final cache transaction defects beyond current
+fix-small read guard: actual EncoderWorker.encode getforeign->miss->worker
+->put replaces the same foreign entry; directput on existing hardlink drops
+outside nlink2->1. _quarantine(read_ident!=None) can skip regular UID
+refusal because identity omitsUID. Tiny /tmp/v100-cache-publish-review.py
+root probe confirmsall. Next fresh /tmp/v100-fix-cache-publish-task.md BEFORE
+fix-json; do not accept whole cache until it passes. Current36485 still
+finishing fix-small, preserve its good read/bench/memory changes. Root
+scratch probe is separate; do not modify it to manufacture passes.
+Fetch explanation correction MUST describe actual os.link+unlink publish,
+NOT os.replace/rename (which this fetcher intentionally does not use).
+
+10:40 UTC current36485 ENDED0 prematurely after3 scoped good code commits:
+78fd52a bench90,79528b8 readowner186,3ba1150 mem67. Root independently
+focused343passed combined; cachepublication probe stillfails all5cases
+(foreignsingle/multi + ownedmulti replaced; worker automaticput replaced;
+read_ident foreignquarantine moved). No doc changes made before EOS
+promptdump. Fresh /tmp/v100-finish-small-docs-task.md only completes doc
+claims+handoff, then cachepublication task, then fixJSON. Never accept0
+alone or repeat the already-finished3 code commits.
+
+10:5x UTC finish-small-docs writer completion (docs/comments only, baseline
+3ba1150; the three accepted code commits NOT redone): (1) dependencies.md
+now states missing torchvision as a KNOWN runtime blocker (clean imports
+without it, but the actual socket-denied Qwen3VLProcessor.from_pretrained
+probe failed via Qwen3VLVideoProcessor's torchvision import; both pinned ML
+envs lack it; tokenizer-only load succeeded; no encoder parity/RAM/GPU
+proof) with no pin/lock/install changes; (2) the false 'neither order can
+ever download both' staged-ancestor claim corrected to an order-independent
+REORDER/REPAIR SAFETY policy describing the actual os.link+unlink publish
+(never os.replace/rename) in module+function docstrings, UsageError
+rationale, fetch test comment, models.md, plus dated appendix to
+fetch-staging-done.md; conservative both-order refusal unchanged, no
+control-flow/manifest/asset changes. Cache publication defects remain
+UNFIXED and queued (/tmp/v100-fix-cache-publish-task.md before fix-json);
+read_ident quarantine branch still uncovered; whole cache NOT accepted.
+Evidence: guarded focused fetch 99 passed; ML-free import-boundary
+cpu_guard+cli 53 passed; guarded full 3.11.15 suite 742 passed+1skip rc0
+(counts unchanged by this docs-only delta); py_compile clean. sandbox.yaml
+and models/assets untouched/unstaged. Local handoff
+2026-10-09-finish-small-docs-done.md; vault untouched (read-only local
+fallback). Awaiting root independent review before acceptance.

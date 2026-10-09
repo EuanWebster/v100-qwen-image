@@ -36,10 +36,17 @@ commits are what is guaranteed identical.
 That mix is precisely why the lock installs with `uv pip sync` only:
 `pip install --require-hashes -r requirements.lock` cannot handle VCS
 requirements at all and is **not** a supported path here. `torchvision`
-is **not** required for the text-to-image import path: `transformers`'
-`Qwen3VLProcessor` and the pipeline module import cleanly without it (verified
-2026-10-07); if a future load path needs it, it joins via an explicit
-requirements change, not silently.
+is absent from **both pinned ML envs** and is **not** needed for the
+text-to-image *import* path: `transformers`' `Qwen3VLProcessor` and the
+pipeline module import cleanly without it (verified 2026-10-07). But its
+absence is a **known runtime blocker, not a hypothetical future optional
+need** (verified 2026-10-09): the actual socket-denied local
+`Qwen3VLProcessor.from_pretrained` probe failed because that processor's
+`Qwen3VLVideoProcessor` import chain requires `torchvision`
+(`ModuleNotFoundError`). A tokenizer-only local load succeeded
+(Qwen2Tokenizer); there is still **no** real encoder parity, RAM-fit or
+GPU proof. Any fix joins via an explicit requirements change, never
+silently — none was made for this finding.
 
 No `requirements.in`/lock change touches the **developer-only CPU
 environment**: `pyproject.toml` + `uv.lock` remain the pinned pytest-only env
