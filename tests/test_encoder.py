@@ -1401,20 +1401,64 @@ def test_fifo_entry_squat_is_refused_without_blocking(tmp_path):
 
 
 def test_foreign_owned_entry_is_refused_as_miss(tmp_path, monkeypatch):
-    """The fstat ownership branch: an entry file not owned by this user is
-    refused before any byte is read (identity squat hygiene). get() is a
-    clean miss; the name is moved aside, never read."""
+    """Ownership rule: a regular entry not owned by this user is a clean
+    miss with the evidence and the name PRESERVED — no read, no touch, no
+    rename — so generic OSError routing can never move a refused foreign
+    file into quarantine."""
     import qwen_engine.encoder as encoder_mod
 
     cache = EmbeddingCache(tmp_path / "embeds")
     key = "b1" * 32
     cache.entry_path(key).parent.mkdir(parents=True, exist_ok=True)
     cache.entry_path(key).write_bytes(b"someone-elses-file")
+    before = cache.entry_path(key).stat()
     real_geteuid = os.geteuid
     monkeypatch.setattr(encoder_mod.os, "geteuid",
                         lambda: real_geteuid() + 1000)
     assert cache.get(key) is None, "foreign-owned entry must be a miss"
-    assert not cache.entry_path(key).exists()
+    assert cache.entry_path(key).is_file(), \
+        "a refused foreign-owned entry must be preserved in place"
+    assert cache.entry_path(key).read_bytes() == b"someone-elses-file"
+    after = cache.entry_path(key).stat()
+    assert (after.st_ino, after.st_mtime_ns, after.st_nlink) == \
+        (before.st_ino, before.st_mtime_ns, before.st_nlink), \
+        "a refused foreign-owned entry must not be touched or renamed"
+    assert not cache.quarantine_dir.exists() or \
+        list(cache.quarantine_dir.iterdir()) == [], \
+        "the refusal must not move anything into quarantine"
+
+
+def test_lru_linked_name_preserved_and_valid_entries_still_evicted(tmp_path):
+    """Regression (root's /tmp/v100-cache-ownership-review.py): LRU counts,
+    orders and evicts only regular, singly linked, current-user-owned
+    entries by NO-FOLLOW stat. An entry-shaped hard link onto an external
+    file is never unlinked (the outside inode's nlink and the linked name
+    are preserved) and never uses up the valid-entry budget; ordinary LRU
+    over valid entries — evicting the oldest, protecting the new — still
+    works under the cap."""
+    payload = EncodedPayload(blobs=(Blob("x", b"a"),))
+    cache = EmbeddingCache(tmp_path / "embeds", max_entries=1)
+    cache.root.mkdir()
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(payload.to_entry_bytes("a" * 64))
+    os.utime(outside, (1, 1))  # looks like the oldest entry by mtime
+    link = cache.entry_path("a" * 64)
+    os.link(outside, link)
+    before = outside.stat()
+    cache.put("b" * 64, payload)
+    after = outside.stat()
+    assert after.st_nlink == before.st_nlink == 2, \
+        "LRU eviction must never decrement an external inode's nlink"
+    assert link.exists(), "an unsafe entry-shaped name is not deleted as an eviction"
+    assert cache.get("b" * 64) is not None, \
+        "the unsafe name must not use up the valid-entry budget"
+    # Ordinary LRU stays ordinary: the cap now holds one valid entry, so
+    # the next valid publish evicts the older valid one — and only it.
+    cache.put("c" * 64, payload)
+    assert cache.get("c" * 64) is not None, "the new entry is protected"
+    assert cache.get("b" * 64) is None, "the older valid entry is evicted"
+    assert link.exists() and outside.stat().st_nlink == 2, \
+        "the linked name and external nlink survive ordinary eviction too"
 
 
 # ---------------------------------------------------------------------------

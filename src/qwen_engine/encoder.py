@@ -839,6 +839,23 @@ def _entry_identity(st: os.stat_result) -> tuple:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_mode)
 
 
+def _owned_by_current_user(st: os.stat_result) -> bool:
+    """Ownership rule on an ALREADY-STATED snapshot: a cache entry must
+    belong to the effective user running us. Applied to the lstat of the
+    path (miss decisions, quarantine, LRU) and to the fstat of an opened
+    descriptor, so no generic OSError routing can undo the refusal."""
+    return not (hasattr(os, "geteuid") and st.st_uid != os.geteuid())
+
+
+def _lru_evictable(st: os.stat_result) -> bool:
+    """LRU-safe name (from a NO-FOLLOW stat): regular, singly linked and
+    owned by the current user — exactly the shape an atomic cache file of
+    this cache has. Anything else neither counts toward the cap nor may
+    be deleted as an eviction."""
+    return (stat.S_IFMT(st.st_mode) == stat.S_IFREG and st.st_nlink == 1
+            and _owned_by_current_user(st))
+
+
 def _root_state(root: Path) -> _RootState:
     try:
         canonical = str(root.resolve())
@@ -860,9 +877,14 @@ class EmbeddingCache:
       the writes or move the lock), and the cache only ever reads, touches
       or
       moves files *it owns under that root*: an entry leaf that is a
-      symlink, has more than one hard link, is not a regular file or is not
-      owned by this user is refused — never read, never mtime-touched
-      (atomic cache files have single ownership), only moved aside by name.
+      symlink, has more than one hard link or is not a regular file is
+      refused — never read, never mtime-touched (atomic cache files
+      have single ownership), only moved aside by name; a *foreign-owned
+      regular* entry is likewise refused as a miss, but its name and
+      bytes are **preserved** — never read, touched or renamed, in
+      :meth:`get` and in the quarantine path alike (ownership is
+      rechecked on the lstat and on the opened descriptor, so generic
+      OSError routing cannot undo that refusal).
       Quarantine is refused unless ``root/quarantine`` is a real directory
       contained under the canonical root; a refused move leaves the
       evidence exactly where it is and still reports a miss. The LRU touch
@@ -891,6 +913,11 @@ class EmbeddingCache:
       proves the file is still the exact one that read corrupt — a valid
       entry published in the meantime is never quarantined.
     * LRU cap by mtime (hits refresh mtime); eviction is a plain delete.
+      Only regular, singly linked, current-user-owned entries are counted
+      toward the cap or evicted — counted, ordered and re-checked by a
+      no-follow stat — so an unsafe entry-shaped name never uses up the
+      valid-entry budget and is never deleted as an eviction (an external
+      inode's nlink can never be decremented through the LRU).
     """
 
     def __init__(self, root: str | Path, *, max_entries: int = DEFAULT_MAX_ENTRIES,
@@ -977,6 +1004,13 @@ class EmbeddingCache:
             # regular file); move the NAME aside — the move follows
             # nothing and cannot modify any external target.
             return self._quarantine(path, key, read_ident=None)
+        if not _owned_by_current_user(st):
+            # Foreign-owned regular entry: a MISS with no open, no read,
+            # no touch and no rename — the evidence and the name stay
+            # exactly where they are. Checked on the lstat BEFORE the
+            # descriptor, so the OSError path below can never route this
+            # refusal into a quarantine move.
+            return None
         read_ident: tuple | None = None
         try:
             data, read_ident = self._bounded_entry_read(path)
@@ -1028,7 +1062,11 @@ class EmbeddingCache:
         return path
 
     def entries(self) -> list[str]:
-        """Current valid cache keys (corrupt files are skipped, not repaired)."""
+        """The keys whose entry-shaped NAMES are present under the root.
+        This is a name listing only — no content, kind, link or ownership
+        validation is claimed or performed (quarantine-refused and LRU-
+        unsafe squats list too, and refused-corrupt files are left in
+        place, not repaired); only :meth:`get` validates an entry."""
         if not self.root.is_dir():
             return []
         keys = []
@@ -1140,6 +1178,11 @@ class EmbeddingCache:
                     return None  # replaced after the corrupt read
             elif (stat.S_IFMT(st.st_mode) == stat.S_IFREG
                     and st.st_nlink == 1):
+                if not _owned_by_current_user(st):
+                    # Foreign-owned regular entry: the evidence and the
+                    # name are PRESERVED, never moved — the ownership
+                    # refusal is never undone on this path either.
+                    return None
                 # Re-check the CURRENT bytes before quarantining, bounded:
                 # only content that is actually corrupt (or unreadable /
                 # over the cap) may be moved — never a valid entry.
@@ -1166,23 +1209,40 @@ class EmbeddingCache:
         return None
 
     def _enforce_lru(self, protect: str) -> None:
-        paths = [(self.root / (k + _ENTRY_SUFFIX), k) for k in self.entries()]
-        if len(paths) <= self.max_entries:
+        """Enforce the cap over the VALID entries only. Counting, mtime
+        ordering and eviction all use a NO-FOLLOW stat: only regular,
+        singly linked, current-user-owned names are valid entries — an
+        unsafe entry-shaped name (symlink, extra hard link, nonregular or
+        foreign-owned squat) neither uses up the valid-entry budget nor is
+        ever deleted as an eviction, so an external inode's link count,
+        bytes and mtime can never be decremented through the LRU. The
+        shape is re-checked by lstat right before each unlink."""
+        candidates: list[tuple[float, str, Path]] = []
+        for key in self.entries():
+            path = self.root / (key + _ENTRY_SUFFIX)
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue  # vanished: no budget, nothing to evict
+            if not _lru_evictable(st):
+                continue  # unsafe squat: no budget, never evicted
+            candidates.append((st.st_mtime, key, path))
+        if len(candidates) <= self.max_entries:
             return
 
-        def _mtime(item: tuple[Path, str]) -> float:
-            try:
-                return item[0].stat().st_mtime
-            except OSError:
-                return float("-inf")
-
-        paths.sort(key=lambda item: (_mtime(item), item[1]))
-        overflow = len(paths) - self.max_entries
-        for path, key in paths:
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        overflow = len(candidates) - self.max_entries
+        for _, key, path in candidates:
             if overflow <= 0:
                 break
             if key == protect:
                 continue
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue  # vanished since the snapshot: no eviction spent
+            if not _lru_evictable(st):
+                continue  # went unsafe: no eviction spent
             try:
                 path.unlink(missing_ok=True)
                 overflow -= 1
