@@ -891,9 +891,11 @@ class EmbeddingCache:
       symlink, has more than one hard link or is not a regular file is
       refused — never read, never mtime-touched (atomic cache files
       have single ownership), only moved aside by name; a *foreign-owned
-      regular* entry is likewise refused as a miss, but its name and
-      bytes are **preserved** — never read, touched or renamed, in
-      :meth:`get` and in the quarantine path alike (ownership is
+      regular* entry is likewise refused as a miss **at any link count**
+      — the ownership refusal runs before the link-shape branch in
+      :meth:`get` and before any move of a regular file in the quarantine
+      path — and its name and bytes are **preserved**: never read,
+      touched or renamed (ownership is
       rechecked on the lstat and on the opened descriptor, so generic
       OSError routing cannot undo that refusal).
       Quarantine is refused unless ``root/quarantine`` is a real directory
@@ -984,10 +986,13 @@ class EmbeddingCache:
     def get(self, key: str) -> EncodedPayload | None:
         """Return the cached payload, or ``None`` on miss.
 
-        Ownership first: the entry name is examined with ``lstat`` and only
-        a *regular, singly linked* file is opened at all — a symlink, hard
-        link, or nonregular squat is refused as a miss and moved aside by
-        name, never read and never mtime-touched, so an external file can
+        Ownership first: the entry name is examined with ``lstat`` — a
+        *foreign-owned regular* file is refused as a miss at **any link
+        count** (name and bytes preserved, never moved, before the
+        link-shape branch), and only a regular, singly linked, owned file
+        is opened at all — a symlink, (own) hard link, or nonregular squat
+        is refused as a miss and moved aside by name, never read and never
+        mtime-touched, so an external file can
         neither answer through a cache path nor have its bytes / link /
         mtime changed through one. The opened descriptor must likewise be
         regular, singly linked and owned (O_NOFOLLOW + O_NONBLOCK + fstat:
@@ -1009,19 +1014,21 @@ class EmbeddingCache:
             return None
         except OSError:
             return self._quarantine(path, key, read_ident=None)
+        if stat.S_IFMT(st.st_mode) == stat.S_IFREG and not \
+                _owned_by_current_user(st):
+            # Foreign-owned regular entry AT ANY LINK COUNT: a MISS with
+            # no open, no read, no touch and no rename — the evidence and
+            # the name stay exactly where they are. Checked on the lstat
+            # BEFORE the link-shape branch and the descriptor, so neither
+            # a quarantine routing on this path nor generic OSError
+            # handling can undo the refusal.
+            return None
         if stat.S_IFMT(st.st_mode) != stat.S_IFREG or st.st_nlink != 1:
-            # Symlinked / multiply linked / nonregular squat: refuse to
-            # read or touch (an atomic cache file is a singly linked
+            # Symlinked / (own) multiply linked / nonregular squat: refuse
+            # to read or touch (an atomic cache file is a singly linked
             # regular file); move the NAME aside — the move follows
             # nothing and cannot modify any external target.
             return self._quarantine(path, key, read_ident=None)
-        if not _owned_by_current_user(st):
-            # Foreign-owned regular entry: a MISS with no open, no read,
-            # no touch and no rename — the evidence and the name stay
-            # exactly where they are. Checked on the lstat BEFORE the
-            # descriptor, so the OSError path below can never route this
-            # refusal into a quarantine move.
-            return None
         read_ident: tuple | None = None
         try:
             data, read_ident = self._bounded_entry_read(path)
@@ -1162,17 +1169,20 @@ class EmbeddingCache:
                     read_ident: tuple | None) -> None:
         """Move a corrupt entry aside under the cache-wide root mutex.
 
-        ``read_ident`` is the identity of the bytes that were actually read
-        and found corrupt; when it is not ``None`` the file is quarantined
-        ONLY if it still carries that identity — if a valid entry was
-        published in the meantime (different inode), the NEW entry stands
-        and this read simply reports a miss. With ``read_ident=None`` (an
-        ownership refusal, an entry-name squat, or a failed read) whatever
-        currently sits at the path is re-checked: a singly linked, owned
-        regular file is only quarantined after a fresh BOUNDED parse proves
-        it corrupt — never a freshly published valid entry; symlinked,
-        multiply linked or nonregular names are moved aside unread (the
-        move follows nothing and modifies no external target). Before ANY
+        ``read_ident`` is the identity of the bytes actually read and found
+        corrupt; when it is not ``None`` the file is quarantined ONLY if it
+        still carries that identity — if a valid entry was published in the
+        meantime (different inode), the NEW entry stands and this read
+        simply reports a miss. With
+        ``read_ident=None`` (an ownership refusal, an entry-name squat, or
+        a failed read) whatever currently sits at the path is re-checked: a
+        FOREIGN-owned regular file is preserved at ANY link count — never
+        moved, the ownership refusal preceding any move of a regular file;
+        an OWN singly linked regular file is only quarantined after a fresh
+        BOUNDED parse proves it corrupt — never a freshly published valid
+        entry; own multiply linked regular names and symlinked or
+        nonregular names are moved aside unread (the move follows nothing
+        and modifies no external target). Before ANY
         move the quarantine directory itself must pass
         :meth:`_quarantine_dir_ok`; a refused or failed move leaves the
         evidence in place and still reports a miss.
@@ -1187,23 +1197,30 @@ class EmbeddingCache:
             if read_ident is not None:
                 if _entry_identity(st) != read_ident:
                     return None  # replaced after the corrupt read
-            elif (stat.S_IFMT(st.st_mode) == stat.S_IFREG
-                    and st.st_nlink == 1):
+            elif stat.S_IFMT(st.st_mode) == stat.S_IFREG:
                 if not _owned_by_current_user(st):
-                    # Foreign-owned regular entry: the evidence and the
-                    # name are PRESERVED, never moved — the ownership
-                    # refusal is never undone on this path either.
+                    # Foreign-owned regular entry AT ANY LINK COUNT: the
+                    # evidence and the name are PRESERVED, never moved —
+                    # the ownership refusal is never undone on this path
+                    # either, so the check comes before the link-shape
+                    # branch and before any move of a regular file.
                     return None
-                # Re-check the CURRENT bytes before quarantining, bounded:
-                # only content that is actually corrupt (or unreadable /
-                # over the cap) may be moved — never a valid entry.
-                try:
-                    data, _ = self._bounded_entry_read(path)
-                    if data is not None:
-                        EncodedPayload.from_entry_bytes(data, key)
-                        return None  # parses valid after all — leave it
-                except (_EntryCorrupt, OSError):
-                    pass  # corrupt / unreadable / over cap: quarantine below
+                if st.st_nlink == 1:
+                    # Re-check the CURRENT bytes before quarantining,
+                    # bounded: only content that is actually corrupt (or
+                    # unreadable / over the cap) may be moved — never a
+                    # freshly published valid entry.
+                    try:
+                        data, _ = self._bounded_entry_read(path)
+                        if data is not None:
+                            EncodedPayload.from_entry_bytes(data, key)
+                            return None  # parses valid after all — leave it
+                    except (_EntryCorrupt, OSError):
+                        pass  # corrupt / unreadable / over cap: quarantine below
+                # (Own) multiply linked regular file: moved aside unread,
+                # as before — the move follows nothing and, foreign
+                # ownership having been refused above, touches no
+                # foreign-owned file.
             if not self._quarantine_dir_ok():
                 # Evidence preserved where a move is unsafe (redirected or
                 # unusable quarantine directory): miss, nothing moved.

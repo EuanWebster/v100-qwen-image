@@ -1617,6 +1617,44 @@ def test_foreign_owned_entry_is_refused_as_miss(tmp_path, monkeypatch):
         "the refusal must not move anything into quarantine"
 
 
+@pytest.mark.parametrize("nlink", [1, 2], ids=["single-link", "multi-link"])
+def test_foreign_owned_regular_refused_at_any_link_count(tmp_path, monkeypatch,
+                                                         nlink):
+    """Ownership BEFORE link shape (root's extended
+    /tmp/v100-cache-ownership-review.py follow-up): a foreign-owned
+    REGULAR entry is a preserved miss at nlink 1 AND nlink 2 — the
+    multi-link case must not be routed into the name-only quarantine
+    move. Same bytes / mtime / nlink before and after; nothing moves."""
+    import qwen_engine.encoder as encoder_mod
+
+    cache = EmbeddingCache(tmp_path / "embeds")
+    key = "b2" * 32
+    cache.entry_path(key).parent.mkdir(parents=True, exist_ok=True)
+    entry = cache.entry_path(key)
+    if nlink == 2:
+        twin = tmp_path / "foreign-twin"
+        twin.write_bytes(b"someone-elses-multi-linked-file")
+        os.link(twin, entry)
+    else:
+        entry.write_bytes(b"someone-elses-multi-linked-file")
+    os.utime(entry, (1234, 5678))
+    before = entry.stat()
+    real_geteuid = os.geteuid
+    monkeypatch.setattr(encoder_mod.os, "geteuid",
+                        lambda: real_geteuid() + 1000)
+    assert cache.get(key) is None, "foreign-owned entry must be a miss"
+    after = entry.stat()
+    assert entry.is_file() and entry.read_bytes() == \
+        b"someone-elses-multi-linked-file"
+    assert (after.st_ino, after.st_mtime_ns, after.st_nlink) == \
+        (before.st_ino, before.st_mtime_ns, before.st_nlink), \
+        "a foreign-owned regular entry must keep bytes/mtime/nlink at " \
+        "ANY link count — the refusal never becomes a quarantine move"
+    assert not cache.quarantine_dir.exists() or \
+        list(cache.quarantine_dir.iterdir()) == [], \
+        "the link-shape branch must never move a foreign-owned regular name"
+
+
 def test_lru_linked_name_preserved_and_valid_entries_still_evicted(tmp_path):
     """Regression (root's /tmp/v100-cache-ownership-review.py): LRU counts,
     orders and evicts only regular, singly linked, current-user-owned
