@@ -150,6 +150,22 @@ appeared or changed partial is refused, never truncated over), and every
 `os.write` is repeated until the chunk is fully written. Final verification
 always rehashes
 the whole assembled file from disk, so a corrupt partial can never publish.
+A staging partial must be the **sole name of its inode**: a multiply
+hard-linked partial — empty, partial-length or byte-complete alike — is
+refused (exit 6) before any read, transport or write, because resume
+appends through the shared inode and would silently rewrite every other
+name linked to it, verified finals included (root reproduction: a verified
+`victim.bin` hard-linked to `new.bin.partial` let a resume publish rc0 and
+silently rewrite `victim.bin`); the link count is re-checked on the opened
+FD before any truncate/seek/write, so an ordinary concurrent `link()`
+cannot slip past the preflight, and every name and byte is preserved on
+refusal. Atomic publish is the one deliberate exception: it creates its own
+temporary second hardlink only **after** the full SHA256 rehash passed, and
+unlinks the staging name immediately. If that unlink fails, the remaining
+`*.partial` is recoverable debris sharing the verified final's inode: a
+later fetch refuses to resume into a multiply-linked partial, so the debris
+is inert, and removing the stale name loses nothing while the final name
+stands.
 An existing file that verifies is skipped; an existing file whose identity
 does **not** match is refused, never deleted or overwritten; symlinked
 paths on the write path are refused; an explicit `--models-dir` root
@@ -168,7 +184,10 @@ filename — schema-v1 accepts a manifest listing both `foo` and
 `foo.partial`, yet fetching `foo` would mistake the verified final
 `foo.partial` for its own partial, append to it and delete it on a hash
 mismatch; a filename that is simultaneously another's directory (`a` and
-`a/b`) is refused the same way (usability preflight); the read-only plan
+`a/b`) is refused the same way (usability preflight), as is a staged path
+that lands on another artifact's **directory** (`a/x` stages at `a/x.partial`
+while `a/x.partial/y` needs that exact path as a directory — neither manifest
+order can ever download both); the read-only plan
 reports the same typed usage error without any write or socket (the
 committed 24-entry manifest contains no such names — the refusal protects
 the reusable tool contract, not just this manifest); a bounded disk estimate (manifest
