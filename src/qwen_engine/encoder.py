@@ -35,7 +35,22 @@ Pieces
   unconfigured = nothing written). All mutations run under a cache-wide
   in-process mutex associated with the **canonical root**, and per-key locks
   are shared the same way: instances on one root cannot race the LRU into
-  emptying the cache, and cannot double-encode the same key.
+  emptying the cache, and cannot double-encode the same key. The configured
+  root/scratch paths are resolved **once** to canonical absolute paths at
+  construction (CWD
+  changes can never redirect a later write or move the lock registry to a
+  different directory), and the cache **only ever operates on files it owns
+  under that root**: a leaf entry that is a symlink, carries more than one
+  hard link, is not a regular file or is not owned by this user is refused
+  as a miss — never read, never touched (no external file's bytes, link
+  count or mtime can be moved through a cache path); quarantine is refused
+  unless its directory is a real directory contained under the root, and a
+  refused move leaves the evidence in place. Entry reads are bounded
+  (``max_entry_bytes``: pre-size check + a ``cap + 1`` bounded read, no
+  parse of oversized content), and a ``put`` that exceeds the cap fails
+  **before** constructing the combined entry buffer. This is ordinary
+  single-writer hygiene: no hostile-concurrent-filesystem safety is
+  claimed.
 
 * **EncoderWorker**: configurable ``command`` with ``{python}`` /
   ``{request}`` / ``{response}`` placeholders, timeout and cooperative
@@ -63,6 +78,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -117,6 +133,20 @@ STDERR_EXCERPT_CHARS = 4000
 #: read itself is bounded to ``cap + 1`` bytes, so a file that was small at
 #: ``stat`` time but grows while read still cannot evade the limit.
 DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024 * 1024
+
+#: Default cap on the bytes of one cache **entry file** the cache will read
+#: or accept (:attr:`EmbeddingCache.max_entry_bytes`). An entry is a JSON
+#: header line plus the raw blob bytes — the header's JSON overhead makes
+#: an entry a different size from the base64-encoded worker response that
+#: produced it, so reusing the same 256 MiB default as
+#: :data:`DEFAULT_MAX_RESPONSE_BYTES` is a shared policy bound, not a
+#: mathematical guarantee; it still bounds what a corrupt or hostile entry
+#: file can pull into RAM: the entry is pre-sized on the opened descriptor
+#: and read at most ``cap + 1`` bytes, and oversized content is never
+#: parsed. A cap must additionally keep ``cap + 1`` representable as an
+#: index (``<= sys.maxsize``), so ``read(cap + 1)`` can never raise a raw
+#: ``OverflowError`` — same representability rule as the worker response cap.
+DEFAULT_MAX_ENTRY_BYTES = 256 * 1024 * 1024
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _REVISION_RE = re.compile(r"[0-9a-f]{40}")
@@ -604,6 +634,21 @@ class _EntryCorrupt(Exception):
     """Internal: an entry (or response payload) violates the blob format."""
 
 
+def _entry_header_line(payload: "EncodedPayload", key: str) -> bytes:
+    """The canonical JSON header line (no terminator) of an entry. Kept
+    separate from the blob concatenation so a size check can measure the
+    exact entry size BEFORE the combined buffer is ever constructed."""
+    header = {
+        "schema": ENTRY_SCHEMA,
+        "key": key,
+        "metadata": plain_json(payload.metadata),
+        "blobs": [{"name": b.name, "bytes": len(b.data), "sha256": b.sha256}
+                  for b in payload.blobs],
+    }
+    return json.dumps(header, sort_keys=True, ensure_ascii=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
 @dataclass(frozen=True)
 class Blob:
     """An opaque named byte payload. The engine never interprets blob bytes —
@@ -662,16 +707,8 @@ class EncodedPayload:
 
     def to_entry_bytes(self, key: str) -> bytes:
         """Canonical entry bytes: one JSON header line + raw blob payloads."""
-        header = {
-            "schema": ENTRY_SCHEMA,
-            "key": key,
-            "metadata": plain_json(self.metadata),
-            "blobs": [{"name": b.name, "bytes": len(b.data), "sha256": b.sha256}
-                      for b in self.blobs],
-        }
-        line = json.dumps(header, sort_keys=True, ensure_ascii=True,
-                          separators=(",", ":"))
-        return line.encode("utf-8") + b"\n" + b"".join(bytes(b.data) for b in self.blobs)
+        return (_entry_header_line(self, key) + b"\n"
+                + b"".join(bytes(b.data) for b in self.blobs))
 
     @classmethod
     def from_entry_bytes(cls, data: bytes, key: str) -> "EncodedPayload":
@@ -746,15 +783,38 @@ class EncodedPayload:
 
 
 def _canonicalize_dir(path: Any, field: str) -> Path:
+    """Resolve a configured directory path **once** at construction into a
+    canonical **absolute** path, stored verbatim for BOTH file I/O and the
+    lock registry (so the I/O target and the mutation lock can never
+    disagree): later CWD changes cannot redirect a cache/scratch write, and
+    retargeting an explicitly chosen root symlink afterwards cannot move
+    the writes — or the registry entry — to a different root. The original
+    string is rejected when empty/whitespace *before* ``Path`` conversion
+    turns ``""`` into ``.``; NUL bytes and non-path types keep their typed
+    errors. Nothing is created here: no mkdir at construction; no
+    hostile-concurrent-filesystem safety is claimed (resolution is a
+    one-time snapshot, not a continuous guarantee)."""
     if not isinstance(path, (str, os.PathLike)):
         raise EncoderRequestError(f"{field}: must be a path string or "
                                   f"os.PathLike, got {type(path).__name__}")
-    p = Path(path)
-    if str(p) == "" or not str(p).strip():
+    raw = os.fsdecode(path)
+    if not raw.strip():
         raise EncoderRequestError(f"{field}: must not be blank")
-    if "\0" in str(p):
+    if "\0" in raw:
         raise EncoderRequestError(f"{field}: must not contain a NUL byte")
-    return p
+    return Path(os.path.realpath(raw))
+
+
+def _contained_under(root: Path, path: Path) -> bool:
+    """True when ``path`` is ``root`` itself or lives under it after full
+    symlink resolution (both sides canonicalized, so a root reached through
+    an explicitly chosen symlink stays consistent)."""
+    try:
+        real_root = os.path.realpath(root)
+        real_path = os.path.realpath(path)
+    except OSError:  # pragma: no cover - exotic path failures
+        return False
+    return real_path == real_root or real_path.startswith(real_root + os.sep)
 
 
 _REGISTRY_GUARD = threading.Lock()
@@ -794,6 +854,28 @@ def _root_state(root: Path) -> _RootState:
 class EmbeddingCache:
     """Disk cache of :class:`EncodedPayload` under ``root``.
 
+    * **Ownership**: the configured root is resolved once to a canonical
+      absolute path at construction, used verbatim for I/O and the lock
+      registry (CWD-stable; a later root-symlink retarget cannot redirect
+      the writes or move the lock), and the cache only ever reads, touches
+      or
+      moves files *it owns under that root*: an entry leaf that is a
+      symlink, has more than one hard link, is not a regular file or is not
+      owned by this user is refused — never read, never mtime-touched
+      (atomic cache files have single ownership), only moved aside by name.
+      Quarantine is refused unless ``root/quarantine`` is a real directory
+      contained under the canonical root; a refused move leaves the
+      evidence exactly where it is and still reports a miss. The LRU touch
+      never follows symlinks. FIFOs and other nonregular squats cannot
+      block a read (opened ``O_NONBLOCK``, validated on the opened
+      descriptor). Ordinary single-writer hygiene: no hostile-concurrent
+      filesystem safety is claimed.
+    * **Bounded reads**: an entry is pre-sized on the opened descriptor and
+      read at most ``max_entry_bytes + 1`` bytes — before any parse, and
+      again in the quarantine re-check (never an unbounded second read);
+      oversized content is a corrupt miss and is never parsed. A
+      :meth:`put` whose entry would exceed the cap fails *before* the
+      combined entry buffer is constructed.
     * Atomic publish (temp file + ``os.replace``) — readers never see partial
       entries, which is also the cross-process concurrency story; within one
       process :meth:`lock_for` serialises same-key work.
@@ -811,13 +893,28 @@ class EmbeddingCache:
     * LRU cap by mtime (hits refresh mtime); eviction is a plain delete.
     """
 
-    def __init__(self, root: str | Path, *, max_entries: int = DEFAULT_MAX_ENTRIES) -> None:
+    def __init__(self, root: str | Path, *, max_entries: int = DEFAULT_MAX_ENTRIES,
+                 max_entry_bytes: int = DEFAULT_MAX_ENTRY_BYTES) -> None:
         self.root = _canonicalize_dir(root, "cache root")
         if not isinstance(max_entries, int) or isinstance(max_entries, bool) \
                 or max_entries < 1:
             raise EncoderRequestError(
                 f"max_entries: must be a positive integer, got {max_entries!r}")
+        if isinstance(max_entry_bytes, bool) or not isinstance(
+                max_entry_bytes, int) or max_entry_bytes < 1:
+            raise EncoderRequestError(
+                f"max_entry_bytes: must be a positive integer, got "
+                f"{max_entry_bytes!r}")
+        if max_entry_bytes + 1 > sys.maxsize:
+            # read(cap + 1) must stay representable as an index-sized
+            # integer (the same rule the worker response cap follows):
+            # 10**100 is a typed configuration refusal, never a raw
+            # OverflowError at the bounded read.
+            raise EncoderRequestError(
+                f"max_entry_bytes: {max_entry_bytes!r} is not a representable "
+                f"bound (cap + 1 must be <= sys.maxsize = {sys.maxsize})")
         self.max_entries = max_entries
+        self.max_entry_bytes = max_entry_bytes
         self._state = _root_state(self.root)
 
     # -- paths ---------------------------------------------------------------
@@ -847,46 +944,74 @@ class EmbeddingCache:
     # -- ops -----------------------------------------------------------------
 
     def get(self, key: str) -> EncodedPayload | None:
-        """Return the cached payload, or ``None`` on miss. A corrupt entry is
-        a miss **and** gets quarantined — but only *that same file*: the
-        quarantine moves the entry aside only after an identity check under
-        the cache-wide root mutex, so a valid entry published after a stale
-        corrupt read is never quarantined (a confirmed race otherwise moved
-        the NEW entry into quarantine). The LRU touch likewise runs under
-        the mutex, next to the LRU eviction it races with. Lock order stays
-        key-lock → root-mutex (never the reverse)."""
+        """Return the cached payload, or ``None`` on miss.
+
+        Ownership first: the entry name is examined with ``lstat`` and only
+        a *regular, singly linked* file is opened at all — a symlink, hard
+        link, or nonregular squat is refused as a miss and moved aside by
+        name, never read and never mtime-touched, so an external file can
+        neither answer through a cache path nor have its bytes / link /
+        mtime changed through one. The opened descriptor must likewise be
+        regular, singly linked and owned (O_NOFOLLOW + O_NONBLOCK + fstat:
+        no FIFO block, no symlink follow, no read of a foreign file). The
+        read is bounded (pre-size, then ``cap + 1``); oversized content is
+        a corrupt miss and is never parsed. A corrupt entry is a miss
+        **and** gets quarantined — but only *that same file*: the
+        quarantine moves the entry aside only after an identity check
+        under the cache-wide root mutex, so a valid entry published after a
+        stale corrupt read is never quarantined (a confirmed race otherwise
+        moved the NEW entry into quarantine). The LRU touch likewise runs
+        under the mutex, next to the LRU eviction it races with, and never
+        follows symlinks. Lock order stays key-lock → root-mutex (never
+        the reverse)."""
         path = self.entry_path(key)
-        read_ident: tuple | None = None
         try:
-            if not path.exists():
-                return None
-            if not path.is_file():
-                # A directory / FIFO squatting on the entry name: miss, and
-                # quarantine it (never overwrite or read in place).
-                return self._quarantine(path, key, read_ident=None)
-            with path.open("rb") as fh:
-                data = fh.read()
-                read_ident = _entry_identity(os.fstat(fh.fileno()))
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return None
         except OSError:
             return self._quarantine(path, key, read_ident=None)
+        if stat.S_IFMT(st.st_mode) != stat.S_IFREG or st.st_nlink != 1:
+            # Symlinked / multiply linked / nonregular squat: refuse to
+            # read or touch (an atomic cache file is a singly linked
+            # regular file); move the NAME aside — the move follows
+            # nothing and cannot modify any external target.
+            return self._quarantine(path, key, read_ident=None)
+        read_ident: tuple | None = None
+        try:
+            data, read_ident = self._bounded_entry_read(path)
+        except OSError:
+            return self._quarantine(path, key, read_ident=None)
+        if data is None:
+            # Over the cap (at pre-size or by the bounded read): a corrupt
+            # miss — the oversized bytes were never read whole, never
+            # parsed.
+            return self._quarantine(path, key, read_ident=read_ident)
         try:
             payload = EncodedPayload.from_entry_bytes(data, key)
         except _EntryCorrupt:
             return self._quarantine(path, key, read_ident=read_ident)
         with self._state.mutex:  # LRU touch serialised with eviction
             try:
-                os.utime(path, None)  # LRU refresh; a failed touch must not lose a hit
+                # follow_symlinks=False: a hit can never refresh the mtime
+                # of anything reached through a link (no-follow by the same
+                # rule as the read above).
+                os.utime(path, None, follow_symlinks=False)
             except OSError:
-                pass
+                pass  # a failed touch must not lose a hit
         return payload
 
     def put(self, key: str, payload: EncodedPayload) -> Path:
         """Atomically publish ``payload`` under ``key``, then enforce the LRU
         cap (the just-written entry is protected). Publish and eviction are
         one transaction under the cache-wide root mutex: concurrent puts can
-        never snapshot an entry list and then evict each other's entries."""
+        never snapshot an entry list and then evict each other's entries.
+        The size bound is enforced on the *declared* size (header line plus
+        blob lengths) BEFORE the combined buffer is constructed, so a put
+        that exceeds ``max_entry_bytes`` fails typed without ever building
+        the huge payload buffer."""
         path = self.entry_path(key)
-        data = payload.to_entry_bytes(key)
+        data = self._entry_bytes_bounded(payload, key)
         with self._state.mutex:
             self.root.mkdir(parents=True, exist_ok=True)
             tmp = self.root / f".{key}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -912,6 +1037,78 @@ class EmbeddingCache:
                 keys.append(entry.name[: -len(_ENTRY_SUFFIX)])
         return keys
 
+    # -- ownership + bounds internals -----------------------------------------
+
+    def _bounded_entry_read(self, path: Path) -> tuple[bytes | None, tuple]:
+        """Safely open one entry and read it BOUNDED by
+        ``max_entry_bytes``. Returns ``(data, identity)``; ``data`` is
+        ``None`` when the entry is over the cap — pre-sized on the opened
+        descriptor, then read at most ``cap + 1`` bytes, so an entry that
+        lies about its size is still caught and oversized content is
+        never read whole or parsed. Raises ``OSError`` when the path cannot
+        be opened safely (symlink swap → ELOOP, nonregular / multiply
+        linked / foreign-owned descriptor → refused before any read)."""
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK
+        fd = os.open(path, flags)
+        try:
+            st = os.fstat(fd)
+            if stat.S_IFMT(st.st_mode) != stat.S_IFREG:
+                raise OSError(f"entry is not a regular file: {path}")
+            if st.st_nlink != 1:
+                raise OSError(f"entry has {st.st_nlink} links (not singly "
+                              f"owned): {path}")
+            if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+                raise OSError(f"entry is not owned by this user: {path}")
+            cap = self.max_entry_bytes
+            if st.st_size > cap:
+                return None, _entry_identity(st)  # pre-size refusal, no read
+            chunks: list[bytes] = []
+            got = 0
+            while got < cap + 1:  # bounded: at most cap + 1 bytes, ever
+                chunk = os.read(fd, min(cap + 1 - got, 1 << 20))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                got += len(chunk)
+            data = b"".join(chunks) if got <= cap else None
+            return data, _entry_identity(os.fstat(fd))
+        finally:
+            os.close(fd)
+
+    def _quarantine_dir_ok(self) -> bool:
+        """True only when ``root/quarantine`` IS a real directory contained
+        under the canonical root. An external symlink (or any other wrong
+        kind) squatting on the name is refused — never mkdir'd through,
+        never moved into — so a quarantine redirection can never relocate
+        cache evidence outside the configured root."""
+        qd = self.quarantine_dir
+        try:
+            st = os.lstat(qd)
+        except FileNotFoundError:
+            try:
+                qd.mkdir(parents=True, exist_ok=True)
+                st = os.lstat(qd)
+            except OSError:
+                return False
+        except OSError:
+            return False
+        if os.path.islink(qd) or not stat.S_ISDIR(st.st_mode):
+            return False
+        return _contained_under(self.root, qd)
+
+    def _entry_bytes_bounded(self, payload: EncodedPayload, key: str) -> bytes:
+        """Entry bytes with the cap enforced on the DECLARED size (header
+        line + blob lengths, no concatenation), so an over-cap put fails
+        typed before a huge combined buffer exists."""
+        line = _entry_header_line(payload, key)
+        total = len(line) + 1 + sum(len(b.data) for b in payload.blobs)
+        if total > self.max_entry_bytes:
+            raise EncoderError(
+                f"cache entry for {key} would be {total} bytes, over "
+                f"max_entry_bytes={self.max_entry_bytes}; refusing before "
+                f"constructing the entry buffer")
+        return line + b"\n" + b"".join(bytes(b.data) for b in payload.blobs)
+
     def _quarantine(self, path: Path, key: str, *,
                     read_ident: tuple | None) -> None:
         """Move a corrupt entry aside under the cache-wide root mutex.
@@ -921,28 +1118,43 @@ class EmbeddingCache:
         ONLY if it still carries that identity — if a valid entry was
         published in the meantime (different inode), the NEW entry stands
         and this read simply reports a miss. With ``read_ident=None`` (an
-        entry-name squat, or a failed read) whatever currently sits at the
-        path is re-checked: a regular file is only quarantined after a
-        fresh parse proves it corrupt, never a freshly published valid
-        entry."""
+        ownership refusal, an entry-name squat, or a failed read) whatever
+        currently sits at the path is re-checked: a singly linked, owned
+        regular file is only quarantined after a fresh BOUNDED parse proves
+        it corrupt — never a freshly published valid entry; symlinked,
+        multiply linked or nonregular names are moved aside unread (the
+        move follows nothing and modifies no external target). Before ANY
+        move the quarantine directory itself must pass
+        :meth:`_quarantine_dir_ok`; a refused or failed move leaves the
+        evidence in place and still reports a miss.
+        """
         with self._state.mutex:  # quarantine is a mutation too
-            if read_ident is not None:
-                try:
-                    current = _entry_identity(path.stat())
-                except OSError:
-                    return None  # vanished between read and lock
-                if current != read_ident:
-                    return None  # replaced after the corrupt read
-            elif path.is_file():
-                try:
-                    with path.open("rb") as fh:
-                        data = fh.read()
-                    EncodedPayload.from_entry_bytes(data, key)
-                    return None  # parses valid after all — never quarantine it
-                except (_EntryCorrupt, OSError):
-                    pass  # corrupt / unreadable: quarantine below
             try:
-                self.quarantine_dir.mkdir(parents=True, exist_ok=True)
+                st = os.lstat(path)
+            except FileNotFoundError:
+                return None  # vanished: miss, nothing to move
+            except OSError:
+                return None
+            if read_ident is not None:
+                if _entry_identity(st) != read_ident:
+                    return None  # replaced after the corrupt read
+            elif (stat.S_IFMT(st.st_mode) == stat.S_IFREG
+                    and st.st_nlink == 1):
+                # Re-check the CURRENT bytes before quarantining, bounded:
+                # only content that is actually corrupt (or unreadable /
+                # over the cap) may be moved — never a valid entry.
+                try:
+                    data, _ = self._bounded_entry_read(path)
+                    if data is not None:
+                        EncodedPayload.from_entry_bytes(data, key)
+                        return None  # parses valid after all — leave it
+                except (_EntryCorrupt, OSError):
+                    pass  # corrupt / unreadable / over cap: quarantine below
+            if not self._quarantine_dir_ok():
+                # Evidence preserved where a move is unsafe (redirected or
+                # unusable quarantine directory): miss, nothing moved.
+                return None
+            try:
                 target = self.quarantine_dir / (
                     f"{key}.{os.getpid()}.{time.time_ns()}.corrupt")
                 os.replace(path, target)

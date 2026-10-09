@@ -32,6 +32,7 @@ from qwen_engine.encoder import (
     ComponentIdentity,
     EmbeddingCache,
     EncoderCancelledError,
+    EncoderError,
     EncoderImplementationIdentity,
     EncoderProtocolError,
     EncoderRequest,
@@ -1300,3 +1301,274 @@ def test_corrupt_quarantine_still_works_after_identity_check(tmp_path):
     cache.entry_path(key).write_bytes(b"corrupt\nx")
     assert cache.get(key) is None
     assert len(list(cache.quarantine_dir.iterdir())) == 1
+
+
+# ---------------------------------------------------------------------------
+# Cache ownership: links / squats / foreign ownership are refused as misses
+# ---------------------------------------------------------------------------
+
+
+def _touch_fixed_mtime(path: Path) -> None:
+    path.write_bytes(b"EXTERNAL-BYTES-do-not-touch")
+    os.utime(path, (1_000_000_000, 1_000_000_000))
+
+
+def test_external_symlink_entry_is_miss_and_target_untouched(tmp_path):
+    """A symlink squatting on an entry name is refused WITHOUT ever being
+    read or touched: the external target's bytes and mtime cannot move
+    through a cache path; only the link itself is moved aside by name."""
+    cache = EmbeddingCache(tmp_path / "embeds")
+    external = tmp_path / "external.bin"
+    _touch_fixed_mtime(external)
+    before = external.stat()
+    key = "d" * 64
+    entry = cache.entry_path(key)
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.symlink_to(external)
+    assert cache.get(key) is None, "symlink squat must be a miss"
+    after = external.stat()
+    assert external.read_bytes() == b"EXTERNAL-BYTES-do-not-touch"
+    assert (after.st_mtime_ns, after.st_size) == (before.st_mtime_ns,
+                                                  before.st_size), \
+        "external mtime/size must be untouched"
+    assert not entry.exists() and not entry.is_symlink()
+    moved = list(cache.quarantine_dir.iterdir())
+    assert len(moved) == 1 and os.path.islink(moved[0])
+
+
+def test_external_hardlink_entry_is_miss_and_target_untouched(tmp_path):
+    """A second hard link on the entry name (nlink > 1) is refused as a
+    miss: never read, never touched — only the extra link is moved aside,
+    so the external file's bytes, mtime and content never change."""
+    cache = EmbeddingCache(tmp_path / "embeds")
+    external = tmp_path / "external.bin"
+    _touch_fixed_mtime(external)
+    before = external.stat()
+    key = "e" * 64
+    entry = cache.entry_path(key)
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    os.link(external, entry)
+    assert cache.get(key) is None, "multiply linked squat must be a miss"
+    after = external.stat()
+    assert external.read_bytes() == b"EXTERNAL-BYTES-do-not-touch"
+    assert after.st_mtime_ns == before.st_mtime_ns
+    assert after.st_size == before.st_size
+    assert not entry.exists(), "the extra link must leave the entry name"
+    moved = list(cache.quarantine_dir.iterdir())
+    assert len(moved) == 1
+    # Move-by-name: the squat was renamed, never read, copied or touched —
+    # the quarantined name still shares the external inode (the cache never
+    # duplicates foreign content), and no write ever went through it.
+    assert moved[0].stat().st_ino == after.st_ino
+    assert moved[0].read_bytes() == b"EXTERNAL-BYTES-do-not-touch"
+
+
+def test_external_quarantine_dir_symlink_is_refused_evidence_stays(tmp_path):
+    """root/quarantine squatting as a symlink to an external directory is
+    refused: nothing is mkdir'd through it, nothing is moved into it — the
+    corrupt evidence stays at the entry name (still a miss, still
+    listable), and the external directory stays empty."""
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    cache = EmbeddingCache(tmp_path / "embeds")
+    cache.root.mkdir(parents=True)
+    cache.quarantine_dir.symlink_to(outside)
+    key = "f" * 64
+    cache.entry_path(key).write_bytes(b"corrupt-header\njunk")
+    assert cache.get(key) is None
+    assert cache.entry_path(key).is_file(), \
+        "a refused quarantine move must leave the evidence in place"
+    assert cache.entry_path(key).read_bytes() == b"corrupt-header\njunk"
+    assert list(outside.iterdir()) == [], "nothing may be moved outside"
+    assert list(cache.entries()) == [key], \
+        "the cache file listing stays accurate with the squat in place"
+
+
+def test_fifo_entry_squat_is_refused_without_blocking(tmp_path):
+    """A FIFO on the entry name is refused as a miss immediately: the
+    cache never opens it for a blocking read (lstat branch first,
+    O_NONBLOCK as the backstop on the descriptor)."""
+    cache = EmbeddingCache(tmp_path / "embeds")
+    key = "a1" * 32
+    entry = cache.entry_path(key)
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(entry)
+    started = time.monotonic()
+    assert cache.get(key) is None
+    assert time.monotonic() - started < 5.0, "get() must not block on a FIFO"
+    assert not entry.exists()
+    assert len(list(cache.quarantine_dir.iterdir())) == 1
+
+
+def test_foreign_owned_entry_is_refused_as_miss(tmp_path, monkeypatch):
+    """The fstat ownership branch: an entry file not owned by this user is
+    refused before any byte is read (identity squat hygiene). get() is a
+    clean miss; the name is moved aside, never read."""
+    import qwen_engine.encoder as encoder_mod
+
+    cache = EmbeddingCache(tmp_path / "embeds")
+    key = "b1" * 32
+    cache.entry_path(key).parent.mkdir(parents=True, exist_ok=True)
+    cache.entry_path(key).write_bytes(b"someone-elses-file")
+    real_geteuid = os.geteuid
+    monkeypatch.setattr(encoder_mod.os, "geteuid",
+                        lambda: real_geteuid() + 1000)
+    assert cache.get(key) is None, "foreign-owned entry must be a miss"
+    assert not cache.entry_path(key).exists()
+
+
+# ---------------------------------------------------------------------------
+# Cache entry size bounds: validation, exact cap, over-cap behaviour
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, False, 1.5, "1024", None,
+                                 10 ** 100, sys.maxsize])
+def test_max_entry_bytes_validation_is_typed(tmp_path, bad):
+    """Positive non-bool int only, and cap + 1 must stay index-representable
+    (sys.maxsize itself is refused; 10**100 never reaches a raw
+    OverflowError at a read)."""
+    with pytest.raises(EncoderRequestError, match="max_entry_bytes"):
+        EmbeddingCache(tmp_path / "embeds", max_entry_bytes=bad)
+
+
+def test_max_entry_bytes_maxsize_boundary_accepted(tmp_path):
+    cache = EmbeddingCache(tmp_path / "embeds",
+                           max_entry_bytes=sys.maxsize - 1)
+    assert cache.max_entry_bytes == sys.maxsize - 1
+
+
+def _sized_payload():
+    return EncodedPayload(metadata={"m": 1},
+                          blobs=(Blob("prompt_embeds", b"BODY" * 50),))
+
+
+def test_entry_exactly_at_cap_roundtrips(tmp_path):
+    """The exact-cap boundary is a pass, not a refusal: declared size ==
+    cap publishes, and the bounded read answers a hit."""
+    key = cache_key(make_request())
+    payload = _sized_payload()
+    exact = len(payload.to_entry_bytes(key))
+    cache = EmbeddingCache(tmp_path / "embeds", max_entry_bytes=exact)
+    cache.put(key, payload)
+    hit = cache.get(key)
+    assert hit is not None
+    assert bytes(hit.blobs[0].data) == bytes(payload.blobs[0].data)
+
+
+def test_entry_over_cap_is_miss_quarantined_never_parsed(tmp_path,
+                                                         monkeypatch):
+    """One byte over the cap: pre-sized on the descriptor, so the oversized
+    content is a corrupt miss — no oversized parser call, no unbounded
+    (quarantine re-)read — and the SAME file is quarantined with its
+    evidence bytes intact."""
+    import qwen_engine.encoder as encoder_mod
+
+    key = cache_key(make_request())
+    payload = _sized_payload()
+    entry_size = len(payload.to_entry_bytes(key))
+    EmbeddingCache(tmp_path / "embeds").put(key, payload)  # full-size write
+
+    parses: list[int] = []
+    real_parse = EncodedPayload.from_entry_bytes
+
+    def spy(data, k):
+        parses.append(len(data))
+        return real_parse(data, k)
+
+    monkeypatch.setattr(EncodedPayload, "from_entry_bytes", spy)
+    cache = EmbeddingCache(tmp_path / "embeds",
+                           max_entry_bytes=entry_size - 1)
+    assert cache.get(key) is None, "cap+1 bytes must be a miss"
+    assert parses == [], "oversized entry bytes must never reach the parser"
+    moved = list(cache.quarantine_dir.iterdir())
+    assert len(moved) == 1
+    assert len(moved[0].read_bytes()) == entry_size, \
+        "quarantined evidence must be the whole entry, moved not truncated"
+
+
+def test_put_over_cap_refuses_before_building_the_buffer(tmp_path,
+                                                         monkeypatch):
+    """A put whose entry would exceed the cap fails typed BEFORE the
+    combined buffer exists: the declared-size check runs without ever
+    concatenating the body (to_entry_bytes is never reached), and nothing
+    is written — not even a temp file."""
+    key = cache_key(make_request())
+    payload = _sized_payload()
+    entry_size = len(payload.to_entry_bytes(key))
+    calls: list[int] = []
+    real_build = EncodedPayload.to_entry_bytes
+
+    def spy(self, k):
+        calls.append(1)
+        return real_build(self, k)
+
+    monkeypatch.setattr(EncodedPayload, "to_entry_bytes", spy)
+    cache = EmbeddingCache(tmp_path / "embeds",
+                           max_entry_bytes=entry_size - 1)
+    with pytest.raises(EncoderError, match="over max_entry_bytes"):
+        cache.put(key, payload)
+    assert calls == [], "an over-cap put must not construct the entry buffer"
+    assert not cache.entry_path(key).exists()
+    # The refusal happens before any filesystem mutation at all: no entry,
+    # no temp file — the root may not even exist yet.
+    assert not cache.root.exists() or [
+        p for p in cache.root.iterdir() if p.name.endswith(".tmp")] == []
+
+
+# ---------------------------------------------------------------------------
+# Root canonicalization: resolve-once + CWD stability
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_root_symlink_retarget_cannot_redirect_writes(tmp_path):
+    """Regression (root's /tmp/v100-cache-root-snapshot-review.py): the
+    root is resolved ONCE at construction, so retargeting an explicitly
+    chosen root symlink afterwards cannot move cache writes into a new
+    root; the ORIGINAL resolved root receives the entry, and instances on
+    that actual root still share one mutation lock."""
+    first, second, link = tmp_path / "first", tmp_path / "second", \
+        tmp_path / "configured"
+    first.mkdir()
+    second.mkdir()
+    link.symlink_to(first, target_is_directory=True)
+    cache = EmbeddingCache(link)
+    link.unlink()
+    link.symlink_to(second, target_is_directory=True)
+    key = "a" * 64
+    cache.put(key, EncodedPayload(blobs=(Blob("x", b"a"),)))
+    assert (first / (key + ".embed")).is_file(), \
+        "the ORIGINAL resolved root must receive the entry"
+    assert not (second / (key + ".embed")).exists(), \
+        "the retargeted root must receive nothing"
+    assert cache._state is EmbeddingCache(first)._state, \
+        "instances on the actual root share the mutation lock"
+
+
+def test_relative_cache_root_and_scratch_are_cwd_stable(tmp_path,
+                                                        monkeypatch):
+    """Relative configured paths are resolved at construction: a later
+    chdir can neither redirect a cache write nor send the worker's scratch
+    files to a same-named directory under the new CWD."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (tmp_path / "rel-scratch").mkdir()
+    monkeypatch.chdir(tmp_path)
+    cache = EmbeddingCache("rel-cache")
+    worker = EncoderWorker(
+        command=[sys.executable, str(FAKE_WORKER), "--request", "{request}",
+                 "--response", "{response}"],
+        timeout_s=15.0, scratch_dir="rel-scratch")
+    assert cache.root.is_absolute() and worker.scratch_dir.startswith(
+        os.path.realpath(str(tmp_path)))
+    assert cache.root == Path(os.path.realpath(str(tmp_path))) / "rel-cache"
+    assert worker.scratch_dir == os.path.realpath(
+        str(tmp_path / "rel-scratch"))
+    monkeypatch.chdir(elsewhere)
+    payload = worker.run(make_request())
+    key = cache_key(make_request())
+    cache.put(key, payload)
+    assert (tmp_path / "rel-cache" / (key + ".embed")).is_file()
+    assert not (elsewhere / "rel-cache").exists()
+    assert not (elsewhere / "rel-scratch").exists()
+    assert list(elsewhere.iterdir()) == []
