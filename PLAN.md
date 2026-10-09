@@ -147,7 +147,7 @@ CPU tests never touch a heavy ML import:
 | `qwen_engine/log.py` | Structured **phase/event logging**: JSONL events `{ts, phase, event, elapsed_ms, counters…}` to a configurable sink, plus human-readable phase lines. Shared by engine, CLI and bench. | stdlib |
 | `qwen_engine/memory.py` | **Memory-policy** descriptor + verdict logic (R4; detail in M5.3): "does this config fit *right now*?" from calibrated observations, current free memory, and headroom; conservative on unknown; stale calibration invalidated (C8). (Supersedes the draft's standalone `vramfit.py` naming.) | config/manifest/log types |
 | `qwen_engine/encoder.py` | Encoder **subprocess worker + embedding cache** (port `run_subprocess_logged`; key **v3** — v2 plus the optional immutable `EncoderImplementationIdentity` (M2.2b foundation): encoder artifact-set digest (**asset component only**, never the whole key), worker protocol/implementation + prompt-extraction revisions, exact diffusers/transformer commits, torch build/version, safetensors/torchvision versions; generic fake requests may carry none, a production worker must require one; atomic writes, quarantine, timeout/cancel, bounded worker responses, fake-worker tests — R5; detail in M1.4/M2.2b). | stdlib |
-| `qwen_engine/mem_preflight.py` | **Host-memory preflight for the forthcoming CPU encoder child (M2.2b)**: conservative stdlib check, before any ML import/weight read/loader call, that checkpoint bytes + explicit dtype expansion + explicit runtime headroom fit the **tighter** of host `MemAvailable` and this process's cgroup v2 (`memory.max - memory.current`, deepest-existing on the walk-up); a finite cap is never substituted away by host RAM; unknown/unreadable constrained state **refuses** (never asserts safety); passing is a conservative prerequisite, **not measured model-fit evidence**; scoped to Linux cgroup v2 — not the M5.3 `memory.py` policy and not a general resource framework. | stdlib |
+| `qwen_engine/mem_preflight.py` | **Host-memory preflight for the forthcoming CPU encoder child (M2.2b)**: conservative stdlib check, before any ML import/weight read/loader call, that checkpoint bytes + explicit dtype expansion (integer ceiling division) + explicit runtime headroom fit the **tighter** of host `MemAvailable` (validated `kB` unit; conversion-limit-exceeding digits are unknown) and this process's cgroup v2 state. A real read walks **every visible ancestor** but is fail-closed **unknown**: a missing `memory.max` at any level proves nothing about the controller, and the visible root's completeness is unproven (a namespace `/` can hide a tighter ancestor), so real autodiscovery refuses regardless of root file contents — the tightest visible `limit - current` travels only as an **advisory visible availability** (an UPPER bound on true availability a hidden ancestor can only tighten) with truthful per-level source notes. An explicitly injected finite/unlimited `MemorySnapshot` is **trusted caller evidence** for pure budget arithmetic (finite cap never substituted away by host RAM; unknown host always refuses; absent finite current is never zero; zero cap is a zero budget). Passing is a conservative prerequisite, **not measured model-fit evidence**; the default deployment may legitimately refuse all real loads until trusted complete host-budget evidence exists. Scoped to Linux cgroup v2 — not the M5.3 `memory.py` policy and not a general resource framework. | stdlib |
 | `qwen_engine/bench.py` | **Versioned benchmark/result schemas** (R6; detail in M1.5): phase timings, peak host RSS, peak CUDA memory when available, environment and model identifiers; feeds `calibration.json`. | stdlib |
 | `qwen_engine/cli.py` | The only v1 front-end (GUI deferred, YAGNI): argparse → validate config → plan via `core.plan()` (adapter-independent) → `generate`; implements the **exit-code contract** (M1 acceptance criteria). `cli_gen.py` at the repo root stays as a thin entry-point shim. | the above only |
 
@@ -1207,3 +1207,50 @@ standing rule that executed plans stay honest.)*
   adapter, measured RAM/VRAM fit and GPU remain pending their actual
   dependencies; no network, no GPU, no model load, no permission request;
   `models/assets/`, manifest, fetcher and `sandbox.yaml` untouched.
+ - 2026-10-09 **M2.2b item 9 senior-review correction: fail-closed cgroup
+   scope gate + typed giant MemAvailable** (sole writer Qwen, review2 task
+   after deliberate interruption of the first correction draft; valid
+   draft hierarchy/counter/host/unit/integer fixes preserved): root+peer
+   probes (`/tmp/v100-memory-review-probe.py`,
+   `/tmp/v100-memory-scope-review.py`) reproduced that the draft still
+   proceeded with a **missing intermediate** `memory.max` and with a
+   **present** root file whose completeness was unproven, plus a raw
+   `ValueError` on a unit-correct 5000-digit `MemAvailable`. Corrections:
+   **(1)** a missing `memory.max` at ANY visible level is unknown —
+   `ENOENT` does not prove the controller is disabled (missing/mismapped
+   directory possible, no controller evidence read) — never silently
+   skipped, with already-seen finite caps still named truthfully;
+   **(2)** visible-root completeness is never assumed: a namespace `/` can
+   be a non-root cgroup under a tighter hidden ancestor, so real
+   **autodiscovery returns unknown/refuse regardless of the visible
+   root's `memory.max` contents** (present finite or `max`) — an honest
+   fail-closed gate, documented; the default deployment may legitimately
+   refuse every real load until trusted complete host-budget evidence
+   exists; the walk still computes the tightest visible minimum of
+   `limit - current` (sibling usage included, pure selection helper +
+   truthful per-level source notes) but only as an **advisory visible
+   availability** — an UPPER bound on true availability that hidden
+   ancestors can only tighten (root's 10:22 clarification: required bytes
+   are the allocation lower bound; never label observed availability a
+   lower bound) — the actual 17,534,339,488 B > visible 16 GiB refusal
+   evidence survives the gate as an explicit guaranteed-refusal reason;
+   **(3)** `MemAvailable` digits beyond the interpreter's int-conversion
+   safety limit are caught LOCALLY as unknown (interpreter limit never
+   raised, value never approximated). An explicitly injected
+   finite/unlimited `MemorySnapshot` remains **trusted caller evidence**
+   for pure budget arithmetic/pass tests (documented); `budget()` never
+   consults the advisory field; no root-is-complete default, no production
+   bypass, no broad mount/namespace parser.
+   `tests/test_mem_preflight.py` **40 → 67**: read-path tests fail closed
+   on unknown root scope; pass/arithmetic tests use trusted injected
+   snapshots; hierarchy tests still demonstrate the minimum of EACH finite
+   `limit - current` and truthful provenance notes. Evidence: both root
+   probes fully green; guarded focused **67 passed** on 3.11.15 and on
+   pinned-source 3.13.5; guarded full **732 passed + 1 skip** (3.11) and
+   **733 passed** (3.13 pinned), rc 0. Real-sandbox read-only diagnostic
+   (stdlib only, no model/asset reads): the checkpoint request now
+   **refuses** with `cgroup_state unknown`, the advisory visible
+   availability (16 GiB cap minus current) and the truthful
+   lower-bound-above-upper-bound guaranteed-refusal reason — the honest
+   gate live. No network, no GPU, no permissions;
+   `models/assets/`, manifest, fetcher and `sandbox.yaml` untouched.
