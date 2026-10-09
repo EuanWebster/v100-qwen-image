@@ -574,3 +574,30 @@ def test_injected_root_resolve_oserror_is_structured_everywhere(tmp_path,
     assert status["status"] == "unconfigured"
     with pytest.raises(mf.ArtifactUnreadableError):
         mf.resolve_model_paths(man, root, "dit")
+
+
+# --- json parser safety limits at the parse boundary ------------------------
+
+
+@pytest.mark.parametrize("case, value, boom", [
+    ("digit-limit", "9" * 5000, None),
+    ("deep-nesting", "[" * 2000 + "0" + "]" * 2000, None),
+    ("injected-ValueError", "1", ValueError("exceeds the integer-string digit limit")),
+    ("injected-RecursionError", "1", RecursionError("decoder nesting limit")),
+], ids=["digit-limit", "deep-nesting", "injected-ValueError",
+        "injected-RecursionError"])
+def test_manifest_parse_safety_limits_are_typed(tmp_path, monkeypatch,
+                                                case, value, boom):
+    if case == "digit-limit" and not getattr(
+            sys, "get_int_max_str_digits", lambda: 0)():
+        pytest.skip("integer-string digit limit disabled")
+    if boom is not None:
+        def raiser(*args, **kwargs):
+            raise boom
+
+        monkeypatch.setattr("json.loads", raiser)
+    path = tmp_path / "manifest.json"
+    path.write_text('{"schema_version": 1, "note": ' + value + "}")
+    with pytest.raises(mf.ManifestFormatError) as exc:
+        mf.load_manifest(path)
+    assert type(exc.value) is mf.ManifestFormatError

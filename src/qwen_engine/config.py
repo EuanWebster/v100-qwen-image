@@ -312,6 +312,9 @@ class GenerationConfig:
     def from_json(cls, text: str) -> "GenerationConfig":
         try:
             data = json.loads(text)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
+            # JSONDecodeError subclasses ValueError; the integer-string digit
+            # limit raises plain ValueError and pathologically deep nesting
+            # RecursionError — both are typed parse failures, never crashes.
             raise ConfigError(FieldError("config", f"invalid JSON: {exc}")) from exc
         return cls.from_dict(data)

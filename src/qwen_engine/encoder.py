@@ -733,7 +733,10 @@ class EncodedPayload:
         try:
             header = json.loads(head.decode("utf-8"),
                                 parse_constant=reject_constant)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError,
+                RecursionError) as exc:
+            # RecursionError: the decoder's nesting guard fires before the
+            # depth-200 validation of the parsed value; both are corruption.
             raise _EntryCorrupt(f"bad header: {exc}") from exc
         if not isinstance(header, Mapping):
             raise _EntryCorrupt(f"header must be an object, got {type(header).__name__}")
@@ -1759,7 +1762,11 @@ class EncoderWorker:
                 f"stderr:\n{err_x}", stderr=err_x)
         try:
             doc = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError,
+                RecursionError) as exc:
+            # ValueError covers JSONDecodeError and the integer-string digit
+            # limit; RecursionError the decoder's nesting guard — typed
+            # protocol failures with stderr, reaping and cleanup unchanged.
             raise EncoderProtocolError(
                 f"worker response is not valid UTF-8 JSON with only finite "
                 f"numbers: {exc}; captured stderr:\n{err_x}",

@@ -121,7 +121,10 @@ def _load_config(args: argparse.Namespace) -> GenerationConfig:
             ) from exc
         try:
             loaded = json.loads(text)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
+            # JSONDecodeError subclasses ValueError; the integer-string digit
+            # limit raises plain ValueError and pathologically deep nesting
+            # RecursionError, both before any schema validation runs.
             raise ConfigError(f"config: config file is not valid JSON: {exc}") from exc
         if not isinstance(loaded, Mapping):
             raise ConfigError("config: config file must contain a JSON object")

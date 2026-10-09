@@ -365,7 +365,10 @@ class BenchmarkResult:
     def from_json(cls, text: str) -> "BenchmarkResult":
         try:
             data = json.loads(text)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
+            # ValueError subsumes JSONDecodeError and covers the
+            # integer-string digit limit; RecursionError covers deeply
+            # nested input the decoder refuses before any schema check.
             raise BenchSchemaError(f"benchmark result is not valid JSON: {exc}") from exc
         return cls.from_dict(data)
 
@@ -796,7 +799,10 @@ def load_calibration(path: str | Path) -> CalibrationLog:
         raise BenchSchemaError(f"calibration file not readable: {p}: {exc}") from exc
     try:
         data = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        # ValueError subsumes UnicodeDecodeError/JSONDecodeError and covers
+        # the integer-string digit limit; RecursionError covers deeply
+        # nested input.
         raise BenchSchemaError(f"calibration file is not valid UTF-8 JSON: {p}: {exc}") from exc
     return CalibrationLog.from_dict(data)
 

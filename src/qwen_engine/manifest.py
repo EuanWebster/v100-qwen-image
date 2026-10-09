@@ -370,7 +370,10 @@ def load_manifest(path: str | Path) -> ModelManifest:
         raise ManifestFormatError(f"manifest file is not valid UTF-8: {path}: {exc}") from exc
     try:
         data = json.loads(text)
-    except json.JSONDecodeError as exc:
+    except (ValueError, RecursionError) as exc:
+        # ValueError subsumes JSONDecodeError and covers the integer-string
+        # digit limit; RecursionError covers deeply nested input, which the
+        # decoder rejects before any depth validation of the value.
         raise ManifestFormatError(f"manifest file is not valid JSON: {path}: {exc}") from exc
     return manifest_from_dict(data)
 

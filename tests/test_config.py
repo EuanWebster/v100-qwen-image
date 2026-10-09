@@ -253,3 +253,35 @@ def test_true_cfg_scale_huge_int_is_config_error_not_overflow(bad):
         GenerationConfig(true_cfg_scale=bad)
     with pytest.raises(ConfigError, match="true_cfg_scale"):
         GenerationConfig.from_dict({"true_cfg_scale": bad})
+
+
+# --- json parser safety limits at the parse boundary ------------------------
+
+
+@pytest.mark.parametrize("case, doc", [
+    ("digit-limit", '{"prompt": "p", "seed": ' + "9" * 5000 + "}"),
+    ("deep-nesting",
+     '{"prompt": "p", "seed": ' + "[" * 2000 + "0" + "]" * 2000 + "}"),
+], ids=["digit-limit", "deep-nesting"])
+def test_json_parser_safety_limits_are_typed_config_errors(case, doc):
+    if case == "digit-limit" and not getattr(
+            sys, "get_int_max_str_digits", lambda: 0)():
+        pytest.skip("integer-string digit limit disabled")
+    with pytest.raises(ConfigError) as exc:
+        GenerationConfig.from_json(doc)
+    assert type(exc.value) is ConfigError
+
+
+@pytest.mark.parametrize("boom", [
+    ValueError("exceeds the integer-string digit limit"),
+    RecursionError("decoder nesting limit"),
+], ids=["injected-ValueError", "injected-RecursionError"])
+def test_injected_parser_failures_wrap_as_config_errors(monkeypatch, boom):
+    """Portable wrapper probe (identical behaviour on 3.11 and 3.13): any
+    ValueError / RecursionError out of the decoder is a typed ConfigError."""
+    def raiser(*args, **kwargs):
+        raise boom
+
+    monkeypatch.setattr("json.loads", raiser)
+    with pytest.raises(ConfigError):
+        GenerationConfig.from_json('{"prompt": "p"}')

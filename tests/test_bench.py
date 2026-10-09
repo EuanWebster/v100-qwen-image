@@ -722,3 +722,38 @@ def test_observation_observed_at_overflow_is_a_schema_error():
     rejected as a schema error instead."""
     with pytest.raises(BenchSchemaError, match="observed_at"):
         observation(observed_at=10 ** 400)
+
+
+# --- json parser safety limits at the parse boundary ------------------------
+
+
+@pytest.mark.parametrize("entry", ["result_from_json", "load_calibration"])
+@pytest.mark.parametrize("value", ["9" * 5000, "[" * 2000 + "0" + "]" * 2000],
+                         ids=["digit-limit", "deep-nesting"])
+def test_bench_json_parse_safety_limits_are_typed(tmp_path, entry, value):
+    if value.startswith("9") and not getattr(
+            sys, "get_int_max_str_digits", lambda: 0)():
+        pytest.skip("integer-string digit limit disabled")
+    doc = '{"n": ' + value + "}"
+    if entry == "result_from_json":
+        with pytest.raises(BenchSchemaError):
+            BenchmarkResult.from_json(doc)
+    else:
+        p = tmp_path / "cal.json"
+        p.write_text(doc)
+        with pytest.raises(BenchSchemaError):
+            load_calibration(p)
+
+
+@pytest.mark.parametrize("boom", [
+    ValueError("exceeds the integer-string digit limit"),
+    RecursionError("decoder nesting limit"),
+], ids=["injected-ValueError", "injected-RecursionError"])
+def test_injected_parser_failures_wrap_as_bench_schema_errors(monkeypatch,
+                                                              boom):
+    def raiser(*args, **kwargs):
+        raise boom
+
+    monkeypatch.setattr("json.loads", raiser)
+    with pytest.raises(BenchSchemaError):
+        BenchmarkResult.from_json('{"n": 1}')

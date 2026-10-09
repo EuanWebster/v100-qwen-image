@@ -667,3 +667,18 @@ def test_cli_flag_true_cfg_scale_infinite_exits_2(tmp_path, capsys):
     assert run_cli(tmp_path, ["--dry-run", "--true-cfg-scale", "1e1000"]) == 2
     err = capsys.readouterr().err
     assert "true_cfg_scale" in err and "Traceback" not in err
+
+
+# --- json parser safety limits reach the exit-code contract -----------------
+
+
+def test_cli_config_giant_integer_seed_is_exit_two(tmp_path, capsys):
+    if not getattr(sys, "get_int_max_str_digits", lambda: 0)():
+        pytest.skip("integer-string digit limit disabled")
+    cfg = tmp_path / "config.json"
+    cfg.write_text('{"prompt": "cube", "seed": ' + "9" * 5000 + "}")
+    # ConfigError -> ExitCode.CONFIG, a typed boundary rejection, never the
+    # unexpected-error exit 1 with a traceback.
+    assert run_cli(tmp_path, ["--config", cfg, "--dry-run"]) == 2
+    err = capsys.readouterr().err
+    assert "config error:" in err and "Traceback" not in err

@@ -2094,3 +2094,48 @@ def test_relative_cache_root_and_scratch_are_cwd_stable(tmp_path,
     assert not (elsewhere / "rel-cache").exists()
     assert not (elsewhere / "rel-scratch").exists()
     assert list(elsewhere.iterdir()) == []
+
+
+# --- json parser safety limits at the entry/worker parse boundaries ---------
+
+
+@pytest.mark.parametrize("value", ["9" * 5000, "[" * 2000 + "0" + "]" * 2000],
+                         ids=["digit-limit", "deep-nesting"])
+def test_parser_safety_limit_corrupt_entry_is_miss_and_quarantine(tmp_path,
+                                                                  value):
+    if value.startswith("9") and not getattr(
+            sys, "get_int_max_str_digits", lambda: 0)():
+        pytest.skip("integer-string digit limit disabled")
+    cache = EmbeddingCache(tmp_path / "cache")
+    cache.root.mkdir()
+    key = "a" * 64
+    header = ('{"schema": ' + json.dumps(ENTRY_SCHEMA) + ', "key": '
+              + json.dumps(key) + ', "metadata": {"n": ' + value
+              + '}, "blobs": []}\n')
+    cache.entry_path(key).write_text(header)
+    assert cache.get(key) is None  # typed miss, never a raw exception
+    quarantined = list(cache.quarantine_dir.iterdir())
+    assert len(quarantined) == 1 and ".corrupt" in quarantined[0].name
+    assert not cache.entry_path(key).exists()
+
+
+@pytest.mark.parametrize("boom", [
+    ValueError("exceeds the integer-string digit limit"),
+    RecursionError("decoder nesting limit"),
+], ids=["injected-ValueError", "injected-RecursionError"])
+def test_injected_parser_failures_stay_typed_in_cache_and_worker(
+        tmp_path, monkeypatch, boom):
+    def raiser(*args, **kwargs):
+        raise boom
+
+    monkeypatch.setattr("json.loads", raiser)
+    with pytest.raises(_EntryCorrupt):
+        EncodedPayload.from_entry_bytes(b'{"schema": 1}\n', "0" * 64)
+    worker = EncoderWorker(command=["x", "{request}", "{response}"],
+                           timeout_s=1, scratch_dir=tmp_path)
+    resp = tmp_path / "response.json"
+    resp.write_text('{"status": "ok"}')
+    with pytest.raises(EncoderProtocolError) as exc:
+        worker._result_from_files(_ExitedChild(), resp, "worker said hi",
+                                  "0" * 64, "rid")
+    assert "worker said hi" in exc.value.stderr  # diagnostics retained
