@@ -56,7 +56,15 @@ Contract (see ``docs/models.md`` §4):
   partial is created ``O_EXCL`` (a concurrently appeared partial is refused,
   never truncated), and the opened FD is re-verified as the expected regular
   file at the expected resume size before any byte is written. The tool
-  never follows a symlink it is about to write through.
+  never follows a symlink it is about to write through. A staging partial
+  must be the SOLE name of its inode: a multiply hard-linked partial is
+  refused (exit 6) before any transport or write — empty, partial-length
+  or byte-complete alike, because resuming into a shared inode silently
+  rewrites every other name sharing it, verified finals included — and the
+  link count is re-checked on the opened FD before truncate/seek/write so
+  an ordinary concurrent ``link()`` cannot slip past the preflight.
+  Publish-time linking of a fully verified partial is the one deliberate,
+  integrity-checked exception (see the publish bullet above).
 * Manifest-safety preflight (static — no disk state, no network): before any
   mkdir/network/write the manifest is refused (usage error, exit 2) if one
   artifact's staged partial path ``<final>.partial`` equals another
@@ -65,7 +73,10 @@ Contract (see ``docs/models.md`` §4):
   fetching ``foo`` would then mistake the verified final ``foo.partial``
   for its own partial, append to it and delete it on a hash mismatch. A
   filename that is simultaneously another's directory (``a`` and ``a/b``)
-  is refused the same way as a usability preflight. The read-only offline
+  is refused the same way as a usability preflight, and so is an artifact's
+  STAGED path being another artifact's ancestor directory (``a/x`` stages
+  at ``a/x.partial``, which ``a/x.partial/y`` needs as a directory —
+  neither manifest order can ever download both). The read-only offline
   plan reports this typed usage error too — never a write, never a socket.
 * Before any transfer, a bounded disk estimate (remaining manifest bytes plus
   a 1 MiB headroom per pending file) is compared with fresh ``statvfs`` free
@@ -418,7 +429,10 @@ def _check_write_path_symlinks(root: Path, filename: str) -> None:
 
 def _resume_offset(art: ModelArtifact, partial: Path) -> tuple[int, bool]:
     """Size of a resumable partial plus whether one exists at all; raises on
-    anything we refuse to append to. ``(0, False)`` means no partial."""
+    anything we refuse to append to. ``(0, False)`` means no partial. A
+    multiply hard-linked partial is refused BEFORE any transport/write —
+    resume appends through the shared inode and would silently corrupt every
+    other name linked to it (verified finals included)."""
     try:
         st = partial.lstat()
     except FileNotFoundError:
@@ -429,6 +443,15 @@ def _resume_offset(art: ModelArtifact, partial: Path) -> tuple[int, bool]:
         raise UnsafePathError(f"partial is a symlink, refusing to resume: {partial}")
     if not _stat.S_ISREG(st.st_mode):
         raise UnsafePathError(f"partial is not a regular file: {partial}")
+    if st.st_nlink > 1:
+        raise UnsafePathError(
+            f"partial {partial} has {st.st_nlink} hard links — a resume "
+            "staging file must be the sole name of its inode: appending "
+            "through a shared inode would silently rewrite every other "
+            "name linked to it, verified finals included. Refused before "
+            "any read, transport or write; every name and its bytes are "
+            "untouched — inspect the links and de-duplicate deliberately "
+            "before rerunning")
     if st.st_size > art.bytes:
         raise IntegrityError(
             f"partial for '{art.filename}' is {_human(st.st_size)} — larger "
@@ -439,9 +462,10 @@ def _resume_offset(art: ModelArtifact, partial: Path) -> tuple[int, bool]:
 
 def _open_partial(partial: Path, start: int) -> int:
     """Open the partial for writing WITHOUT ever following a symlink, and
-    re-verify on the opened FD that it is a regular file of exactly the
-    expected resume size (ordinary concurrent filesystem changes between the
-    earlier lstat and this open are refused, not truncated over):
+    re-verify on the opened FD that it is a REGULAR, SOLELY LINKED file of
+    exactly the expected resume size (ordinary concurrent filesystem changes
+    between the earlier lstat and this open — a size drift or a new hard
+    link — are refused, not truncated or appended over):
 
     * ``start == 0``: create with ``O_CREAT | O_EXCL`` — a partial that
       appeared concurrently is refused, never truncated;
@@ -490,6 +514,13 @@ def _open_partial(partial: Path, start: int) -> int:
             raise UnsafePathError(
                 f"the opened partial {partial} is not a regular file — "
                 "refusing to write through it")
+        if st.st_nlink > 1:
+            raise UnsafePathError(
+                f"the opened partial {partial} has {st.st_nlink} hard links — "
+                "refusing to truncate or append through an inode that is "
+                "shared with another name (a link appeared after the "
+                "pre-flight check, or the create path raced with a link); "
+                "appending would silently rewrite every name sharing it")
         if st.st_size != start:
             raise RefuseClobberError(
                 f"the partial {partial} changed while this fetch was "
@@ -703,7 +734,15 @@ def _download(art: ModelArtifact, dest: Path, transport,
 
 def _atomic_no_clobber_publish(partial: Path, dest: Path) -> None:
     """os.link is atomic and fails on an existing target (no clobber, never
-    rename/replace over anything); the partial link is then removed."""
+    rename/replace over anything); the partial link is then removed.
+
+    This is the one place a verified partial is *allowed* to hold two names:
+    the second link is created only AFTER the full SHA256 rehash passed, and
+    the partial name is unlinked immediately. If that unlink fails the extra
+    ``*.partial`` name is recoverable debris, not a hazard — it shares (and
+    therefore proves) the already-verified final's inode; a later fetch
+    refuses to resume into a multiply-linked partial, and removing the stale
+    name loses nothing while the final name stands."""
     try:
         os.link(partial, dest)
     except FileExistsError:
@@ -743,10 +782,18 @@ def _check_manifest_filename_collisions(manifest: ModelManifest) -> None:
       second hits ``makedirs`` over an existing file mid-run, after the
       first has already transferred. Refusing up front names the conflict
       while nothing has happened yet.
+    * **Staged-path-versus-directory collision (same preflight, static):**
+      ``a/x`` stages at ``a/x.partial``; an artifact ``a/x.partial/y`` needs
+      ``a/x.partial`` to be a DIRECTORY. Neither order can ever download
+      both — the first leaves a file where the second must mkdir — so any
+      manifest whose artifact's staged partial path is a proper ancestor
+      directory of another artifact's final (either order) is refused here,
+      before mkdir/network/write.
     """
     identities = [art.identity for art in manifest.artifacts]
     # Schema-v1 guarantees uniqueness, so the identity -> index map is exact.
     index = {ident: i for i, ident in enumerate(identities)}
+    staged_index = {f"{ident}.partial": i for i, ident in enumerate(identities)}
     for i, ident in enumerate(identities):
         staged = f"{ident}.partial"
         j = index.get(staged)
@@ -772,6 +819,16 @@ def _check_manifest_filename_collisions(manifest: ModelManifest) -> None:
                     f"'{ancestor}' is a final file while artifacts[{i}] "
                     f"'{ident}' needs '{ancestor}' as a directory — the two "
                     "can never both download; fix the manifest")
+            # ... nor the staged partial path of another artifact (which
+            # lands exactly there the moment that artifact is fetched):
+            k = staged_index.get(ancestor)
+            if k is not None and k != i:
+                raise UsageError(
+                    f"manifest filename collision: artifacts[{i}] "
+                    f"'{ident}' needs '{ancestor}' as a directory, but "
+                    f"fetching artifacts[{k}] '{identities[k]}' stages its "
+                    f"resume partial at exactly that path — the two can "
+                    "never both download; fix the manifest")
 
 
 def load_manifest_checked(path: str) -> ModelManifest:

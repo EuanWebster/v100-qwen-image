@@ -13,7 +13,10 @@ byte-complete-partial rehash-and-publish, nofollow/O_EXCL/size-drift partial
 opens, short-``os.write`` completion, URL/host pinning and sanitized
 (query-, userinfo- and reason-stripped) error messages, read-only/offline
 plan+help, and (review2) the symlink+``..`` lexical-collapse escape from
-``--models-dir`` plus ``.``/``..`` Hub repo segments.
+``--models-dir`` plus ``.``/``..`` Hub repo segments, and (review items
+5–6) hard-linked staging partials (pre-transport and opened-FD link-count
+refusals, publish's own temporary link still valid) and staged-path
+ancestor-directory manifest collisions.
 """
 from __future__ import annotations
 
@@ -1156,6 +1159,11 @@ def test_file_directory_prefix_collision_refused_before_write(tmp_path):
     (("a/b", "a/b/c"), True),
     (("a/b", "a_x/c"), False),
     (("d/x", "d/x.partial", "d/y"), True),
+    (("a/x", "a/x.partial/y"), True),
+    (("a/x.partial/y", "a/x"), True),
+    (("a/x", "b/x.partial/y"), False),
+    (("a/x", "a/xpartial/y"), False),
+    (("a/x.partial/y",), False),
 ])
 def test_manifest_collision_check_is_exact(filenames, refused):
     from qwen_engine.manifest import ModelArtifact, ModelManifest
@@ -1166,3 +1174,148 @@ def test_manifest_collision_check_is_exact(filenames, refused):
             fetch._check_manifest_filename_collisions(manifest)
     else:
         fetch._check_manifest_filename_collisions(manifest)
+
+
+def test_committed_manifest_stays_accepted():
+    """The committed 24-entry manifest must still pass the extended static
+    preflight — a read-only acceptance check, no disk state, no schema
+    change."""
+    fetch.load_manifest_checked(str(ROOT / "models" / "manifest.json"))
+
+
+# ---------------------------------------------------------------------------
+# Review fix 5 — a hard-linked staging partial must never be resumed into
+# ---------------------------------------------------------------------------
+
+# Root's /tmp/v100-fetch-hardlink-review.py: a verified final 'victim.bin'
+# (b'prefix') hard-linked to 'new.bin.partial' let a resume append b'tail'
+# THROUGH THE SHARED INODE and publish rc0 — silently rewriting victim.bin
+# to b'prefixtail'. Staging files must be the sole name of their inode;
+# empty, partial-length and byte-complete stagings refuse identically,
+# before transport and again on the opened FD.
+
+@pytest.mark.parametrize("shape", ["partial", "empty", "byte-complete"])
+def test_hardlinked_staging_partial_refused_names_preserved(tmp_path, shape):
+    root = tmp_path / "assets"
+    root.mkdir()
+    if shape == "empty":
+        # 0-byte staging inode shared with an unrelated name.
+        entries = [art(b"tail", "new.bin")]
+        partial = root / "new.bin.partial"
+        partial.write_bytes(b"")
+        os.link(partial, root / "shared.bin")
+        names_before = {"new.bin.partial": b"", "shared.bin": b""}
+    elif shape == "partial":
+        # The reproduced corruption: the verified final itself is the link.
+        entries = [art(b"prefix", "victim.bin"), art(b"prefixtail", "new.bin")]
+        (root / "victim.bin").write_bytes(b"prefix")
+        os.link(root / "victim.bin", root / "new.bin.partial")
+        names_before = {"victim.bin": b"prefix", "new.bin.partial": b"prefix"}
+    else:  # byte-complete: full expected length on a shared inode — no
+        # rehash read, no Range-from-EOF publish, refusal regardless.
+        entries = [art(b"prefix", "victim.bin"), art(b"prefix", "new.bin")]
+        (root / "victim.bin").write_bytes(b"prefix")
+        os.link(root / "victim.bin", root / "new.bin.partial")
+        names_before = {"victim.bin": b"prefix", "new.bin.partial": b"prefix"}
+    manifest = write_manifest(tmp_path, entries)
+    mtimes = {n: (root / n).stat().st_mtime_ns for n in names_before}
+    t = ExplodingTransport()
+    res = run(tmp_path, manifest, root, transport=t,
+              disk_free=lambda _p: 1 << 40)
+    assert res.rc == fetch.EXIT_REFUSED, res.err
+    assert "hard link" in res.err
+    assert t.calls == []                            # refused pre-transport
+    for name, blob in names_before.items():         # every name + bytes kept
+        assert (root / name).read_bytes() == blob
+        assert (root / name).stat().st_mtime_ns == mtimes[name]
+    assert (root / "new.bin.partial").stat().st_nlink == 2  # never replaced
+    assert not (root / "new.bin").exists()          # nothing published
+
+
+def test_link_added_after_preflight_refused_on_opened_fd_before_write(
+        tmp_path):
+    """The FD recheck closes the ordinary race: a concurrent link() landing
+    between the preflight lstat and the opened-file fstat is refused BEFORE
+    any truncate/seek/write — no bytes of either name change."""
+    blob = b"prefixtail"
+    entry = art(blob, "a/x.bin")
+    manifest = write_manifest(tmp_path, [entry])
+    root = tmp_path / "assets"
+    (root / "a").mkdir(parents=True)
+    partial = root / "a" / "x.bin.partial"
+    partial.write_bytes(b"prefix")                  # 6 of 10 bytes, nlink 1
+    raced = root / "a" / "raced.bin"
+
+    def attach_link(start):                         # the ordinary race
+        os.link(partial, raced)
+        return ok_stream(blob)(start)
+
+    t = FakeTransport({_url(entry): attach_link})
+    res = run(tmp_path, manifest, root, transport=t,
+              disk_free=lambda _p: 1 << 40)
+    assert res.rc == fetch.EXIT_REFUSED, res.err
+    assert "hard link" in res.err
+    assert len(t.calls) == 1 and t.calls[0][1] == 6  # only the resume probe
+    assert partial.read_bytes() == b"prefix"         # not truncated/appended
+    assert raced.read_bytes() == b"prefix"           # second name untouched
+    assert not (root / "a" / "x.bin").exists()       # nothing published
+
+
+def test_normal_publish_temporary_second_link_still_valid(tmp_path):
+    """Integrity-verified publish creating its OWN temporary second link is
+    the allowed, documented exception: resume → rehash → link → unlink must
+    still succeed, leaving the final singly linked with no staging debris."""
+    blob = b"prefixtail"
+    entry = art(blob, "a/x.bin")
+    manifest = write_manifest(tmp_path, [entry])
+    root = tmp_path / "assets"
+    (root / "a").mkdir(parents=True)
+    (root / "a" / "x.bin.partial").write_bytes(b"prefix")  # sole link
+    t = FakeTransport({_url(entry): ok_stream(blob)})
+    res = run(tmp_path, manifest, root, transport=t,
+              disk_free=lambda _p: 1 << 40)
+    assert res.rc == 0, res.err
+    final = root / "a" / "x.bin"
+    assert final.read_bytes() == blob
+    assert final.stat().st_nlink == 1
+    _no_partial_left(root)
+
+
+# ---------------------------------------------------------------------------
+# Review fix 6 — staged path as another artifact's ancestor directory
+# ---------------------------------------------------------------------------
+
+# 'a/x' stages at 'a/x.partial'; 'a/x.partial/y' needs that very path as a
+# DIRECTORY. Neither manifest order can ever download both — refuse the
+# static conflict for BOTH plan and fetch, before mkdir/network/write.
+
+_STAGING_ANCESTOR_ENTRIES = lambda: [art(b"K" * 8, "a/x"),
+                                     art(b"L" * 16, "a/x.partial/y")]
+
+
+@pytest.mark.parametrize("order", ["x-first", "y-first"])
+def test_staging_ancestor_collision_refused_before_mkdir(tmp_path, order):
+    entries = _STAGING_ANCESTOR_ENTRIES()
+    if order == "y-first":
+        entries.reverse()
+    manifest = write_manifest(tmp_path, entries)
+    root = tmp_path / "assets"
+    t = ExplodingTransport()
+    res = run(tmp_path, manifest, root, transport=t)
+    assert res.rc == fetch.EXIT_USAGE, res.err
+    assert "collision" in res.err and "a/x.partial" in res.err
+    assert t.calls == []
+    assert not root.exists()                        # no mkdir happened
+    assert not list(tmp_path.rglob("*.partial"))
+
+
+def test_plan_reports_staging_ancestor_collision_read_only(tmp_path,
+                                                           monkeypatch):
+    _no_network(monkeypatch)
+    manifest = write_manifest(tmp_path, _STAGING_ANCESTOR_ENTRIES())
+    root = tmp_path / "assets"
+    res = run(tmp_path, manifest, root, fetch_mode=False)
+    assert res.rc == fetch.EXIT_USAGE, res.err
+    assert "collision" in res.err
+    assert not root.exists()
+    assert not list(tmp_path.rglob("*.partial"))
