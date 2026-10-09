@@ -67,3 +67,18 @@ partial preserved; torchvision missing in both exact ML envs; encoder
 No numeric real-checkpoint parity, image quality, measured CPU/GPU fit or
 CUDA execution proven. Remaining adapter/quant/offload/calibration/image
 acceptance milestones stay gated on the actual card/runtime evidence.
+
+11:04 UTC design refinement, root + read-only audit_encoder: production
+encoding kwargs exactly {cfg_active: bool}, factory derives config.cfg_active;
+true requires nonblank negative, false never encodes negative but deliberately
+retains its text in conservative cache identity. Canonical dtype fp16/bf16/fp32
+is explicit and independent of DiT quant. Scale/headroom/count are not encoding
+kwargs; fixed one output/no images. Source digest may conservatively include
+all small qwen_engine .py modules, sorted relative names/content hashes/lengths
+under a version tag (never absolute paths/mtime), with distinct extraction tag.
+Observed metadata must name the SAME interpreter executing child; no parent
+metadata mistaken for custom child runtime. Production cannot accept an absent
+or unreviewed/unlocked torchvision build: current lock omission is a gate.
+Exact VCS direct_url source URL/git/full commit plus observed versions required
+without importing ML. Existing whole-root closed-tree preflight is NOT an
+encoder-only verifier; new narrow component verifier needed in later task.

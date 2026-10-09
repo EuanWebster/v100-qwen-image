@@ -52,9 +52,13 @@ failed_exclusive_open_preserves_existing_temp name+bytes preserved after the
 10:50 invariant fix — it was false in the pre-fix baseline);
 `/tmp/v100-cache-ownership-review.py` and `/tmp/v100-cache-review-probe.py`
 green. Guarded focused encoder suite 197 passed (3.11.15); guarded full suite
-**753 passed + 1 skipped, rc 0** (was 742+1skip; +11 here). Python 3.13
-pytest not installed in this sandbox; full-suite evidence is 3.11.15 as the
-brief requires.
+**753 passed + 1 skipped, rc 0** (was 742+1skip; +11 here). Correction
+(root acceptance 2026-10-09 11:00): the earlier claim that Python 3.13 pytest
+is absent in-sandbox was **wrong** — `/tmp/qwen-review.bIFHcI/venv/bin/python`
+(3.13.5, pytest 9.1.1) works with `PYTHONPATH=/work/src` plus the pinned
+source env vars; root's independent full runs were 753+1skip on 3.11.15 and
+754 passed on pinned 3.13, and this writer later reproduced the 3.13 full
+suite directly (fix-json task, 08993bc).
 
 Fetch prose correction (docs-milestone-only, per task): the overspecific
 "reverse order … hits a file where the other artifact must mkdir" direction

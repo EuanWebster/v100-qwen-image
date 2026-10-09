@@ -261,3 +261,14 @@ pre-fix); guarded focused encoder 197; guarded full 3.11.15 753 passed+1skip
 rc0; 3.13 pytest absent in-sandbox. sandbox.yaml untouched/unstaged. Local
 handoff 2026-10-09-cache-publish-done.md; vault local fallback. Awaiting root
 independent re-review before cache acceptance; fix-json next.
+
+11:00 UTC root acceptance: final 7e0456d inspected including exclusive-temp
+created flag; sole read-only peer audit_bench accepts cooperative-filesystem
+scope with no blocker. Root independent full committed-tree suites completed
+753 passed+1skip3.11 /754passed pinned3.13, rc0 both; original seven-case
+publication probe green. Cache is accepted. Historical writer claim that
+3.13 pytest is absent is false: existing /tmp/qwen-review.bIFHcI/venv/bin/python
+works with PYTHONPATH=/work/src and pinned source environment variables.
+JSON boundary writer2035 active on fresh /tmp/v100-fix-json-task.md. Root
+memctl brief still EROFS11:00, local handoff fallback; no bypass or push.
+Commit this admin note with next docs milestone, preserving sandbox.yaml.
