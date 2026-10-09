@@ -9,15 +9,19 @@ Pieces
 ------
 * **Wire schemas** (versioned tags, strict validation):
 
-  - ``qwen_engine.encoder_request.v1`` — what the engine hands the worker.
+  - ``qwen_engine.encoder_request.v2`` — what the engine hands the worker
+    (v2 adds the optional :class:`EncoderImplementationIdentity` block).
   - ``qwen_engine.encoder_result.v1``  — what the worker writes back
     (status ok/error; payload blobs are opaque base64 bytes on the wire).
 
-* **Cache key v2** (:func:`cache_key`, plan R5): model repo + revision/hash,
+* **Cache key v3** (:func:`cache_key`, plan R5): model repo + revision/hash,
   processor / tokenizer / chat-template identities (revision *or* content
   hash), prompt, **negative prompt** (the LTX ``_embed_cache_key`` negative-key
-  fix, tested both variants), **all** encoding kwargs, encoder dtype, and
-  **ordered** image content hashes for future image conditioning.
+  fix, tested both variants), **all** encoding kwargs, encoder dtype,
+  **ordered** image content hashes for future image conditioning, and the
+  optional immutable :class:`EncoderImplementationIdentity` (v3 — the worker
+  protocol/implementation, prompt-extraction algorithm and installed-package
+  revisions that determine *what code* produced the embeddings).
 
 * **Entry format** ``qwen_engine.embed_entry.v1``: one canonical JSON header
   line + the raw concatenated blob bytes, each blob pinned by length and
@@ -79,10 +83,18 @@ from qwen_engine.log import PhaseLogger
 # Versioned schema tags
 # ---------------------------------------------------------------------------
 
-REQUEST_SCHEMA = "qwen_engine.encoder_request.v1"
+REQUEST_SCHEMA = "qwen_engine.encoder_request.v2"
 RESULT_SCHEMA = "qwen_engine.encoder_result.v1"
-CACHE_KEY_SCHEMA = "qwen_engine.embed_cache_key.v2"
+CACHE_KEY_SCHEMA = "qwen_engine.embed_cache_key.v3"
 ENTRY_SCHEMA = "qwen_engine.embed_entry.v1"
+
+#: The known source pins (PLAN M0.1, docs/dependencies.md). These are the
+#: commits the pinned checkouts at ``/tmp/v100_m0_ml/src/*`` prove out; an
+#: identity record must carry the versions/commits of the packages ACTUALLY
+#: installed in the worker environment — checking them against these pins is
+#: a later loader step, never an assumption baked in here.
+PINNED_DIFFUSERS_COMMIT = "c6df88a511a98740646ee55577b590c9852650ce"
+PINNED_TRANSFORMERS_COMMIT = "856157a2f3e9594954310df18fdccc31ffddebe9"
 
 #: LRU cap on cached embeddings (plan R5).
 DEFAULT_MAX_ENTRIES = 128
@@ -206,6 +218,155 @@ def validate_identity_fields(revision: Any, sha: Any, at: str,
                   "component must not enter a cache key)")
 
 
+_IDENTITY_FIELDS = (
+    "encoder_artifact_set_sha256", "worker_protocol_revision",
+    "worker_implementation_revision", "prompt_extraction_revision",
+    "diffusers_commit", "transformers_commit", "torch_build", "torch_version",
+    "safetensors_version", "torchvision_version",
+)
+
+
+def _nonempty_str(errors: list[str], at: str, value: Any, what: str) -> None:
+    if value is _MISSING:
+        return  # absent from a mapping: reported as missing by the caller
+    if not isinstance(value, str) or not value.strip():
+        _err_list(errors, at, f"must be a non-empty string ({what}), got {value!r}")
+    elif value != value.strip():
+        _err_list(errors, at, f"must not have surrounding whitespace, got {value!r}")
+
+
+@dataclass(frozen=True)
+class EncoderImplementationIdentity:
+    """Immutable *implementation* identity of a production encoder worker.
+
+    The cache key's model/processor/tokenizer/chat-template fields record
+    *what data* is encoded; this record pins *which code* encodes it, so one
+    key can never silently name two different encoder implementations:
+
+    * ``encoder_artifact_set_sha256`` — the version-tagged artifact-set digest
+      of the encoder + processor files (:mod:`qwen_engine.local_bundle`).
+      This is the **asset component** of the key, never the whole key; a
+      worker cache key additionally carries the revisions below.
+    * ``worker_protocol_revision`` / ``worker_implementation_revision`` —
+      wire-protocol revision and revision of the worker implementation code.
+    * ``prompt_extraction_revision`` — revision of the prompt-formatting /
+      hidden-state-extraction algorithm (the fidelity-critical path).
+    * ``diffusers_commit`` / ``transformers_commit`` — exact 40-hex commits.
+      Known source pins: :data:`PINNED_DIFFUSERS_COMMIT` /
+      :data:`PINNED_TRANSFORMERS_COMMIT`; the values must come from the
+      *installed* packages (a later loader step), not from these constants.
+    * ``torch_build`` / ``torch_version`` — torch build flavour (e.g. the
+      CUDA/CPU build tag) and version actually importable by the worker.
+    * ``safetensors_version`` / ``torchvision_version`` — installed versions
+      actually importable by the worker (torchvision is a known real-load
+      gap: record what the environment check observed, e.g. an explicit
+      "absent" marker — never a fabricated version and never silently omit
+      the field).
+
+    Every field is required and validated (64-hex / 40-hex where applicable);
+    generic fake requests may simply carry no identity at all (``None`` on
+    :class:`EncoderRequest`), but a future production worker must construct
+    one from observed environment facts and refuse to run without it.
+    """
+
+    encoder_artifact_set_sha256: str
+    worker_protocol_revision: str
+    worker_implementation_revision: str
+    prompt_extraction_revision: str
+    diffusers_commit: str
+    transformers_commit: str
+    torch_build: str
+    torch_version: str
+    safetensors_version: str
+    torchvision_version: str
+
+    def __post_init__(self) -> None:
+        errors: list[str] = []
+        validate_implementation_identity_fields(self, "implementation_identity",
+                                                errors)
+        if errors:
+            raise EncoderRequestError("; ".join(errors))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in _IDENTITY_FIELDS}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "EncoderImplementationIdentity":
+        """Strict parse: every field required, unknown keys refused, all with
+        the shared typed errors."""
+        errors: list[str] = []
+        if not isinstance(data, Mapping):
+            raise EncoderRequestError(
+                "implementation_identity: must be an object, got "
+                f"{type(data).__name__}")
+        for key in sorted(set(data) - set(_IDENTITY_FIELDS)):
+            _err_list(errors, f"implementation_identity.{key}",
+                      "unknown implementation-identity key")
+        for name in _IDENTITY_FIELDS:
+            if name not in data:
+                _err_list(errors, f"implementation_identity.{name}",
+                          "missing required field")
+        validate_implementation_identity_fields(data, "implementation_identity",
+                                                errors, missing_ok=True)
+        if errors:
+            raise EncoderRequestError("; ".join(errors))
+        return cls(**{name: data[name] for name in _IDENTITY_FIELDS})
+
+
+class _Missing:
+    """Sentinel: field absent (already reported elsewhere)."""
+
+
+_MISSING = _Missing()
+
+
+def validate_implementation_identity_fields(obj: Any, at: str,
+                                            errors: list[str], *,
+                                            missing_ok: bool = False) -> None:
+    """Collect every violation of :class:`EncoderImplementationIdentity`
+    (attribute access on an instance, or key access on a mapping) into
+    ``errors``. A field that is merely *absent* from a mapping is skipped
+    when ``missing_ok`` (the parser reports it as missing); an explicit
+    ``null`` is always a violation."""
+    def get(name: str) -> Any:
+        if isinstance(obj, Mapping):
+            if name not in obj:
+                return _MISSING if missing_ok else None
+            return obj[name]
+        value = getattr(obj, name, _MISSING)
+        return value
+
+    sha = get("encoder_artifact_set_sha256")
+    if sha is not _MISSING and (not isinstance(sha, str)
+                                or not _SHA256_RE.fullmatch(sha)):
+        _err_list(errors, f"{at}.encoder_artifact_set_sha256",
+                  f"must be 64 lowercase hex chars, got {sha!r}")
+    for field_name in ("diffusers_commit", "transformers_commit"):
+        value = get(field_name)
+        if value is not _MISSING and (not isinstance(value, str)
+                                      or not _REVISION_RE.fullmatch(value)):
+            _err_list(errors, f"{at}.{field_name}",
+                      f"must be an exact 40-hex commit sha, got {value!r}")
+    _nonempty_str(errors, f"{at}.worker_protocol_revision",
+                  get("worker_protocol_revision"), "wire protocol revision")
+    _nonempty_str(errors, f"{at}.worker_implementation_revision",
+                  get("worker_implementation_revision"),
+                  "worker implementation revision")
+    _nonempty_str(errors, f"{at}.prompt_extraction_revision",
+                  get("prompt_extraction_revision"),
+                  "prompt-extraction algorithm revision")
+    _nonempty_str(errors, f"{at}.torch_build", get("torch_build"),
+                  "torch build flavour")
+    _nonempty_str(errors, f"{at}.torch_version", get("torch_version"),
+                  "torch version")
+    _nonempty_str(errors, f"{at}.safetensors_version",
+                  get("safetensors_version"), "safetensors version")
+    _nonempty_str(errors, f"{at}.torchvision_version",
+                  get("torchvision_version"),
+                  "torchvision version (an explicit absence marker is the "
+                  "honest value where torchvision is not installed)")
+
+
 @dataclass(frozen=True)
 class EncoderRequest:
     """Everything that determines an encoding — the cache-key inputs live
@@ -214,7 +375,9 @@ class EncoderRequest:
     JSON values (``kwargs``) are deep-frozen snapshots taken at
     construction: the caller mutating its own (nested) mapping afterwards
     changes neither the cache key nor the wire document — they are computed
-    from the same immutable snapshot."""
+    from the same immutable snapshot. ``implementation_identity`` is itself a
+    frozen record of validated strings, so it enjoys the same guarantee: no
+    caller-side mutation can move the key or the wire document."""
 
     prompt: str
     dtype: str
@@ -228,6 +391,9 @@ class EncoderRequest:
     kwargs: Mapping[str, Any] = field(default_factory=dict)
     #: Ordered image content hashes (future image conditioning; order matters).
     images: tuple[str, ...] = ()
+    #: Optional production implementation identity (v3 key documents). Generic
+    #: fake requests may omit it; a future production worker must set it.
+    implementation_identity: EncoderImplementationIdentity | None = None
 
     def __post_init__(self) -> None:
         errors: list[str] = validate_request_fields(self)
@@ -255,6 +421,9 @@ class EncoderRequest:
             "dtype": self.dtype,
             "kwargs": plain_json(self.kwargs),
             "images": list(self.images),
+            "implementation_identity": (
+                None if self.implementation_identity is None
+                else self.implementation_identity.to_dict()),
         }
 
     def to_request_dict(self, request_id: str) -> dict[str, Any]:
@@ -277,7 +446,7 @@ class EncoderRequest:
                       f"must be {REQUEST_SCHEMA!r}, got {data.get('schema')!r}")
         known = {"schema", "request_id", "prompt", "negative_prompt", "dtype",
                  "model", "processor", "tokenizer", "chat_template", "kwargs",
-                 "images"}
+                 "images", "implementation_identity"}
         for key in sorted(set(data) - known):
             _err_list(errors, key, "unknown request key")
         rid = data.get("request_id")
@@ -319,6 +488,17 @@ class EncoderRequest:
                 for i in images):
             _err_list(errors, "images",
                       f"must be a list of 64-hex sha256 content hashes, got {images!r}")
+        impl: EncoderImplementationIdentity | None = None
+        if "implementation_identity" in data and data["implementation_identity"] is not None:
+            impl_value = data["implementation_identity"]
+            if not isinstance(impl_value, Mapping):
+                _err_list(errors, "implementation_identity",
+                          f"must be an object or null, got {type(impl_value).__name__}")
+            else:
+                try:
+                    impl = EncoderImplementationIdentity.from_dict(impl_value)
+                except EncoderRequestError as exc:
+                    errors.append(str(exc))
         kwargs = data.get("kwargs", {})
         if not isinstance(kwargs, dict):
             _err_list(errors, "kwargs", f"must be an object, got {kwargs!r}")
@@ -338,6 +518,7 @@ class EncoderRequest:
                 chat_template=components["chat_template"],
                 kwargs=kwargs,
                 images=tuple(images),
+                implementation_identity=impl,
             )
         except EncoderRequestError as exc:
             raise EncoderRequestError(f"invalid encoder request: {exc}") from exc
@@ -365,6 +546,11 @@ def validate_request_fields(req: EncoderRequest) -> list[str]:
         if not isinstance(value, ComponentIdentity):
             _err_list(errors, comp, f"must be a ComponentIdentity, got "
                                     f"{type(value).__name__}")
+    if req.implementation_identity is not None and not isinstance(
+            req.implementation_identity, EncoderImplementationIdentity):
+        _err_list(errors, "implementation_identity",
+                  f"must be an EncoderImplementationIdentity or None, got "
+                  f"{type(req.implementation_identity).__name__}")
     if not isinstance(req.kwargs, Mapping):
         _err_list(errors, "kwargs",
                   f"must be a mapping, got {type(req.kwargs).__name__}")
@@ -383,9 +569,11 @@ def validate_request_fields(req: EncoderRequest) -> list[str]:
 
 
 def cache_key(request: EncoderRequest) -> str:
-    """Cache key v2 (R5): sha256 over the canonical key document. The
+    """Cache key v3 (R5): sha256 over the canonical key document. The
     negative prompt is part of the key (the LTX negative-key fix), as are all
-    kwargs, dtype, component identities and ordered image hashes."""
+    kwargs, dtype, component identities, ordered image hashes, and the
+    optional production implementation identity (v3 — distinct encoder
+    implementations can never share a key)."""
     doc = json.dumps(request.key_document(), sort_keys=True, ensure_ascii=True,
                      separators=(",", ":"))
     return hashlib.sha256(doc.encode("utf-8")).hexdigest()

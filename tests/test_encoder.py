@@ -1,13 +1,14 @@
 """M1.4 encoder worker + cache tests — fake worker only, no model (plan R5).
 
-Covers: cache-key v2 semantics (negative-key fix both variants), atomic
-writes, corrupt-entry miss + quarantine, LRU cap, per-key concurrency,
-worker timeout / cancel (terminate → kill) / error + stderr capture /
-protocol violations, scratch cleanup on every path, and the no-heavy-imports
-boundary.
+Covers: cache-key v2/v3 semantics (negative-key fix both variants,
+production implementation identity), atomic writes, corrupt-entry miss +
+quarantine, LRU cap, per-key concurrency, bounded worker responses, worker
+timeout / cancel (terminate → kill) / error + stderr capture / protocol
+violations, scratch cleanup on every path, and the no-heavy-imports boundary.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -22,12 +23,15 @@ import pytest
 from qwen_engine.encoder import (
     CACHE_KEY_SCHEMA,
     ENTRY_SCHEMA,
+    PINNED_DIFFUSERS_COMMIT,
+    PINNED_TRANSFORMERS_COMMIT,
     REQUEST_SCHEMA,
     RESULT_SCHEMA,
     Blob,
     ComponentIdentity,
     EmbeddingCache,
     EncoderCancelledError,
+    EncoderImplementationIdentity,
     EncoderProtocolError,
     EncoderRequest,
     EncoderRequestError,
@@ -94,9 +98,9 @@ def assert_scratch_clean(tmp_path) -> None:
 
 
 def test_schema_tags_are_versioned():
-    assert REQUEST_SCHEMA == "qwen_engine.encoder_request.v1"
+    assert REQUEST_SCHEMA == "qwen_engine.encoder_request.v2"
     assert RESULT_SCHEMA == "qwen_engine.encoder_result.v1"
-    assert CACHE_KEY_SCHEMA == "qwen_engine.embed_cache_key.v2"
+    assert CACHE_KEY_SCHEMA == "qwen_engine.embed_cache_key.v3"
     assert ENTRY_SCHEMA == "qwen_engine.embed_entry.v1"
 
 
@@ -156,7 +160,169 @@ def test_request_from_dict_rejects_unknown_keys_and_bad_schema():
 
 
 # ---------------------------------------------------------------------------
-# Cache key v2
+# Production encoder implementation identity (cache key v3)
+# ---------------------------------------------------------------------------
+
+IDENTITY_VALUES = {
+    "encoder_artifact_set_sha256": SHA_A,
+    "worker_protocol_revision": "worker-proto.v1",
+    "worker_implementation_revision": "worker-impl.3ce32fd",
+    "prompt_extraction_revision": "prompt-extract.v1",
+    "diffusers_commit": PINNED_DIFFUSERS_COMMIT,
+    "transformers_commit": PINNED_TRANSFORMERS_COMMIT,
+    "torch_build": "cpu",
+    "torch_version": "2.9.0",
+    "safetensors_version": "0.5.2",
+    "torchvision_version": "absent",
+}
+
+
+def make_identity(**overrides) -> EncoderImplementationIdentity:
+    return EncoderImplementationIdentity(**{**IDENTITY_VALUES, **overrides})
+
+
+def test_pinned_commit_constants_match_the_reviewed_pins():
+    assert PINNED_DIFFUSERS_COMMIT == \
+        "c6df88a511a98740646ee55577b590c9852650ce"
+    assert PINNED_TRANSFORMERS_COMMIT == \
+        "856157a2f3e9594954310df18fdccc31ffddebe9"
+
+
+def test_generic_request_may_have_no_implementation_identity():
+    """Existing generic (fake) requests stay valid with identity=None; the
+    key document states the absence explicitly, and a wire document without
+    the block parses back to the same key."""
+    req = make_request()
+    assert req.implementation_identity is None
+    assert req.key_document()["implementation_identity"] is None
+    doc = req.to_request_dict("rid")
+    parsed, _ = EncoderRequest.from_request_dict(doc)
+    assert parsed.implementation_identity is None
+    assert cache_key(parsed) == cache_key(req)
+    # An absent key parses identically to an explicit null.
+    del doc["implementation_identity"]
+    assert cache_key(EncoderRequest.from_request_dict(doc)[0]) == cache_key(req)
+    assert cache_key(req) != cache_key(make_request(
+        implementation_identity=make_identity()))
+
+
+def test_identity_request_roundtrip_is_exact():
+    req = make_request(implementation_identity=make_identity(),
+                       kwargs={"a": 1}, images=(SHA_A,))
+    doc = req.to_request_dict("rid-1")
+    assert doc["schema"] == REQUEST_SCHEMA
+    assert doc["implementation_identity"] == req.key_document()[
+        "implementation_identity"]
+    parsed, rid = EncoderRequest.from_request_dict(doc)
+    assert rid == "rid-1"
+    assert parsed.implementation_identity == make_identity()
+    assert parsed.key_document() == req.key_document()
+    assert cache_key(parsed) == cache_key(req)
+
+
+@pytest.mark.parametrize("field,alt", [
+    ("encoder_artifact_set_sha256", SHA_B),
+    ("worker_protocol_revision", "worker-proto.v2"),
+    ("worker_implementation_revision", "worker-impl.deadbee"),
+    ("prompt_extraction_revision", "prompt-extract.v2"),
+    ("diffusers_commit", "f" * 40),
+    ("transformers_commit", "e" * 40),
+    ("torch_build", "cu126"),
+    ("torch_version", "2.10.0"),
+    ("safetensors_version", "0.6.0"),
+    ("torchvision_version", "0.20.0"),
+])
+def test_every_identity_field_changes_the_key(field, alt):
+    base = cache_key(make_request(implementation_identity=make_identity()))
+    other = cache_key(make_request(
+        implementation_identity=make_identity(**{field: alt})))
+    assert base != other, f"cache key ignores implementation identity {field}"
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("encoder_artifact_set_sha256", "z" * 64),
+        ("encoder_artifact_set_sha256", SHA_A.upper()),
+        ("encoder_artifact_set_sha256", SHA_A[:63]),
+        ("encoder_artifact_set_sha256", None),
+        ("diffusers_commit", "c" * 41),
+        ("diffusers_commit", "main"),
+        ("diffusers_commit", 123),
+        ("transformers_commit", None),
+        ("worker_protocol_revision", " "),
+        ("worker_implementation_revision", ""),
+        ("worker_implementation_revision", 42),
+        ("prompt_extraction_revision", None),
+        ("prompt_extraction_revision", " spaced "),
+        ("torch_build", ""),
+        ("torch_version", None),
+        ("safetensors_version", 0.5),
+        ("torchvision_version", None),  # absence is stated with a marker, not null
+    ],
+)
+def test_identity_rejects_malformed_values(field, bad):
+    with pytest.raises(EncoderRequestError) as exc:
+        make_identity(**{field: bad})
+    assert field in str(exc.value)
+
+
+def test_identity_parsing_is_strict():
+    d = dict(IDENTITY_VALUES)
+    with pytest.raises(EncoderRequestError, match="unknown"):
+        EncoderImplementationIdentity.from_dict({**d, "surprise": 1})
+    for drop in ("torch_version", "encoder_artifact_set_sha256"):
+        with pytest.raises(EncoderRequestError, match=drop):
+            EncoderImplementationIdentity.from_dict(
+                {k: v for k, v in d.items() if k != drop})
+    with pytest.raises(EncoderRequestError, match="must be an object"):
+        EncoderImplementationIdentity.from_dict("not-a-mapping")
+    with pytest.raises(EncoderRequestError, match="non-empty"):
+        EncoderImplementationIdentity.from_dict({**d, "torch_version": None})
+    EncoderImplementationIdentity.from_dict(d)  # the exact document parses
+
+
+def test_request_from_dict_rejects_bad_identity():
+    doc = make_request(implementation_identity=make_identity()
+                       ).to_request_dict("rid")
+    doc["implementation_identity"]["surprise"] = 1
+    with pytest.raises(EncoderRequestError, match="surprise"):
+        EncoderRequest.from_request_dict(doc)
+    doc = make_request(implementation_identity=make_identity()
+                       ).to_request_dict("rid")
+    doc["implementation_identity"]["torch_version"] = ""
+    with pytest.raises(EncoderRequestError, match="torch_version"):
+        EncoderRequest.from_request_dict(doc)
+    doc = make_request(implementation_identity=make_identity()
+                       ).to_request_dict("rid")
+    doc["implementation_identity"] = "identity-as-string"
+    with pytest.raises(EncoderRequestError, match="implementation_identity"):
+        EncoderRequest.from_request_dict(doc)
+
+
+def test_identity_mutation_cannot_move_key_or_wire():
+    """The record is frozen and to_dict/key_document are fresh documents:
+    nothing a caller holds can move the key or the wire document later."""
+    ident = make_identity()
+    req = make_request(implementation_identity=ident)
+    key_before = cache_key(req)
+    wire_before = req.to_request_dict("rid")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ident.torch_version = "9.9.9"  # type: ignore[misc]
+    snapshot = ident.to_dict()
+    snapshot["torch_build"] = "poison"
+    assert cache_key(req) == key_before
+    assert req.to_request_dict("rid") == wire_before
+
+
+def test_request_rejects_non_identity_implementation_values():
+    for bad in ({"torch_version": "1"}, "identity", 5, [1]):
+        with pytest.raises(EncoderRequestError, match="implementation_identity"):
+            make_request(implementation_identity=bad)
+
+
+# ---------------------------------------------------------------------------
+# Cache key v2/v3
 # ---------------------------------------------------------------------------
 
 

@@ -146,7 +146,7 @@ CPU tests never touch a heavy ML import:
 | `qwen_engine/adapters/qwen21_diffusers.py` | The eventual `Qwen21DiffusersAdapter` — the **only** module that imports torch / diffusers / transformers, and those imports are deferred *inside* the adapter (lazy), executed only on an actual run. Does not exist yet; stubbing it at M1 is a boundary violation the import test catches. | torch, diffusers, transformers |
 | `qwen_engine/log.py` | Structured **phase/event logging**: JSONL events `{ts, phase, event, elapsed_ms, counters…}` to a configurable sink, plus human-readable phase lines. Shared by engine, CLI and bench. | stdlib |
 | `qwen_engine/memory.py` | **Memory-policy** descriptor + verdict logic (R4; detail in M5.3): "does this config fit *right now*?" from calibrated observations, current free memory, and headroom; conservative on unknown; stale calibration invalidated (C8). (Supersedes the draft's standalone `vramfit.py` naming.) | config/manifest/log types |
-| `qwen_engine/encoder.py` | Encoder **subprocess worker + embedding cache** (port `run_subprocess_logged`; key v2, atomic writes, quarantine, timeout/cancel, fake-worker tests — R5; detail in M1.4). | stdlib |
+| `qwen_engine/encoder.py` | Encoder **subprocess worker + embedding cache** (port `run_subprocess_logged`; key **v3** — v2 plus the optional immutable `EncoderImplementationIdentity` (M2.2b foundation): encoder artifact-set digest (**asset component only**, never the whole key), worker protocol/implementation + prompt-extraction revisions, exact diffusers/transformer commits, torch build/version, safetensors/torchvision versions; generic fake requests may carry none, a production worker must require one; atomic writes, quarantine, timeout/cancel, bounded worker responses, fake-worker tests — R5; detail in M1.4/M2.2b). | stdlib |
 | `qwen_engine/bench.py` | **Versioned benchmark/result schemas** (R6; detail in M1.5): phase timings, peak host RSS, peak CUDA memory when available, environment and model identifiers; feeds `calibration.json`. | stdlib |
 | `qwen_engine/cli.py` | The only v1 front-end (GUI deferred, YAGNI): argparse → validate config → plan via `core.plan()` (adapter-independent) → `generate`; implements the **exit-code contract** (M1 acceptance criteria). `cli_gen.py` at the repo root stays as a thin entry-point shim. | the above only |
 
@@ -1092,3 +1092,46 @@ standing rule that executed plans stay honest.)*
   `manifest.py`, `models/manifest.json`, the fetcher, `sandbox.yaml`
   (user-owned) and `models/` assets untouched and unread by this pass; no
   network, no model load, no GPU, no service change.
+- 2026-10-09 **M2.2b stage 1 item 1: production encoder implementation
+  identity in the generic protocol/cache — foundation implemented and
+  offline-tested** (sole writer Qwen, task
+  `/tmp/v100-m22b-foundation-task.md`, on accepted `3ce32fd`; shared vault
+  read-only this session — `docs/handoffs/2026-10-09-resume.md` is the local
+  fallback, no memctl writes, `sandbox.yaml` user edit untouched):
+  `qwen_engine/encoder.py` gains the validated immutable
+  **`EncoderImplementationIdentity`** record — encoder artifact-set SHA256
+  (the **asset component** of the future worker cache key, never the whole
+  key), worker protocol + implementation revisions, prompt-extraction
+  algorithm revision, exact 40-hex diffusers/transformers commits
+  (constants `PINNED_DIFFUSERS_COMMIT` `c6df88a5…650ce` /
+  `PINNED_TRANSFORMERS_COMMIT` `856157a2…ebe9` anchor the known source pins;
+  installed-package verification against them is a LATER loader step),
+  torch build + version, safetensors version and torchvision version (an
+  explicit absence marker is the honest value while torchvision is missing —
+  never null, never fabricated). Folded into `EncoderRequest` as the
+  optional `implementation_identity` with a deliberate schema bump: request
+  wire `qwen_engine.encoder_request.v2`, key
+  `qwen_engine.embed_cache_key.v3`; all model/component/prompt/negative/
+  dtype/kwargs/image key fields and the deep-freeze guarantee preserved
+  (the record is a frozen string record; `to_dict`/`key_document` return
+  fresh documents, so no caller-side mutation can move key or wire).
+  Existing generic fake requests may explicitly carry **no** identity
+  (key-document `implementation_identity: null`; absent parses identically
+  to null); a future production worker must require one — this is identity
+  **plumbing**, not any claim that a production encoder ran. Parsing is
+  strict through the existing typed errors (unknown keys, missing fields,
+  explicit nulls, non-hex commits/digest, blank/whitespace/non-string
+  revisions, non-mapping). `tests/test_encoder.py` **108 → 142** offline
+  tests (schema tags + pin constants anchored; exact wire/key roundtrip;
+  every one of the 10 fields changes the key; 17-class malformed-value
+  matrix; strict identity and request-level parsing refusals; frozen-record
+  + poisoned-snapshot mutation cannot move key or wire; generic request
+  without identity unchanged). Evidence: guarded suite **601 passed + 1
+  skip** without / **602 passed** with pinned source envs on 3.11.15
+  (`/work/.venv`) and 3.13.5 (`/tmp/qwen-review.bIFHcI/venv`,
+  `PYTHONPATH=/work/src`), rc 0; pinned-interface checker exit 0, trees
+  re-verified `c6df88a5`/`856157a2` via `git rev-parse HEAD`; the skip is
+  the documented external-tree skip, never counted as a pass. **This proves
+  nothing about real loads:** encoder load, safetensors payload, numeric
+  parity, torchvision dependency, adapter and GPU stay pending; no network,
+  no GPU, no model load, no permission request.

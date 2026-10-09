@@ -19,6 +19,10 @@ Driven entirely by underscore-prefixed keys in the request ``kwargs``:
 
 An otherwise plain request answers ``ok`` with a deterministic blob derived
 from the prompt, so cache round-trips are byte-reproducible.
+
+Request schema v2 may carry an ``implementation_identity`` block; the fake
+ignores it entirely (it is a *generic* worker — only a production worker
+requires an implementation identity).
 """
 from __future__ import annotations
 
