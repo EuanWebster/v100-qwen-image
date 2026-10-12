@@ -417,6 +417,49 @@ async function httpChecks() {
   // under test slices a 1xx WITH headers by its CRLF boundary — pure
   // protocol cases are covered by scripts/raw_http_selfcheck.mjs.)
   check('100-continue is refused 417 (no early 100)', status(continueHdr) === 417);
+
+  // ---- legacy/early-error HTTP framing (root 16:48 review) -------------
+  // The SAME four wire legs as root's memory-socket probe, now against the
+  // REAL served socket. The inherited stdlib framing suppresses ALL output
+  // while request_version is the HTTP/0.9 default: the versionless GET and
+  // explicit HTTP/0.9 were SERVED as bare legacy bodies, and the broken
+  // request line / HTTP/2.0 refusals arrived as bare JSON with NO status
+  // line. All four must now come back FRAMED: real HTTP/1.x status line,
+  // the shared defensive header set, typed JSON error — never a bare body.
+  const defensive = (r) => ['x-content-type-options', 'referrer-policy',
+    'cross-origin-resource-policy', 'x-frame-options',
+    'content-security-policy', 'cache-control', 'connection']
+    .every((n) => head(r).toLowerCase().includes(n + ':'));
+  const legacyNoVersion = await rawRequest(`GET /app.js\r\nHost: 127.0.0.1:${port}\r\n\r\n`);
+  check('versionless request refused FRAMED 400 with defensive headers (never a bare body)',
+        status(legacyNoVersion) === 400 && defensive(legacyNoVersion) &&
+        jsonOf(legacyNoVersion)?.code === 'unsupported_request_version' &&
+        !body(legacyNoVersion).includes('console.log'),
+        head(legacyNoVersion).split('\r\n')[0]);
+  const legacy09 = await rawRequest(`GET /app.js HTTP/0.9\r\nHost: 127.0.0.1:${port}\r\n\r\n`);
+  check('explicit HTTP/0.9 refused FRAMED 400 with defensive headers (never served)',
+        status(legacy09) === 400 && defensive(legacy09) &&
+        jsonOf(legacy09)?.code === 'unsupported_request_version',
+        head(legacy09).split('\r\n')[0]);
+  const brokenLine = await rawRequest('BROKEN\r\n\r\n');
+  check('broken request line FRAMED typed 400 with defensive headers',
+        status(brokenLine) === 400 && defensive(brokenLine) &&
+        jsonOf(brokenLine)?.code === 'malformed_request',
+        head(brokenLine).split('\r\n')[0]);
+  const http20 = await rawRequest(`GET /api/v1/status HTTP/2.0\r\nHost: 127.0.0.1:${port}\r\n\r\n`);
+  check('HTTP/2.0 refused FRAMED 505 with defensive headers',
+        status(http20) === 505 && defensive(http20),
+        head(http20).split('\r\n')[0]);
+  // Malformed HEAD legs: framed refusals with an honest Content-Length but
+  // NEVER a payload (the HEAD framing contract holds even pre-dispatch).
+  for (const wire of [`HEAD /app.js\r\nHost: 127.0.0.1:${port}\r\n\r\n`,
+                      `HEAD /app.js HTTP/0.9\r\nHost: 127.0.0.1:${port}\r\n\r\n`]) {
+    const r = await rawRequest(wire);
+    check(`malformed HEAD leg framed with NO payload (${wire.split('\r\n')[0]})`,
+          status(r) === 400 && defensive(r) && body(r).length === 0 &&
+          /content-length: \d+/i.test(head(r)),
+          head(r).split('\r\n')[0]);
+  }
 }
 
 function rawChunked() {
