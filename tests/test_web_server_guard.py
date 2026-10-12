@@ -21,7 +21,12 @@ PORT = 8765
 
 
 def h(**name_to_values: list[str]) -> dict[str, list[str]]:
-    return {k.replace("_", "-"): v for k, v in name_to_values.items()}
+    out = {k.replace("_", "-"): v for k, v in name_to_values.items()}
+    # POST-shaped fixtures (carrying the UI header) always carry the exact
+    # JSON content type unless a test overrides it explicitly.
+    if "x-qwen-ui" in out and "content-type" not in out:
+        out["content-type"] = ["application/json"]
+    return out
 
 
 # ---------------------------------------------------------------- Host
@@ -104,8 +109,161 @@ def test_transfer_encoding_and_expect_policy():
     assert server.header_policy("POST", te, ok_origin).code == "transfer_encoding_unsupported"
     ex = dict(post); ex["expect"] = ["PGFQ 10"]
     assert server.header_policy("POST", ex, ok_origin).status == 417
-    ex = dict(post); ex["expect"] = ["100-Continue"]
-    assert server.header_policy("POST", ex, ok_origin) is None
+    # Closed posture: NO Expect extension at all, including 100-continue —
+    # the server never emits an early 100 before Host/Origin/length checks.
+    for expect_value in ("100-Continue", "100-continue"):
+        ex = dict(post); ex["expect"] = [expect_value]
+        err = server.header_policy("POST", ex, ok_origin)
+        assert err is not None and err.status == 417, expect_value
+
+
+def test_content_type_exact_json_enforced_before_body():
+    ok_origin = "http://127.0.0.1:8765"
+    base = h(origin=[ok_origin], x_qwen_ui=["1"], content_length=["5"])
+    good = dict(base); good["content-type"] = ["application/json"]
+    assert server.header_policy("POST", good, ok_origin) is None
+    good_cs = dict(base)
+    good_cs["content-type"] = ["application/json; charset=UTF-8"]
+    assert server.header_policy("POST", good_cs, ok_origin) is None
+    for bad in ("text/plain;charset=UTF-8",
+                "application/x-www-form-urlencoded",
+                "application/json; charset=iso-8859-1",
+                "application/jsonx", "application/json;charset=utf8", ""):
+        wrong = dict(base); wrong["content-type"] = [bad]
+        err = server.header_policy("POST", wrong, ok_origin)
+        assert err is not None and err.status == 415, bad
+    missing = dict(base); missing.pop("content-type")
+    assert server.header_policy("POST", missing, ok_origin).status == 415
+    dup = dict(base); dup["content-type"] = ["application/json", "application/json"]
+    assert server.header_policy("POST", dup, ok_origin).status == 400
+
+
+def test_long_digit_headers_are_typed_not_500():
+    # Arbitrary-length digit strings never reach int() unguarded.
+    _, err = server.validate_host(["127.0.0.1:" + "9" * 10000], "127.0.0.1", 8765)
+    assert err is not None
+    ok_origin = "http://127.0.0.1:8765"
+    headers = h(origin=[ok_origin], x_qwen_ui=["1"], content_length=["9" * 10000],
+                content_type=["application/json"])
+    err = server.header_policy("POST", headers, ok_origin)
+    assert err is not None and err.status in (400, 413)
+
+
+def test_overload_response_is_well_formed():
+    head, _, body = server._OVERLOAD_BYTES.partition(b"\r\n\r\n")
+    declared = [int(line.split(b":")[1])
+                for line in head.split(b"\r\n") if line.lower().startswith(b"content-length")]
+    assert declared == [len(body)]
+    assert body.endswith(b"\n") and b"overloaded" in body
+    assert head.startswith(b"HTTP/1.1 503") and b"access-control" not in head.lower()
+
+
+def test_overload_refusal_carries_the_FULL_defensive_header_set():
+    # The raw sendall path must NOT drift from the header set every other
+    # response carries: reuse of the shared constant is asserted, not just
+    # some fixed headers.
+    head = server._OVERLOAD_BYTES.partition(b"\r\n\r\n")[0]
+    for name, value in server._DEFENSIVE_HEADERS:
+        assert f"{name}: {value}".encode("ascii") in head, name
+    assert b"Content-Security-Policy" in head and b"Referrer-Policy" in head
+    assert b"Cross-Origin-Resource-Policy: same-origin" in head
+    assert b"X-Frame-Options: DENY" in head
+    assert not any(name.lower().startswith(b"access-control")
+                   for name in (line.split(b":")[0] for line in head.split(b"\r\n")))
+    # built FROM the constant (one source of truth), not a second literal list
+    import inspect
+    src = inspect.getsource(server._raw_refusal_bytes)
+    assert "_DEFENSIVE_HEADERS" in src
+
+
+class _FakeSocket:
+    """Records closes only — never a real socket (the guard denies those)."""
+
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def test_drain_connection_queue_closes_every_queued_socket():
+    import queue as _queue
+
+    q: _queue.Queue = _queue.Queue()
+    sockets = [_FakeSocket() for _ in range(5)]
+    for s in sockets:
+        q.put((s, ("127.0.0.1", 1234)))
+    assert server.drain_connection_queue(q) == 5
+    assert all(s.closed == 1 for s in sockets)
+    assert q.empty()
+    assert q.unfinished_tasks == 0          # every item was task_done'd
+    # idempotent on an already-empty queue
+    assert server.drain_connection_queue(q) == 0
+
+
+def test_stop_workers_terminates_persistent_workers_in_finite_time():
+    import queue as _queue
+    import threading
+    import time
+
+    q: _queue.Queue = _queue.Queue()
+    done = _queue.Queue()
+
+    def worker():
+        while True:
+            item = q.get()
+            if item is server._WORKER_SHUTDOWN:
+                q.task_done()
+                done.put("exit")
+                return
+            q.task_done()
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(3)]
+    for t in threads:
+        t.start()
+    t0 = time.monotonic()
+    server.stop_workers(q, threads)
+    assert time.monotonic() - t0 < 5.0, "shutdown must be finite"
+    assert all(not t.is_alive() for t in threads), "workers must have exited"
+    assert done.qsize() == 3
+    # a second stop on dead workers must not raise or block forever
+    server.stop_workers(q, threads)
+
+
+def test_server_close_owns_its_worker_pool_lifecycle():
+    # server_close must drain the queue and stop the pool (no live worker
+    # leak, no dangling queued sockets) with finite bounds — verified via
+    # the source wiring and the pure helpers, no sockets here.
+    import inspect
+
+    src = inspect.getsource(server._Server.server_close)
+    assert "drain_connection_queue(self._queue)" in src
+    assert "stop_workers(self._queue, self._workers)" in src
+    assert "_stopping = True" in src
+    close_src = inspect.getsource(server._Server.process_request)
+    assert "_stopping" in close_src, "connections after stop must not queue"
+
+
+def test_every_method_obeyes_common_policy_before_typing_the_rejection():
+    # The catch-all routes ANY method through header_policy first: an
+    # unsupported method with a foreign Origin is 403, not a 501 page.
+    ok_origin = "http://127.0.0.1:8765"
+    for method in ("OPTIONS", "CONNECT", "TRACE", "FOOBAR"):
+        err = server.header_policy(method, h(origin=["http://evil.example"]),
+                                   ok_origin)
+        assert err is not None and err.status == 403, method
+        assert server.header_policy(method, h(origin=[ok_origin]),
+                                    ok_origin) is None, method
+        # known routes answer 405 with an Allow header; unknown 404 — typed
+        # JSON either way, never the stock 501 HTML page
+        with pytest.raises(api.ApiError) as exc:
+            server.resolve_route(method, "/api/v1/plan")
+        assert exc.value.status == 405, method
+        assert exc.value.headers == (("Allow", "POST"),), method
+    import inspect
+    handler_src = inspect.getsource(server._Handler.handle_one_request)
+    assert "_dispatch(self.command)" in handler_src, \
+        "methods without a do_* dispatcher must hit the policy path"
 
 
 # ---------------------------------------------------------------- routes
@@ -239,3 +397,22 @@ def test_web_import_is_ml_free_and_never_touches_weights():
     proc = subprocess.run([sys.executable, "-B", "-c", code],
                           capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
+
+
+def test_chrome_lifecycle_protocol_selfcheck_pure():
+    # Pure protocol checks for the shared Chrome helpers (no Chrome launch,
+    # no fake DOM): timeouts, pending cleanup, group-only signals, spawn
+    # errors, and the documented no---no-zygote source fact.
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    script = (Path(__file__).resolve().parent.parent
+              / "scripts" / "chrome_lifecycle_selfcheck.mjs")
+    proc = subprocess.run([node, str(script)], capture_output=True,
+                          text=True, timeout=180)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "FAIL" not in proc.stdout
+    assert "remains explicitly pending" in proc.stdout  # honesty note present

@@ -36,11 +36,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import queue
 import socket
 import stat as stat_module
 import sys
+import threading
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib import resources
 from typing import Any
 
@@ -60,6 +63,16 @@ DEFAULT_PORT = 8765
 MAX_BODY_BYTES = 64 * 1024
 #: Finite socket/read timeout applied before any header or body read.
 CONNECTION_TIMEOUT_SECONDS = 30
+#: Concurrency cap: a small pool of PERSISTENT worker threads serves this
+#: single-user local development server. No thread is ever spawned per
+#: connection (thread churn exhausts pid-limited containers), and extra
+#: connections are refused (503) once the queue backs up.
+MAX_CONCURRENT_HANDLERS = 4
+MAX_QUEUED_CONNECTIONS = 16
+#: Exactly application/json, optional utf-8 charset parameter — a form
+#: content type is refused 415 before the body is ever read.
+_JSON_CONTENT_TYPE_RE = re.compile(
+    r"application/json(\s*;\s*charset\s*=\s*utf-8)?\Z", re.IGNORECASE)
 
 STATIC_ASSETS = ("index.html", "app.css", "app.js")
 STATIC_ROUTES = {
@@ -115,8 +128,11 @@ def validate_host(values: list[str], bound_ip: str,
     name, sep, port_part = host.rpartition(":")
     if not sep or not name:
         return None, "Host must include the bound port (host:port)"
-    if not port_part.isdigit() or not port_part.isascii() or int(port_part) > 65535:
-        return None, "Host port must be a plain ASCII decimal port"
+    # Bounded digit conversion BEFORE int() — an arbitrary-length digit
+    # string must be a typed refusal, never a ValueError -> 500.
+    if not port_part.isdigit() or not port_part.isascii() \
+            or len(port_part) > 5:
+        return None, "Host port must be a plain ASCII decimal port (max 5 digits)"
     if len(port_part) > 1 and port_part[0] == "0":
         return None, "Host port must not have leading zeros"
     if int(port_part) != port:
@@ -138,7 +154,7 @@ def header_policy(method: str, headers: dict[str, list[str]],
         return None
 
     for name in ("origin", "sec-fetch-site", "x-qwen-ui", "content-length",
-                 "expect"):
+                 "expect", "content-type"):
         err = dup(name)
         if err:
             return err
@@ -167,9 +183,18 @@ def header_policy(method: str, headers: dict[str, list[str]],
         return ApiError(400, "transfer_encoding_unsupported",
                         "chunked/Transfer-Encoding requests are not supported")
     expect = headers.get("expect", [None])[0]
-    if expect is not None and expect.lower() != "100-continue":
+    if expect is not None:
+        # NO Expect extension is supported — including 100-continue: the
+        # server never emits an early 100 before Host/Origin/length
+        # validation and never reads an unsupported Expect body.
         return ApiError(417, "expectation_failed",
                         "this server supports no Expect extensions")
+    types = headers.get("content-type", [])
+    if not types or not _JSON_CONTENT_TYPE_RE.match(types[0].strip()):
+        return ApiError(415, "unsupported_media_type",
+                        "POST body must be application/json (a form or "
+                        "other content type is refused before the body is "
+                        "read)")
     lengths = headers.get("content-length", [])
     if not lengths:
         return ApiError(411, "length_required",
@@ -179,7 +204,9 @@ def header_policy(method: str, headers: dict[str, list[str]],
         return ApiError(400, "invalid_content_length",
                         "Content-Length must be one plain ASCII decimal "
                         "without signs or whitespace")
-    if int(raw) > MAX_BODY_BYTES:
+    # Bounded digit conversion BEFORE int() (arbitrary-length digit strings
+    # must be typed refusals, never a ValueError -> 500).
+    if len(raw) > 6 or int(raw) > MAX_BODY_BYTES:
         return ApiError(413, "request_too_large",
                         f"request bodies are capped at {MAX_BODY_BYTES} bytes")
     return None
@@ -208,8 +235,10 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "export", target
     known = set(STATIC_ROUTES) | {STATUS_ROUTE, PLAN_ROUTE, EXPORT_ROUTE}
     if target in known:
+        allow = "POST" if target in (PLAN_ROUTE, EXPORT_ROUTE) else "GET"
         raise ApiError(405, "method_not_allowed",
-                       "this route does not accept that method")
+                       "this route does not accept that method",
+                       headers=(("Allow", allow),))
     raise ApiError(404, "not_found", "no such route")
 
 
@@ -236,14 +265,31 @@ def read_manifest_limited(path: str) -> tuple[bytes | None, str | None]:
             st = os.fstat(fd)
             if not stat_module.S_ISREG(st.st_mode):
                 return None, api.MANIFEST_UNREADABLE
-            data = os.read(fd, _MANIFEST_LIMIT + 1)
+            # BOUNDED chunk loop to EOF (a single os.read may legitimately
+            # return fewer bytes than requested); past the cap it is typed
+            # too-large, never buffered further.
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                try:
+                    chunk = os.read(fd, 1 << 16)
+                except OSError:
+                    return None, api.MANIFEST_UNREADABLE
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MANIFEST_LIMIT:
+                    return None, "manifest_too_large"
+                chunks.append(chunk)
         except OSError:
             return None, api.MANIFEST_UNREADABLE
-        if len(data) > _MANIFEST_LIMIT:
-            return None, "manifest_too_large"
-        return data, None
+        return b"".join(chunks), None
     finally:
-        os.close(fd)
+        # A close failure must never mask the primary outcome.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def load_static_assets() -> dict[str, bytes]:
@@ -298,9 +344,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
         payload = resp.payload if resp.payload is not None else \
             ApiError(500, "internal_error", "empty response").to_payload()
+        # allow_nan=False: no non-finite number may ever become an invalid
+        # JSON token on the wire, whatever upstream produced it.
         self._send(resp.status,
-                   (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"),
-                   "application/json; charset=utf-8")
+                   (json.dumps(payload, sort_keys=True,
+                               allow_nan=False) + "\n").encode("utf-8"),
+                   "application/json; charset=utf-8",
+                   resp.headers)
 
     def send_error(self, code: int, message: str | None = None,
                    explain: str | None = None) -> None:
@@ -310,14 +360,71 @@ class _Handler(BaseHTTPRequestHandler):
                        message or HTTPStatus(code).phrase)
         self._send_api(ApiResponse(status=code, payload=err.to_payload()))
 
+    def parse_request(self) -> bool:
+        ok = super().parse_request()
+        if ok:
+            # Keep the RAW wire target: the stdlib normalizes a leading '//'
+            # in self.path before we would see it — routing must consider
+            # both, so a real '//x' request is refused, never served.
+            raw = self.raw_requestline
+            if isinstance(raw, bytes):
+                raw = raw.decode("iso-8859-1", "replace")
+            parts = raw.strip().split(" ")
+            self.raw_target = parts[1] if len(parts) >= 2 else ""
+        return ok
+
     def handle_expect_100(self) -> bool:
-        expect = self.headers.get("Expect")
-        if expect is not None and expect.lower() != "100-continue":
-            self.send_error(417, "unsupported Expect extension")
-            return False
-        self.send_response_only(HTTPStatus.CONTINUE)
-        self.end_headers()
-        return True
+        # NO Expect extension is supported (including 100-continue): never
+        # send an early 100 before Host/Origin/length validation, never read
+        # an unsupported Expect body. The 417 itself goes through the same
+        # Host/header policy first.
+        headers = self._header_map()
+        host_origin, host_err = validate_host(headers.get("host", []),
+                                              self.server.bound_ip,
+                                              self.server.bound_port)
+        if host_err is not None:
+            err = ApiError(400, "invalid_host", host_err)
+        else:
+            err = header_policy(self.command, headers, host_origin) or \
+                ApiError(417, "expectation_failed",
+                         "this server supports no Expect extensions")
+        self._send_api(ApiResponse(status=err.status, payload=err.to_payload(),
+                                   headers=err.headers))
+        return False
+
+    def handle_one_request(self) -> None:
+        # EVERY parsed method — including ones with no do_* dispatcher at
+        # all (TRACE, FOOBAR, ...) — goes through the SAME Host/Origin
+        # header policy and the typed 405/404 JSON path, instead of the
+        # stock unguarded 501 HTML error page. Structural mirror of the
+        # stdlib implementation with the unknown-method branch re-pointed.
+        try:
+            try:
+                self.raw_requestline = self.rfile.readline(65537)
+                if len(self.raw_requestline) > 65536:
+                    self.requestline = ""
+                    self.request = ""
+                    self.close_connection = True
+                    return
+                if not self.raw_requestline:
+                    self.close_connection = True
+                    return
+                if not self.parse_request():  # an error was already sent
+                    return
+                name = "do_" + self.command
+                method = getattr(self, name, None) if name.isidentifier() else None
+                if method is not None:
+                    method()
+                else:
+                    self._dispatch(self.command)
+            except TimeoutError as exc:  # pragma: no cover - socket timeout
+                self.log_error("Request timed out: %r", exc)
+                self.close_connection = True
+                return
+            self.wfile.flush()
+        finally:
+            self.request_version = None
+            self.command = None
 
     def _dispatch(self, method: str) -> None:
         try:
@@ -332,9 +439,14 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             err = header_policy(method, headers, host_origin)
             if err is not None:
-                self._send_api(ApiResponse(status=err.status, payload=err.to_payload()))
+                self._send_api(ApiResponse(status=err.status, payload=err.to_payload(),
+                                           headers=err.headers))
                 return
-            kind, arg = resolve_route(method, self.path)
+            # Route on the RAW wire target (fall back to self.path only if
+            # the raw line could not be captured): the stdlib folds '//'
+            # targets before self.path, so checking raw closes that gap.
+            target = getattr(self, "raw_target", None) or self.path
+            kind, arg = resolve_route(method, target)
             if kind == "static":
                 asset, ctype = STATIC_ROUTES[arg]
                 self._send(200, self.server.assets[asset], ctype)
@@ -351,7 +463,8 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     self._send_api(api.export_response(self.server.web_runtime, body))
         except ApiError as exc:
-            self._send_api(ApiResponse(status=exc.status, payload=exc.to_payload()))
+            self._send_api(ApiResponse(status=exc.status, payload=exc.to_payload(),
+                                       headers=exc.headers))
         except (TimeoutError, socket.timeout, ConnectionError, OSError):
             # A dead/slow socket is simply closed; nothing to report.
             self.close_connection = True
@@ -364,35 +477,196 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._dispatch("POST")
 
+    # EVERY other method goes through the same Host/Origin/header policy
+    # BEFORE the typed 405/404 — no method bypasses the checks. OPTIONS
+    # grants nothing: no CORS preflight, ever (the 405 carries Allow, never
+    # an Access-Control-* header).
     def do_OPTIONS(self) -> None:
-        # OPTIONS grants nothing: no CORS preflight, ever. Plain typed 405.
-        self._send_api(ApiResponse(
-            status=405,
-            payload=ApiError(405, "method_not_allowed",
-                             "OPTIONS does not grant cross-origin access").to_payload()))
+        self._dispatch("OPTIONS")
 
-    def _deny_method(self) -> None:
-        self._send_api(ApiResponse(
-            status=405,
-            payload=ApiError(405, "method_not_allowed",
-                             "only GET (static/status) and POST (plan/export) "
-                             "are served").to_payload()))
+    def do_HEAD(self) -> None:
+        self._dispatch("HEAD")
 
-    do_HEAD = _deny_method
-    do_PUT = _deny_method
-    do_DELETE = _deny_method
-    do_PATCH = _deny_method
-    do_TRACE = _deny_method
+    def do_PUT(self) -> None:
+        self._dispatch("PUT")
+
+    def do_DELETE(self) -> None:
+        self._dispatch("DELETE")
+
+    def do_PATCH(self) -> None:
+        self._dispatch("PATCH")
+
+    def do_TRACE(self) -> None:
+        self._dispatch("TRACE")
 
 
-class _Server(ThreadingHTTPServer):
-    daemon_threads = True
+# ---------------------------------------------------------------------------
+# Server: bounded persistent worker pool with a finite, leak-free close
+# ---------------------------------------------------------------------------
+
+
+#: Sentinel asked of each worker at graceful shutdown (never a connection).
+_WORKER_SHUTDOWN = object()
+
+
+def drain_connection_queue(conn_queue: "queue.Queue[Any]") -> int:
+    """Close every connection still WAITING in the queue without handling
+    it (graceful shutdown must not leave queued sockets dangling). Returns
+    the number closed. Pure: takes a queue, needs no sockets of its own."""
+    closed = 0
+    while True:
+        try:
+            request, _client_address = conn_queue.get_nowait()
+        except queue.Empty:
+            return closed
+        try:
+            request.close()
+        except OSError:  # pragma: no cover - already closed
+            pass
+        conn_queue.task_done()
+        closed += 1
+
+
+def stop_workers(conn_queue: "queue.Queue[Any]",
+                 workers: list[threading.Thread],
+                 put_timeout: float = 2.0,
+                 join_timeout: float = 5.0) -> None:
+    """Ask each started worker to exit (one sentinel per worker) and join
+    with FINITE timeouts — never blocking forever. A worker mid-request is
+    already bounded by the handler socket timeout; the threads are daemons
+    as the last-resort backstop. Pure except for thread join/put bounds."""
+    for _ in workers:
+        try:
+            conn_queue.put(_WORKER_SHUTDOWN, timeout=put_timeout)
+        except Exception:  # full/broken queue: worker sees _stopping instead
+            break
+    for t in workers:
+        t.join(join_timeout)
+
+
+class _Server(HTTPServer):
+    """Loopback server with a BOUNDED POOL of persistent worker threads —
+    no per-connection thread creation, finite handler idle timeout via
+    _Handler.timeout, typed 503 when saturated."""
     allow_reuse_address = False
 
     web_runtime: WebRuntime
     assets: dict[str, bytes]
     bound_ip: str
     bound_port: int
+
+    def __init__(self, addr_info, handler) -> None:
+        super().__init__(addr_info, handler)
+        self._queue: "queue.Queue[Any]" = queue.Queue(
+            maxsize=MAX_QUEUED_CONNECTIONS)
+        self._workers: list[threading.Thread] = []
+        self._pool_ready = False
+        self._stopping = False
+
+    def _ensure_pool(self) -> None:
+        # Lazily started on the first connection: startup itself then costs
+        # no extra threads (kind to pid-limited containers). If the box
+        # cannot start ANY worker thread we serve serially instead of
+        # dying — still correct, just single-flight.
+        if self._pool_ready or self._stopping:
+            return
+        self._pool_ready = True
+        for i in range(MAX_CONCURRENT_HANDLERS):
+            t = threading.Thread(target=self._worker,
+                                 name=f"qwen-web-worker-{i}", daemon=True)
+            try:
+                t.start()
+                self._workers.append(t)
+            except RuntimeError:  # cannot start thread here — serial fallback
+                break
+
+    def process_request(self, request, client_address) -> None:
+        self._ensure_pool()
+        if self._stopping:
+            # Graceful shutdown already started: refuse without queueing so
+            # no socket is ever left dangling in the queue.
+            try:
+                request.sendall(_OVERLOAD_BYTES)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        if not self._workers:
+            # Serial fallback: handle in the accept thread (bounded by the
+            # handler socket timeout), never spawn per connection.
+            try:
+                try:
+                    self.finish_request(request, client_address)
+                except Exception:
+                    self.handle_error(request, client_address)
+                finally:
+                    self.shutdown_request(request)
+            except Exception:
+                pass
+            return
+        try:
+            self._queue.put_nowait((request, client_address))
+        except queue.Full:
+            # Saturate guard: fixed bytes, no thread, no buffering.
+            try:
+                request.sendall(_OVERLOAD_BYTES)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+
+    def _worker(self) -> None:
+        while True:
+            try:
+                item = self._queue.get()
+            except OSError:  # interpreter teardown
+                return
+            if item is _WORKER_SHUTDOWN:   # graceful shutdown sentinel
+                self._queue.task_done()
+                return
+            request, client_address = item
+            try:
+                try:
+                    self.finish_request(request, client_address)
+                except Exception:
+                    self.handle_error(request, client_address)
+                finally:
+                    self.shutdown_request(request)
+            finally:
+                self._queue.task_done()
+
+    def server_close(self) -> None:
+        # Graceful shutdown must not leak its OWN pool: close the listening
+        # socket, CLOSE every still-queued connection unhandled (never
+        # dangling), then ask each worker to exit and join with a finite
+        # timeout. Finite handler timeouts remain the only wait inside a
+        # worker; the threads are daemons as the last-resort backstop.
+        self._stopping = True
+        super().server_close()
+        drain_connection_queue(self._queue)
+        stop_workers(self._queue, self._workers)
+        self._workers = []
+
+
+#: Prebuilt overload refusal — built ONCE from the shared _DEFENSIVE_HEADERS
+#: constant so this raw path can NEVER drift away from the defensive header
+#: set every other response carries (CSP, nosniff, frame-deny, no-referrer,
+#: CORP, no-store, close). It must stay far below the kernel socket buffer:
+#: one sendall, never reading the (possibly oversize) request.
+def _raw_refusal_bytes(status_line: str, body: bytes) -> bytes:
+    lines = [status_line.encode("ascii"),
+             b"Content-Type: application/json; charset=utf-8"]
+    lines += [f"{name}: {value}".encode("ascii")
+              for name, value in _DEFENSIVE_HEADERS]
+    lines.append(f"Content-Length: {len(body)}".encode("ascii"))
+    return b"\r\n".join(lines) + b"\r\n\r\n" + body
+
+
+_OVERLOAD_BODY = (
+    b'{"schema":"qwen_engine.web_error.v1","code":"overloaded",'
+    b'"message":"too many concurrent connections; retry"}\n'
+)
+_OVERLOAD_BYTES = _raw_refusal_bytes("HTTP/1.1 503 Service Unavailable",
+                                     _OVERLOAD_BODY)
 
 
 # ---------------------------------------------------------------------------
@@ -455,12 +729,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     paths = {
-        "output_dir": None if args.output_dir is None else os.path.abspath(args.output_dir),
-        "cache_dir": None if args.cache_dir is None else os.path.abspath(args.cache_dir),
-        "log_dir": None if args.log_dir is None else os.path.abspath(args.log_dir),
-        "benchmarks_dir": None if args.benchmarks_dir is None else os.path.abspath(args.benchmarks_dir),
-        "models_dir": None if args.models_dir is None else os.path.abspath(args.models_dir),
-        "manifest_path": None if args.manifest is None else os.path.abspath(args.manifest),
+        # SAFELY RESOLVED at startup (realpath normalizes symlinks/'..' —
+        # never abspath-only, which would leave a final-symlink swap to
+        # request time; the manifest FD is then opened with O_NOFOLLOW on
+        # the resolved path, so the read cannot be diverted either).
+        "output_dir": None if args.output_dir is None else os.path.realpath(args.output_dir),
+        "cache_dir": None if args.cache_dir is None else os.path.realpath(args.cache_dir),
+        "log_dir": None if args.log_dir is None else os.path.realpath(args.log_dir),
+        "benchmarks_dir": None if args.benchmarks_dir is None else os.path.realpath(args.benchmarks_dir),
+        "models_dir": None if args.models_dir is None else os.path.realpath(args.models_dir),
+        "manifest_path": None if args.manifest is None else os.path.realpath(args.manifest),
     }
     status = _startup_config_or_exit(paths)
     if status:
