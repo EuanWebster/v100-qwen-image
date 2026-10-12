@@ -55,16 +55,19 @@
 
   // Accepted grammar (deliberately strict, checked BEFORE any BigInt):
   //   * surrounding whitespace trimmed;
+  //   * at most SEED_MAX_DIGITS (20) characters AFTER trimming — length is
+  //     bounded first so a longer string is rejected as-is even if leading
+  //     zeros would put its value in range (documented policy; the HTML has
+  //     deliberately NO maxlength, because maxlength silently TRUNCATES a
+  //     pasted 21-digit value into a DIFFERENT valid seed — losing user
+  //     input; parseSeed rejects instead);
   //   * ASCII decimal digits only (\d is ASCII-only without /u);
-  //   * at most SEED_MAX_DIGITS (20) characters AFTER trimming — so a string
-  //     of 21+ digits is rejected even if leading zeros would put its value
-  //     in range (documented policy: length is bounded before parsing);
   //   * the parsed value must be within [0, 2^64 - 1].
   // The full uint64 maximum stays representable as an exact decimal STRING.
   function parseSeed(str) {
     var s = String(str).trim();
-    if (!/^\d+$/.test(s)) return null;
     if (s.length > SEED_MAX_DIGITS) return null;
+    if (!/^\d+$/.test(s)) return null;
     var value;
     try { value = BigInt(s); } catch (err) { return null; }
     if (value < SEED_MIN || value > SEED_MAX) return null;
@@ -96,14 +99,29 @@
 
   function validateForm() {
     var errors = {};
+    // GenerationConfig (config.py) requires a non-empty trimmed prompt, so
+    // the form mirrors that — surfaced only after the user has touched the
+    // prompt or tried to submit (no intrusive alert on first paint, and we
+    // never auto-fill anything).
+    if (!$('prompt').value.trim()) {
+      errors.prompt = 'Prompt must not be empty — enter the text you want ' +
+                      'used exactly as typed.';
+    }
     var steps = Number($('steps').value);
     if (!Number.isInteger(steps) || steps < 1 || steps > 1000) {
       errors.steps = 'Steps must be a whole number from 1 to 1000.';
     }
     var seedStr = seedWireString($('seed').value);
     if (seedStr === null) {
-      errors.seed = 'Seed must be a whole-number string of at most ' +
-                    SEED_MAX_DIGITS + ' digits, from 0 to ' + SEED_MAX + '.';
+      var seedRaw = String($('seed').value).trim();
+      if (/^\d+$/.test(seedRaw) && seedRaw.length > SEED_MAX_DIGITS) {
+        errors.seed = 'Seed is too long: at most ' + SEED_MAX_DIGITS +
+                      ' decimal digits. The text was kept exactly as entered ' +
+                      '(nothing was truncated).';
+      } else {
+        errors.seed = 'Seed must be a whole-number string of at most ' +
+                      SEED_MAX_DIGITS + ' digits, from 0 to ' + SEED_MAX + '.';
+      }
     }
     var cfg = Number($('cfg').value);
     if (!Number.isFinite(cfg) || cfg < 1) {
@@ -123,14 +141,21 @@
     if (el) el.setAttribute('aria-invalid', invalid ? 'true' : 'false');
   }
 
+  var promptTouched = false;
+
   function renderValidation(errors) {
     setText('steps-error', errors.steps || '');
     setText('seed-error', errors.seed || '');
     setText('cfg-error', errors.cfg || '');
     setText('dims-error', errors.dims || '');
+    // The prompt error only appears once the user has edited the prompt or
+    // attempted to submit — never as a first-load alert.
+    var showPrompt = promptTouched && !!errors.prompt;
+    setText('prompt-error', showPrompt ? errors.prompt : '');
     setAriaInvalid('steps', !!errors.steps);
     setAriaInvalid('seed', !!errors.seed);
     setAriaInvalid('cfg', !!errors.cfg);
+    setAriaInvalid('prompt', showPrompt);
     // The dimension error message is shared, so it marks BOTH controls.
     setAriaInvalid('width', !!errors.dims);
     setAriaInvalid('height', !!errors.dims);
@@ -241,8 +266,18 @@
 
   function routeOnHashchange() {
     var name = (location.hash || '').replace(/^#/, '');
+    if (name === '') {
+      // Empty hash is Create. Without this, navigating History from an
+      // initially-hash-less page and pressing browser Back would keep
+      // History instead of restoring Create.
+      if (activeView !== 'create') {
+        renderView('create');
+        $('create-heading').focus();   // user-driven back/forward only
+      }
+      return;
+    }
     if (!Object.prototype.hasOwnProperty.call(VIEWS, name)) {
-      return;   // unknown hash (#main, #whatever): keep the current view
+      return;   // unknown non-empty hash (#main, #whatever): keep current view
     }
     if (name === activeView) return;
     renderView(name);
@@ -274,6 +309,7 @@
   function init() {
     $('create-form').addEventListener('submit', function (ev) {
       ev.preventDefault();
+      promptTouched = true;
       renderValidation(validateForm().errors);
       refuseSubmit();
     });
@@ -281,6 +317,7 @@
     $('create-form').addEventListener('keydown', function (ev) {
       if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') {
         ev.preventDefault();
+        promptTouched = true;
         renderValidation(validateForm().errors);
         refuseSubmit();
       }
@@ -304,6 +341,7 @@
           setPreviewAspect(Number($('width').value), Number($('height').value));
           syncPresetButtons();
         }
+        if (id === 'prompt') promptTouched = true;
         renderValidation(validateForm().errors);
       });
     });

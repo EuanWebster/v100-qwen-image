@@ -37,9 +37,10 @@
             <label for="prompt">Prompt</label>
             <textarea id="prompt" name="prompt" rows="4"
               placeholder="Describe the image you want to generate…"
-              aria-describedby="prompt-help"></textarea>
+              aria-describedby="prompt-help prompt-error"></textarea>
             <p id="prompt-help" class="help">Your words are used exactly as typed.
               Nothing is generated or auto-filled for you.</p>
+            <p class="error" id="prompt-error" aria-live="polite"></p>
           </div>
 
           <fieldset class="field preset-field">
@@ -66,8 +67,8 @@
             <label for="seed">Seed</label>
             <div class="seed-row">
               <input id="seed" name="seed" type="text" value="0"
-                     inputmode="numeric" spellcheck="false" maxlength="20"
-                     title="Whole number 0–18446744073709551615 (up to 20 decimal digits), kept as an exact decimal string and never rounded. Strings longer than 20 digits are rejected, including ones padded with leading zeros."
+                     inputmode="numeric" spellcheck="false"
+                     title="Whole number 0–18446744073709551615 (up to 20 decimal digits), kept as an exact decimal string and never rounded. Longer strings are rejected as entered — nothing is ever truncated to fit."
                      aria-describedby="seed-help seed-error">
               <button type="button" id="random-seed" class="btn-secondary"
                       title="Generate a cryptographically random seed">Random</button>
