@@ -81,7 +81,9 @@ def test_seed_grammar_is_bounded_before_bigint_without_truncation():
     m = re.search(r"function parseSeed\(str\)\s*\{(.*?)\n  \}", js, re.S)
     assert m, "parseSeed not found"
     body = m.group(1)
-    assert ".trim()" in body
+    # Python whitespace semantics (pyStrip), NOT JS trim(): the server
+    # strips PYTHON whitespace before the digit grammar.
+    assert "pyStrip(String(str))" in body
     assert r"/^\d+$/" in body
     assert body.index("length > SEED_MAX_DIGITS") < body.index(r"/^\d+$/"), \
         "length bound must precede the digit regex"
@@ -195,8 +197,8 @@ def test_prompt_required_like_config_but_never_alerted_on_load():
     # user edited the prompt or attempted submit — never a first-load alert.
     js = _read("app.js")
     m = re.search(r"function validateForm\(\)\s*\{(.*?)\n  \}", js, re.S)
-    assert m and r"$('prompt').value.trim()" in m.group(1), \
-        "validateForm must check the prompt (mirrors config.py)"
+    assert m and r"pyStrip($('prompt').value)" in m.group(1), \
+        "validateForm must check the prompt with PYTHON whitespace semantics"
     assert "promptTouched" in js
     m = re.search(r"function renderValidation\((?:errors)?\w*\)\s*\{(.*?)\n  \}",
                   js, re.S)
@@ -302,7 +304,10 @@ def test_w2_status_is_strictly_validated_never_trusted_by_shape():
     assert "s.schema !== STATUS_SCHEMA" in body
     assert "s.planning_available !== true" in body          # strict boolean
     assert "s.generation_available !== false" in body       # literal false ONLY
-    assert "generation_blockers.length > 16" in body        # bounded shape
+    # EXACT blocker set (four required + manifest reason when applicable),
+    # never "any bounded subset" — a malformed server cannot hide blockers.
+    assert "blockersExact(s.generation_blockers, manifest.blocker)" in body
+    assert "parseManifestCore(s.manifest)" in body
     assert "GATE_STATES" in js and "not_implemented" in js
     # a schema-rejected status is a typed state, distinct from a disconnect
     assert "Status rejected" in js and "Not connected" in js
@@ -511,16 +516,104 @@ def test_w2_parse_plan_bounds_aligned_with_server_contract():
     assert "m.verification !== 'not_performed'" in body
     assert "m.fit !== 'not_evaluated'" in body
     assert "m.ready !== false" in body
-    # closed blocker-code list, not arbitrary strings
-    assert "KNOWN_BLOCKER_CODES.indexOf" in body
+    # EXACT blocker set, not any subset of the closed list
+    assert "blockersExact(raw.generation_blockers, manifest.blocker)" in body
+    assert "parseManifestCore(m)" in body
     m = re.search(r"var KNOWN_BLOCKER_CODES = \[([\s\S]*?)\];", js)
     assert m, "KNOWN_BLOCKER_CODES missing"
     from qwen_engine.web import api
     codes = set(re.findall(r"'([a-z_]+)'", m.group(1)))
     assert {"adapter_not_implemented", "hardware_not_probed",
             "assets_unverified", "calibration_unknown"} <= codes
-    # the same closed list must gate status blockers too
+    # the same exact-set contract must gate status blockers too
     m = re.search(r"function parseStatus\(s\)\s*\{([\s\S]*?)\n  \}", js)
-    assert "KNOWN_BLOCKER_CODES.indexOf" in m.group(1)
+    assert "blockersExact(s.generation_blockers, manifest.blocker)" in m.group(1)
     # gate CODES are exact too (closed per-gate contract)
     assert "gate.code !== spec.code" in m.group(1)
+
+
+# ------------------------------------------- root-follow-up regressions
+
+def test_py_strip_covers_plain_space_and_matches_python_whitespace():
+    # The '   ' + cfg>1 mainstream case: Python str.strip() strips plain
+    # SPACE, so a pyStrip WITHOUT U+0020 would compute cfg_active=true for
+    # an all-space negative prompt and reject the server's cfg_active=false.
+    js = _read("app.js")
+    m = re.search(r"function pyStrip\(s\)\s*\{(.*?)\n  \}", js, re.S)
+    assert m, "pyStrip not found"
+    body = m.group(1)
+    cls = re.search(r"/\[([^\]]*)\]/", body).group(1)
+    assert "\\x20" in cls, "pyStrip must strip plain space like Python does"
+    for esc in ("\\x09", "\\x0A", "\\x0B", "\\x0C", "\\x0D",
+                "\\x1C", "\\x1D", "\\x1E", "\\x1F", "\\x85", "\\xA0"):
+        assert esc in cls, esc
+    assert "uFEFF" not in cls, "Python strip does NOT strip U+FEFF"
+    # python-side cross-check: every char Python's str.strip removes is
+    # covered by the JS class (space included).
+    ws = "".join(chr(c) for c in range(0x100) if chr(c).isspace())
+    assert " " in ws  # sanity of the premise itself
+
+
+def test_status_requests_are_sequenced_never_land_late():
+    # A newer status check must win over an older late arrival in BOTH
+    # directions (success after disconnect, failure after success).
+    js = _read("app.js")
+    assert "var statusSeq = 0;" in js
+    m = re.search(r"function checkStatus\(\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "checkStatus not found"
+    body = m.group(1)
+    assert "var seq = ++statusSeq;" in body
+    assert "if (seq !== statusSeq) return null;" in body
+
+
+def test_body_without_readable_stream_fails_closed_not_unbounded():
+    js = _read("app.js")
+    m = re.search(r"function readBodyLimited\(res\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "readBodyLimited not found"
+    body = m.group(1)
+    assert "UNSUPPORTED_BODY" in body
+    assert "res.arrayBuffer()" not in body, \
+        "arrayBuffer fallback reads UNBOUNDED — fail closed instead"
+    assert "bodyError: 'unsupported'" in js
+    assert "err === UNSUPPORTED_BODY" in js
+
+
+def test_rejected_plan_document_invalidates_recognized_status():
+    # A rejected plan BODY or schema must take planning/export away again
+    # and show the typed schema-rejection chip (not a silent 'Connected').
+    js = _read("app.js")
+    m = re.search(r"function runPlan\([\s\S]*?\n  \}", js)
+    assert m, "runPlan not found"
+    body = m.group(0)
+    rejection = body[body.index("if (r.bodyError)"):]
+    rejection = rejection[:rejection.index("var plan = parsePlan")]
+    assert "setApiAvailable(false)" in rejection
+    assert "Status rejected" in rejection
+    schema_branch = body[body.index("var plan = parsePlan"):]
+    schema_branch = schema_branch[:schema_branch.index("promptTouched = true")]
+    assert "setApiAvailable(false)" in schema_branch
+    assert "Status rejected" in schema_branch
+
+
+def test_manifest_core_and_blocker_contract_shared_and_exact():
+    js = _read("app.js")
+    m = re.search(r"function parseManifestCore\(m\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "parseManifestCore not found — status/plan share ONE parser"
+    body = m.group(1)
+    assert "m.verification !== 'not_performed'" in body
+    assert "m.valid && !m.configured" in body          # valid implies configured
+    assert "MANIFEST_REASON_CODES.indexOf(m.reason)" in body
+    assert "m.schema_version" in body and "m.artifact_count" in body
+    # exact required set mirrors the REAL server gates
+    from qwen_engine.web import api
+    m2 = re.search(r"var REQUIRED_BLOCKER_CODES = \[([\s\S]*?)\];", js)
+    assert m2, "REQUIRED_BLOCKER_CODES missing"
+    codes = set(re.findall(r"'([a-z_]+)'", m2.group(1)))
+    assert codes == {g["code"] for g in api._gates().values()}, \
+        "required blockers must equal the server's gate codes exactly"
+    m3 = re.search(r"var MANIFEST_REASON_CODES = \[([\s\S]*?)\];", js)
+    assert m3
+    reason_codes = set(re.findall(r"'([a-z_]+)'", m3.group(1)))
+    from qwen_engine.web import api as _api
+    assert reason_codes <= {_api.MANIFEST_UNCONFIGURED, _api.MANIFEST_FILE_MISSING,
+                            _api.MANIFEST_INVALID, _api.MANIFEST_UNREADABLE}

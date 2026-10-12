@@ -73,6 +73,20 @@
     'manifest_invalid', 'manifest_unreadable'
   ];
 
+  // The FOUR gate codes are ALWAYS blockers; the manifest contributes its
+  // closed reason code ONLY when configured=false or valid=false (exact
+  // server contract, api._blockers). A document carrying any other mix —
+  // even a recognizable-looking subset — is refused, so a malformed server
+  // can never hide a required blocker behind a plausible shape.
+  var REQUIRED_BLOCKER_CODES = [
+    'adapter_not_implemented', 'hardware_not_probed', 'assets_unverified',
+    'calibration_unknown'
+  ];
+  var MANIFEST_REASON_CODES = [
+    'manifest_unconfigured', 'manifest_file_missing', 'manifest_invalid',
+    'manifest_unreadable'
+  ];
+
   // Public string bound, ALIGNED with the server's 64 KiB request cap: a
   // UTF-8 body of at most 65536 bytes can never encode a JSON string longer
   // than 65536 UTF-16 code units, so no server-valid echo is ever rejected
@@ -80,12 +94,13 @@
   // invented generation limit (config.py imposes no prompt-length limit).
   var MAX_CONFIG_STRING_CHARS = 65536;
 
-  // CPython str.strip() whitespace set (JS trim() differs: it drops U+FEFF
-  // and keeps U+001C-U+001F / U+0085). parsePlan mirrors Python exactly so
-  // a server-valid cfg_active is never falsely rejected by JS whitespace
-  // rules.
+  // CPython str.strip() whitespace set EXACTLY (JS trim() differs: it drops
+  // U+FEFF, and a plain character class without \x20 would KEEP the most
+  // mainstream whitespace of all — plain SPACE U+0020). parsePlan mirrors
+  // Python exactly so a server-valid cfg_active is never falsely rejected
+  // by JS whitespace rules ('   ' + cfg>1 is cfg_active FALSE server-side).
   function pyStrip(s) {
-    return s.replace(/[\x09\x0A\x0B\x0C\x0D\x1C\x1D\x1E\x1F\x85\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/g, '');
+    return s.replace(/[\x20\x09\x0A\x0B\x0C\x0D\x1C\x1D\x1E\x1F\x85\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/g, '');
   }
 
   var PRESETS = {
@@ -120,7 +135,8 @@
   // and it stays a STRING on the wire, in the draft and in every render —
   // never a rounded JS Number.
   function parseSeed(str) {
-    var s = String(str).trim();
+    // Python-side seed parsing strips PYTHON whitespace — mirror it.
+    var s = pyStrip(String(str));
     if (s.length > SEED_MAX_DIGITS) return null;
     if (!/^\d+$/.test(s)) return null;
     var value;
@@ -159,7 +175,8 @@
   // results (JSON.stringify would silently turn Infinity into null) and
   // non-integers for integer fields are refused BEFORE serialization.
   function numberField(id, wantInt) {
-    var raw = String($(id).value).trim();
+    // Python numeric parsing strips PYTHON whitespace — mirror it.
+    var raw = pyStrip(String($(id).value));
     if (raw === '') return { error: 'A value is required (empty fields are not sent as 0).' };
     var n = Number(raw);
     if (!Number.isFinite(n)) return { error: 'Must be a finite number.' };
@@ -173,7 +190,7 @@
     // the form mirrors that — surfaced only after the user has touched the
     // prompt or tried to submit (no intrusive alert on first paint, and we
     // never auto-fill anything).
-    if (!$('prompt').value.trim()) {
+    if (!pyStrip($('prompt').value)) {
       errors.prompt = 'Prompt must not be empty — enter the text you want ' +
                       'used exactly as typed.';
     }
@@ -184,7 +201,7 @@
     }
     var seedStr = seedWireString($('seed').value);
     if (seedStr === null) {
-      var seedRaw = String($('seed').value).trim();
+      var seedRaw = pyStrip(String($('seed').value));
       if (/^\d+$/.test(seedRaw) && seedRaw.length > SEED_MAX_DIGITS) {
         errors.seed = 'Seed is too long: at most ' + SEED_MAX_DIGITS +
                       ' decimal digits. The text was kept exactly as entered ' +
@@ -296,18 +313,27 @@
   // never buffered. No unbounded bodies are ever read.
   var MAX_RESPONSE_BYTES = 262144;
   var apiConnected = false;      // a RECOGNIZED status document was seen
+  // EVERY status completion branch is guarded by this sequence: a newer
+  // check (success OR failure) always wins over an older late arrival —
+  // an old success must not re-enable planning after a newer disconnect,
+  // and an old failure must not disable a newer valid connection.
+  var statusSeq = 0;
 
   var BODY_TOO_LARGE = { bodyTooLarge: true };
+  // Fail-closed marker: when the readable-stream API is unavailable the
+  // body is NOT read through an unbounded fallback — it is refused as a
+  // typed body error (schema rejection), never silently buffered whole.
+  var UNSUPPORTED_BODY = { unsupportedBody: true };
 
   // Complete body bytes, capped. The abort signal of the surrounding
   // request also errors an in-flight body stream, so a stalled or
   // truncated body cannot hang the page.
   function readBodyLimited(res) {
     if (!res.body || typeof res.body.getReader !== 'function') {
-      return res.arrayBuffer().then(function (buf) {
-        if (buf.byteLength > MAX_RESPONSE_BYTES) throw BODY_TOO_LARGE;
-        return new Uint8Array(buf);
-      });
+      // No bounded streaming available: FAIL CLOSED. An arrayBuffer-style
+      // fallback would read the whole body before the cap could be
+      // checked — refusing is the honest bounded behaviour.
+      return Promise.reject(UNSUPPORTED_BODY);
     }
     var reader = res.body.getReader();
     var chunks = [];
@@ -383,6 +409,9 @@
         if (err === BODY_TOO_LARGE) {
           return settle({ res: res, bodyError: 'too_large' });
         }
+        if (err === UNSUPPORTED_BODY) {
+          return settle({ res: res, bodyError: 'unsupported' });
+        }
         return settle({ network: true, timedOut: timedOut });
       });
     }, function () {
@@ -427,20 +456,10 @@
           gate.code !== spec.code ||
           spec.states.indexOf(gate.state) === -1) return null;
     }
-    if (!Array.isArray(s.generation_blockers) ||
-        s.generation_blockers.length > 16) return null;
-    for (var j = 0; j < s.generation_blockers.length; j++) {
-      // Known blocker codes only — an arbitrary bounded string is refused.
-      if (KNOWN_BLOCKER_CODES.indexOf(s.generation_blockers[j]) === -1) {
-        return null;
-      }
-    }
-    if (s.manifest !== undefined) {
-      var m = s.manifest;
-      if (!m || typeof m !== 'object' || typeof m.configured !== 'boolean' ||
-          typeof m.valid !== 'boolean' ||
-          m.verification !== 'not_performed') return null;
-    }
+    // EXACT blocker set (four required + manifest reason when applicable).
+    var manifest = parseManifestCore(s.manifest);
+    if (!manifest) return null;   // status ALWAYS carries the manifest block
+    if (!blockersExact(s.generation_blockers, manifest.blocker)) return null;
     return { recognized: true, planning: true, generation: false };
   }
 
@@ -451,10 +470,58 @@
            'trusted.';
   }
 
+  // The EXACT manifest core the server projects (api._manifest_core, shared
+  // by status and plan): metadata only — never filenames/hashes/paths, and
+  // verification is ALWAYS 'not_performed'. When valid: typed counts, no
+  // reason. When invalid/unconfigured: a CLOSED reason code. Returns null
+  // (reject) or { configured, valid, blocker } where blocker is the code
+  // the server adds to generation_blockers (null when it adds none).
+  function parseManifestCore(m) {
+    if (!m || typeof m !== 'object' ||
+        typeof m.configured !== 'boolean' || typeof m.valid !== 'boolean' ||
+        m.verification !== 'not_performed') return null;
+    if (m.valid && !m.configured) return null;      // valid implies configured
+    var blocker = null;
+    if (!m.configured) {
+      blocker = 'manifest_unconfigured';
+    } else if (!m.valid) {
+      if (MANIFEST_REASON_CODES.indexOf(m.reason) === -1 ||
+          m.reason === 'manifest_unconfigured') return null;
+      blocker = m.reason;
+    } else {
+      if (m.reason !== undefined) return null;      // reason only when invalid
+      if (!Number.isInteger(m.schema_version) || m.schema_version < 1 ||
+          m.schema_version > 64) return null;
+      if (!Number.isInteger(m.artifact_count) || m.artifact_count < 0 ||
+          m.artifact_count > 1000000) return null;
+    }
+    return { configured: m.configured, valid: m.valid, blocker: blocker };
+  }
+
+  // The EXACT blocker set: the four REQUIRED gate codes plus the manifest
+  // blocker (when one applies), each exactly once. Missing, duplicated or
+  // extra codes all reject — a malformed server can never hide a required
+  // blocker behind an otherwise recognizable document.
+  function blockersExact(list, manifestBlocker) {
+    if (!Array.isArray(list)) return false;
+    var expected = REQUIRED_BLOCKER_CODES.slice();
+    if (manifestBlocker) expected.push(manifestBlocker);
+    if (list.length !== expected.length) return false;
+    for (var i = 0; i < expected.length; i++) {
+      if (list.indexOf(expected[i]) === -1) return false;
+    }
+    for (var j = 0; j < list.length; j++) {
+      if (expected.indexOf(list[j]) === -1) return false;
+    }
+    return true;
+  }
+
   function checkStatus() {
+    var seq = ++statusSeq;
     return apiRequest(API_STATUS, { headers: { 'Accept': 'application/json' } },
                       'json')
       .then(function (r) {
+        if (seq !== statusSeq) return null;   // superseded: never land late
         if (r.network) {
           // No server (file://, qwen-web not running) or the WHOLE request
           // (headers and body) timed out — an honest disconnect, never a
@@ -488,12 +555,15 @@
           // A COMPLETE body that is not usable JSON (or over the fixed cap)
           // is a REJECTED schema — explicitly not a disconnect.
           setApiAvailable(false);
-          renderChip('Status rejected', 'Status rejected — ' +
-            (r.bodyError === 'too_large' ? 'body over the size cap'
-                                         : 'not decodable JSON'));
+          var why = r.bodyError === 'too_large' ? 'body over the size cap'
+                    : r.bodyError === 'unsupported'
+                      ? 'body could not be read bounded by this engine'
+                      : 'not decodable JSON';
+          renderChip('Status rejected', 'Status rejected — ' + why);
           setText('settings-backend', statusUnrecognizedText(
             r.bodyError === 'too_large' ? 'body over the size cap'
-                                        : 'body was not valid JSON'));
+              : r.bodyError === 'unsupported' ? 'body reading unsupported'
+                                              : 'body was not valid JSON'));
           return null;
         }
         var status = parseStatus(r.json);   // JSON null rejects safely here
@@ -638,20 +708,36 @@
         return false;
       }
       if (r.bodyError) {
+        // A rejected PLAN document invalidates the recognized status too:
+        // the server contract is broken, so planning must not stay enabled
+        // on a stale 'Connected'. This is a typed schema rejection — an
+        // explicit re-check is required to trust the connection again.
+        setApiAvailable(false);
+        renderChip('Status rejected',
+          'Status rejected — server contract broken');
         setText('api-message', 'The plan body was not usable (' +
                                (r.bodyError === 'too_large'
                                  ? 'over the fixed response cap'
-                                 : 'not decodable JSON') +
+                                 : r.bodyError === 'unsupported'
+                                   ? 'unreadable bounded body'
+                                   : 'not decodable JSON') +
                                ') — a schema rejection, not a disconnect; ' +
-                               'nothing is rendered or trusted.');
+                               'nothing is rendered or trusted. Use ' +
+                               '"Check configuration" to re-establish a ' +
+                               'status before planning again.');
         return false;
       }
       var plan = parsePlan(r.json);
       if (!plan) {
+        setApiAvailable(false);
+        renderChip('Status rejected',
+          'Status rejected — server contract broken');
         setText('api-message', 'The plan document did not match the expected ' +
                                'schema — nothing is rendered or trusted; ' +
                                'previous results are hidden and your draft is ' +
-                               'unchanged.');
+                               'unchanged. Use "Check configuration" to ' +
+                               're-establish a recognized status before ' +
+                               'planning again.');
         return false;
       }
       promptTouched = true;
@@ -769,19 +855,14 @@
     // dimensions (config.py C6); multiples-of-32 make this division exact.
     if (raw.latent_tokens !== (c.width / 16) * (c.height / 16)) return null;
     var m = raw.manifest;
-    if (!m || typeof m !== 'object' || typeof m.configured !== 'boolean' ||
-        typeof m.valid !== 'boolean' || m.ready !== false ||
-        m.verification !== 'not_performed' || m.fit !== 'not_evaluated') return null;
+    var manifest = parseManifestCore(m);
+    if (!manifest) return null;
+    if (m.ready !== false || m.verification !== 'not_performed' ||
+        m.fit !== 'not_evaluated') return null;
     if (!raw.hardware || raw.hardware.status !== 'unknown') return null;
     if (!raw.calibration || raw.calibration.status !== 'unknown') return null;
-    if (!Array.isArray(raw.generation_blockers) ||
-        raw.generation_blockers.length > 16) return null;
-    for (var j = 0; j < raw.generation_blockers.length; j++) {
-      // Known blocker codes only — an arbitrary bounded string is refused.
-      if (KNOWN_BLOCKER_CODES.indexOf(raw.generation_blockers[j]) === -1) {
-        return null;
-      }
-    }
+    // EXACT blocker set (four required + manifest reason when applicable).
+    if (!blockersExact(raw.generation_blockers, manifest.blocker)) return null;
     return raw;
   }
 
