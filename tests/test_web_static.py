@@ -359,6 +359,51 @@ def test_w2_export_downloads_raw_blob_without_reserialization():
     assert "local form errors" in body
 
 
+def test_export_refuses_every_body_error_and_requires_typed_bytes():
+    js = _read("app.js")
+    m = re.search(r"function exportConfig\(\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "exportConfig not found"
+    body = m.group(1)
+    # ALL bodyError outcomes are refused before any download is built — an
+    # 'unsupported' readable-stream outcome can arrive with res.ok=true and
+    # NO bytes at all, and Blob([undefined]) would otherwise download the
+    # literal text 'undefined' under a success message.
+    assert re.search(r"if \(r\.bodyError\)", body), \
+        "export must refuse EVERY bodyError outcome, not just too_large"
+    guard = body.index("if (r.bodyError)")
+    blob = body.index("new Blob([r.bytes])")
+    assert guard < blob, "the bodyError refusal must precede the download path"
+    # a download is produced ONLY from actual Uint8Array bytes
+    assert "r.bytes instanceof Uint8Array" in body, \
+        "export must type-check the raw bytes before Blob/download"
+    assert body.index("instanceof Uint8Array") < blob, \
+        "the bytes type guard must precede the download path"
+    # a schema/readability failure invalidates the trusted availability with
+    # a DISTINCT rejected state — never a fabricated disconnect, and never
+    # a success message.
+    rejected = body[guard:blob]
+    assert "Status rejected" in rejected and "Not connected" not in rejected, \
+        "body refusal must be a typed rejection, not a disconnect"
+    assert "setApiAvailable(false)" in rejected, \
+        "a refused export body must invalidate planning/export availability"
+    assert "not a disconnect" in rejected
+
+
+def test_parse_plan_rejects_blank_prompt_exactly_like_generation_config():
+    js = _read("app.js")
+    m = re.search(r"function parsePlan\(raw\)\s*\{([\s\S]*?)\n  \}", js, re.S)
+    assert m, "parsePlan not found"
+    body = m.group(1)
+    # shared GenerationConfig refuses `not prompt.strip()` (config.py); an
+    # echoed plan with an empty/Python-whitespace-only prompt is a broken
+    # contract and must be REJECTED — under the corrected pyStrip
+    # predicate, never JS trim() (FEFF / U+001C-class differences).
+    assert "pyStrip(c.prompt)" in body, \
+        "parsePlan must require a non-blank echoed prompt under Python strip"
+    assert "c.prompt.trim()" not in body, \
+        "JS trim must not substitute for the Python whitespace predicate"
+
+
 def test_w2_failure_paths_preserve_the_draft():
     js = _read("app.js")
     # only applyPreset (2 writes) and the Random button (1 write) may write
