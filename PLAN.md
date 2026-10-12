@@ -152,7 +152,7 @@ CPU tests never touch a heavy ML import:
 | `qwen_engine/mem_preflight.py` | **Host-memory preflight for the forthcoming CPU encoder child (M2.2b)**: conservative stdlib check, before any ML import/weight read/loader call, that checkpoint bytes + explicit dtype expansion (integer ceiling division) + explicit runtime headroom fit the **tighter** of host `MemAvailable` (validated `kB` unit; conversion-limit-exceeding digits are unknown) and this process's cgroup v2 state. A real read walks **every visible ancestor** but is fail-closed **unknown**: a missing `memory.max` at any level proves nothing about the controller, and the visible root's completeness is unproven (a namespace `/` can hide a tighter ancestor), so real autodiscovery refuses regardless of root file contents — the tightest visible `limit - current` travels only as an **advisory visible availability** (an UPPER bound on true availability a hidden ancestor can only tighten) with truthful per-level source notes. An explicitly injected finite/unlimited `MemorySnapshot` is **trusted caller evidence** for pure budget arithmetic (finite cap never substituted away by host RAM; unknown host always refuses; absent finite current is never zero; zero cap is a zero budget). Passing is a conservative prerequisite, **not measured model-fit evidence**; the default deployment may legitimately refuse all real loads until trusted complete host-budget evidence exists. Scoped to Linux cgroup v2 — not the M5.3 `memory.py` policy and not a general resource framework. | stdlib |
 | `qwen_engine/bench.py` | **Versioned benchmark/result schemas** (R6; detail in M1.5): phase timings, peak host RSS, peak CUDA memory when available, environment and model identifiers; feeds `calibration.json`. | stdlib |
 | `qwen_engine/cli.py` | The engine's CLI front-end (kept after the 2026-10-12 web pivot; the desktop-GUI idea is superseded by the web workspace — see the W milestones): argparse → validate config → plan via `core.plan()` (adapter-independent) → `generate`; implements the **exit-code contract** (M1 acceptance criteria). `cli_gen.py` at the repo root stays as a thin entry-point shim. | the above only |
-| `qwen_engine/web_static/` | **Original static web workspace** (W milestones; design in `docs/web-interface.md`): self-contained HTML/CSS/JS — no framework, no CDN, no external fonts. Honest "Not connected" state until a W2 same-origin server reports ready. W1 = Create + History + Settings shell only: **no server, no job manager, no fake results/jobs/timings**. FreeVideo's web studio was a visual/UX reference only — no code or assets copied, no ComfyUI involvement. | none (browser-side; its server is W2) |
+| `qwen_engine/web_static/` | **Original static web workspace** (W milestones; design in `docs/web-interface.md`): self-contained HTML/CSS/JS — no framework, no CDN, no external fonts, and (since the 2026-10-12 review fixes) **no network requests at all**: the speculative capability probe was removed; W1 makes zero HTTP calls under any protocol. Generate is unconditionally disabled — no generation adapter or job API exists. W1 = Create + History + Settings shell only: **no server, no job manager, no fake results/jobs/timings**. FreeVideo's web studio was a visual/UX reference only — no code or assets copied, no ComfyUI involvement. | none (browser-side; its server is W2) |
 
 **Boundary invariant (tested):** `python -c "import qwen_engine"` and
 `cli_gen.py --help` / `--dry-run` must succeed on a machine with **no torch, no
@@ -407,18 +407,39 @@ Visual/UX reference only (inspected, not vendored): FlashML-org/FreeVideo `web/`
 studio layout — header + left controls / right stable preview, progressive
 disclosure, stat cards, creations history. Engine stays ComfyUI-free.
 
-- **W1 (done 2026-10-12, commit `89041f9`)** — polished **static** workspace:
+- **W1 (done 2026-10-12, commit `89041f9`; review fixes same day)** — polished
+  **static** workspace:
   `src/qwen_engine/web_static/{index.html,app.css,app.js}` + guarded text tests.
   Starts honestly "Not connected"; Generate disabled with a visible reason; no
   server, no jobs, no fake results. Full-browser dark shell, Create/History/
   Settings routing, BigInt decimal-string seeds (`crypto` random), presets,
   lightweight form validation only (server stays authoritative). Design:
   `docs/web-interface.md`.
-- **W2** — tiny same-origin **static+capability server** (stdlib `http.server`
-  subclass or similar): serves `web_static` and `/api/v1/capability`
-  (`{ready, reason}` from real engine status); package-data for the assets;
-  still **no generation**. Config import/export moves here when the
-  authoritative `GenerationConfig` serializer exists.
+  **2026-10-12 root/peer review fixes** (see
+  `docs/handoffs/2026-10-12-web-w1-review-fixes.md`): the speculative
+  `/api/v1/capability` probe is **removed entirely** — W1 makes zero network
+  requests and Generate is unconditionally disabled (submit handlers refuse
+  directly; the disabled button is not the gate); manual dimension edits
+  recompute exact preset `aria-pressed` (exact 1344×768 → Landscape, non-preset
+  clears all); `parseSeed` bounds trimmed ASCII decimals to ≤ 20 chars
+  **before** BigInt (leading-zero strings > 20 rejected by documented policy;
+  full uint64 max kept as an exact string) with `maxlength="20"`;
+  `renderValidation` sets `aria-invalid` on steps/seed/cfg/**both** dimension
+  inputs; the seed gets a full row (all 20 digits inspectable at 380/375/320)
+  with helper "Leave at 0 or choose Random." and the precise range retained in
+  title/docs; hash nav focuses the new active `tabindex="-1"` heading on
+  user/hashchange only and unknown hashes (skip-link `#main`) no longer reroute
+  History/Settings back to Create; privacy wording is factual (static hosting
+  enforces nothing; locality is enforced by the planned W2 server). New real
+  Chrome check script `scripts/chrome_browser_check.mjs` (no dependencies;
+  Node built-in WebSocket CDP; **not** part of the guarded suite; requires
+  `CHROME_PATH`).
+- **W2** — tiny same-origin **static+status server** (stdlib `http.server`
+  subclass or similar): serves `web_static` plus a **reviewed status/plan
+  contract** (engine status + validated plan only — **never generation**, that
+  is W3); package-data for the assets. Config import/export moves here when
+  the authoritative `GenerationConfig` serializer exists. The W1 front-end
+  performs no requests; the W2 contract is added by review, not assumed.
 - **W3** — generation wiring: job submit/status endpoints over the real engine
   path (`core` + adapter), real results into the preview + History, honest
   timings. Gated on the engine milestones (M3/M4) — the UI never invents output.
