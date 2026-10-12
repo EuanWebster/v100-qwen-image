@@ -73,6 +73,17 @@ function notRunCheck(name, detail = '') {
   results.push(`NOT RUN  ${name}${detail ? '  [' + detail + ']' : ''}`);
   notRun++;
 }
+// An aborted run must NEVER report success: these recorders bypass the
+// freeze (late results from other legs stay frozen, but the ABORT itself is
+// always recorded, so 'N/N passed' can never follow a timeout).
+function forceFail(name, detail = '') {
+  results.push(`FAIL  ${name}${detail ? '  [' + detail + ']' : ''}`);
+  failed++;
+}
+function forceNotRun(name, detail = '') {
+  results.push(`NOT RUN  ${name}${detail ? '  [' + detail + ']' : ''}`);
+  notRun++;
+}
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Bounded cleanup of OUR OWN spawned child group (never a broad kill). */
@@ -279,6 +290,35 @@ async function httpChecks() {
   check('unknown method on an unknown route is typed 404 JSON',
         status(weirdUnknown) === 404 && /not_found/.test(body(weirdUnknown)));
 
+  // Request-line abuse (root review): an oversized request line must get a
+  // TYPED 414 JSON with the defensive headers — never a silent close — and
+  // a TAB-separated request line must not be served through the stdlib's
+  // whitespace folding (the old normalized self.path turned '\t//app.js'
+  // into a 200 of //app.js).
+  const longLine = await rawRequest(
+    `GET /${'a'.repeat(70000)} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`);
+  check('request line over 65536 bytes gets typed 414 JSON, never a silent close',
+        status(longLine) === 414 && /malformed_request/.test(body(longLine)) &&
+        /x-content-type-options: nosniff/i.test(head(longLine)),
+        head(longLine).split('\r\n')[0]);
+  const tabLine = await rawRequest(`GET\t//app.js HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`);
+  check('TAB-separated request line with a bad target form is typed 400, never served 200',
+        status(tabLine) === 400 && /malformed|target/i.test(body(tabLine)),
+        head(tabLine).split('\r\n')[0] + ' | ' + body(tabLine).slice(0, 60));
+  const weirdHost = await rawRequest(`WEIRD / HTTP/1.1\r\nHost: evil.example:${port}\r\n\r\n`);
+  check('unknown method + foreign Host: host policy refuses BEFORE method typing (typed 400)',
+        status(weirdHost) === 400 && /invalid_host/.test(body(weirdHost)),
+        head(weirdHost).split('\r\n')[0]);
+
+  // cfg_active over REAL HTTP with the most mainstream blank of all: an
+  // all-space negative prompt + cfg>1 is FALSE (config.py .strip() strips
+  // plain space). A client mixing JS trim semantics would reject this plan.
+  const spaceNeg = await post('/api/v1/plan',
+    envelope({ prompt: 'cfg probe', negative_prompt: '   ', true_cfg_scale: 2.0 }));
+  check('all-space negative prompt: server cfg_active is false (config.py strip)',
+        status(spaceNeg) === 200 && jsonOf(spaceNeg).cfg_active === false,
+        responseBody(spaceNeg).slice(0, 100));
+
   // foreign origin / cross-site on every route
   const foreignOriginGet = await rawRequest(`GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nOrigin: http://evil.example\r\n\r\n`);
   check('foreign Origin denied on GET status', status(foreignOriginGet) === 403);
@@ -408,6 +448,13 @@ async function chromeChecks() {
   if (cap && !cap.ok) {
     notRunCheck('real Chrome leg — only ' + cap.free + ' free task slots (pids ' + cap.detail +
                 '); cause not verified, run on a clean sandbox');
+    return;
+  }
+  // ACQUISITION GUARD: once the whole-run deadline has fired, do NOT
+  // create a profile or spawn a browser we might fail to supervise.
+  if (stopped) {
+    forceNotRun('real Chrome leg — deadline already hit before acquisition ' +
+                '(no profile created, no browser spawned)');
     return;
   }
   const profileDir = mkdtempSync(join(tmpdir(), 'qwen-web-chrome-'));
@@ -557,7 +604,7 @@ async function chromeChecks() {
     hidden: document.getElementById('plan-panel').hidden,
     seedErr: document.getElementById('seed-error').textContent,
     msg: document.getElementById('api-message').textContent })`);
-  check('invalid draft during an in-flight valid request shows its errors immediately',
+  check('invalid draft during an in-flight valid request shows its errors immediately (controlled-backend fixture: delayed fetch override, not a real stalled network)',
         overlap.hidden === true && overlap.seedErr !== '' &&
         /local form errors/.test(overlap.msg), overlap.msg);
   await delay(2500);      // attempt A's body lands ~1.5 s in: seq is stale
@@ -565,7 +612,7 @@ async function chromeChecks() {
     hidden: document.getElementById('plan-panel').hidden,
     seedErr: document.getElementById('seed-error').textContent,
     msg: document.getElementById('api-message').textContent })`);
-  check('the stale delayed response never clears the newer errors or renders',
+  check('the stale delayed response never clears the newer errors or renders (same fixture)',
         lateLanding.hidden === true && lateLanding.seedErr !== '',
         lateLanding.msg);
   await evaluate('window.fetch = window.__plainFetch;');
@@ -610,9 +657,9 @@ async function chromeChecks() {
     chip: document.getElementById('connection-chip').textContent,
     msg: document.getElementById('api-message').textContent,
     hidden: document.getElementById('plan-panel').hidden })`);
-  check('stalled response BODY past the (test-reduced) deadline = timeout, never a hang',
+  check('stalled response BODY past the (test-reduced) deadline = timeout, never a hang (controlled-backend fixture: stalled fetch override + test-only 700 ms deadline)',
         /timed out/i.test(stalled.msg) && stalled.hidden === true, stalled.msg);
-  check('body timeout surfaces as an honest disconnect chip, not a success',
+  check('body timeout surfaces as an honest disconnect chip, not a success (same fixture)',
         /Not connected/.test(stalled.chip), stalled.chip);
   await evaluate('window.fetch = window.__plainFetch2; window.QwenStudio.setFetchTimeoutForChecks(15000);');
   await evaluate('document.getElementById("btn-check-config").click()');
@@ -681,6 +728,28 @@ async function chromeChecks() {
                   15000, '5000-char prompt plan');
   check('5000-char prompt plans through the real UI (bounds match the server contract)', true);
 
+  // The '   ' negative-prompt case through the REAL form: pyStrip must
+  // mirror Python str.strip() (space included), so a plan must succeed and
+  // CFG must render INACTIVE — a pyStrip without U+0020 would falsely
+  // reject this server-valid document client-side.
+  await evaluate(`(function(){
+    var p = document.getElementById('prompt');
+    p.value = 'space negative probe'; p.dispatchEvent(new Event('input'));
+    var n = document.getElementById('negative');
+    n.value = '   '; n.dispatchEvent(new Event('input'));
+    var c = document.getElementById('cfg');
+    c.value = '2'; c.dispatchEvent(new Event('input'));
+    document.getElementById('btn-plan').click();
+  })()`);
+  await waitUntil(async () => !await evaluate('document.getElementById("plan-panel").hidden'),
+                  15000, 'space-negative plan');
+  const spacePlan = await evaluate(`({
+    cfg: document.getElementById('plan-cfg').textContent,
+    msg: document.getElementById('api-message').textContent })`);
+  check('all-space negative + cfg 2 plans with CFG inactive (Python strip parity in the browser)',
+        /inactive/.test(spacePlan.cfg) && spacePlan.msg === '',
+        spacePlan.cfg + ' | ' + spacePlan.msg.slice(0, 80));
+
   // every network-origin request the page made was same-origin (CSP
   // connect-src 'self' holds in practice; data:/blob: URLs are local)
   const foreign = netUrls.filter((n) => /^https?:/i.test(n.url) && !n.url.startsWith(ORIGIN + '/'));
@@ -693,8 +762,14 @@ async function chromeChecks() {
 // ---------------------------------------------------------------- run
 let exitCode = 1;
 let startupDone = false;
+let timedOut = false;
 const guard = watchdog(WHOLE_CHECK_MS, 'whole integration check');
-guard.catch(() => { stopped = true; });   // freeze results once the bound hits
+guard.catch((err) => {
+  stopped = true;                          // freeze late results
+  timedOut = true;
+  forceFail('whole-run watchdog aborted the integration check',
+            String((err && err.message) || err).slice(0, 160));
+});
 try {
   // STARTUP is covered by the whole-check deadline too (previously it was
   // awaited BEFORE any watchdog existed — a hung start orphaned the child).
@@ -706,7 +781,9 @@ try {
   const runner = (async () => { await httpChecks(); await chromeChecks(); })();
   runner.catch(() => { /* after a watchdog abort, late failures are expected */ });
   await Promise.race([runner, guard]);
-  exitCode = failed === 0 ? 0 : 1;
+  // timedOut runs are failed BY DEFINITION (the forceFail above guarantees
+  // failed > 0); never print a clean N/N after an abort.
+  exitCode = (failed === 0 && !timedOut) ? 0 : 1;
 } catch (err) {
   if (!startupDone && !/exceeded its/.test(String(err && err.message))) {
     // never announced an origin — environment problem (child group, if any,
@@ -714,7 +791,8 @@ try {
     console.error('integration: server could not start —', err.message);
     exitCode = 2;
   } else {
-    check('integration script completed without error', false, String((err && err.stack) || err));
+    forceFail('integration script completed without error',
+              String((err && err.stack) || err).slice(0, 160));
     exitCode = 1;
   }
 } finally {

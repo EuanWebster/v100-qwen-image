@@ -54,7 +54,10 @@ export function launchChrome({ chromePath, profileDir, extraArgs = [] }) {
     '--no-first-run', '--no-default-browser-check',
     '--disable-gpu', '--disable-dev-shm-usage', '--disable-crash-reporter',
     '--disable-breakpad', '--disable-background-networking', '--disable-sync',
-    '--no-zygote', '--renderer-process-limit=1', '--num-raster-threads=1',
+    // NO --no-zygote: per upstream content_main_runner_impl.cc the
+    // zygote-disabled + sandbox-enabled combination EXPLICITLY exits —
+    // normal Chrome defaults stay as they are.
+    '--renderer-process-limit=1', '--num-raster-threads=1',
     '--disable-features=AudioServiceOutOfProcess', '--mute-audio',
     // Sandbox stays ENABLED by default; only an explicit environment
     // request disables it (never by default, per policy).
@@ -62,8 +65,10 @@ export function launchChrome({ chromePath, profileDir, extraArgs = [] }) {
     ...extraArgs,
     'about:blank',
   ];
+  // stdout is IGNORED (the child can never block writing it; we parse only
+  // stderr), stderr is capped to a rolling 16 KiB tail (bounded memory).
   const chrome = spawn(chromePath, args,
-    { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
   const wsUrl = new Promise((res, rej) => {
     let settled = false;
     const fail = (err) => { if (!settled) { settled = true; clearTimeout(t); rej(err); } };
@@ -72,7 +77,7 @@ export function launchChrome({ chromePath, profileDir, extraArgs = [] }) {
       DEFAULTS.devtoolsAnnounceMs);
     let errBuf = '';
     chrome.stderr?.on('data', (b) => {
-      errBuf += String(b);
+      errBuf = (errBuf + String(b)).slice(-16384);   // bounded tail only
       const m = /DevTools listening on (ws:\/\/\S+)/.exec(errBuf);
       if (m && !settled) { settled = true; clearTimeout(t); res(m[1]); }
     });
@@ -102,6 +107,16 @@ export function openCdpSocket(wsUrl) {
 export function makeCdp(ws) {
   let nextId = 1;
   const pending = new Map();
+  const killAll = (why) => {
+    // A closed/errored socket must reject ALL pending and clear their
+    // timers immediately - no stale entries left dangling.
+    cdp.dead = true;
+    for (const { rej, timer } of pending.values()) {
+      clearTimeout(timer);
+      rej(new Error(`cdp socket ${why}`));
+    }
+    pending.clear();
+  };
   ws.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
@@ -127,10 +142,20 @@ export function makeCdp(ws) {
           rej(new Error(`CDP send ${method} timed out after ${DEFAULTS.sendMs} ms`));
         }, DEFAULTS.sendMs);
         pending.set(id, { res, rej, timer });
-        ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+        try {
+          ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+        } catch (err) {
+          // A SYNCHRONOUS send failure clears the pending entry and its
+          // timer right away, not leaving a stale timeout behind.
+          pending.delete(id);
+          clearTimeout(timer);
+          rej(new Error(`CDP send ${method} failed synchronously: ${err?.message || err}`));
+        }
       });
     },
   };
+  ws.addEventListener('close', () => killAll('closed'));
+  ws.addEventListener('error', () => killAll('errored'));
   return cdp;
 }
 
