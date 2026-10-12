@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-/* Real-Chrome behavioural check for the W1 static web workspace.
+/* Real-Chrome behavioural check for the static web workspace (W1 assets,
+ * W2-aware expectations).
  *
  * NOT part of the guarded main suite (`run_cpu_tests.sh` stays static-only,
  * ML-free and socket-free). Run it directly, and only when a Chrome binary
@@ -19,7 +20,10 @@
  * Covers: seed edges/length/non-ASCII, snapshot keys, presets and manual
  * dimension matching, preview ratio, hash nav + heading focus (and the
  * #main skip-link case), aria-invalid wiring, Generate ALWAYS disabled with
- * zero HTTP probes, and horizontal overflow at 1440/375/320.
+ * no remote probes (W2: the only fetch is the same-origin /api/v1/status
+ * check, which must fail honestly to "Not connected" on a file:// page),
+ * and horizontal overflow at 1440/375/320. The served-UI (real status/plan)
+ * browser checks live in scripts/web_integration_check.mjs.
  *
  * STATUS: not run to green inside the 2026-10-12 review container (the
  * cgroup pids controller was saturated by processes from earlier sessions;
@@ -119,16 +123,21 @@ async function main() {
   await s('Page.navigate', { url: pageUrl });
   await delay(600); // local file:// load; settle deterministically
 
-  /* ---- 1. no network probes at all ---- */
-  const pageRequests = netRequests.filter((r) => !r.startsWith('File '));
-  const probed = netRequests.filter((r) => /Fetch|XHR|WebSocket/.test(r));
-  check('zero HTTP/XHR/Fetch probes from the page', probed.length === 0, probed.join('; '));
-  check('fetch spy saw no calls', await evaluate('window.__fetchCalls.length') === 0);
-  void pageRequests;
+  /* ---- 1. no remote probes: over file:// the only fetch attempt is the
+   * SAME-ORIGIN status call (which must fail honestly to "Not connected") ---- */
+  const remoteProbed = netRequests.filter((r) => /https?:/.test(r));
+  check('zero network-origin (http/https) probes from a file:// page',
+        remoteProbed.length === 0, remoteProbed.join('; '));
+  const fetchCalls = await evaluate('window.__fetchCalls.join(",")');
+  check('only the same-origin status endpoint is ever fetched',
+        fetchCalls === '' || fetchCalls === '/api/v1/status', fetchCalls);
+  const chip = await evaluate('document.getElementById("connection-chip").textContent');
+  check('file:// lands honestly on Not connected',
+        /Not connected/.test(chip), chip);
 
   /* ---- 2. app surface + initial honest state ---- */
-  check('QwenStudio exposes w1-static',
-        await evaluate('window.QwenStudio && window.QwenStudio.version') === 'w1-static');
+  check('QwenStudio exposes w2-api',
+        await evaluate('window.QwenStudio && window.QwenStudio.version') === 'w2-api');
   check('Generate starts disabled',
         await evaluate('document.getElementById("generate-btn").disabled') === true);
   check('no autofocus on load (activeElement is body)',
@@ -321,18 +330,22 @@ async function main() {
 
   /* ---- 10. always disabled: submit refuses, no pretend success ---- */
   await setVal('prompt', 'a red fox');
+  const fetchesBefore = await evaluate('window.__fetchCalls.length');
   await evaluate('document.getElementById("generate-btn").click()');
   await evaluate(`document.getElementById('create-form').dispatchEvent(new Event('submit', {cancelable:true}))`);
+  await delay(120);
   const afterSubmit = await evaluate(`[
       document.getElementById('generate-btn').disabled,
       document.getElementById('generate-reason').textContent,
-      window.__fetchCalls.length
+      window.__fetchCalls.join(",")
     ].join('||')`);
-  const [stillDisabled, submitMsg, spyCount] = afterSubmit.split('||');
+  const [stillDisabled, submitMsg, spyCalls] = afterSubmit.split('||');
   check('Generate still disabled after submit attempt', stillDisabled === 'true');
   check('submit handler refuses honestly (Nothing was submitted)',
         /Nothing was submitted/.test(submitMsg), submitMsg);
-  check('still zero fetch calls after submit attempt', spyCount === '0');
+  check('submit attempt triggers no new fetches (status check only, ever)',
+        spyCalls === '' || spyCalls === '/api/v1/status',
+        `calls=[${spyCalls}] before=${fetchesBefore}`);
 
   /* ---- 11. overflow at 1440 / 375 / 320 ---- */
   for (const width of [1440, 375, 320]) {
