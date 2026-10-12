@@ -2,8 +2,10 @@
 
 Dated 2026-10-12 (user pivot: the **web UI is the primary interface**, replacing
 the planned/deferred desktop GUI; the engine and CLI are kept unchanged).
-This document is the narrow design record for W1; PLAN.md §W carries the
-milestone list.
+This document is the narrow design record for W1 **and the now-implemented
+W2** (review-pending until root's final acceptance); PLAN.md §W carries the
+milestone list. Statements below are CURRENT unless explicitly labelled
+historical.
 
 ## What FreeVideo is — and is not
 
@@ -13,10 +15,10 @@ was used **only as a visual/UX reference**: header + two columns (left
 controls / right stable preview), progressive disclosure, measured stat cards,
 and a creations thumbnail history. **No FreeVideo code or assets are vendored;
 there is no ComfyUI dependency anywhere in this project** — FreeVideo's
-division of labour (ComfyUI owns execution) is *not* copied; our future W2/W3
-server talks to our own engine only. Only T2I-relevant patterns were adapted;
-video/editor/nodes/LoRA/sharing/batch/queue/automatic-download/cloud features
-are out of scope by directive.
+division of labour (ComfyUI owns execution) is *not* copied; our W2 server
+(implemented) and the future W3 server talk to our own engine only. Only
+T2I-relevant patterns were adapted; video/editor/nodes/LoRA/sharing/batch/
+queue/automatic-download/cloud features are out of scope by directive.
 
 ## Files and boundary
 
@@ -28,9 +30,14 @@ are out of scope by directive.
   exists. Opening the files over `file://` still works: the single status
   fetch fails and the chip honestly says **"Not connected"** — static
   hosting remains disconnected from any engine.
-* `src/qwen_engine/web/{api.py,server.py,__main__.py}` — W2 server: `api.py`
-  is the **pure contract module** (schemas, validation, projections — no
-  sockets, no filesystem); `server.py` is the stdlib transport (loopback bind,
+* `src/qwen_engine/web/{api.py,server.py,__main__.py}` — W2 server
+  (implemented, review-pending): `api.py` is the **contract module** with no
+  socket code and no ML — but NOT filesystem-free: `status` serves
+  startup-cached manifest metadata, while `plan`/`export` run the shared
+  `GenerationConfig` validator, which **stats the configured runtime-path
+  directories** at request time. No response path ever reads model weights,
+  streams bytes of an artifact or computes a hash. `server.py` is the stdlib
+  transport (loopback bind,
   header policy, exact route allowlist, static serving, typed errors).
   Runnable as `qwen-web` or `python -m qwen_engine.web`; `--help` prints
   without binding, reading or importing ML. Generation is not implemented
@@ -116,9 +123,13 @@ instead of rerouting History/Settings back to Create.
   preserves the draft and says so.
 * The browser checks (dimensions 64–4096 multiples of 32; steps 1–1000; finite
   CFG ≥ 1; seed grammar) are **lightweight form validation**, labelled as such
-  in the UI — explicitly *not* a RAM/model fit check. The future status/plan
-  backend would own authoritative `GenerationConfig` validation and runtime
-  paths (Settings says so). The prompt check mirrors `config.py` truthfully
+  in the UI — explicitly *not* a RAM/model fit check. Authoritative
+  `GenerationConfig` validation and runtime paths are owned by the W2
+  server (`api.py` + `server.py`), which is implemented (review-pending);
+  the frontend parsers additionally refuse any server document they cannot
+  fully validate — including a blank/Python-whitespace-only echoed
+  `config.prompt`, exactly as shared `GenerationConfig` does. The prompt
+  check mirrors `config.py` truthfully
   (`prompt` must be a non-empty trimmed string) and is surfaced only after
   the user edits the prompt or attempts submit — never a first-load alert,
   and nothing is ever auto-filled. Generate itself stays disabled regardless.
@@ -172,13 +183,15 @@ instead of rerouting History/Settings back to Create.
   bytes → exact 64 bits). Null-vs-explicit-random semantics belong to the W2
   API contract, not to invented frontend behaviour.
 * `QwenStudio.formSnapshot()` produces the **UI wire format** (seed is a
-  STRING) and is *not* the engine's `GenerationConfig` JSON; exporting a
-  compatible config is W2's job once an authoritative serializer exists.
+  STRING) and is *not* the engine's `GenerationConfig` JSON; the authoritative
+  serializer is the implemented W2 `POST /api/v1/config/export` (raw canonical
+  JSON attachment, exact uint64 seed, runtime paths excluded), which the page
+  downloads without reserialization.
 * Ctrl/Meta+Enter runs the same unconditional refusal as the submit event:
   validation is shown, then the handler states plainly that nothing was
   submitted — it can never pretend a job exists.
 
-## W2 — server, contract and security model
+## W2 — server, contract and security model (implemented, review-pending)
 
 ### Running it
 
@@ -243,7 +256,11 @@ the editable fields — runtime paths **omitted** (an exported machine's
 folders are not part of a portable config; import will be designed with them
 explicitly), and the seed an **exact uint64 JSON number** (Python serializes
 it losslessly; browsers would not). The browser downloads the raw attachment
-as a `Blob` and never `JSON.parse`/reserializes it. Import is deliberately
+as a `Blob` and never `JSON.parse`/reserializes it — and it builds a download
+ONLY from complete, actual `Uint8Array` bytes: a success status whose body
+cannot be read bounded, exceeds the cap, or is otherwise unusable is refused
+as a typed schema rejection (availability invalidated, distinct rejected
+chip) with nothing downloaded and the draft untouched. Import is deliberately
 **not** implemented yet.
 
 ### Hostile-input policy
@@ -313,28 +330,70 @@ routing, Generate gated only by the then-present capability probe) — all
 pass; no console errors; mobile `scrollWidth` ≤ viewport. Guarded CPU suite
 780 passed + 1 skipped.
 
-**2026-10-12 (review fixes, this update)** — guarded CPU suite on this
-container: **786 passed + 1 skipped** (baseline 780+1 plus 6 new/expanded
-asset tests; 14 asset tests total) with `bash run_cpu_tests.sh` (default
-interpreter), and **787 passed, 0 skipped** with the pinned-env invocation
-(`PYTHON=/tmp/qwen-review.bIFHcI/venv/bin/python PYTHONPATH=/work/src
-QWEN_DIFFUSERS_SRC=… QWEN_TRANSFORMERS_SRC=… bash run_cpu_tests.sh` — the
-one previously-skipped test runs under the pinned sources). Both
+**2026-10-12 (mid-day review fixes — HISTORICAL counts)** — guarded CPU suite
+on this container: 786 passed + 1 skipped (default interpreter), 787 passed
+0 skipped under the pinned env. Superseded by the final counts below; kept
+because the environment note below is still true. Both
 interpreters on this box are Python 3.13.5; **no Python 3.11 binary exists
 here**, so the "3.11" leg of the standing protocol could not be executed on
 this container and is recorded as not-run rather than assumed. ML-free,
-socket-free, writes only under a fresh temp root.
+socket-free, writes only under a fresh temp root — *these three properties
+describe the guarded pytest suite only*: the integration script below opens
+real loopback sockets and writes tiny fixtures inside its own temp root, and
+the served-Chrome legs run a real browser.
 
-Real-Chrome behaviour: `scripts/chrome_browser_check.mjs` is shipped and
+Real-Chrome behaviour (the paragraph below is **historical** — the
+process-exhausted container state BEFORE the 2026-10-12 15:35 restart):
+`scripts/chrome_browser_check.mjs` is shipped and
 runs its own checks (seed grammar incl. length/non-ASCII, snapshot keys,
 preset↔manual sync, ratio, nav/focus/`#main`, aria-invalid, always-disabled
 with zero HTTP probes, overflow at 1440/375/320), **but it did not pass
-green in this container at fix time**: the sandbox's cgroup pids controller
-(512) is saturated by ~390 unreaped zombie processes leaked by earlier
-sessions (their parent PID 1 is `sleep` and never reaps), so Chrome fails
-`pthread_create` before loading the page. The script now detects exactly
+green in that container at that fix time**: the sandbox's cgroup pids controller
+(512) was saturated by ~390 unreaped zombie processes leaked by earlier
+sessions (their parent PID 1 is `sleep` and never reaps), so Chrome failed
+`pthread_create` before loading the page. The script detects exactly
 this and exits 3 with an honest diagnosis instead of hanging — an
 environment problem, not a product failure. The static suite encodes the
-same invariants as machine checks. The browser script must be run (and its
-output attached) on a clean sandbox before W2 acceptance.
+same invariants as machine checks.
+
+### Current final verification (2026-10-12, post-restart, final review fixes)
+
+* Guarded CPU suite on this container (`bash run_cpu_tests.sh`, runner-owned
+  fresh basetemp, network denied, ML imports denied, writes only under a
+  fresh temp root): **878 passed + 1 skipped** with the default interpreter,
+  **879 passed** with the pinned env (`PYTHON=/tmp/qwen-review.bIFHcI/venv/
+  bin/python PYTHONPATH=/work/src QWEN_DIFFUSERS_SRC=/tmp/v100_m0_ml/src/
+  diffusers QWEN_TRANSFORMERS_SRC=/tmp/v100_m0_ml/src/transformers`). Both
+  interpreters are Python 3.13.5; **no Python 3.11 binary exists here** —
+  that leg remains not-run, not assumed. (Root's independently verified
+  baseline on `08329c8` was 876+1 skip / 877 pinned; the +2 are the two
+  final-review static regressions.) These no-socket/no-repo-write claims
+  cover the guarded suite ONLY — the integration check opens real loopback
+  sockets and writes tiny fixtures under its own temp root, and the
+  served-UI leg runs a real browser.
+* Root's independent probes on `08329c8` (root-run, root-verified):
+  `/tmp/v100-web-api-review.py` **7/7 PASS**, `/tmp/v100-web-wire-review.py`
+  **5/5 PASS**, root real-HTTP browser review JSON **35 items all PASS**
+  (item count taken programmatically from the recorded run — the earlier
+  "33" claim was wrong; the script has since gained further legs, so the
+  final count belongs to root's own rerun, not to this writer's claim).
+* Real Chrome, `file://` behaviour suite (`scripts/chrome_browser_check.mjs`):
+  **61/61 passed** after the restart (pre-final-fixes snapshot; the served
+  pass below covers the changed export/parse branches).
+* Served real-Chrome integration (`scripts/web_integration_check.mjs`,
+  sandbox ENABLED, `QWEN_PYTHON` = pinned venv, `QWEN_RUN_CHROME=1`):
+  **96/96 executed checks passed** (0 NOT RUN), including the two
+  final-review legs — a controlled-backend export response without a
+  readable body is refused as a typed schema rejection with no download,
+  and `parsePlan` refuses blank/Python-whitespace-only echoed prompts
+  against the real served plan echo. This is the writer's run on the final
+  HEAD; root will re-run everything independently.
+* Process hygiene: the two live orphan repro Chrome trees from the previous
+  session (PIDs 3284/3410, profiles `/tmp/repro-WoE5LY`/`/tmp/repro-fdL5vs`)
+  were closed through their OWN DevTools endpoints (`Browser.close`) after
+  pid/profile/process-group validation; their child trees reaped, the roots
+  became unreapable zombies at PPID 1 (`sleep` never reaps — platform issue,
+  recorded honestly; no broad kill, no PID 1 or service changes). Residual
+  chrome-headless zombies remain unkillable by this agent; browser launches
+  stayed bounded and usage stayed around 150/512 cgroup slots.
 
