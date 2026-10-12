@@ -416,3 +416,23 @@ def test_chrome_lifecycle_protocol_selfcheck_pure():
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "FAIL" not in proc.stdout
     assert "remains explicitly pending" in proc.stdout  # honesty note present
+
+
+def test_raw_http_framing_selfcheck_pure():
+    # Pure framing protocol checks for scripts/raw_http.mjs (no server, no
+    # socket, no Chrome): interim-1xx WITH headers sliced at the CRLF
+    # boundary (the old regex bug), final-block content-length, capped
+    # bytes, latin1 heads and UTF-8 bodies.
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    script = (Path(__file__).resolve().parent.parent
+              / "scripts" / "raw_http_selfcheck.mjs")
+    proc = subprocess.run([node, str(script)], capture_output=True,
+                          text=True, timeout=180)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "FAIL" not in proc.stdout
+    assert "pure framing checks" in proc.stdout        # honesty note present
