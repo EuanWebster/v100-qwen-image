@@ -69,23 +69,30 @@ def test_js_never_uses_innnerhtml_and_keeps_seed_a_decimal_string():
     assert "crypto.getRandomValues" in js
 
 
-def test_seed_grammar_is_bounded_before_bigint():
+def test_seed_grammar_is_bounded_before_bigint_without_truncation():
     js = _read("app.js")
-    # parseSeed enforces a trimmed ASCII-decimal grammar of at most 20
-    # characters BEFORE any BigInt call (documented policy: longer strings,
-    # even all-leading-zero ones, are rejected on length).
+    # parseSeed enforces a trimmed grammar of at most 20 characters BEFORE
+    # the digit regex and any BigInt call (documented policy: longer strings,
+    # even all-leading-zero ones, are rejected on length, keeping the user's
+    # exact text — an inline error explains it).
     m = re.search(r"function parseSeed\(str\)\s*\{(.*?)\n  \}", js, re.S)
     assert m, "parseSeed not found"
     body = m.group(1)
     assert ".trim()" in body
     assert r"/^\d+$/" in body
-    big = body.index("BigInt")
-    assert "length > SEED_MAX_DIGITS" in body
-    assert body.index("SEED_MAX_DIGITS") < big, "length bound must precede BigInt"
+    assert body.index("length > SEED_MAX_DIGITS") < body.index(r"/^\d+$/"), \
+        "length bound must precede the digit regex"
+    assert body.index("length > SEED_MAX_DIGITS") < body.index("BigInt"), \
+        "length bound must precede BigInt"
     assert "SEED_MAX_DIGITS = SEED_MAX.toString().length" in js
+    # maxlength silently TRUNCATES an over-length paste into a DIFFERENT
+    # valid seed — it must not exist; parseSeed is the only enforcement.
     html = _read("index.html")
     m = re.search(r"<input id=\"seed\"[^>]*>", html)
-    assert m and 'maxlength="20"' in m.group(0), "seed input must cap at 20 chars"
+    assert m and "maxlength" not in m.group(0), \
+        "seed input must NOT carry maxlength (silent truncation risk)"
+    assert "nothing was truncated" in js.lower() or "kept exactly as entered" in js.lower(), \
+        "over-length input needs an explicit inline explanation"
 
 
 def test_seed_row_is_a_full_row_with_short_helper_and_accessible_range():
@@ -163,7 +170,7 @@ def test_validation_marks_aria_invalid_on_every_control():
                   js, re.S)
     assert m, "renderValidation not found"
     body = m.group(1)
-    for control in ("steps", "seed", "cfg", "width", "height"):
+    for control in ("steps", "seed", "cfg", "prompt", "width", "height"):
         assert f"'{control}'" in body, f"renderValidation misses {control}"
     assert "setAriaInvalid" in body
     # dimension error must mark BOTH dimension controls
@@ -173,6 +180,25 @@ def test_validation_marks_aria_invalid_on_every_control():
     assert html.count('aria-describedby="dims-error"') == 2
 
 
+def test_prompt_required_like_config_but_never_alerted_on_load():
+    # config.py validates prompt as a non-empty trimmed string; the form
+    # mirrors that truthfully, gated so the error only appears after the
+    # user edited the prompt or attempted submit — never a first-load alert.
+    js = _read("app.js")
+    m = re.search(r"function validateForm\(\)\s*\{(.*?)\n  \}", js, re.S)
+    assert m and r"$('prompt').value.trim()" in m.group(1), \
+        "validateForm must check the prompt (mirrors config.py)"
+    assert "promptTouched" in js
+    m = re.search(r"function renderValidation\((?:errors)?\w*\)\s*\{(.*?)\n  \}",
+                  js, re.S)
+    assert m and "promptTouched" in m.group(1), \
+        "prompt error must be gated on user interaction"
+    assert "auto-fill" in _read("index.html").lower() or "auto-filled" in _read("index.html").lower(), \
+        "the page must state it never auto-fills the prompt"
+    html = _read("index.html")
+    assert 'id="prompt-error"' in html and 'aria-describedby="prompt-help prompt-error"' in html
+
+
 def test_routing_focuses_headings_only_on_user_hashchange():
     js = _read("app.js")
     assert 'addEventListener(\'hashchange\', routeOnHashchange)' in js
@@ -180,8 +206,11 @@ def test_routing_focuses_headings_only_on_user_hashchange():
     m = re.search(r"function initialRoute\(\)\s*\{(.*?)\n  \}", js, re.S)
     assert m and ".focus()" not in m.group(1), "no autofocus on initial load"
     m = re.search(r"function routeOnHashchange\(\)\s*\{(.*?)\n  \}", js, re.S)
-    assert m and "hasOwnProperty.call(VIEWS, name)" in m.group(1), \
-        "unknown hashes (#main) must not reroute to Create"
+    assert m, "routeOnHashchange not found"
+    assert "name === ''" in m.group(1), \
+        "empty hash must route to Create (back/forward from hash-less start)"
+    assert "hasOwnProperty.call(VIEWS, name)" in m.group(1), \
+        "unknown non-empty hashes (#main) must not reroute to Create"
     html = _read("index.html")
     for heading in ("create-heading", "history-heading", "settings-heading"):
         assert f'id="{heading}" tabindex="-1"' in html or \

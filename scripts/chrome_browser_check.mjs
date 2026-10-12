@@ -263,6 +263,21 @@ async function main() {
         await evaluate('document.activeElement.id') === 'create-heading' &&
         await evaluate('document.getElementById("view-create").hidden') === false);
 
+  /* ---- 8b. back from History on a hash-less start restores Create ---- */
+  await s('Page.navigate', { url: pageUrl });   // fresh, no hash
+  await delay(500);
+  check('fresh load shows Create without focusing anything',
+        await evaluate('document.getElementById("view-create").hidden') === false &&
+        await evaluate('document.activeElement.tagName') === 'BODY');
+  await evaluate('document.getElementById("nav-history").click()');
+  await delay(150);
+  await evaluate('history.back()');
+  await delay(250);
+  check('back to hash-less URL restores Create (empty hash routes to Create)',
+        await evaluate('location.hash') === '' &&
+        await evaluate('document.getElementById("view-create").hidden') === false &&
+        await evaluate('document.getElementById("view-history").hidden') === true);
+
   /* ---- 9. aria-invalid wiring ---- */
   const setVal = async (id, v) => evaluate(`(function () {
     var el = document.getElementById('${id}'); el.value = '${v}';
@@ -287,6 +302,37 @@ async function main() {
   check('21-digit seed -> aria-invalid true',
         await evaluate('document.getElementById("seed").getAttribute("aria-invalid")') === 'true');
   await setVal('seed', '0');
+
+  /* ---- 9b. over-length seed entry: NO silent truncation ---- */
+  await s('Input.enable');
+  await evaluate(`(function () {
+    var el = document.getElementById('seed');
+    el.value = ''; el.focus(); return true; })()`);
+  await s('Input.insertText', { text: '100000000000000000000' }); // 21 digits, paste-like
+  const longSeed = await evaluate(`[
+      document.getElementById('seed').value,
+      document.getElementById('seed').getAttribute('aria-invalid'),
+      document.getElementById('seed-error').textContent
+    ].join('||')`);
+  const [rawVal, rawInvalid, rawErr] = longSeed.split('||');
+  check('21-digit entry keeps the ORIGINAL text (no maxlength truncation)',
+        rawVal === '100000000000000000000', `got ${rawVal}`);
+  check('21-digit entry is marked invalid with explanation',
+        rawInvalid === 'true' && /too long|at most 20/i.test(rawErr), rawErr);
+  await setVal('seed', '0');
+
+  /* ---- 9c. prompt required (mirrors config.py) but never alerts on load ---- */
+  check('no prompt error on fresh load (no first-paint alert)',
+        (await evaluate('document.getElementById("prompt-error").textContent')) === '' &&
+        await evaluate('document.getElementById("prompt").getAttribute("aria-invalid")') === 'false');
+  await setVal('prompt', '   ');
+  check('whitespace-only prompt -> accessible error after editing',
+        (await evaluate('document.getElementById("prompt-error").textContent')).length > 0 &&
+        await evaluate('document.getElementById("prompt").getAttribute("aria-invalid")') === 'true');
+  await setVal('prompt', 'a red fox');
+  check('non-empty prompt clears the prompt error',
+        (await evaluate('document.getElementById("prompt-error").textContent')) === '' &&
+        await evaluate('document.getElementById("prompt").getAttribute("aria-invalid")') === 'false');
 
   /* ---- 10. always disabled: submit refuses, no pretend success ---- */
   await setVal('prompt', 'a red fox');
