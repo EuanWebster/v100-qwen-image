@@ -813,7 +813,7 @@ async function chromeChecks() {
   // echo in the same pass: no fetch stub, no DOM stub, no extra browser.
   const blankPrompt = await evaluate(`(async function () {
     var build = window.QwenStudio.buildEnvelope();
-    var res = await window.fetch('/api/v1/config/plan', {
+    var res = await window.fetch('/api/v1/plan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Qwen-UI': '1' },
       cache: 'no-store',
