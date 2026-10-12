@@ -298,3 +298,61 @@ eval('undefined') before its branch: remove this entirely — production CSP doe
 NOT permit unsafe-eval, nor should it. The current draft also has a leftover
 }); bracket; use node--check before any browser run. Don't weaken CSP/tests to
 hide these introduced regressions. Reread this note AGAIN before docs final.
+
+16:24 final read-only peer review: exportConfig rejects only bodyError===too_large,
+but apiRequest may return unsupported with res.ok=true and no bytes; Blob([undefined])
+then downloads literal undefined while claiming success. Refuse EVERY bodyError
+and require Uint8Array bytes before download; regression using realChrome controlled
+backend fixture, explicitly labelled. parsePlan accepts whitespace-only prompt,
+unlike shared GenerationConfig; require nonblank under corrected Python whitespace
+predicate. Root independently confirmed both source branches. Root latest guarded
+default876+1skip and pinned877passed, all7API and5wire probesPASS on08329c8.
+Final Chrome acceptance awaits these small fixes.
+
+Docs still have stale CURRENT assertions in docs/web-interface.md: API described
+as no-filesystem pure despite plan/export directory STAT, future W2 backend/export
+despite implemented endpoints, and final evidence section ends with pre-restart
+Chrome blocked. Label old proof historical and append current verified evidence;
+do not claim no sockets/writes for all tests when temporary fixture writes exist.
+
+16:24 process review: CURRENT budget297/512 is NOT merely zombies. ps shows TWO
+LIVE orphan Chrome roots3284 and3410, PPID1, each with live child tree. Inspect
+their exact command/profile/launch ownership before any cleanup; if these were
+YOUR spawned repros/review children, close/reap or scoped owned-group cleanup.
+Never broad pkill/PID1/service changes; do not claim all browsers cleaned while
+these are live. Root has NOT launched Chrome this resumed turn.
+Exact live Chrome profiles are /tmp/repro-WoE5LY (PID3284, started16:22:16UTC)
+and /tmp/repro-fdL5vs (PID3410, started16:22:45UTC). These match your two double-
+checkStatus reproduction launches in this completed dsh session. No other tree
+is in scope. Verify pid/profile/process-group identity immediately before action.
+
+16:26 correction: root directly found the existing ML311 interpreter's absolute
+target /home/dev/.local/share/uv/python/cpython-3.11-linux-x86_64-gnu/bin/python3.11.
+Earlier claim NO Python3.11 binary here was not established and must be removed.
+Actual --version/runtime command outcome determines availability; current main
+guarded default and review interpreters are both3.13.5, not3.11 evidence. Do not
+install anything or add mismatched site-packages to fake a3.11 test leg.
+16:27 VERIFIED: ML311 --version is Python3.11.15. Existing separate review
+/tmp/qwen-review.bIFHcI/venv311/bin/python is also3.11.15 and root directly ran
+full pinned guarded suite with that interpreter:877passed8.85s. No installation,
+ML imports or dependencies changed. Remove unavailable3.11 claim from current docs.
+
+16:30 review of current export draft: the OLD early bodyError===too_large branch
+still returns before new all-bodyError invalidation, leaving Connected/buttons
+trusted after size-cap schema rejection. Unify handling or invalidate distinctly
+in that branch too. Avoid duplicate contradictory branches. Root reviewer now
+includes new blank-plan and unreadable-export controlled-backend cases and is
+running independently (owned Chrome; normal bind sandbox refused, approved
+escalated local diagnostic rerun, sandbox enabled). Do not run root script yourself.
+16:31 root INDEPENDENT actual Chrome reviewer session10562 exited0:39/39 assertions
+PASS (27 at1440/375/320, noexceptions/noexternal2, valid/blank-plan2, actualHTTP
+statusraces4, explicitly controlled-backend unreadable-export2, actualHTTP15s
+partial-bodytimeout+noexceptions2). Original pre-extension script35, not33.
+Root viewed desktop/mobile screenshots: no horizontal overflow, full20digitseed
+visible, honest empty preview/disabledGenerate. Actual ownedChrome closed; root
+verified0liveChrome,22ChromeZ, budget147/512. Current app draft fixed blank prompt
+and unsupported export; remaining early too_large bypass still must be unified.
+
+16:32 root spotted new R6 integration regression BEFORE acceptance: fetch target
+is /api/v1/config/plan, but the actual allowlisted route is /api/v1/plan. Fix this
+typo before its servedChrome pass; do not weaken parser/assertions to accept404.
