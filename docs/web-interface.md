@@ -270,7 +270,8 @@ Duplicate JSON object keys (at any depth) → `duplicate_json_key`; `NaN` /
 beyond the shared depth limit → typed; int literals that cannot be parsed →
 typed; lone surrogates in any string → `invalid_text`; invalid UTF-8 →
 `invalid_utf8`. Every error is `qwen_engine.web_error.v1` with status
-400/403/405/411/413/417/422/500, a short message and field list — never a
+400/403/404/405/411/413/414/415/417/422/500/503/505, a short message and
+field list — never a
 traceback, never a filesystem path, never an internal module name.
 
 ### Transport hardening
@@ -298,7 +299,19 @@ byte is read**; `Transfer-Encoding` (incl. chunked) → 400; **every `Expect`
 extension, including `100-continue`, is refused 417** — the server never
 emits an early 100 before Host/Origin/length validation and never reads an
 unsupported Expect body. Finite socket/read timeouts apply before header
-parsing; every response closes the connection. Routing uses the **raw wire
+parsing; every response closes the connection. **EVERY response** — including
+the early request-line/unsupported-version errors the stdlib parser emits
+BEFORE any valid version is recognized — carries a real `HTTP/1.x` status
+line and the full defensive header set below: the inherited stdlib framing
+suppresses ALL header output while `request_version` sits at its `HTTP/0.9`
+default, so that legacy/error state is framed explicitly through the SAME
+shared header constant (never a second list). Legacy requests are REFUSED,
+never served: a request line without an HTTP version, or an explicit
+`HTTP/0.x` token, is a typed `unsupported_request_version` 400 raised
+BEFORE any dispatch decision (the version is never normalized to make a
+legacy request servable); `HTTP/2.x` is a framed 505; malformed HEAD legs
+keep the framing contract — headers with an honest `Content-Length`, NEVER
+a payload. Standard HTTP/1.0/1.1 handling is unchanged. Routing uses the **raw wire
 request target** (Python's own parser folds a leading `//` in the normalized
 path — the raw target is checked too, so a real `//x` request is a typed 400,
 never accidentally served) and is an exact origin-form allowlist — absolute
@@ -441,3 +454,28 @@ same invariants as machine checks.
   chrome-headless zombies remain unkillable by this agent; browser launches
   stayed bounded and usage stayed around 150/512 cgroup slots.
 
+* Legacy/early-error HTTP framing fix (this writer, 2026-10-12, the four
+  root-report FAIL cases): the two legacy states that were SERVED bare
+  (versionless request line, explicit HTTP/0.9) are now refused with a
+  framed typed `unsupported_request_version` 400 BEFORE dispatch, and the
+  early errors the stdlib emits before any version is recognized (broken
+  request line, HTTP/2.x → framed 505, legacy POST type refusal) are framed
+  with the real HTTP/1.1 status line and the full shared defensive header
+  set through the one shared frame builder; malformed HEAD legs carry
+  honest headers with zero payload. Supported HTTP/1.0/1.1 behavior is
+  unchanged. Writer's verification on this HEAD (no Chrome and no model
+  launched by this writer): root's 9-case memory-socket probe
+  `/tmp/v100-web-wire-review.py` **9/9 PASS on BOTH actual interpreters**
+  (Python 3.13.5 review venv and Python 3.11.15 review venv311); guarded
+  CPU suites (`run_cpu_tests.sh`, runner-owned fresh basetemp, no
+  override): default interpreter **889 passed + 1 skipped**, pinned venv
+  (3.13.5) **890 passed**, pinned venv311 (**3.11.15**) **890 passed**
+  (10 new guarded memory-socket framing regressions, none weakened);
+  integration check HTTP-ONLY (`QWEN_PYTHON` = pinned venv, NO
+  `QWEN_RUN_CHROME`) **55/55 executed checks passed** including the six
+  new REAL-socket framing legs (four legacy legs + two malformed-HEAD
+  no-payload legs), 1 NOT RUN Chrome leg by design. **PENDING, not
+  claimed:** root will independently rerun the 9-case probe and the final
+  40-check real-Chrome pass — W2 remains **review-pending until root
+  accepts**; the earlier "4 NEW legacy cases FAIL" addendum above is the
+  historical 16:42 snapshot, corrected by this bullet.
