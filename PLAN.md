@@ -19,7 +19,9 @@ benchmark schemas, and fresh-environment test requirements.
 
 Generate high-quality images with Qwen-Image-2.1 at 1024×1024 on a single 16GB Volta
 card (2K as an experimental opt-in whose feasibility is **not yet demonstrated**), with a
-headless CLI front-end and a conservative memory policy that refuses anything it cannot
+local **web workspace** as the primary front-end (2026-10-12 pivot — replaces the
+deferred desktop GUI; the headless CLI stays; design in `docs/web-interface.md`)
+and a conservative memory policy that refuses anything it cannot
 clear from calibration (R4/M5.3 — no uncalibrated guarantees, per C8).
 Maximum image quality takes priority; speed is improved where possible, with no
 user-specified hard generation-time limit.
@@ -149,7 +151,8 @@ CPU tests never touch a heavy ML import:
 | `qwen_engine/encoder.py` | Encoder **subprocess worker + embedding cache** (port `run_subprocess_logged`; key **v3** — v2 plus the optional immutable `EncoderImplementationIdentity` (M2.2b foundation): encoder artifact-set digest (**asset component only**, never the whole key), worker protocol/implementation + prompt-extraction revisions, exact diffusers/transformer commits, torch build/version, safetensors/torchvision versions; generic fake requests may carry none, a production worker must require one; atomic writes, quarantine, timeout/cancel, bounded worker responses, fake-worker tests — R5; detail in M1.4/M2.2b). | stdlib |
 | `qwen_engine/mem_preflight.py` | **Host-memory preflight for the forthcoming CPU encoder child (M2.2b)**: conservative stdlib check, before any ML import/weight read/loader call, that checkpoint bytes + explicit dtype expansion (integer ceiling division) + explicit runtime headroom fit the **tighter** of host `MemAvailable` (validated `kB` unit; conversion-limit-exceeding digits are unknown) and this process's cgroup v2 state. A real read walks **every visible ancestor** but is fail-closed **unknown**: a missing `memory.max` at any level proves nothing about the controller, and the visible root's completeness is unproven (a namespace `/` can hide a tighter ancestor), so real autodiscovery refuses regardless of root file contents — the tightest visible `limit - current` travels only as an **advisory visible availability** (an UPPER bound on true availability a hidden ancestor can only tighten) with truthful per-level source notes. An explicitly injected finite/unlimited `MemorySnapshot` is **trusted caller evidence** for pure budget arithmetic (finite cap never substituted away by host RAM; unknown host always refuses; absent finite current is never zero; zero cap is a zero budget). Passing is a conservative prerequisite, **not measured model-fit evidence**; the default deployment may legitimately refuse all real loads until trusted complete host-budget evidence exists. Scoped to Linux cgroup v2 — not the M5.3 `memory.py` policy and not a general resource framework. | stdlib |
 | `qwen_engine/bench.py` | **Versioned benchmark/result schemas** (R6; detail in M1.5): phase timings, peak host RSS, peak CUDA memory when available, environment and model identifiers; feeds `calibration.json`. | stdlib |
-| `qwen_engine/cli.py` | The only v1 front-end (GUI deferred, YAGNI): argparse → validate config → plan via `core.plan()` (adapter-independent) → `generate`; implements the **exit-code contract** (M1 acceptance criteria). `cli_gen.py` at the repo root stays as a thin entry-point shim. | the above only |
+| `qwen_engine/cli.py` | The engine's CLI front-end (kept after the 2026-10-12 web pivot; the desktop-GUI idea is superseded by the web workspace — see the W milestones): argparse → validate config → plan via `core.plan()` (adapter-independent) → `generate`; implements the **exit-code contract** (M1 acceptance criteria). `cli_gen.py` at the repo root stays as a thin entry-point shim. | the above only |
+| `qwen_engine/web_static/` | **Original static web workspace** (W milestones; design in `docs/web-interface.md`): self-contained HTML/CSS/JS — no framework, no CDN, no external fonts. Honest "Not connected" state until a W2 same-origin server reports ready. W1 = Create + History + Settings shell only: **no server, no job manager, no fake results/jobs/timings**. FreeVideo's web studio was a visual/UX reference only — no code or assets copied, no ComfyUI involvement. | none (browser-side; its server is W2) |
 
 **Boundary invariant (tested):** `python -c "import qwen_engine"` and
 `cli_gen.py --help` / `--dry-run` must succeed on a machine with **no torch, no
@@ -398,6 +401,28 @@ unexpected (logged with context, traceback only into the log sink).
 - **7.2** `README.md` (what fits at what cost, commands) + `docs/bringup.md` (V100
   driver/CDI/PCIe trail for the next Volta box).
 
+### W — Web workspace milestones (2026-10-12 pivot: the web UI is the primary interface; CLI + engine unchanged)
+
+Visual/UX reference only (inspected, not vendored): FlashML-org/FreeVideo `web/`
+studio layout — header + left controls / right stable preview, progressive
+disclosure, stat cards, creations history. Engine stays ComfyUI-free.
+
+- **W1 (done 2026-10-12, commit `89041f9`)** — polished **static** workspace:
+  `src/qwen_engine/web_static/{index.html,app.css,app.js}` + guarded text tests.
+  Starts honestly "Not connected"; Generate disabled with a visible reason; no
+  server, no jobs, no fake results. Full-browser dark shell, Create/History/
+  Settings routing, BigInt decimal-string seeds (`crypto` random), presets,
+  lightweight form validation only (server stays authoritative). Design:
+  `docs/web-interface.md`.
+- **W2** — tiny same-origin **static+capability server** (stdlib `http.server`
+  subclass or similar): serves `web_static` and `/api/v1/capability`
+  (`{ready, reason}` from real engine status); package-data for the assets;
+  still **no generation**. Config import/export moves here when the
+  authoritative `GenerationConfig` serializer exists.
+- **W3** — generation wiring: job submit/status endpoints over the real engine
+  path (`core` + adapter), real results into the preview + History, honest
+  timings. Gated on the engine milestones (M3/M4) — the UI never invents output.
+
 ---
 
 ## Tests / validation
@@ -449,7 +474,9 @@ unexpected (logged with context, traceback only into the log sink).
    not folklore.
 2. Whether Viggle turbo quality holds as an opt-in preset (6.2).
 3. In-sandbox model storage path/mount (2.1).
-4. GUI front-end — deliberately out (YAGNI; CLI per spec).
+4. ~~GUI front-end — deliberately out (YAGNI; CLI per spec).~~ **Resolved
+   2026-10-12:** pivot to a local web workspace as the primary interface
+   (W milestones above; `docs/web-interface.md`). CLI and engine kept.
 
 ## Execution notes
 
@@ -1254,3 +1281,10 @@ standing rule that executed plans stay honest.)*
    lower-bound-above-upper-bound guaranteed-refusal reason — the honest
    gate live. No network, no GPU, no permissions;
    `models/assets/`, manifest, fetcher and `sandbox.yaml` untouched.
+
+- 2026-10-12 **W-milestone pivot (user directive)**: primary interface is now
+  the local web workspace (was "GUI out, CLI per spec"); engine and CLI kept.
+  W1 shipped as static original assets (`web_static/`, FreeVideo-inspired
+  layout only — no code/asset/ComfyUI reuse) with honest disconnected states;
+  server + generation deferred to W2/W3. No dependency, entrypoint or
+  packaging changes; `sandbox.yaml` and ML locks untouched.
