@@ -474,8 +474,14 @@ same invariants as machine checks.
   integration check HTTP-ONLY (`QWEN_PYTHON` = pinned venv, NO
   `QWEN_RUN_CHROME`) **55/55 executed checks passed** including the six
   new REAL-socket framing legs (four legacy legs + two malformed-HEAD
-  no-payload legs), 1 NOT RUN Chrome leg by design. **PENDING, not
-  claimed:** root will independently rerun the 9-case probe and the final
-  40-check real-Chrome pass — W2 remains **review-pending until root
-  accepts**; the earlier "4 NEW legacy cases FAIL" addendum above is the
-  historical 16:42 snapshot, corrected by this bullet.
+  no-payload legs), 1 NOT RUN Chrome leg by design. Root's independent
+  acceptance on 2026-10-12 reran the full integration command with real
+  Chrome 154 and the current Python 3.13.5 venv: **102/102 executed checks
+  passed**, including the real-socket legacy framing cases, desktop/mobile
+  UI paths, export byte checks, browser race/timeout/rejection cases, no
+  third-party requests, and no uncaught page exceptions. The guarded suite
+  independently passed **889 + 1 skipped** on that venv. W2 is accepted;
+  the earlier "4 NEW legacy cases FAIL" addendum and the pending-review
+  wording above are historical snapshots, corrected by this bullet. The
+  previous Python 3.11.15 verification remains writer-reported; that
+  interpreter was not installed in the root review environment.
