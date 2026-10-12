@@ -3,14 +3,25 @@
 Pure text/structure checks on ``src/qwen_engine/web_static/`` — no browser,
 no network, no ML imports, no writes. The assets must stay original,
 self-contained and honest-by-construction (PLAN W-milestone pivot,
-docs/web-interface.md).
+docs/web-interface.md). W1 performs NO network requests at all: the earlier
+speculative capability probe was removed after review, and these tests assert
+it stays removed. Real-Chrome behavioural checks live in
+``scripts/chrome_browser_check.mjs`` — that script is NOT part of this guarded
+suite and requires ``CHROME_PATH``.
 """
 from __future__ import annotations
 
+import dataclasses
 import re
 from pathlib import Path
 
 import qwen_engine
+from qwen_engine.config import (
+    AttentionBackend,
+    GenerationConfig,
+    OffloadMode,
+    Quant,
+)
 
 WEB_DIR = Path(qwen_engine.__file__).resolve().parent / "web_static"
 ASSETS = ("index.html", "app.css", "app.js")
@@ -58,15 +69,60 @@ def test_js_never_uses_innnerhtml_and_keeps_seed_a_decimal_string():
     assert "crypto.getRandomValues" in js
 
 
-def test_starts_disconnected_with_disabled_generate():
+def test_seed_grammar_is_bounded_before_bigint():
+    js = _read("app.js")
+    # parseSeed enforces a trimmed ASCII-decimal grammar of at most 20
+    # characters BEFORE any BigInt call (documented policy: longer strings,
+    # even all-leading-zero ones, are rejected on length).
+    m = re.search(r"function parseSeed\(str\)\s*\{(.*?)\n  \}", js, re.S)
+    assert m, "parseSeed not found"
+    body = m.group(1)
+    assert ".trim()" in body
+    assert r"/^\d+$/" in body
+    big = body.index("BigInt")
+    assert "length > SEED_MAX_DIGITS" in body
+    assert body.index("SEED_MAX_DIGITS") < big, "length bound must precede BigInt"
+    assert "SEED_MAX_DIGITS = SEED_MAX.toString().length" in js
     html = _read("index.html")
-    assert "Not connected" in html
+    m = re.search(r"<input id=\"seed\"[^>]*>", html)
+    assert m and 'maxlength="20"' in m.group(0), "seed input must cap at 20 chars"
+
+
+def test_seed_row_is_a_full_row_with_short_helper_and_accessible_range():
+    html = _read("index.html")
+    seed_block = re.search(r'<div class="field seed-field">.*?\n {10}</div>',
+                           html, re.S)
+    assert seed_block, "seed must be its own full-width field row"
+    assert 'id="steps"' not in seed_block.group(0), "seed must not share the Steps row"
+    assert "Leave at 0 or choose Random." in html
+    # precise range explanation retained accessibly (title attribute)
+    assert "18446744073709551615" in html and "title=" in html
+    css = _read("app.css")
+    assert re.search(r"\.seed-row input\s*{[^}]*min-width:\s*0", css)
+
+
+def test_generate_is_always_disabled_with_no_capability_probe_anywhere():
+    # W1 removed the speculative /api/v1/capability probe entirely: the page
+    # makes no network requests under ANY protocol, and Generate is disabled
+    # unconditionally. No test here may promise an endpoint or a ready state.
+    for name in ASSETS:
+        text = _read(name)
+        assert "api/v1" not in text, f"{name} still references a W1 endpoint"
+        assert "capability" not in text.lower(), f"{name} still probes capability"
+        assert "location.protocol" not in text
+    js = _read("app.js")
+    assert not re.search(r"\bfetch\s*\(", js), "W1 must not call fetch()"
+    assert re.search(r"generate\.disabled\s*=\s*true;\s*//\s*unconditional", js)
+    assert "disabled = false" not in js, "nothing may enable Generate in W1"
+    lowered = js.lower().replace("readystate", "")
+    assert "ready" not in lowered, "no ready-state semantics may survive in W1 app.js"
+    html = _read("index.html")
     m = re.search(r'id="generate-btn"[^>]*', html)
     assert m and "disabled" in m.group(0), "Generate must start disabled"
-    js = _read("app.js")
-    # capability probe is fixed-path and protocol-gated (no file:// fetch)
-    assert "'/api/v1/capability'" in js
-    assert "location.protocol" in js
+    # disabled visual state is NOT the gate: handlers refuse unconditionally
+    assert "function refuseSubmit" in js
+    assert js.count("refuseSubmit()") >= 2, "submit AND keydown must refuse"
+    assert "Nothing was submitted" in js
 
 
 def test_form_snapshot_uses_exact_config_enums_and_keys():
@@ -74,25 +130,64 @@ def test_form_snapshot_uses_exact_config_enums_and_keys():
     # UI wire snapshot mirrors GenerationConfig keys; seed stays a STRING
     m = re.search(r"seed:\s*([^\n]+)", js)
     assert m and "seedWireString" in m.group(1) and "Number" not in m.group(1)
-    for key in ("negative_prompt", "true_cfg_scale", "attention_backend",
-                "vae_tiled_decode"):
-        assert key in js, f"snapshot key {key} missing"
     assert "ui-wire/w1" in js
-    # Selects expose exactly the config.py enum values — no invented options.
+    m = re.search(r"function formSnapshot\(\)\s*\{.*?return\s*\{(.*?)\};", js, re.S)
+    assert m, "formSnapshot not found"
+    keys = set(re.findall(r"^\s*(\w+):", m.group(1), re.M))
+    config_fields = {f.name for f in dataclasses.fields(GenerationConfig)}
+    assert keys - {"kind"} <= config_fields, \
+        f"snapshot keys outside GenerationConfig fields: {keys - config_fields}"
+    assert keys - {"kind"} == config_fields - {
+        "output_dir", "cache_dir", "log_dir", "benchmarks_dir",
+        "models_dir", "manifest_path",
+    }, "snapshot must carry every non-path GenerationConfig field, no aliases"
+
+    # Selects expose EXACTLY the config.py enum values — no invented options,
+    # no aliases, compared against the real Python enums.
     html = _read("index.html")
-    offload = re.search(r'<select id="offload".*?</select>', html, re.S)
-    attention = re.search(r'<select id="attention".*?</select>', html, re.S)
-    quant = re.search(r'<select id="quant".*?</select>', html, re.S)
-    assert offload and attention and quant
-    for value in ("resident", "streamed", "offload"):
-        assert f'value="{value}"' in offload.group(0)
-    for value in ("auto", "sdpa", "efficient", "eager"):
-        assert f'value="{value}"' in attention.group(0)
-    for value in ("fp16", "q8", "q4"):
-        assert f'value="{value}"' in quant.group(0)
+    for select_id, enum_cls in (("quant", Quant), ("offload", OffloadMode),
+                                ("attention", AttentionBackend)):
+        m = re.search(rf'<select id="{select_id}".*?</select>', html, re.S)
+        assert m, f"select {select_id} missing"
+        values = set(re.findall(r'value="([^"]+)"', m.group(0)))
+        assert values == {member.value for member in enum_cls}, \
+            f"{select_id} options diverge from {enum_cls.__name__}"
     for invented in ("candidate-a", "candidate-b", 'value="on"',
                      'value="off"', 'value="default"'):
         assert invented not in html
+
+
+def test_validation_marks_aria_invalid_on_every_control():
+    js = _read("app.js")
+    m = re.search(r"function renderValidation\((?:errors)?\w*\)\s*\{(.*?)\n  \}",
+                  js, re.S)
+    assert m, "renderValidation not found"
+    body = m.group(1)
+    for control in ("steps", "seed", "cfg", "width", "height"):
+        assert f"'{control}'" in body, f"renderValidation misses {control}"
+    assert "setAriaInvalid" in body
+    # dimension error must mark BOTH dimension controls
+    assert body.count("!!errors.dims") == 2
+    html = _read("index.html")
+    # both dimension inputs share the dims error description
+    assert html.count('aria-describedby="dims-error"') == 2
+
+
+def test_routing_focuses_headings_only_on_user_hashchange():
+    js = _read("app.js")
+    assert 'addEventListener(\'hashchange\', routeOnHashchange)' in js
+    assert "heading.focus()" in js
+    m = re.search(r"function initialRoute\(\)\s*\{(.*?)\n  \}", js, re.S)
+    assert m and ".focus()" not in m.group(1), "no autofocus on initial load"
+    m = re.search(r"function routeOnHashchange\(\)\s*\{(.*?)\n  \}", js, re.S)
+    assert m and "hasOwnProperty.call(VIEWS, name)" in m.group(1), \
+        "unknown hashes (#main) must not reroute to Create"
+    html = _read("index.html")
+    for heading in ("create-heading", "history-heading", "settings-heading"):
+        assert f'id="{heading}" tabindex="-1"' in html or \
+               'tabindex="-1"' in re.search(
+                   rf'<h2[^>]*id="{heading}"[^>]*>', html).group(0), \
+            f"{heading} needs tabindex=-1 to be focusable"
 
 
 def test_no_storage_or_service_apis_in_w1():
@@ -100,6 +195,17 @@ def test_no_storage_or_service_apis_in_w1():
     for forbidden in ("localStorage", "sessionStorage", "indexedDB",
                       "navigator.serviceWorker"):
         assert forbidden not in js, f"W1 must not use {forbidden}"
+
+
+def test_privacy_wording_is_factual_about_locality():
+    html = _read("index.html")
+    m = re.search(r"<dt>Privacy</dt><dd>(.*?)</dd>", html, re.S)
+    assert m
+    privacy = " ".join(m.group(1).split())
+    assert "no third-party requests" in privacy
+    assert "analytics" in privacy
+    assert "static hosting" in privacy and "enforces nothing" in privacy, \
+        "must not suggest static hosting enforces locality"
 
 
 def test_assets_import_nothing_python_and_module_stays_ml_free():
