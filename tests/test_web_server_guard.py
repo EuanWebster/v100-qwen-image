@@ -170,10 +170,20 @@ def test_overload_refusal_carries_the_FULL_defensive_header_set():
     assert b"X-Frame-Options: DENY" in head
     assert not any(name.lower().startswith(b"access-control")
                    for name in (line.split(b":")[0] for line in head.split(b"\r\n")))
-    # built FROM the constant (one source of truth), not a second literal list
+    # built FROM the constant (one source of truth), not a second literal
+    # list. The legacy/early-error framing fix consolidated raw framing
+    # into _framed_bytes: _raw_refusal_bytes must DELEGATE to it (no
+    # second header list anywhere) and that one builder must use the
+    # shared constant.
     import inspect
-    src = inspect.getsource(server._raw_refusal_bytes)
-    assert "_DEFENSIVE_HEADERS" in src
+    raw_src = inspect.getsource(server._raw_refusal_bytes)
+    builder_src = inspect.getsource(server._framed_bytes)
+    assert "_framed_bytes" in raw_src  # delegation, never a second copy
+    assert "_DEFENSIVE_HEADERS" in builder_src
+    for name, _ in server._DEFENSIVE_HEADERS:
+        # no defensive header NAME may appear as a literal outside the
+        # shared constant's own definition (drift guard for both builders)
+        assert f'"{name}"' not in raw_src and f'"{name}"' not in builder_src
 
 
 class _FakeSocket:
@@ -452,7 +462,9 @@ def _memory_handler(raw: bytes):
     h.wfile = io.BytesIO()
     h.connection = types.SimpleNamespace(
         getsockname=lambda: ("127.0.0.1", 8765))
-    h.server = types.SimpleNamespace(bound_ip="127.0.0.1", bound_port=8765)
+    h.server = types.SimpleNamespace(bound_ip="127.0.0.1", bound_port=8765,
+                                     assets={"app.js": b"console.log('fixed asset')"},
+                                     web_runtime=api.WebRuntime())
     h.close_connection = False
     h.request_version = "HTTP/1.1"
     h.address_string = lambda: "127.0.0.1"
@@ -483,6 +495,100 @@ def test_unknown_method_with_foreign_host_hits_host_policy_first():
     out = _memory_handler(b"WEIRD / HTTP/1.1\r\nHost: evil.example:8765\r\n\r\n")
     assert " 400 " in out.split("\r\n")[0]
     assert "invalid_host" in out                    # policy BEFORE method typing
+
+
+# --------------------- legacy/early-error HTTP framing (root 9-case review)
+
+#: The four root-review FAIL legs: versionless request line, explicit
+#: HTTP/0.9, broken request line, HTTP/2.0. ALL four must come back with a
+#: REAL HTTP/1.x status line and the full shared defensive header set —
+#: never a bare body (the inherited stdlib emitters suppress EVERYTHING
+#: while request_version is the HTTP/0.9 default).
+_LEGACY_FRAMING_CASES = (
+    (b"GET /app.js\r\nHost: 127.0.0.1:8765\r\n\r\n", 400),
+    (b"GET /app.js HTTP/0.9\r\nHost: 127.0.0.1:8765\r\n\r\n", 400),
+    (b"BROKEN\r\n\r\n", 400),
+    (b"GET /app.js HTTP/2.0\r\nHost: 127.0.0.1:8765\r\n\r\n", 505),
+)
+
+
+@pytest.mark.parametrize("wire,status", _LEGACY_FRAMING_CASES,
+                         ids=["no-version", "explicit-0.9", "broken-line",
+                              "http-2.0"])
+def test_legacy_and_early_errors_are_framed_never_bare(wire, status):
+    out = _memory_handler(wire)
+    head, _, body = out.partition("\r\n\r\n")
+    assert head.startswith(f"HTTP/1.1 {status} "), head.split("\r\n")[0]
+    for name, value in server._DEFENSIVE_HEADERS:
+        assert f"{name}: {value}" in head, name    # shared defensive set
+    assert '"schema": "qwen_engine.web_error.v1"' in body  # typed JSON
+    assert "console.log" not in out, \
+        "a legacy request must NEVER be served — framed refusal only"
+
+
+@pytest.mark.parametrize("wire", [
+    b"POST /api/v1/plan\r\nHost: 127.0.0.1:8765\r\n\r\n",
+    b"POST /api/v1/plan HTTP/0.9\r\nHost: 127.0.0.1:8765\r\n\r\n",
+], ids=["no-version", "explicit-0.9"])
+def test_legacy_versions_refused_before_dispatch_not_normalized(wire):
+    # The gate fires in parse_request BEFORE any dispatch decision: a
+    # fully header-valid POST without an HTTP/1.x version must hit the
+    # version refusal (unsupported_request_version), NEVER the POST
+    # write-policy chain (ui_header_required/411/415) — proof that the
+    # version is refused, not normalized into a servable state.
+    out = _memory_handler(wire)
+    head, _, body = out.partition("\r\n\r\n")
+    assert head.startswith("HTTP/1.1 400 "), head
+    # Refused BEFORE dispatch either way — by the stdlib's own legacy type
+    # check (no version token) or by our gate (explicit HTTP/0.9) — but
+    # never by the POST write-policy chain, which only dispatch reaches.
+    if b"HTTP/0.9" in wire:
+        assert "unsupported_request_version" in body
+    else:
+        assert "Bad HTTP/0.9 request type" in body
+    assert "ui_header_required" not in body and "length_required" not in body
+    # parse_request must REFUSE, never reassign request_version to serve:
+    import inspect
+    assert "self.request_version =" not in inspect.getsource(
+        server._Handler.parse_request)
+
+
+def test_malformed_head_refusals_are_framed_and_payloadless():
+    # HEAD framing contract under early/legacy errors: real status line and
+    # headers (with an honest Content-Length) but NEVER a payload — even
+    # though self.command is not set yet when the error fires.
+    for wire in (b"HEAD /app.js\r\nHost: 127.0.0.1:8765\r\n\r\n",
+                 b"HEAD /app.js HTTP/0.9\r\nHost: 127.0.0.1:8765\r\n\r\n"):
+        out = _memory_handler(wire)
+        head, _, body = out.partition("\r\n\r\n")
+        assert head.startswith("HTTP/1.1 400 "), head.split("\r\n")[0]
+        for name, value in server._DEFENSIVE_HEADERS:
+            assert f"{name}: {value}" in head, name
+        assert "content-length:" in head.lower()
+        assert body == "", wire   # headers framed, payload NEVER
+
+
+@pytest.mark.parametrize("version", ["HTTP/1.0", "HTTP/1.1"])
+def test_supported_http_versions_behave_exactly_as_before(version):
+    out = _memory_handler(f"GET /app.js {version}\r\n"
+                          f"Host: 127.0.0.1:8765\r\n\r\n".encode("ascii"))
+    head, _, body = out.partition("\r\n\r\n")
+    assert head.startswith("HTTP/1.1 200 OK"), head.split("\r\n")[0]
+    assert body == "console.log('fixed asset')"
+    for name, value in server._DEFENSIVE_HEADERS:
+        assert f"{name}: {value}" in head, name
+
+
+def test_legacy_framing_normalization_shares_the_one_header_builder():
+    # Static drift guard: the legacy/error-state branch of _send must use
+    # the SAME shared builder/constant as every other response — a second
+    # literal header list anywhere is exactly the bug this guards.
+    import inspect
+    src = inspect.getsource(server._Handler._send)
+    assert 'if self.request_version == "HTTP/0.9":' in src
+    assert "_framed_bytes" in src and "send_response_only" in src
+    for name, _ in server._DEFENSIVE_HEADERS:
+        assert f'"{name}"' not in src
 
 
 def test_drain_connection_queue_recognizes_sentinels(tmp_path):
