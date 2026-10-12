@@ -542,8 +542,13 @@ def test_py_strip_covers_plain_space_and_matches_python_whitespace():
     m = re.search(r"function pyStrip\(s\)\s*\{(.*?)\n  \}", js, re.S)
     assert m, "pyStrip not found"
     body = m.group(1)
-    cls = re.search(r"/\[([^\]]*)\]/", body).group(1)
+    cls = re.search(r"\[([^\]]*)\]", body).group(1)
     assert "\\x20" in cls, "pyStrip must strip plain space like Python does"
+    # EDGE-ONLY stripping: Python .strip() never touches INTERIOR
+    # whitespace — '4 2' must be REJECTED by the seed grammar, not parsed
+    # as 42 (root browser review caught the interior-strip variant).
+    assert body.count("[") >= 2 and re.search(r"/\^[^/]*\+\|[^/]*/g", body), \
+        "pyStrip must anchor at ^ and $ (leading/trailing only)"
     for esc in ("\\x09", "\\x0A", "\\x0B", "\\x0C", "\\x0D",
                 "\\x1C", "\\x1D", "\\x1E", "\\x1F", "\\x85", "\\xA0"):
         assert esc in cls, esc
@@ -617,3 +622,12 @@ def test_manifest_core_and_blocker_contract_shared_and_exact():
     from qwen_engine.web import api as _api
     assert reason_codes <= {_api.MANIFEST_UNCONFIGURED, _api.MANIFEST_FILE_MISSING,
                             _api.MANIFEST_INVALID, _api.MANIFEST_UNREADABLE}
+
+
+def test_api_requests_bypass_the_http_cache():
+    # Two status checks must be TWO real requests (the root wire race proves
+    # it); a cached status document is never authoritative.
+    js = _read("app.js")
+    m = re.search(r"function apiRequest\([^)]*\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "apiRequest not found"
+    assert "requestOpts.cache = 'no-store'" in m.group(1)

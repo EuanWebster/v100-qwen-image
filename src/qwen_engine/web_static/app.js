@@ -100,7 +100,10 @@
   // Python exactly so a server-valid cfg_active is never falsely rejected
   // by JS whitespace rules ('   ' + cfg>1 is cfg_active FALSE server-side).
   function pyStrip(s) {
-    return s.replace(/[\x20\x09\x0A\x0B\x0C\x0D\x1C\x1D\x1E\x1F\x85\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/g, '');
+    // EDGES ONLY — Python str.strip() removes LEADING/TRAILING whitespace
+    // and NEVER interior whitespace: '4 2' must stay '4 2' (rejected by the
+    // seed grammar), not silently become '42'.
+    return s.replace(/^[\x20\x09\x0A\x0B\x0C\x0D\x1C\x1D\x1E\x1F\x85\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]+|[\x20\x09\x0A\x0B\x0C\x0D\x1C\x1D\x1E\x1F\x85\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]+$/g, '');
   }
 
   var PRESETS = {
@@ -391,6 +394,10 @@
       }
     }
     requestOpts.signal = controller.signal;
+    // No HTTP-cache path for API calls: every status/plan/export request
+    // goes to the server (a cached status is NEVER an authoritative one,
+    // and two checks must be two REAL requests — verifiable in the wire).
+    requestOpts.cache = 'no-store';
     function settle(value) { clearTimeout(timer); return value; }
     return fetch(url, requestOpts).then(function (res) {
       return readBodyLimited(res).then(function (bytes) {
