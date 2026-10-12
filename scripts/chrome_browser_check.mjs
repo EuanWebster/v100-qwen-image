@@ -3,26 +3,37 @@
  *
  * NOT part of the guarded main suite (`run_cpu_tests.sh` stays static-only,
  * ML-free and socket-free). Run it directly, and only when a Chrome binary
- * is available:
+ * is available and the machine has free task slots:
  *
  *     CHROME_PATH=/path/to/chrome node scripts/chrome_browser_check.mjs
  *
- * Dependencies: none. Uses the existing Chrome binary plus Node built-ins
- * only (node:child_process, node:fs, node:os, node:path, and the global
- * WebSocket for the DevTools protocol). It launches its own Chrome child
+ * Dependencies: none (Node built-ins + the global WebSocket; shared bounded
+ * lifecycle in ./chrome_lifecycle.mjs). It launches its own Chrome child
  * with a throwaway profile under the system temp dir and always cleans
- * both up. No screenshots are written or committed.
+ * that child up (Browser.close, then own-group signal — never a broad kill).
+ * Chrome's own sandbox stays enabled unless QWEN_CHROME_NO_SANDBOX=1 is set
+ * explicitly. Every wait is bounded: DevTools announce, websocket open,
+ * EACH CDP send and the whole check; an early child exit rejects startup.
+ * No screenshots are written or committed.
  *
  * Covers: seed edges/length/non-ASCII, snapshot keys, presets and manual
  * dimension matching, preview ratio, hash nav + heading focus (and the
  * #main skip-link case), aria-invalid wiring, Generate ALWAYS disabled with
  * zero HTTP probes, and horizontal overflow at 1440/375/320.
+ *
+ * STATUS: not run to green inside the 2026-10-12 review container (the
+ * cgroup pids controller was saturated by processes from earlier sessions;
+ * that cause is REPORTED, not verified). Must be run on a clean sandbox.
  */
-import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  cgroupCapacity, launchChrome, makeCdp, openCdpSocket, shutdownChrome, watchdog,
+} from './chrome_lifecycle.mjs';
+
+const WHOLE_CHECK_MS = 180000;
 
 const CHROME = process.env.CHROME_PATH;
 if (!CHROME) {
@@ -36,28 +47,27 @@ const here = dirname(fileURLToPath(import.meta.url));
 const pageUrl = 'file://' + resolve(here, '..', 'src', 'qwen_engine',
                                     'web_static', 'index.html');
 
-// Honest preflight on cgroup-limited machines: spawning Chrome needs a batch
-// of free task slots (cgroup pids controller). Refuse EARLY with a clear
-// message instead of hanging on pthread_create EAGAIN.
-try {
-  const { readFileSync } = await import('node:fs');
-  const max = Number(readFileSync('/sys/fs/cgroup/pids.max', 'utf8').trim());
-  const cur = Number(readFileSync('/sys/fs/cgroup/pids.current', 'utf8').trim());
-  if (Number.isFinite(max) && Number.isFinite(cur) && max - cur < 64) {
-    console.error(`chrome_browser_check: only ${max - cur} free task slots ` +
-                  `(${cur}/${max} in the cgroup pids controller) — Chrome ` +
-                  'cannot start. Unreaped zombie processes are leaking the ' +
-                  'limit; this is an environment problem, not a product ' +
-                  'failure. Clean the sandbox (or run on a fresh box).');
+// Honest preflight on cgroup-limited machines: report the free capacity and
+// refuse EARLY instead of hanging. The CAUSE is not claimed — no procstat
+// diagnostics run here, so the message stays free-capacity-only.
+{
+  const cap = cgroupCapacity();
+  if (cap && !cap.ok) {
+    console.error(`chrome_browser_check: only ${cap.free} free task slots ` +
+                  `(pids ${cap.detail} in the cgroup pids controller) — ` +
+                  'Chrome cannot start reliably. Cause not verified from ' +
+                  'here; run this script on a clean sandbox. This is an ' +
+                  'environment problem, not a product failure.');
     process.exit(3);
   }
-} catch { /* not a cgroup v2 box we can read — proceed and let Chrome speak */ }
+}
 
 const profileDir = mkdtempSync(join(tmpdir(), 'qwen-chrome-check-'));
 
 let results = [];
 let chrome = null;
 let ws = null;
+let cdp = null;
 let failed = 0;
 
 function check(name, ok, detail = '') {
@@ -65,60 +75,32 @@ function check(name, ok, detail = '') {
   if (!ok) failed++;
 }
 
-function delay(ms) { return new Promise((r) => setTimeout(r, ms)); }
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
-  chrome = spawn(CHROME, [
-    '--remote-debugging-port=0',
-    `--user-data-dir=${profileDir}`,
-    '--no-first-run', '--no-default-browser-check', '--no-sandbox',
-    '--disable-gpu', '--disable-dev-shm-usage', '--disable-crash-reporter',
-    '--disable-breakpad', '--disable-background-networking', '--disable-sync',
-    '--no-zygote', '--renderer-process-limit=1', '--num-raster-threads=1',
-    '--disable-features=AudioServiceOutOfProcess', '--mute-audio',
-    'about:blank',
-  ], { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
-  const wsUrl = await new Promise((res, rej) => {
-    const t = setTimeout(() => rej(new Error('chrome did not announce a DevTools port within 45 s')), 45000);
-    const onData = (buf, sink) => {
-      const m = /DevTools listening on (ws:\/\/\S+)/.exec(sink.toString());
-      if (m) { clearTimeout(t); res(m[1]); }
-    };
-    let errBuf = '';
-    chrome.stderr.on('data', (b) => { errBuf += b; onData(0, Buffer.from(errBuf)); });
-    chrome.on('error', (e) => { clearTimeout(t); rej(e); });
-  });
+  const launched = launchChrome({ chromePath: CHROME, profileDir });
+  chrome = launched.chrome;
+  const url = await launched.wsUrl;   // early child exit rejects here
+  const sock = openCdpSocket(url);
+  ws = sock.ws;
+  await sock.ready;
+  cdp = makeCdp(ws);
 
-  ws = new WebSocket(wsUrl);
-  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
-
-  let nextId = 1;
-  const pending = new Map();
-  const netRequests = [];
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (msg.id && pending.has(msg.id)) {
-      const { resolve: r, reject: j } = pending.get(msg.id);
-      pending.delete(msg.id);
-      msg.error ? j(new Error(JSON.stringify(msg.error))) : r(msg.result);
-    } else if (msg.method === 'Network.requestWillBeSent') {
-      netRequests.push(msg.params.request.type + ' ' + msg.params.request.url);
-    }
-  };
-  const send = (method, params = {}, sessionId) => new Promise((resolveP, rejectP) => {
-    const id = nextId++;
-    pending.set(id, { resolve: resolveP, reject: rejectP });
-    ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
-  });
-
-  const { targetId } = await send('Target.createTarget', { url: 'about:blank' });
-  const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
-  const s = (method, params) => send(method, params || {}, sessionId);
+  const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+  const s = (method, params) => cdp.send(method, params || {}, sessionId);
 
   // fetch spy installed BEFORE any page script runs
   await s('Page.enable');
   await s('Runtime.enable');
   await s('Network.enable');
+  const netRequests = [];
+  cdp.onEvent = (msg) => {
+    if (msg.method === 'Network.requestWillBeSent') {
+      // the resource type lives on params.type — NOT params.request.type
+      netRequests.push(`${msg.params.type} ${msg.params.request.url}`);
+    }
+  };
   await s('Page.addScriptToEvaluateOnNewDocument', { source:
     'window.__fetchCalls = []; var __of = window.fetch;' +
     'window.fetch = function () { window.__fetchCalls.push(String(arguments[0]));' +
@@ -138,9 +120,11 @@ async function main() {
   await delay(600); // local file:// load; settle deterministically
 
   /* ---- 1. no network probes at all ---- */
+  const pageRequests = netRequests.filter((r) => !r.startsWith('File '));
   const probed = netRequests.filter((r) => /Fetch|XHR|WebSocket/.test(r));
   check('zero HTTP/XHR/Fetch probes from the page', probed.length === 0, probed.join('; '));
   check('fetch spy saw no calls', await evaluate('window.__fetchCalls.length') === 0);
+  void pageRequests;
 
   /* ---- 2. app surface + initial honest state ---- */
   check('QwenStudio exposes w1-static',
@@ -303,8 +287,9 @@ async function main() {
         await evaluate('document.getElementById("seed").getAttribute("aria-invalid")') === 'true');
   await setVal('seed', '0');
 
-  /* ---- 9b. over-length seed entry: NO silent truncation ---- */
-  await s('Input.enable');
+  /* ---- 9b. over-length seed entry: NO silent truncation ----
+   * Input.insertText works WITHOUT an enable call — the Input domain has no
+   * Input.enable method (requesting it would fail the whole session). */
   await evaluate(`(function () {
     var el = document.getElementById('seed');
     el.value = ''; el.focus(); return true; })()`);
@@ -384,22 +369,16 @@ async function main() {
         await evaluate('document.documentElement.scrollWidth <= window.innerWidth + 1') === true);
 }
 
+const guard = watchdog(WHOLE_CHECK_MS, 'whole browser check');
 try {
-  await main();
+  await Promise.race([main(), guard]);
 } catch (err) {
   check('script completed without error', false, String(err && err.stack || err));
 } finally {
+  guard.cancel();
   console.log(results.join('\n'));
   console.log(`\n${results.length - failed}/${results.length} browser checks passed`);
-  if (ws) { try { ws.close(); } catch {} }
-  if (chrome) {
-    // Prefer a graceful CDP close so Chrome reaps its own children; fall back
-    // to killing the whole process group.
-    try { chrome.kill('SIGTERM', true); } catch {}
-    await delay(1500);
-    try { chrome.kill('SIGKILL', true); } catch {}
-    try { chrome.unref(); } catch {}
-  }
+  await shutdownChrome(chrome, ws, cdp);
   try { rmSync(profileDir, { recursive: true, force: true, maxRetries: 5 }); } catch {}
 }
 process.exit(failed === 0 ? 0 : 1);
