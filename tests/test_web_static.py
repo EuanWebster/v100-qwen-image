@@ -1,13 +1,16 @@
-"""W1 guarded tests for the packaged static web workspace assets.
+"""Guarded tests for the packaged static web workspace assets (W1 + W2).
 
 Pure text/structure checks on ``src/qwen_engine/web_static/`` — no browser,
 no network, no ML imports, no writes. The assets must stay original,
 self-contained and honest-by-construction (PLAN W-milestone pivot,
-docs/web-interface.md). W1 performs NO network requests at all: the earlier
-speculative capability probe was removed after review, and these tests assert
-it stays removed. Real-Chrome behavioural checks live in
-``scripts/chrome_browser_check.mjs`` — that script is NOT part of this guarded
-suite and requires ``CHROME_PATH``.
+docs/web-interface.md). W1 made zero network requests (the speculative
+capability probe was removed after review); W2 replaces that with a strict
+same-origin contract: the ONLY fetch targets are the three relative
+``/api/v1/...`` endpoints of the local qwen-web server, and failures render
+honestly as "Not connected". Real-Chrome behavioural checks live in
+``scripts/chrome_browser_check.mjs`` and the served-UI checks in
+``scripts/web_integration_check.mjs`` — neither is part of this guarded
+suite and both require ``CHROME_PATH``.
 """
 from __future__ import annotations
 
@@ -108,21 +111,27 @@ def test_seed_row_is_a_full_row_with_short_helper_and_accessible_range():
     assert re.search(r"\.seed-row input\s*{[^}]*min-width:\s*0", css)
 
 
-def test_generate_is_always_disabled_with_no_capability_probe_anywhere():
-    # W1 removed the speculative /api/v1/capability probe entirely: the page
-    # makes no network requests under ANY protocol, and Generate is disabled
-    # unconditionally. No test here may promise an endpoint or a ready state.
+def test_generate_is_always_disabled_with_only_same_origin_api_calls():
+    # W2 truth: the page may talk ONLY to the three same-origin relative
+    # endpoints (/api/v1/status, /api/v1/plan, /api/v1/config/export).
+    # Generate stays unconditionally disabled (generation is W3); the
+    # submit handlers refuse directly — the disabled button is not the gate.
     for name in ASSETS:
         text = _read(name)
-        assert "api/v1" not in text, f"{name} still references a W1 endpoint"
         assert "capability" not in text.lower(), f"{name} still probes capability"
         assert "location.protocol" not in text
     js = _read("app.js")
-    assert not re.search(r"\bfetch\s*\(", js), "W1 must not call fetch()"
+    # Every fetch target is one of the three relative API constants — never
+    # a string-literal URL, never a host, never an absolute origin.
+    assert not re.search(r"fetch\(\s*['\"]", js), "fetch must use API constants only"
+    for const, route in (("API_STATUS", "/api/v1/status"),
+                         ("API_PLAN", "/api/v1/plan"),
+                         ("API_EXPORT", "/api/v1/config/export")):
+        m = re.search(rf"var {const} = '([^']+)'", js)
+        assert m, f"{const} missing"
+        assert m.group(1) == route
     assert re.search(r"generate\.disabled\s*=\s*true;\s*//\s*unconditional", js)
-    assert "disabled = false" not in js, "nothing may enable Generate in W1"
-    lowered = js.lower().replace("readystate", "")
-    assert "ready" not in lowered, "no ready-state semantics may survive in W1 app.js"
+    assert "disabled = false" not in js, "nothing may enable Generate"
     html = _read("index.html")
     m = re.search(r'id="generate-btn"[^>]*', html)
     assert m and "disabled" in m.group(0), "Generate must start disabled"
@@ -137,7 +146,7 @@ def test_form_snapshot_uses_exact_config_enums_and_keys():
     # UI wire snapshot mirrors GenerationConfig keys; seed stays a STRING
     m = re.search(r"seed:\s*([^\n]+)", js)
     assert m and "seedWireString" in m.group(1) and "Number" not in m.group(1)
-    assert "ui-wire/w1" in js
+    assert "ui-wire/w2" in js
     m = re.search(r"function formSnapshot\(\)\s*\{.*?return\s*\{(.*?)\};", js, re.S)
     assert m, "formSnapshot not found"
     keys = set(re.findall(r"^\s*(\w+):", m.group(1), re.M))
@@ -250,3 +259,106 @@ def test_assets_import_nothing_python_and_module_stays_ml_free():
          "('torch','diffusers','transformers')]"],
         capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
+
+
+# ---------------------------------------------------------------- W2
+
+
+def _python_schema_tags() -> dict[str, str]:
+    from qwen_engine.web import api
+    return {"status": api.WEB_STATUS_SCHEMA, "plan": api.WEB_PLAN_SCHEMA,
+            "request": api.WEB_PLAN_REQUEST_SCHEMA, "error": api.WEB_ERROR_SCHEMA}
+
+
+def test_w2_schema_literals_match_the_python_api_exactly():
+    js = _read("app.js")
+    tags = _python_schema_tags()
+    for tag in tags.values():
+        assert f"'{tag}'" in js, f"wire schema tag missing from app.js: {tag}"
+    assert "'X-Qwen-UI'" in js or '"X-Qwen-UI"' in js
+
+
+def test_w2_envelope_exact_editable_fields_no_kind_no_paths():
+    from qwen_engine.web.api import EDITABLE_FIELDS, RUNTIME_PATH_FIELDS
+    js = _read("app.js")
+    m = re.search(r"buildEnvelope\(\)[\s\S]*?return \{\s*ok: true,\s*envelope: \{([\s\S]*?)\n      \}\n    \};", js)
+    assert m, "buildEnvelope envelope literal not found"
+    body = m.group(1)
+    assert "schema: PLAN_REQUEST_SCHEMA" in body
+    config_body = body[body.index("config: {") + len("config: {"):]
+    config_keys = set(re.findall(r"^\s*(\w+):", config_body, re.M))
+    assert config_keys == set(EDITABLE_FIELDS)
+    assert "kind" not in body, "UI wire kind must be excluded from the envelope"
+    for path_field in RUNTIME_PATH_FIELDS:
+        assert path_field not in body
+    assert not re.search(r"schema:\s*[\w.]*\+", body)
+
+
+def test_w2_status_is_strictly_validated_never_trusted_by_shape():
+    js = _read("app.js")
+    m = re.search(r"function parseStatus\(s\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "parseStatus not found"
+    body = m.group(1)
+    assert "s.schema !== STATUS_SCHEMA" in body
+    assert "s.planning_available !== true" in body          # strict boolean
+    assert "gen === false ? false : 'unexpected'" in body   # never trust 'true'
+    assert "GATE_STATES" in js and "not_implemented" in js
+    assert "unrecognized" in js
+
+
+def test_w2_plan_response_seed_must_be_decimal_string_or_null():
+    js = _read("app.js")
+    m = re.search(r"function parsePlan\(raw\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "parsePlan not found"
+    body = m.group(1)
+    assert r"/^\d{1,20}$/" in body, "plan seed must be validated as a string"
+    assert "typeof c.seed === 'string'" in body
+    # rendering uses textContent helpers only, never markup or .value writes
+    m = re.search(r"function planRenderFields\(plan\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m
+    assert "innerHTML" not in m.group(1)
+    assert ".value" not in m.group(1)
+
+
+def test_w2_finite_numbers_checked_before_serialization():
+    js = _read("app.js")
+    m = re.search(r"function numberField\(id, wantInt\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "numberField not found"
+    body = m.group(1)
+    assert "raw === ''" in body, "empty fields must be an error, never 0"
+    assert "Number.isFinite" in body
+    assert "Number.isInteger" in body
+
+
+def test_w2_export_downloads_raw_blob_without_reserialization():
+    js = _read("app.js")
+    m = re.search(r"function exportConfig\(\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "exportConfig not found"
+    body = m.group(1)
+    assert "res.blob()" in body, "export must download raw response bytes"
+    assert "JSON.parse" not in body and ".text()" not in body, \
+        "export bytes must never be parsed/reserialized on the success path"
+    assert "URL.createObjectURL" in body and "URL.revokeObjectURL" in body
+    assert "qwen-editable-config.json" in body
+    # never a silent export of a stale/invalid draft:
+    assert "buildEnvelope()" in body
+    assert "local form errors" in body
+
+
+def test_w2_failure_paths_preserve_the_draft():
+    js = _read("app.js")
+    # only applyPreset (2 writes) and the Random button (1 write) may write
+    # an input value — no server response ever populates the form.
+    assert js.count(".value = ") == 3, "server data must never write form fields"
+    assert "draft was preserved" in js or "draft stays" in js or \
+           "Nothing was sent or changed" in js
+
+
+def test_w2_plan_panel_is_rendered_not_invented():
+    html = _read("index.html")
+    for elem_id in ("btn-check-config", "btn-plan", "btn-export", "api-message",
+                    "plan-panel", "plan-seed", "plan-tokens", "plan-cfg",
+                    "plan-manifest", "plan-blockers"):
+        assert f'id="{elem_id}"' in html, f"W2 UI element missing: {elem_id}"
+    assert 'hidden' in re.search(r'<section class="plan-panel"[^>]*>', html).group(0), \
+        "plan panel must start hidden (nothing rendered before a server answer)"

@@ -20,7 +20,7 @@
     <a href="#settings" id="nav-settings" class="nav-link nav-settings">Settings</a>
   </nav>
   <p class="connection-chip" id="connection-chip" role="status"
-     aria-label="Backend connection status">Generation unavailable</p>
+     aria-label="Backend connection status">Not connected</p>
 </header>
 
 <main id="main">
@@ -146,15 +146,27 @@
             </div>
 
             <p class="help">Values are kept exactly as selected (no
-              browser-side remapping). Nothing is sent anywhere in this build;
-              a future local server would validate them authoritatively and
-              have the final say.</p>
+              browser-side remapping). They are sent only to the local
+              qwen-web server on this same origin, which validates them
+              authoritatively and has the final say.</p>
           </details>
 
           <div class="actions">
             <button type="submit" id="generate-btn" class="btn-primary" disabled>
               Generate</button>
             <p class="disabled-reason" id="generate-reason" role="status"></p>
+          </div>
+
+          <div class="actions api-actions" role="group"
+               aria-label="Configuration and planning">
+            <button type="button" class="btn-secondary" id="btn-check-config">
+              Check configuration</button>
+            <button type="button" class="btn-secondary" id="btn-plan">
+              Plan</button>
+            <button type="button" class="btn-secondary" id="btn-export">
+              Export editable configuration</button>
+            <p class="api-status" id="api-message" role="status"
+               aria-live="polite"></p>
           </div>
         </form>
       </aside>
@@ -197,6 +209,25 @@
             <p class="stat-value">—<span class="visually-hidden">(unknown)</span></p>
           </div>
         </div>
+
+        <section class="plan-panel" id="plan-panel" hidden
+                 aria-labelledby="plan-panel-heading">
+          <h3 id="plan-panel-heading">Server plan</h3>
+          <p class="plan-note" id="plan-panel-note" role="status"></p>
+          <dl class="plan-list">
+            <div><dt>Seed (decimal string)</dt><dd id="plan-seed">—</dd></div>
+            <div><dt>Dimensions</dt><dd id="plan-dims">—</dd></div>
+            <div><dt>Steps</dt><dd id="plan-steps">—</dd></div>
+            <div><dt>CFG</dt><dd id="plan-cfg">—</dd></div>
+            <div><dt>Latent tokens</dt><dd id="plan-tokens">—</dd></div>
+            <div><dt>Quant / offload / attention</dt><dd id="plan-quant">—</dd></div>
+            <div><dt>Manifest</dt><dd id="plan-manifest">—</dd></div>
+            <div><dt>Hardware</dt><dd id="plan-hardware">—</dd></div>
+            <div><dt>Calibration</dt><dd id="plan-calibration">—</dd></div>
+          </dl>
+          <p class="stat-label">Generation blockers (why nothing runs yet)</p>
+          <ul class="plan-blockers" id="plan-blockers" aria-live="polite"></ul>
+        </section>
       </section>
 
     </div>
@@ -218,20 +249,33 @@
   <section id="view-settings" class="view" hidden aria-labelledby="settings-heading">
     <h2 id="settings-heading" tabindex="-1">Settings</h2>
     <dl class="settings-list">
-      <div><dt>Backend status</dt><dd id="settings-backend">No engine server
-        exists yet in this build. This page never contacts one: it is static,
-        so both file:// and plain static HTTP hosting are disconnected. A
-        reviewed status/plan contract is a later-milestone concern.</dd></div>
-      <div><dt>Runtime paths &amp; model files</dt><dd>There is no local
-        engine server in this build, so nothing here reads or manages runtime
-        paths, and no model or weight is downloaded by this page.</dd></div>
-      <div><dt>Validation of full settings</dt><dd>What this page checks is a
-        lightweight form check only, not a fitness or memory check. No server
-        in this build validates anything yet.</dd></div>
+      <div><dt>Backend status</dt><dd id="settings-backend">This page talks
+        only to the local qwen-web server on the same origin, when it is
+        running. Opened over file:// or without that server it is
+        disconnected: planning and authoritative validation are unavailable.
+        The server offers planning only — never generation.</dd></div>
+      <div><dt>Generation gates</dt><dd id="settings-gates">Unknown until the
+        server answers: adapter, hardware, assets and calibration gates are
+        reported by /api/v1/status and are all explicitly unsatisfied in
+        this build.</dd></div>
+      <div><dt>Generation</dt><dd id="settings-generation">Planning and
+        authoritative config validation come from the local server;
+        generation needs a pipeline adapter and job API that do not exist
+        yet — Generate is disabled and the handlers refuse outright.</dd></div>
+      <div><dt>Runtime paths &amp; model files</dt><dd>Runtime paths
+        (output, cache, log, benchmarks, models, manifest) belong to the
+        server's own configuration and can never be set from this page;
+        the editable-config export omits them. No model or weight is
+        downloaded by this page.</dd></div>
+      <div><dt>Validation of full settings</dt><dd>What this page checks is
+        a lightweight form check only, not a fitness or memory check. The
+        local server performs the authoritative GenerationConfig validation
+        when it is reachable.</dd></div>
       <div><dt>Privacy</dt><dd>This page makes no third-party requests and
-        loads no external fonts, scripts or analytics. Locality is enforced
-        only by the planned local server (a later milestone); plain static
-        hosting serves these files but enforces nothing by itself.</dd></div>
+        loads no external fonts, scripts or analytics; its only requests
+        are same-origin calls to the local server. Plain static hosting
+        serves these files but enforces nothing by itself — locality is
+        enforced by the qwen-web server binding loopback only.</dd></div>
       <div><dt>Drafts</dt><dd>Nothing is saved by the browser automatically.
         An opt-in draft store for validated form values may come later.</dd></div>
     </dl>
