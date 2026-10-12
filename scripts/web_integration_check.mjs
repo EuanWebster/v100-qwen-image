@@ -26,7 +26,11 @@
  *      must never land), a stalled response BODY past a test-reduced
  *      deadline (timeout, not hang), schema-rejected status JSON (typed
  *      rejection, not a disconnect), Unicode/long prompts in the form and
- *      a raw uint64-max download verified from the NEW file on disk.
+ *      a raw uint64-max download verified from the NEW file on disk, an
+ *      export success envelope WITHOUT a readable body (controlled-backend
+ *      fixture: refused as a typed schema rejection, never a download of
+ *      'undefined') and a parsePlan blank/Python-whitespace-only echoed
+ *      prompt rejection against the real served plan echo.
  *      Cleanup lives at the OUTERMOST scope: however the run ends, the
  *      chrome lifecycle state (outer-scoped) is shut down (bounded) BEFORE
  *      our server child group is killed — an aborted leg can never orphan
@@ -749,6 +753,97 @@ async function chromeChecks() {
   check('all-space negative + cfg 2 plans with CFG inactive (Python strip parity in the browser)',
         /inactive/.test(spacePlan.cfg) && spacePlan.msg === '',
         spacePlan.cfg + ' | ' + spacePlan.msg.slice(0, 80));
+
+  // R5: an export response that is HTTP-successful but has NO readable
+  // body must never download anything. Controlled-backend fixture: the
+  // fetch override resolves a Response-like success envelope whose body
+  // stream is absent — the exact shape that previously produced
+  // Blob([undefined]) → a file containing the literal 'undefined' under a
+  // success message. (Fixture, not a real stalled-network proof.)
+  const beforeRejectedDownload = downloads.length;
+  await evaluate(`(() => {
+    window.__plainFetch4 = window.fetch;
+    window.fetch = function (u, o) {
+      if (String(u).indexOf('/api/v1/config/export') >= 0)
+        return Promise.resolve({
+          ok: true, status: 200, url: String(u),
+          headers: new Headers({ 'Content-Type': 'application/json' }),
+          body: null,   // NO readable stream: the typed 'unsupported' case
+        });
+      return window.__plainFetch4(u, o);
+    };
+  })()`);
+  const draftPromptBefore = await evaluate('document.getElementById("prompt").value');
+  await evaluate('document.getElementById("btn-export").click()');
+  await waitUntil(async () =>
+    /Export refused/.test(await evaluate('document.getElementById("api-message").textContent')),
+    8000, 'no-body export refused');
+  const rejectedExport = await evaluate(`({
+    chip: document.getElementById('connection-chip').textContent,
+    msg: document.getElementById('api-message').textContent,
+    prompt: document.getElementById('prompt').value })`);
+  check('no-body export success envelope is refused, never downloaded (controlled-backend fixture: fetch override without readable body)',
+        /Export refused/.test(rejectedExport.msg) &&
+        !/Downloaded/.test(rejectedExport.msg), rejectedExport.msg.slice(0, 90));
+  check('no-body export is a typed schema rejection — distinct chip, not a fabricated disconnect (same fixture)',
+        /Status rejected/.test(rejectedExport.chip) && !/Not connected/.test(rejectedExport.chip) &&
+        /not a disconnect/.test(rejectedExport.msg), rejectedExport.chip);
+  await delay(800);   // any spurious download would have begun by now
+  check('no download was triggered by the refused export (same fixture)',
+        downloads.length === beforeRejectedDownload,
+        `new downloads: ${downloads.length - beforeRejectedDownload}`);
+  check('draft is unchanged by the refused export (same fixture)',
+        rejectedExport.prompt === draftPromptBefore, rejectedExport.prompt.slice(0, 40));
+  await evaluate('window.fetch = window.__plainFetch4;');
+  await evaluate('document.getElementById("btn-check-config").click()');
+  await waitUntil(async () =>
+    /Connected .*planning only/.test(await evaluate('document.getElementById("connection-chip").textContent')),
+    15000, 'reconnect after refused export');
+  const beforeRestoredDownload = downloads.length;
+  await evaluate('document.getElementById("btn-export").click()');
+  await waitUntil(async () => downloads.slice(beforeRestoredDownload)
+                                    .some((d) => d.done), 15000, 'export after reconnect');
+  check('export works again after the refused-response scenario (real server bytes)',
+        downloads.slice(beforeRestoredDownload).length >= 1,
+        `new downloads: ${downloads.length - beforeRestoredDownload}`);
+
+  // R6: parsePlan must refuse an echoed config.prompt that is empty or
+  // Python-whitespace-only — EXACTLY shared GenerationConfig
+  // (config.py: `not prompt.strip()`). Runs against the REAL served plan
+  // echo in the same pass: no fetch stub, no DOM stub, no extra browser.
+  const blankPrompt = await evaluate(`(async function () {
+    var build = window.QwenStudio.buildEnvelope();
+    var res = await window.fetch('/api/v1/config/plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Qwen-UI': '1' },
+      cache: 'no-store',
+      body: JSON.stringify(build.envelope)
+    });
+    var doc = await res.json();
+    var baseline = window.QwenStudio.parsePlan(doc) !== null;
+    var blanks = ['', ' ', '\\t\\n\\u000b\\u000c\\r', ' \\u00a0 ',
+                  '\\u2028\\u2029', '\\u3000', '\\u0085\\u001c\\u001f'];
+    var accepted = [];
+    for (var i = 0; i < blanks.length; i++) {
+      var d = JSON.parse(JSON.stringify(doc));
+      d.config.prompt = blanks[i];
+      if (window.QwenStudio.parsePlan(d) !== null) accepted.push(JSON.stringify(blanks[i]));
+    }
+    var d2 = JSON.parse(JSON.stringify(doc));
+    d2.config.prompt = '\\u200b';    // zero-width space: NOT Python whitespace
+    var zwspAccepted = window.QwenStudio.parsePlan(d2) !== null;
+    var d3 = JSON.parse(JSON.stringify(doc));
+    d3.config.prompt = 'a\\tb';      // interior whitespace must be preserved
+    var interiorAccepted = window.QwenStudio.parsePlan(d3) !== null;
+    return { baseline: baseline, accepted: accepted,
+             zwspAccepted: zwspAccepted, interiorAccepted: interiorAccepted };
+  })()`);
+  check('parsePlan rejects empty/Python-whitespace-only echoed prompt (real served plan echo, corrected strip predicate)',
+        blankPrompt.baseline === true && blankPrompt.accepted.length === 0,
+        'accepted blanks: ' + blankPrompt.accepted.join(' '));
+  check('parsePlan keeps ZWSP and interior-whitespace prompts (exact Python strip parity, never over-strips)',
+        blankPrompt.zwspAccepted === true && blankPrompt.interiorAccepted === true,
+        JSON.stringify(blankPrompt));
 
   // every network-origin request the page made was same-origin (CSP
   // connect-src 'self' holds in practice; data:/blob: URLs are local)
