@@ -1,5 +1,12 @@
 # Handoff: V100 Qwen-Image project
 
+> **Current-state pointer (added 2026-10-12 — the text below is the historical
+> **Oct-7 snapshot and is preserved unchanged).** This snapshot's "Implementation
+> has not started" applied to that date only: the engine milestones and the web
+> W1/W2 work have since landed. For the CURRENT state run `memctl brief
+> v100-qwen-image` and read the latest handoff (`docs/handoffs/` — most recent
+> file) before acting; do not resume from the historical text alone.
+
 Updated 2026-10-07 by Codex. Euan is ending the host session and will reopen
 Codex inside this project's sandbox. Review and requirements interview are
 complete. Implementation has not started.

@@ -1,11 +1,13 @@
 """Pure W2 web contract: status / plan / editable-config-export (no sockets).
 
-Every function here is deterministic and ML-free; the RESPONSE path performs
-no filesystem I/O. (Startup validation and the shared config validator may
-stat configured path metadata — directories, never weight bytes; a plan or
-status call itself reads nothing.) The only filesystem knowledge enters
-through :class:`WebRuntime`, which the server validates and canonicalises
-once at startup. Browser JSON can never select a runtime path — unknown
+Every function here is deterministic and ML-free. The STATUS response is
+served from metadata CACHED at startup — it performs no filesystem I/O at
+request time. PLAN and EXPORT run the SHARED config validator, which may
+STAT configured runtime-path metadata (directories only, never weight
+bytes) while validating the request against the manifest. No path here
+ever READS model weights or computes hashes. The only filesystem knowledge
+enters through :class:`WebRuntime`, which the server validates and
+canonicalises once at startup. Browser JSON can never select a runtime path — unknown
 path fields are refused, not stripped.
 
 Wire rules that are load-bearing (reviewed W2 contract):

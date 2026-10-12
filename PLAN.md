@@ -152,7 +152,7 @@ CPU tests never touch a heavy ML import:
 | `qwen_engine/mem_preflight.py` | **Host-memory preflight for the forthcoming CPU encoder child (M2.2b)**: conservative stdlib check, before any ML import/weight read/loader call, that checkpoint bytes + explicit dtype expansion (integer ceiling division) + explicit runtime headroom fit the **tighter** of host `MemAvailable` (validated `kB` unit; conversion-limit-exceeding digits are unknown) and this process's cgroup v2 state. A real read walks **every visible ancestor** but is fail-closed **unknown**: a missing `memory.max` at any level proves nothing about the controller, and the visible root's completeness is unproven (a namespace `/` can hide a tighter ancestor), so real autodiscovery refuses regardless of root file contents — the tightest visible `limit - current` travels only as an **advisory visible availability** (an UPPER bound on true availability a hidden ancestor can only tighten) with truthful per-level source notes. An explicitly injected finite/unlimited `MemorySnapshot` is **trusted caller evidence** for pure budget arithmetic (finite cap never substituted away by host RAM; unknown host always refuses; absent finite current is never zero; zero cap is a zero budget). Passing is a conservative prerequisite, **not measured model-fit evidence**; the default deployment may legitimately refuse all real loads until trusted complete host-budget evidence exists. Scoped to Linux cgroup v2 — not the M5.3 `memory.py` policy and not a general resource framework. | stdlib |
 | `qwen_engine/bench.py` | **Versioned benchmark/result schemas** (R6; detail in M1.5): phase timings, peak host RSS, peak CUDA memory when available, environment and model identifiers; feeds `calibration.json`. | stdlib |
 | `qwen_engine/cli.py` | The engine's CLI front-end (kept after the 2026-10-12 web pivot; the desktop-GUI idea is superseded by the web workspace — see the W milestones): argparse → validate config → plan via `core.plan()` (adapter-independent) → `generate`; implements the **exit-code contract** (M1 acceptance criteria). `cli_gen.py` at the repo root stays as a thin entry-point shim. | the above only |
-| `qwen_engine/web_static/` | **Original static web workspace** (W milestones; design in `docs/web-interface.md`): self-contained HTML/CSS/JS — no framework, no CDN, no external fonts, and (since the 2026-10-12 review fixes) **no network requests at all**: the speculative capability probe was removed; W1 makes zero HTTP calls under any protocol. Generate is unconditionally disabled — no generation adapter or job API exists. W1 = Create + History + Settings shell only: **no server, no job manager, no fake results/jobs/timings**. FreeVideo's web studio was a visual/UX reference only — no code or assets copied, no ComfyUI involvement. | none (browser-side; its server is W2) |
+| `qwen_engine/web_static/` | **Original static web workspace** (W milestones; design in `docs/web-interface.md`): self-contained HTML/CSS/JS — no framework, no CDN, no external fonts. Since W2 the page makes **only same-origin, relative API calls** (`/api/v1/status`, `/api/v1/plan`, `/api/v1/config/export`) to the local `qwen-web` server — no other network code exists. The earlier "no network requests at all" statement is HISTORICAL W1 evidence (W1 shipped without a server; the speculative capability probe was removed in the 2026-10-12 review). Opened over `file://` or without a server the page shows honest disconnected states. Generate is unconditionally disabled — no generation adapter or job API exists. FreeVideo's web studio was a visual/UX reference only — no code or assets copied, no ComfyUI involvement. | `qwen_engine/web/` (W2 server, stdlib-only) |
 
 **Boundary invariant (tested):** `python -c "import qwen_engine"` and
 `cli_gen.py --help` / `--dry-run` must succeed on a machine with **no torch, no
@@ -441,12 +441,47 @@ disclosure, stat cards, creations history. Engine stays ComfyUI-free.
   Chrome check script `scripts/chrome_browser_check.mjs` (no dependencies;
   Node built-in WebSocket CDP; **not** part of the guarded suite; requires
   `CHROME_PATH`).
-- **W2** — tiny same-origin **static+status server** (stdlib `http.server`
-  subclass or similar): serves `web_static` plus a **reviewed status/plan
-  contract** (engine status + validated plan only — **never generation**, that
-  is W3); package-data for the assets. Config import/export moves here when
-  the authoritative `GenerationConfig` serializer exists. The W1 front-end
-  performs no requests; the W2 contract is added by review, not assumed.
+- **W2 (implemented 2026-10-12 — review pending root acceptance, this update)** — runnable **local server + authoritative
+  config/plan API**, stdlib-only and ML-free:
+  `qwen_engine/web/{api.py,server.py,__main__.py}` + `qwen-web` script +
+  `python -m qwen_engine.web`; assets now shipped via setuptools package-data
+  and served same-origin. Binds **literal 127.0.0.1 only** (default port 8765;
+  `::1` refused until an actually-tested IPv6 milestone; never the harness
+  port 3081). Runtime paths (`--manifest/--models-dir/--output-dir/…`) are
+  **server-startup-only flags**, canonicalized once, can never come from
+  browser JSON, and are omitted entirely when unset (no default writes).
+  `GET /api/v1/status` → `qwen_engine.web_status.v1` (planning true /
+  generation false with the four honest gates adapter-not-implemented,
+  hardware-not-probed, assets-unverified, calibration-unknown; manifest
+  **metadata only** — never `resolve_manifest`/`manifest_status`, which would
+  stream-hash gigabytes). `POST /api/v1/plan` → exact envelope
+  `qwen_engine.web_plan_request.v1` with **only** the 11 editable
+  `GenerationConfig` fields, seed as a decimal **string** wire (≤20 ASCII
+  digits, uint64 range, never a float/bool/JS number), merged with server
+  runtime paths, answered with the **web projection** `qwen_engine.web_plan.v1`
+  (never the raw `core.plan` doc — no paths, filenames, hashes or tracebacks
+  in any response). `POST /api/v1/config/export` returns the editable fields
+  as a raw attachment with the seed as an **exact uint64 JSON number**
+  (import is W3-later, not implemented). Typed errors everywhere
+  (`qwen_engine.web_error.v1`, 400/413/417/403/405/500, no tracebacks;
+  duplicate JSON keys, NaN/Infinity, overflow floats, deep nesting, lone
+  surrogates and invalid UTF-8 all refused with typed codes). Transport
+  hardening: single exact Host bound to the literal+port, foreign
+  Origin/cross-site Sec-Fetch-Site denied on every route, no CORS ever
+  (OPTIONS = plain 405), exact `X-Qwen-UI: 1` write gate, Content-Length
+  ≤ 65536 enforced before read, no Transfer-Encoding, unsupported Expect →
+  417, finite socket timeouts, exact origin-form allowlist routing (no
+  `translate_path`, no directory listing), defensive headers + CSP
+  `default-src 'none'; connect-src 'self'`. The front end now validates the
+  strict status, renders authoritative plans via `textContent` only, and
+  downloads export bytes as a raw blob **without ever parsing/reserializing**
+  them (seed strings never pass through `Number`). Guarded tests:
+  `tests/test_web_api.py`, `tests/test_web_server_guard.py` (pure dispatch,
+  policy functions, entrypoint — no sockets, no ML, no writes); the
+  real-socket smoke suite is the **separate** command
+  `scripts/web_integration_check.mjs` (spawns its own ephemeral-port server,
+  Chrome leg strictly opt-in). CLI unchanged; generation stays W3. Design +
+  evidence: `docs/web-interface.md`.
 - **W3** — generation wiring: job submit/status endpoints over the real engine
   path (`core` + adapter), real results into the preview + History, honest
   timings. Gated on the engine milestones (M3/M4) — the UI never invents output.
