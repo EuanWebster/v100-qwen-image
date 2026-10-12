@@ -81,8 +81,11 @@ def test_seed_grammar_is_bounded_before_bigint_without_truncation():
     m = re.search(r"function parseSeed\(str\)\s*\{(.*?)\n  \}", js, re.S)
     assert m, "parseSeed not found"
     body = m.group(1)
-    # Python whitespace semantics (pyStrip), NOT JS trim(): the server
-    # strips PYTHON whitespace before the digit grammar.
+    # Python whitespace semantics (pyStrip), NOT JS trim(): trimming is a
+    # BROWSER-SIDE affordance on the user's typed input, applied at the
+    # edges before the canonical digit STRING is put on the wire. The API
+    # wire NEVER strips — the server accepts only canonical digits and
+    # refuses anything else rather than editing it.
     assert "pyStrip(String(str))" in body
     assert r"/^\d+$/" in body
     assert body.index("length > SEED_MAX_DIGITS") < body.index(r"/^\d+$/"), \
@@ -387,6 +390,45 @@ def test_export_refuses_every_body_error_and_requires_typed_bytes():
     assert "setApiAvailable(false)" in rejected, \
         "a refused export body must invalidate planning/export availability"
     assert "not a disconnect" in rejected
+
+
+def test_export_too_large_cannot_bypass_the_unified_refusal():
+    # ROOT FINDING (16:30 review): an OLD early `if (r.bodyError ===
+    # 'too_large') { ...; return false; }` sat BEFORE the unified branch
+    # and returned without setApiAvailable(false) or the rejected chip —
+    # an over-cap export body left 'Connected' and enabled buttons
+    # standing. The regression this guards: NO special-cased bodyError
+    # branch may exist beside the unified one; too_large may appear only
+    # INSIDE `if (r.bodyError)` as a reason string.
+    js = _read("app.js")
+    m = re.search(r"function exportConfig\(\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "exportConfig not found"
+    body = m.group(1)
+    assert re.search(r"if \(r\.bodyError === ", body) is None, \
+        "no early special-cased bodyError branch may bypass the unified refusal"
+    guard = body.index("if (r.bodyError)")
+    http_err = body.index("if (!r.res.ok)")
+    blob = body.index("new Blob([r.bytes])")
+    assert guard < http_err, \
+        "the unified bodyError refusal must precede the HTTP-error path"
+    assert guard < blob, \
+        "the unified bodyError refusal must precede the download path"
+    # the too_large reason and the invalidation live INSIDE the one
+    # unified branch — one setApiAvailable(false), distinct rejected chip,
+    # never 'Not connected', never a success message.
+    branch = body[guard:http_err]
+    assert branch.count("setApiAvailable(false)") == 1, \
+        "exactly one invalidation, in the unified branch"
+    assert "'too_large'" in branch and "'unsupported'" in branch, \
+        "too_large must be a reason inside the unified refusal"
+    assert "over the fixed response cap" in branch, \
+        "the size-cap reason must be stated accurately"
+    assert "Status rejected" in branch and "Not connected" not in branch, \
+        "the too_large outcome is a typed rejection, not a disconnect"
+    # the Uint8Array actual-bytes requirement on success survives (the
+    # download is built ONLY from real bytes, never parsed/reserialized)
+    assert body.index("r.bytes instanceof Uint8Array") < blob
+    assert "JSON.parse" not in body and ".text()" not in body
 
 
 def test_parse_plan_rejects_blank_prompt_exactly_like_generation_config():
