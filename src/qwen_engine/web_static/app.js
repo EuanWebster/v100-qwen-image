@@ -833,6 +833,11 @@
       if (!Object.prototype.hasOwnProperty.call(c, want[i])) return null;
     }
     if (typeof c.prompt !== 'string' || c.prompt.length > MAX_CONFIG_STRING_CHARS) return null;
+    // EXACTLY shared GenerationConfig (config.py: `not self.prompt.strip()`):
+    // an echo whose prompt is empty or Python-whitespace-only is a broken
+    // contract — the validated server never echoes one. JS trim differs from
+    // Python strip, so use the corrected pyStrip predicate.
+    if (pyStrip(c.prompt).length === 0) return null;
     if (typeof c.negative_prompt !== 'string' ||
         c.negative_prompt.length > MAX_CONFIG_STRING_CHARS) return null;
     // config.py validates dimensions as multiples of DIM_MULTIPLE (32) in
@@ -913,10 +918,46 @@
       }
       if (!r.res.ok) {
         renderApiError(r.res, apiErrorPayloadFromBytes(r.bytes));
+        setText('api-message', $('api-message').textContent +
+          ' Nothing was downloaded; your draft is unchanged.');
+        return false;
+      }
+      if (r.bodyError) {
+        // EVERY remaining bodyError is refused — not just the size cap.
+        // An 'unsupported' readable-stream outcome can otherwise arrive
+        // with res.ok=true and NO bytes at all, and Blob([undefined])
+        // would download the literal text 'undefined' under a success
+        // message. This is a typed schema rejection that invalidates the
+        // trusted availability (distinct rejected chip, explicit re-check
+        // required) — never a fabricated disconnect.
+        setApiAvailable(false);
+        renderChip('Status rejected',
+          'Status rejected — server contract broken');
+        setText('api-message', 'Export refused: the response body was unusable (' +
+                               (r.bodyError === 'unsupported'
+                                 ? 'unreadable bounded body'
+                                 : 'not decodable JSON') +
+                               ') — a schema rejection, not a disconnect; ' +
+                               'nothing was downloaded and your draft is ' +
+                               'unchanged. Use "Check configuration" to ' +
+                               're-establish a recognized status before ' +
+                               'exporting again.');
         return false;
       }
       // RAW bytes only — never parsed, never reserialized: the exact
-      // uint64 seed must survive byte-for-byte into the download.
+      // uint64 seed must survive byte-for-byte into the download, and a
+      // download is produced ONLY from actual Uint8Array bytes. A success
+      // render whose bytes are missing or wrong-typed is a client contract
+      // bug: refuse honestly, never fabricate a Blob from 'undefined'.
+      if (!(r.bytes instanceof Uint8Array)) {
+        setApiAvailable(false);
+        renderChip('Status rejected',
+          'Status rejected — server contract broken');
+        setText('api-message', 'Export refused: the raw success response ' +
+                               'carried no readable bytes — nothing was ' +
+                               'downloaded and your draft is unchanged.');
+        return false;
+      }
       var blob = new Blob([r.bytes]);
       var url = URL.createObjectURL(blob);
       var a = document.createElement('a');
