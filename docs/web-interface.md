@@ -49,12 +49,14 @@ Settings, and a connection chip. Desktop layout is a 380 px controls column
 plus a flexible preview column; under ~940 px it stacks with no horizontal
 overflow. Visible focus rings, labels for every control, `aria-live` error
 text paired with `aria-invalid="true|false"` on every validated control
-(steps, seed, CFG, and **both** dimension inputs for the shared dimension
-error), skip link, `aria-current` on the active route, `aria-pressed` on
-presets. View routing is hash-driven with `tabindex="-1"` headings focused
-**only** on user-driven `hashchange` (never on initial load); back/forward
-restore the view, and an unknown hash such as the skip link's `#main` keeps
-the current view instead of rerouting History/Settings back to Create.
+(prompt, steps, seed, CFG, and **both** dimension inputs for the shared
+dimension error), skip link, `aria-current` on the active route,
+`aria-pressed` on presets. View routing is hash-driven with `tabindex="-1"`
+headings focused **only** on user-driven `hashchange` (never on initial
+load); back/forward restore views — an **empty hash routes to Create** (so
+Back from History after a hash-less start restores Create), while an unknown
+non-empty hash such as the skip link's `#main` keeps the current view
+instead of rerouting History/Settings back to Create.
 
 ## Honesty model (the load-bearing part)
 
@@ -76,8 +78,10 @@ the current view instead of rerouting History/Settings back to Create.
   CFG ≥ 1; seed grammar) are **lightweight form validation**, labelled as such
   in the UI — explicitly *not* a RAM/model fit check. The future status/plan
   backend would own authoritative `GenerationConfig` validation and runtime
-  paths (Settings says so). No prompt-required assumption is invented: W1
-  simply never enables Generate.
+  paths (Settings says so). The prompt check mirrors `config.py` truthfully
+  (`prompt` must be a non-empty trimmed string) and is surfaced only after
+  the user edits the prompt or attempts submit — never a first-load alert,
+  and nothing is ever auto-filled. Generate itself stays disabled regardless.
 * No draft autosave, no storage APIs in W1 (Settings explains). Any future
   draft persistence must be opt-in and store only validated form values.
 
@@ -85,7 +89,9 @@ the current view instead of rerouting History/Settings back to Create.
 
 * Prompt first: blank textarea, helpful placeholder, **nothing silently
   generated or auto-filled**; used exactly as typed (`textContent` only — no
-  `innerHTML` injection paths anywhere).
+  `innerHTML` injection paths anywhere). Like `GenerationConfig` in
+  `config.py`, a prompt must not be empty; the lightweight form check says
+  so accessibly after editing or submit — not on first load.
 * Presets: Square 1024×1024 / Landscape 1344×768 / Portrait 768×1344
   (`aria-pressed`), each driving width/height and the preview's true
   aspect-ratio frame (kept honest by the ratio-aware `max-width` cap).
@@ -94,10 +100,12 @@ the current view instead of rerouting History/Settings back to Create.
   `aria-pressed` — no stale preset state.
 * Steps default **40**; seed gets its **own full row** (never squeezed beside
   Steps so all 20 digits stay inspectable at the 380 px desktop side panel and
-  at 375/320 mobile) with text default **"0"**, `maxlength="20"` and an
-  explicit **Random** action. Helper text is "Leave at 0 or choose Random.";
-  the precise range explanation lives in the input's `title` (and here) — not
-  crammed into the visible helper.
+  at 375/320 mobile) with text default **"0"** and an explicit **Random**
+  action. The field deliberately has **no `maxlength`**: maxlength would
+  silently truncate a pasted 21-digit value into a *different* valid seed;
+  `parseSeed` rejects the original text instead and says so inline. Helper
+  text is "Leave at 0 or choose Random."; the precise range explanation lives
+  in the input's `title` (and here) — not crammed into the visible helper.
 * Advanced (collapsible): negative prompt; **CFG default 1.0**; width/height;
   quantization **fp16 + q8/q4 candidates explicitly marked unvalidated**;
   offload **`resident`/`streamed`/`offload`** and attention
@@ -113,10 +121,12 @@ the current view instead of rerouting History/Settings back to Create.
 * **Seed semantics:** the full uint64 range `0–18446744073709551615` is kept
   as a **decimal string** and handled with `BigInt` internally — never coerced
   through JS `Number`. Grammar, enforced in `parseSeed` **before** any BigInt:
-  trimmed, ASCII decimal digits only, **at most 20 characters** — so longer
-  digit strings are rejected on length alone, including ones whose leading
-  zeros would make the value small (documented policy; `maxlength="20"` only
-  hardens typing, it is not the enforcement) — then the `[0, 2^64−1]` range.
+  trimmed, ASCII decimal digits only, **at most 20 characters — length is
+  checked FIRST** — so longer digit strings are rejected on length alone,
+  including ones whose leading zeros would make the value small (documented
+  policy; the input keeps the user's exact text and explains the rejection —
+  nothing is truncated, which is why there is no `maxlength`) — then the
+  `[0, 2^64−1]` range.
   Random seeds come from `crypto.getRandomValues` (8
   bytes → exact 64 bits). Null-vs-explicit-random semantics belong to the W2
   API contract, not to invented frontend behaviour.
@@ -138,9 +148,9 @@ pass; no console errors; mobile `scrollWidth` ≤ viewport. Guarded CPU suite
 780 passed + 1 skipped.
 
 **2026-10-12 (review fixes, this update)** — guarded CPU suite on this
-container: **785 passed + 1 skipped** (baseline 780+1 plus 5 new/expanded
-asset tests; 13 asset tests total) with `bash run_cpu_tests.sh` (default
-interpreter), and **786 passed, 0 skipped** with the pinned-env invocation
+container: **786 passed + 1 skipped** (baseline 780+1 plus 6 new/expanded
+asset tests; 14 asset tests total) with `bash run_cpu_tests.sh` (default
+interpreter), and **787 passed, 0 skipped** with the pinned-env invocation
 (`PYTHON=/tmp/qwen-review.bIFHcI/venv/bin/python PYTHONPATH=/work/src
 QWEN_DIFFUSERS_SRC=… QWEN_TRANSFORMERS_SRC=… bash run_cpu_tests.sh` — the
 one previously-skipped test runs under the pinned sources). Both

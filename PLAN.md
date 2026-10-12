@@ -421,15 +421,22 @@ disclosure, stat cards, creations history. Engine stays ComfyUI-free.
   requests and Generate is unconditionally disabled (submit handlers refuse
   directly; the disabled button is not the gate); manual dimension edits
   recompute exact preset `aria-pressed` (exact 1344×768 → Landscape, non-preset
-  clears all); `parseSeed` bounds trimmed ASCII decimals to ≤ 20 chars
-  **before** BigInt (leading-zero strings > 20 rejected by documented policy;
-  full uint64 max kept as an exact string) with `maxlength="20"`;
-  `renderValidation` sets `aria-invalid` on steps/seed/cfg/**both** dimension
-  inputs; the seed gets a full row (all 20 digits inspectable at 380/375/320)
+  clears all); `parseSeed` bounds trimmed decimals to ≤ 20 chars **before
+  the digit regex and any BigInt** (leading-zero strings > 20 rejected by
+  documented policy; full uint64 max kept as an exact string) with **no HTML
+  `maxlength`** — a later root finding showed maxlength silently truncates an
+  over-length paste into a *different* seed; the original text is kept and
+  rejected with an inline explanation; `renderValidation` sets `aria-invalid`
+  on prompt/steps/seed/cfg/**both** dimension inputs (the prompt check mirrors
+  `config.py`'s non-empty requirement — a root correction of the brief's
+  initial claim — surfaced only after editing or submit, never on load); the
+  seed gets a full row (all 20 digits inspectable at 380/375/320)
   with helper "Leave at 0 or choose Random." and the precise range retained in
   title/docs; hash nav focuses the new active `tabindex="-1"` heading on
-  user/hashchange only and unknown hashes (skip-link `#main`) no longer reroute
-  History/Settings back to Create; privacy wording is factual (static hosting
+  user/hashchange only, **empty hash routes to Create** (back from History
+  after a hash-less start restores Create) and unknown non-empty hashes
+  (skip-link `#main`) no longer reroute History/Settings back to Create;
+  privacy wording is factual (static hosting
   enforces nothing; locality is enforced by the planned W2 server). New real
   Chrome check script `scripts/chrome_browser_check.mjs` (no dependencies;
   Node built-in WebSocket CDP; **not** part of the guarded suite; requires

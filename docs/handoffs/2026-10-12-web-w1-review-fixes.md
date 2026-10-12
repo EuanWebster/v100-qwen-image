@@ -22,14 +22,15 @@ assets/ML locks/services untouched; no installs, no network, no model loads.
    match and `aria-pressed`: exact 1344×768 → Landscape pressed; any
    non-preset size clears all. Preview keeps its true-ratio `max-width`
    cap.
-3. **Seed bounds before BigInt.** `parseSeed`: trimmed, ASCII digits only,
-   **length ≤ 20 enforced before `BigInt`** (so >20-digit strings,
-   including leading-zero ones, are rejected by documented policy), then
-   the uint64 range. `maxlength="20"` hardens typing only. Full uint64 max
-   stays an exact decimal STRING; no Number coercion.
+3. **Seed bounds before BigInt.** `parseSeed`: trimmed, length ≤ 20 checked
+   **first**, then ASCII digits, then the uint64 range (over-length strings,
+   including leading-zero ones, are rejected on length with the exact text
+   kept — see corrections below). Full uint64 max stays an exact decimal
+   STRING; no Number coercion.
 4. **aria-invalid.** `renderValidation` sets `aria-invalid` true/false on
-   steps, seed, cfg and **both** dimension inputs (shared dims error).
-   No new prompt-required gate: W1 simply never enables Generate.
+   prompt (gated on interaction — see corrections), steps, seed, cfg and
+   **both** dimension inputs (shared dims error). Generate stays disabled
+   regardless of validity.
 5. **Seed row.** Seed moved to its own full-width row (`min-width:0`,
    compact non-shrinking Random button) so all 20 digits are inspectable
    at the 380 px side panel and 375/320 mobile. Helper shortened to
@@ -43,17 +44,45 @@ assets/ML locks/services untouched; no installs, no network, no model loads.
    analytics; static hosting enforces nothing; locality is enforced only
    by the planned W2 server.
 
+## Root mid-flight corrections (from `docs/handoffs/2026-10-12-web-review-progress.md`, applied in the follow-up product commit)
+
+* **Empty hash routes to Create** (root live-code finding): previously an
+  empty hash was ignored, so History navigation from a hash-less start plus
+  browser Back did not restore Create. `routeOnHashchange` now treats `''`
+  as Create while unknown non-empty hashes (`#main`) still preserve the
+  current view; a real-Chrome back/forward regression was added to
+  `scripts/chrome_browser_check.mjs`.
+* **Prompt required — brief corrected by root.** The original task text
+  claimed `GenerationConfig` permits an empty prompt; `config.py` in fact
+  requires a non-empty trimmed string (config.py:215). The form now mirrors
+  that truthfully: an accessible error after prompt edits or a submit
+  attempt (`promptTouched` gate), `aria-invalid` on the textarea, **never**
+  a first-load alert, **never** an auto-fill.
+* **`maxlength` removed entirely** (root losslessness finding): HTML
+  maxlength 20 silently truncates a 21-digit paste (e.g.
+  `100000000000000000000` → `10000000000000000000`, a DIFFERENT valid seed).
+  There is now no maxlength anywhere; `parseSeed` checks length ≤ 20 first
+  and keeps the exact text with a "too long / nothing truncated" inline
+  error. Browser check exercises paste-like `Input.insertText` of 21 digits
+  and asserts the original text is retained and marked invalid.
+
+The root's admin note is committed **as found** at
+`docs/handoffs/2026-10-12-web-review-progress.md`. `sandbox.yaml` remains
+untouched and dirty-uncommitted, as instructed.
+
 ## Proof (honest counts)
 
-* Static asset tests: **8 → 13**; full guarded CPU suite **785 passed +
-  1 skipped** (`bash run_cpu_tests.sh`, default python) and **786 passed,
+* Static asset tests: **8 → 14**; full guarded CPU suite **786 passed +
+  1 skipped** (`bash run_cpu_tests.sh`, default python) and **787 passed,
   0 skipped** with the pinned env command (`PYTHON=/tmp/qwen-review.bIFHcI/
   venv/bin/python PYTHONPATH=/work/src QWEN_DIFFUSERS_SRC=…
-  QWEN_TRANSFORMERS_SRC=… bash run_cpu_tests.sh`). Both interpreters on
+  QWEN_TRANSFORMERS_SRC=… bash run_cpu_tests.sh` — the one previously
+  skipped test runs under the pinned sources). Both interpreters on
   this container are **3.13.5; no 3.11 binary exists here**, so the 3.11
-  leg could not be executed — recorded as not-run, not assumed. The task's
-  "773/772" baseline did not reproduce here either: the pre-fix baseline on
-  this box was 780+1skip (measured before any edit).
+  leg could not be executed — recorded as not-run, not assumed (root's
+  later note concurs: default .venv observed 3.13.5, old 3.11 claims
+  stale). The task's "773/772" baseline did not reproduce here either: the
+  pre-fix baseline on this box was 780+1skip (measured before any edit).
 * **Real Chrome: could NOT be run green in this container.** ~390 zombie
   processes leaked by earlier sessions (parent PID 1 = `sleep`, never
   reaps) saturate the cgroup pids limit (512; ~21–40 free slots vs the
