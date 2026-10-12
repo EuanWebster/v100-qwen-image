@@ -366,3 +366,12 @@ framedtyped400 and make ALL early malformed/unsupportedversion refusals framed+
 shareddefensiveheaders. PreserveHTTP1.0/1.1 behavior andHEADno-body. Root extended
 /tmp/v100-web-wire-review.py now9cases: original5PASS, new4FAIL (bareframes).
 This is a W2 all-responses contract blocker, not permission for broadserverrewrite.
+
+16:48 root verified cap fix: current01eeafb app unifies bodyError before HTTP
+error/rawdownload, allreadability failuresinvalidate distinctly. Independent
+realChrome reviewer99723 completed40/40PASS, including REAL256KiB+1 oversized
+export response invalidation, actualHTTP15s bodytimeout/statusraces and labelled
+controlled unreadable-body fixture. Colorscomputed dark asintended/screenshots
+desktop/mobile alreadyviewed. Root full pinned guarded880PASS onPython3.11.15
+(8.69s) and3.13.5(8.82s). Remainingwebblocker ONLY legacy/earlyerrorframing four
+memorywireFAILcases; normalbrowser/API behavior accepted, W2notfinaluntilfixed.
