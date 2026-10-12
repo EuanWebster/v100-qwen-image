@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen Image Studio</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="app-header">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">Q</span>
+    <h1 class="brand-name">Qwen Image Studio</h1>
+  </div>
+  <nav class="main-nav" aria-label="Primary">
+    <a href="#create" id="nav-create" class="nav-link" aria-current="page">Create</a>
+    <a href="#history" id="nav-history" class="nav-link">History</a>
+    <a href="#settings" id="nav-settings" class="nav-link nav-settings">Settings</a>
+  </nav>
+  <p class="connection-chip" id="connection-chip" role="status"
+     aria-label="Backend connection status">Not connected</p>
+</header>
+
+<main id="main">
+
+  <!-- ===================== Create view ===================== -->
+  <section id="view-create" class="view" aria-labelledby="create-heading">
+    <h2 class="visually-hidden" id="create-heading">Create an image</h2>
+    <div class="layout">
+
+      <aside class="controls" aria-label="Generation controls">
+        <form id="create-form" novalidate>
+
+          <div class="field">
+            <label for="prompt">Prompt</label>
+            <textarea id="prompt" name="prompt" rows="4"
+              placeholder="Describe the image you want to generate…"
+              aria-describedby="prompt-help"></textarea>
+            <p id="prompt-help" class="help">Your words are used exactly as typed.
+              Nothing is generated or auto-filled for you.</p>
+          </div>
+
+          <fieldset class="field preset-field">
+            <legend>Aspect preset</legend>
+            <div class="preset-row" role="group" aria-label="Resolution presets">
+              <button type="button" class="preset-btn" data-preset="square"
+                      aria-pressed="true">Square · 1024×1024</button>
+              <button type="button" class="preset-btn" data-preset="landscape"
+                      aria-pressed="false">Landscape · 1344×768</button>
+              <button type="button" class="preset-btn" data-preset="portrait"
+                      aria-pressed="false">Portrait · 768×1344</button>
+            </div>
+          </fieldset>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="steps">Steps</label>
+              <input id="steps" name="steps" type="number" min="1" max="1000"
+                     step="1" value="40" inputmode="numeric"
+                     aria-describedby="steps-error">
+              <p class="error" id="steps-error" aria-live="polite"></p>
+            </div>
+            <div class="field">
+              <label for="seed">Seed</label>
+              <div class="seed-row">
+                <input id="seed" name="seed" type="text" value="0"
+                       inputmode="numeric" spellcheck="false"
+                       aria-describedby="seed-help seed-error">
+                <button type="button" id="random-seed" class="btn-secondary"
+                        title="Generate a cryptographically random seed">Random</button>
+              </div>
+              <p class="help" id="seed-help">Whole number 0–18446744073709551615
+                (kept as a decimal string — never rounded).</p>
+              <p class="error" id="seed-error" aria-live="polite"></p>
+            </div>
+          </div>
+
+          <details class="field advanced" id="advanced">
+            <summary>Advanced settings</summary>
+
+            <div class="field">
+              <label for="negative">Negative prompt</label>
+              <textarea id="negative" name="negative" rows="2"
+                placeholder="Optional — things to steer away from"></textarea>
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="cfg">Guidance (CFG)</label>
+                <input id="cfg" name="cfg" type="number" min="1" step="0.1"
+                       value="1.0" inputmode="decimal" aria-describedby="cfg-error">
+                <p class="error" id="cfg-error" aria-live="polite"></p>
+              </div>
+              <div class="field">
+                <label for="width">Width</label>
+                <input id="width" name="width" type="number" min="64" max="4096"
+                       step="32" value="1024" inputmode="numeric"
+                       aria-describedby="dims-error">
+                <p class="error" id="dims-error" aria-live="polite"></p>
+              </div>
+              <div class="field">
+                <label for="height">Height</label>
+                <input id="height" name="height" type="number" min="64" max="4096"
+                       step="32" value="1024" inputmode="numeric"
+                       aria-describedby="dims-error">
+              </div>
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="quant">Quantization</label>
+                <select id="quant" name="quant">
+                  <option value="fp16" selected>fp16</option>
+                  <option value="q8">q8 — candidate, unvalidated</option>
+                  <option value="q4">q4 — candidate, unvalidated</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="offload">Layer offload</label>
+                <select id="offload" name="offload"
+                        title="OffloadMode values as declared by the engine config">
+                  <option value="resident" selected>resident</option>
+                  <option value="streamed">streamed</option>
+                  <option value="offload">offload</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="attention">Attention backend</label>
+                <select id="attention" name="attention"
+                        title="AttentionBackend values as declared by the engine config">
+                  <option value="auto" selected>auto</option>
+                  <option value="sdpa">sdpa</option>
+                  <option value="efficient">efficient</option>
+                  <option value="eager">eager</option>
+                </select>
+              </div>
+              <div class="field checkbox-field">
+                <input id="vae-tiling" name="vae_tiled_decode" type="checkbox">
+                <label for="vae-tiling">VAE tiling</label>
+              </div>
+            </div>
+
+            <p class="help">Values are sent exactly as selected (no browser-side
+              remapping). The local engine server validates them authoritatively
+              and has the final say.</p>
+          </details>
+
+          <div class="actions">
+            <button type="submit" id="generate-btn" class="btn-primary" disabled>
+              Generate</button>
+            <p class="disabled-reason" id="generate-reason" role="status"></p>
+          </div>
+        </form>
+      </aside>
+
+      <section class="preview-column" aria-label="Preview">
+        <div class="preview-frame" id="preview-frame" data-aspect="1 / 1">
+          <div class="preview-empty" id="preview-empty">
+            <p class="preview-empty-title">No image yet</p>
+            <p>Generation not available — the local engine server is not
+              connected. When it is, generated images will appear here.</p>
+          </div>
+        </div>
+
+        <div class="result-actions" aria-label="Result actions">
+          <button type="button" class="btn-secondary" id="action-download"
+                  disabled title="No result yet">Download</button>
+          <button type="button" class="btn-secondary" id="action-open"
+                  disabled title="No result yet">Open</button>
+          <button type="button" class="btn-secondary" id="action-again"
+                  disabled title="No result yet">Generate again</button>
+        </div>
+
+        <div class="stats" aria-label="Session statistics">
+          <div class="stat-card">
+            <p class="stat-label">Backend</p>
+            <p class="stat-value" id="stat-backend">Not connected</p>
+          </div>
+          <div class="stat-card">
+            <p class="stat-label">Last result</p>
+            <p class="stat-value" id="stat-result">—<span class="visually-hidden">
+              (unknown)</span></p>
+          </div>
+          <div class="stat-card">
+            <p class="stat-label">Steps taken</p>
+            <p class="stat-value">—<span class="visually-hidden">(unknown)</span></p>
+          </div>
+          <div class="stat-card">
+            <p class="stat-label">Elapsed</p>
+            <p class="stat-value">—<span class="visually-hidden">(unknown)</span></p>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </section>
+
+  <!-- ===================== History view ===================== -->
+  <section id="view-history" class="view" hidden aria-labelledby="history-heading">
+    <h2 id="history-heading">History</h2>
+    <p class="history-empty" id="history-empty">
+      No saved generations yet. Completed images from this machine will appear
+      here as thumbnails. Nothing has been generated in this session, so this
+      list is honestly empty — no placeholders are shown.
+    </p>
+    <div class="history-grid" id="history-grid" aria-live="polite"></div>
+    <p><a class="back-link" href="#create">← Back to Create</a></p>
+  </section>
+
+  <!-- ===================== Settings view ===================== -->
+  <section id="view-settings" class="view" hidden aria-labelledby="settings-heading">
+    <h2 id="settings-heading">Settings</h2>
+    <dl class="settings-list">
+      <div><dt>Backend status</dt><dd id="settings-backend">Not connected.
+        This build of the page has no engine server to talk to yet.</dd></div>
+      <div><dt>Runtime paths &amp; model files</dt><dd>Managed by the local
+        engine server. They are not editable in the browser, and no model or
+        weight will be downloaded automatically by this page.</dd></div>
+      <div><dt>Validation of full settings</dt><dd>The engine server performs
+        authoritative configuration checks. Anything validated here is a
+        lightweight form check only, not a fitness or memory check.</dd></div>
+      <div><dt>Privacy</dt><dd>Local-only. No cloud services, no analytics,
+        no external fonts or scripts.</dd></div>
+      <div><dt>Drafts</dt><dd>Nothing is saved by the browser automatically.
+        An opt-in draft store for validated form values may come later.</dd></div>
+    </dl>
+    <p><a class="back-link" href="#create">← Back to Create</a></p>
+  </section>
+
+</main>
+
+<script src="app.js" defer></script>
+</body>
+</html>
