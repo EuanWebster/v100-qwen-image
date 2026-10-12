@@ -1,29 +1,39 @@
 /* Qwen Image Studio — W1 static workspace front-end.
  *
  * Honest by construction:
- *   * Starts "Not connected". Generate stays disabled with a visible reason
- *     until a future same-origin capability endpoint reports ready.
+ *   * W1 ships NO server and makes NO network requests at all: no fetch and
+ *     no speculative status probe of any kind. Whether this page is opened
+ *     over file:// or
+ *     served by static HTTP, nothing connects to an engine — both are
+ *     equally disconnected.
+ *   * Generate is therefore ALWAYS disabled, with a visible reason: no
+ *     generation adapter or job API is implemented. The disabled button is
+ *     not the gate — the submit handlers themselves refuse unconditionally.
+ *     A reviewed status/plan contract may arrive with W2; generation is W3
+ *     and is never simulated here.
  *   * No fake results, jobs, timings or thumbnails. No draft autosave.
  *   * Seeds are decimal STRINGS handled with BigInt (full uint64 range) —
  *     never coerced through JS Number.
  *   * User-supplied text is only ever inserted via textContent.
- *   * Browser-side checks are lightweight FORM validation only; the engine
- *     server remains the source of truth for GenerationConfig validation.
+ *   * Browser-side checks are lightweight FORM validation only; a future
+ *     server would remain the source of truth for GenerationConfig
+ *     validation.
  *
  * This snapshot is a UI wire format, NOT the engine's GenerationConfig JSON
- * (whose seed semantics the server will own). Do not treat it as valid
+ * (whose seed semantics the server would own). Do not treat it as valid
  * GenerationConfig output.
  */
 'use strict';
 
 (function () {
-  // The single same-origin endpoint this page may ever contact. Probed only
-  // when served over http/https by a future W2 server — never under file://,
-  // and never with anything derived from user input.
-  var CAPABILITY_PATH = '/api/v1/capability';
-
   var SEED_MIN = 0n;
   var SEED_MAX = 18446744073709551615n; // 2^64 - 1
+  var SEED_MAX_DIGITS = SEED_MAX.toString().length; // 20
+
+  var GENERATION_UNAVAILABLE_REASON =
+    'Generate is disabled: no generation adapter or job API is implemented ' +
+    'yet. This is a static page — nothing connects to an engine server, ' +
+    'whether it is opened over file:// or served statically.';
 
   var PRESETS = {
     square:    { width: 1024, height: 1024 },
@@ -32,6 +42,7 @@
   };
 
   var VIEWS = { create: 'view-create', history: 'view-history', settings: 'view-settings' };
+  var VIEW_HEADINGS = { create: 'create-heading', history: 'history-heading', settings: 'settings-heading' };
 
   function $(id) { return document.getElementById(id); }
 
@@ -42,9 +53,18 @@
 
   /* ---------------- Seed handling (BigInt decimal strings) ---------------- */
 
+  // Accepted grammar (deliberately strict, checked BEFORE any BigInt):
+  //   * surrounding whitespace trimmed;
+  //   * ASCII decimal digits only (\d is ASCII-only without /u);
+  //   * at most SEED_MAX_DIGITS (20) characters AFTER trimming — so a string
+  //     of 21+ digits is rejected even if leading zeros would put its value
+  //     in range (documented policy: length is bounded before parsing);
+  //   * the parsed value must be within [0, 2^64 - 1].
+  // The full uint64 maximum stays representable as an exact decimal STRING.
   function parseSeed(str) {
     var s = String(str).trim();
-    if (!/^\d+$/.test(s)) return null;           // decimal digits only
+    if (!/^\d+$/.test(s)) return null;
+    if (s.length > SEED_MAX_DIGITS) return null;
     var value;
     try { value = BigInt(s); } catch (err) { return null; }
     if (value < SEED_MIN || value > SEED_MAX) return null;
@@ -82,8 +102,8 @@
     }
     var seedStr = seedWireString($('seed').value);
     if (seedStr === null) {
-      errors.seed = 'Seed must be a whole-number string from 0 to ' +
-                    '18446744073709551615.';
+      errors.seed = 'Seed must be a whole-number string of at most ' +
+                    SEED_MAX_DIGITS + ' digits, from 0 to ' + SEED_MAX + '.';
     }
     var cfg = Number($('cfg').value);
     if (!Number.isFinite(cfg) || cfg < 1) {
@@ -98,20 +118,31 @@
     return { ok: Object.keys(errors).length === 0, errors: errors };
   }
 
+  function setAriaInvalid(id, invalid) {
+    var el = $(id);
+    if (el) el.setAttribute('aria-invalid', invalid ? 'true' : 'false');
+  }
+
   function renderValidation(errors) {
     setText('steps-error', errors.steps || '');
     setText('seed-error', errors.seed || '');
     setText('cfg-error', errors.cfg || '');
     setText('dims-error', errors.dims || '');
+    setAriaInvalid('steps', !!errors.steps);
+    setAriaInvalid('seed', !!errors.seed);
+    setAriaInvalid('cfg', !!errors.cfg);
+    // The dimension error message is shared, so it marks BOTH controls.
+    setAriaInvalid('width', !!errors.dims);
+    setAriaInvalid('height', !!errors.dims);
   }
 
   /* ---------------- UI wire snapshot ----------------
    * Keys mirror the engine's GenerationConfig fields (negative_prompt,
    * true_cfg_scale, attention_backend, vae_tiled_decode, ...) with enum
    * values taken verbatim from config.py; the ONE deliberate difference is
-   * the UI-only decimal-STRING seed, kept exact until the W2 API converts a
-   * validated decimal to a Python int. This snapshot is NOT an exported
-   * GenerationConfig JSON document.
+   * the UI-only decimal-STRING seed. This snapshot is NOT an exported
+   * GenerationConfig JSON document and nothing consumes it in W1 — there is
+   * no endpoint to send it to.
    */
 
   function formSnapshot() {
@@ -131,92 +162,52 @@
     };
   }
 
-  /* ---------------- Capability / connection state ---------------- */
-
-  var connection = {
-    connected: false,
-    ready: false,
-    reason: 'This page has no engine server to talk to yet. Open it through ' +
-            'the local studio server (a later milestone) to connect.'
-  };
+  /* ---------------- Connection state (no probe: nothing to probe) --------- */
 
   function renderConnection() {
-    var chip = $('connection-chip');
-    var status = connection.ready ? 'Engine ready' : 'Not connected';
-    chip.textContent = status;
-    chip.classList.toggle('is-ready', connection.ready);
+    var status = 'Generation unavailable';
+    setText('connection-chip', status);
     setText('stat-backend', status);
-    setText('settings-backend', connection.connected
-      ? 'Connected, but not reporting ready yet.'
-      : 'Not connected. This build of the page has no engine server to talk ' +
-        'to yet.');
+    setText('settings-backend',
+      'No engine server exists yet in this build. This page never contacts ' +
+      'one: it is static, so both file:// and plain static HTTP hosting are ' +
+      'disconnected. A reviewed status/plan contract is a W2 concern.');
 
     var generate = $('generate-btn');
-    var reason = $('generate-reason');
-    var formOk = validateForm().ok;
-    var promptOk = $('prompt').value.trim().length > 0;
-
-    if (!connection.ready) {
-      generate.disabled = true;
-      reason.textContent = 'Generate is disabled: ' + connection.reason +
-        ' Generation not available.';
-    } else if (!promptOk) {
-      generate.disabled = true;
-      reason.textContent = 'Generate is disabled: enter a prompt first.';
-    } else if (!formOk) {
-      generate.disabled = true;
-      reason.textContent = 'Generate is disabled: fix the highlighted ' +
-        'form fields (lightweight check only — the server validates ' +
-        'authoritatively).';
-    } else {
-      generate.disabled = false;
-      reason.textContent = '';
-    }
-  }
-
-  function probeCapability() {
-    // Only ever when served over http(s); the path is fixed, never derived
-    // from user input. file:// pages simply stay honestly disconnected.
-    var proto = location.protocol;
-    if (proto !== 'http:' && proto !== 'https:') {
-      renderConnection();
-      return;
-    }
-    fetch(CAPABILITY_PATH, { headers: { 'accept': 'application/json' } })
-      .then(function (res) {
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        return res.json();
-      })
-      .then(function (cap) {
-        connection.connected = true;
-        connection.ready = cap && cap.ready === true;
-        connection.reason = connection.ready
-          ? ''
-          : 'The engine server is connected but has not reported ready.';
-        renderConnection();
-      })
-      .catch(function () {
-        connection.connected = false;
-        connection.ready = false;
-        connection.reason = 'The local engine server did not answer.';
-        renderConnection();
-      });
+    generate.disabled = true;   // unconditional in W1
+    setText('generate-reason', GENERATION_UNAVAILABLE_REASON);
   }
 
   /* ---------------- Presets & preview ---------------- */
+
+  function presetNameFor(width, height) {
+    var names = Object.keys(PRESETS);
+    for (var i = 0; i < names.length; i++) {
+      var p = PRESETS[names[i]];
+      if (p.width === width && p.height === height) return names[i];
+    }
+    return null;
+  }
+
+  // Recompute exact preset match from the CURRENT dimension values, so manual
+  // edits never leave a stale pressed preset. Non-preset dimensions clear all.
+  function syncPresetButtons() {
+    var name = presetNameFor(Number($('width').value), Number($('height').value));
+    var buttons = document.querySelectorAll('.preset-btn');
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].setAttribute('aria-pressed',
+        String(buttons[i].dataset.preset === name));
+    }
+  }
 
   function applyPreset(name) {
     var preset = PRESETS[name];
     if (!preset) return;
     $('width').value = String(preset.width);
     $('height').value = String(preset.height);
-    var buttons = document.querySelectorAll('.preset-btn');
-    for (var i = 0; i < buttons.length; i++) {
-      buttons[i].setAttribute('aria-pressed',
-        String(buttons[i].dataset.preset === name));
-    }
+    syncPresetButtons();
     setPreviewAspect(preset.width, preset.height);
-    renderConnection();
+    renderValidation(validateForm().errors);
   }
 
   function setPreviewAspect(width, height) {
@@ -227,15 +218,16 @@
     }
   }
 
-  /* ---------------- View routing ---------------- */
+  /* ---------------- View routing ----------------
+   * Hash-driven views only. An unknown hash (e.g. the skip link's #main)
+   * must NOT silently reroute a History/Settings view back to Create — the
+   * current view is kept. Headings are focused only on user-driven hash
+   * changes (nav clicks, back/forward), never on initial load.
+   */
 
-  function currentView() {
-    var name = (location.hash || '').replace(/^#/, '');
-    return VIEWS[name] ? name : 'create';
-  }
+  var activeView = null;
 
-  function route() {
-    var active = currentView();
+  function renderView(active) {
     Object.keys(VIEWS).forEach(function (name) {
       $(VIEWS[name]).hidden = name !== active;
     });
@@ -244,16 +236,37 @@
       if (name === active) link.setAttribute('aria-current', 'page');
       else link.removeAttribute('aria-current');
     });
+    activeView = active;
   }
 
-  /* ---------------- Submission ---------------- */
+  function routeOnHashchange() {
+    var name = (location.hash || '').replace(/^#/, '');
+    if (!Object.prototype.hasOwnProperty.call(VIEWS, name)) {
+      return;   // unknown hash (#main, #whatever): keep the current view
+    }
+    if (name === activeView) return;
+    renderView(name);
+    var heading = $(VIEW_HEADINGS[name]);
+    if (heading) heading.focus();   // tabindex="-1" headings; user-driven only
+  }
 
-  function trySubmit() {
-    // Called only from an explicit user action. If Generate is genuinely
-    // enabled we will hand the UI snapshot to the W2/W3 API; nothing exists
-    // yet, so this can never fire while disconnected.
-    if ($('generate-btn').disabled) return;
-    // W3 will wire formSnapshot() to the real job endpoint here.
+  function initialRoute() {
+    var name = (location.hash || '').replace(/^#/, '');
+    renderView(VIEWS[name] ? name : 'create');   // no focus on load
+  }
+
+  /* ---------------- Submission ----------------
+   * Generation is not implemented in W1. The handlers enforce that directly:
+   * they never pretend a submission happened, regardless of how they were
+   * reached. The disabled button is a visual state, not the gate.
+   */
+
+  function refuseSubmit() {
+    // Honest, unconditional refusal — reachable via the form submit event or
+    // Ctrl/Meta+Enter, never reports success and never touches the network.
+    setText('generate-reason',
+      'Nothing was submitted: generation is not implemented in this build. ' +
+      'No generation adapter or job API exists, so there is no submit path.');
   }
 
   /* ---------------- Wiring ---------------- */
@@ -262,14 +275,14 @@
     $('create-form').addEventListener('submit', function (ev) {
       ev.preventDefault();
       renderValidation(validateForm().errors);
-      trySubmit();
+      refuseSubmit();
     });
 
     $('create-form').addEventListener('keydown', function (ev) {
       if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') {
         ev.preventDefault();
         renderValidation(validateForm().errors);
-        trySubmit();
+        refuseSubmit();
       }
     });
 
@@ -283,24 +296,23 @@
     $('random-seed').addEventListener('click', function () {
       $('seed').value = randomSeedString();
       renderValidation(validateForm().errors);
-      renderConnection();
     });
 
     ['steps', 'seed', 'cfg', 'width', 'height', 'prompt'].forEach(function (id) {
       $(id).addEventListener('input', function () {
         if (id === 'width' || id === 'height') {
           setPreviewAspect(Number($('width').value), Number($('height').value));
+          syncPresetButtons();
         }
         renderValidation(validateForm().errors);
-        renderConnection();
       });
     });
 
-    window.addEventListener('hashchange', route);
-    route();
+    window.addEventListener('hashchange', routeOnHashchange);
+    initialRoute();
+    syncPresetButtons();
     renderValidation(validateForm().errors);
     renderConnection();
-    probeCapability();
   }
 
   if (document.readyState === 'loading') {
@@ -309,8 +321,8 @@
     init();
   }
 
-  // Small explicit surface for the future server integration and for
-  // manual inspection; snapshot() is UI wire format, not GenerationConfig.
+  // Small explicit surface for manual inspection; snapshot() is UI wire
+  // format, not GenerationConfig, and nothing consumes it in W1.
   window.QwenStudio = {
     version: 'w1-static',
     formSnapshot: formSnapshot,

@@ -20,14 +20,14 @@
     <a href="#settings" id="nav-settings" class="nav-link nav-settings">Settings</a>
   </nav>
   <p class="connection-chip" id="connection-chip" role="status"
-     aria-label="Backend connection status">Not connected</p>
+     aria-label="Backend connection status">Generation unavailable</p>
 </header>
 
 <main id="main">
 
   <!-- ===================== Create view ===================== -->
   <section id="view-create" class="view" aria-labelledby="create-heading">
-    <h2 class="visually-hidden" id="create-heading">Create an image</h2>
+    <h2 class="visually-hidden" id="create-heading" tabindex="-1">Create an image</h2>
     <div class="layout">
 
       <aside class="controls" aria-label="Generation controls">
@@ -54,27 +54,26 @@
             </div>
           </fieldset>
 
-          <div class="field-row">
-            <div class="field">
-              <label for="steps">Steps</label>
-              <input id="steps" name="steps" type="number" min="1" max="1000"
-                     step="1" value="40" inputmode="numeric"
-                     aria-describedby="steps-error">
-              <p class="error" id="steps-error" aria-live="polite"></p>
+          <div class="field">
+            <label for="steps">Steps</label>
+            <input id="steps" name="steps" type="number" min="1" max="1000"
+                   step="1" value="40" inputmode="numeric"
+                   aria-describedby="steps-error">
+            <p class="error" id="steps-error" aria-live="polite"></p>
+          </div>
+
+          <div class="field seed-field">
+            <label for="seed">Seed</label>
+            <div class="seed-row">
+              <input id="seed" name="seed" type="text" value="0"
+                     inputmode="numeric" spellcheck="false" maxlength="20"
+                     title="Whole number 0–18446744073709551615 (up to 20 decimal digits), kept as an exact decimal string and never rounded. Strings longer than 20 digits are rejected, including ones padded with leading zeros."
+                     aria-describedby="seed-help seed-error">
+              <button type="button" id="random-seed" class="btn-secondary"
+                      title="Generate a cryptographically random seed">Random</button>
             </div>
-            <div class="field">
-              <label for="seed">Seed</label>
-              <div class="seed-row">
-                <input id="seed" name="seed" type="text" value="0"
-                       inputmode="numeric" spellcheck="false"
-                       aria-describedby="seed-help seed-error">
-                <button type="button" id="random-seed" class="btn-secondary"
-                        title="Generate a cryptographically random seed">Random</button>
-              </div>
-              <p class="help" id="seed-help">Whole number 0–18446744073709551615
-                (kept as a decimal string — never rounded).</p>
-              <p class="error" id="seed-error" aria-live="polite"></p>
-            </div>
+            <p class="help" id="seed-help">Leave at 0 or choose Random.</p>
+            <p class="error" id="seed-error" aria-live="polite"></p>
           </div>
 
           <details class="field advanced" id="advanced">
@@ -145,9 +144,10 @@
               </div>
             </div>
 
-            <p class="help">Values are sent exactly as selected (no browser-side
-              remapping). The local engine server validates them authoritatively
-              and has the final say.</p>
+            <p class="help">Values are kept exactly as selected (no
+              browser-side remapping). Nothing is sent anywhere in this build;
+              a future local server would validate them authoritatively and
+              have the final say.</p>
           </details>
 
           <div class="actions">
@@ -162,8 +162,9 @@
         <div class="preview-frame" id="preview-frame" data-aspect="1 / 1">
           <div class="preview-empty" id="preview-empty">
             <p class="preview-empty-title">No image yet</p>
-            <p>Generation not available — the local engine server is not
-              connected. When it is, generated images will appear here.</p>
+            <p>Generation is not available in this build — no generation
+              adapter or job API is implemented, so nothing can appear here
+              yet.</p>
           </div>
         </div>
 
@@ -179,7 +180,7 @@
         <div class="stats" aria-label="Session statistics">
           <div class="stat-card">
             <p class="stat-label">Backend</p>
-            <p class="stat-value" id="stat-backend">Not connected</p>
+            <p class="stat-value" id="stat-backend">Generation unavailable</p>
           </div>
           <div class="stat-card">
             <p class="stat-label">Last result</p>
@@ -202,7 +203,7 @@
 
   <!-- ===================== History view ===================== -->
   <section id="view-history" class="view" hidden aria-labelledby="history-heading">
-    <h2 id="history-heading">History</h2>
+    <h2 id="history-heading" tabindex="-1">History</h2>
     <p class="history-empty" id="history-empty">
       No saved generations yet. Completed images from this machine will appear
       here as thumbnails. Nothing has been generated in this session, so this
@@ -214,18 +215,22 @@
 
   <!-- ===================== Settings view ===================== -->
   <section id="view-settings" class="view" hidden aria-labelledby="settings-heading">
-    <h2 id="settings-heading">Settings</h2>
+    <h2 id="settings-heading" tabindex="-1">Settings</h2>
     <dl class="settings-list">
-      <div><dt>Backend status</dt><dd id="settings-backend">Not connected.
-        This build of the page has no engine server to talk to yet.</dd></div>
-      <div><dt>Runtime paths &amp; model files</dt><dd>Managed by the local
-        engine server. They are not editable in the browser, and no model or
-        weight will be downloaded automatically by this page.</dd></div>
-      <div><dt>Validation of full settings</dt><dd>The engine server performs
-        authoritative configuration checks. Anything validated here is a
-        lightweight form check only, not a fitness or memory check.</dd></div>
-      <div><dt>Privacy</dt><dd>Local-only. No cloud services, no analytics,
-        no external fonts or scripts.</dd></div>
+      <div><dt>Backend status</dt><dd id="settings-backend">No engine server
+        exists yet in this build. This page never contacts one: it is static,
+        so both file:// and plain static HTTP hosting are disconnected. A
+        reviewed status/plan contract is a later-milestone concern.</dd></div>
+      <div><dt>Runtime paths &amp; model files</dt><dd>There is no local
+        engine server in this build, so nothing here reads or manages runtime
+        paths, and no model or weight is downloaded by this page.</dd></div>
+      <div><dt>Validation of full settings</dt><dd>What this page checks is a
+        lightweight form check only, not a fitness or memory check. No server
+        in this build validates anything yet.</dd></div>
+      <div><dt>Privacy</dt><dd>This page makes no third-party requests and
+        loads no external fonts, scripts or analytics. Locality is enforced
+        only by the planned local server (a later milestone); plain static
+        hosting serves these files but enforces nothing by itself.</dd></div>
       <div><dt>Drafts</dt><dd>Nothing is saved by the browser automatically.
         An opt-in draft store for validated form values may come later.</dd></div>
     </dl>
