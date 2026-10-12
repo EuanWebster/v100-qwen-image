@@ -124,8 +124,10 @@
 
   /* ---------------- Seed handling (BigInt decimal strings) ---------------- */
 
-  // Accepted grammar (deliberately strict, checked BEFORE any BigInt):
-  //   * surrounding whitespace trimmed;
+  // Accepted grammar for the TYPED value (browser-side; the wire itself
+  // NEVER strips — it carries only canonical digits; deliberately strict,
+  // checked BEFORE any BigInt):
+  //   * surrounding whitespace of the user's input trimmed at the edges;
   //   * at most SEED_MAX_DIGITS (20) characters AFTER trimming — length is
   //     bounded first so a longer string is rejected as-is even if leading
   //     zeros would put its value in range (documented policy; the HTML has
@@ -138,7 +140,10 @@
   // and it stays a STRING on the wire, in the draft and in every render —
   // never a rounded JS Number.
   function parseSeed(str) {
-    // Python-side seed parsing strips PYTHON whitespace — mirror it.
+    // BROWSER-SIDE user input only: the EDGES of what the user typed are
+    // trimmed (Python whitespace set) before the canonical digit STRING
+    // goes on the wire. The API wire NEVER strips — the server accepts
+    // only canonical digits and refuses anything else, never editing it.
     var s = pyStrip(String(str));
     if (s.length > SEED_MAX_DIGITS) return null;
     if (!/^\d+$/.test(s)) return null;
@@ -178,7 +183,9 @@
   // results (JSON.stringify would silently turn Infinity into null) and
   // non-integers for integer fields are refused BEFORE serialization.
   function numberField(id, wantInt) {
-    // Python numeric parsing strips PYTHON whitespace — mirror it.
+    // BROWSER-SIDE user input only: edges of the typed value are trimmed
+    // (Python whitespace set) before parsing — a UI affordance. The API
+    // wire NEVER strips: the server receives already-canonical JSON.
     var raw = pyStrip(String($(id).value));
     if (raw === '') return { error: 'A value is required (empty fields are not sent as 0).' };
     var n = Number(raw);
@@ -911,37 +918,43 @@
                                'draft is unchanged.');
         return false;
       }
-      if (r.bodyError === 'too_large') {
-        setText('api-message', 'Export refused: the response exceeded the ' +
-                               'fixed response cap — nothing was downloaded.');
-        return false;
-      }
-      if (!r.res.ok) {
-        renderApiError(r.res, apiErrorPayloadFromBytes(r.bytes));
-        setText('api-message', $('api-message').textContent +
-          ' Nothing was downloaded; your draft is unchanged.');
-        return false;
-      }
+      // ONE unified bodyError branch: it comes FIRST, before both the
+      // HTTP-error path and the raw-bytes download path, and it covers
+      // EVERY decoding/readability outcome — 'too_large' (the fixed cap
+      // was exceeded), 'unsupported' (no readable bounded stream) and any
+      // unexpected body error. The OLD early too_large return that
+      // bypassed this and left 'Connected' plus enabled buttons standing
+      // is gone: an over-cap body is exactly as much a broken contract as
+      // an unreadable one, so it invalidates availability too. Blob is
+      // never reached, so Blob([undefined]) can never download the
+      // literal text 'undefined' under a success message.
       if (r.bodyError) {
-        // EVERY remaining bodyError is refused — not just the size cap.
-        // An 'unsupported' readable-stream outcome can otherwise arrive
-        // with res.ok=true and NO bytes at all, and Blob([undefined])
-        // would download the literal text 'undefined' under a success
-        // message. This is a typed schema rejection that invalidates the
-        // trusted availability (distinct rejected chip, explicit re-check
-        // required) — never a fabricated disconnect.
+        // A typed schema rejection, NOT a disconnect: the trusted
+        // availability is invalidated (explicit re-check required) with a
+        // DISTINCT rejected chip — never a fabricated disconnect.
         setApiAvailable(false);
         renderChip('Status rejected',
           'Status rejected — server contract broken');
         setText('api-message', 'Export refused: the response body was unusable (' +
-                               (r.bodyError === 'unsupported'
-                                 ? 'unreadable bounded body'
-                                 : 'not decodable JSON') +
+                               (r.bodyError === 'too_large'
+                                 ? 'over the fixed response cap'
+                                 : r.bodyError === 'unsupported'
+                                   ? 'unreadable bounded body'
+                                   : 'unexpected body decoding error') +
                                ') — a schema rejection, not a disconnect; ' +
                                'nothing was downloaded and your draft is ' +
                                'unchanged. Use "Check configuration" to ' +
                                're-establish a recognized status before ' +
                                'exporting again.');
+        return false;
+      }
+      if (!r.res.ok) {
+        // Reachable only with a FULLY READABLE body: an HTTP error whose
+        // body failed to read bounded was already refused above as the
+        // schema rejection it is.
+        renderApiError(r.res, apiErrorPayloadFromBytes(r.bytes));
+        setText('api-message', $('api-message').textContent +
+          ' Nothing was downloaded; your draft is unchanged.');
         return false;
       }
       // RAW bytes only — never parsed, never reserialized: the exact
