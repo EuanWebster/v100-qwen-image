@@ -332,15 +332,16 @@ pass; no console errors; mobile `scrollWidth` ≤ viewport. Guarded CPU suite
 
 **2026-10-12 (mid-day review fixes — HISTORICAL counts)** — guarded CPU suite
 on this container: 786 passed + 1 skipped (default interpreter), 787 passed
-0 skipped under the pinned env. Superseded by the final counts below; kept
-because the environment note below is still true. Both
-interpreters on this box are Python 3.13.5; **no Python 3.11 binary exists
-here**, so the "3.11" leg of the standing protocol could not be executed on
-this container and is recorded as not-run rather than assumed. ML-free,
-socket-free, writes only under a fresh temp root — *these three properties
-describe the guarded pytest suite only*: the integration script below opens
-real loopback sockets and writes tiny fixtures inside its own temp root, and
-the served-Chrome legs run a real browser.
+0 skipped under the pinned env. Superseded by the final counts below. The
+environment note written at that time — "no Python 3.11 binary exists here"
+— was **later shown wrong** (root's 16:26/16:27 corrections; see the current
+section): the existing ML 3.11 interpreter and a separate review venv are
+both Python 3.11.15 and a 3.11 leg HAS since been executed. Kept only as
+the historical record of the counts. The three properties stated then are
+still accurate: ML-free, socket-free, writes only under a fresh temp root —
+*these describe the guarded pytest suite only*: the integration script below
+opens real loopback sockets and writes tiny fixtures inside its own temp
+root, and the served-Chrome legs run a real browser.
 
 Real-Chrome behaviour (the paragraph below is **historical** — the
 process-exhausted container state BEFORE the 2026-10-12 15:35 restart):
@@ -356,38 +357,81 @@ this and exits 3 with an honest diagnosis instead of hanging — an
 environment problem, not a product failure. The static suite encodes the
 same invariants as machine checks.
 
-### Current final verification (2026-10-12, post-restart, final review fixes)
+### Current final verification (2026-10-12, post-restart, final review fixes + cap-branch unification)
 
-* Guarded CPU suite on this container (`bash run_cpu_tests.sh`, runner-owned
+* Guarded CPU suites on this container (`bash run_cpu_tests.sh`, runner-owned
   fresh basetemp, network denied, ML imports denied, writes only under a
-  fresh temp root): **878 passed + 1 skipped** with the default interpreter,
-  **879 passed** with the pinned env (`PYTHON=/tmp/qwen-review.bIFHcI/venv/
-  bin/python PYTHONPATH=/work/src QWEN_DIFFUSERS_SRC=/tmp/v100_m0_ml/src/
-  diffusers QWEN_TRANSFORMERS_SRC=/tmp/v100_m0_ml/src/transformers`). Both
-  interpreters are Python 3.13.5; **no Python 3.11 binary exists here** —
-  that leg remains not-run, not assumed. (Root's independently verified
-  baseline on `08329c8` was 876+1 skip / 877 pinned; the +2 are the two
-  final-review static regressions.) These no-socket/no-repo-write claims
-  cover the guarded suite ONLY — the integration check opens real loopback
-  sockets and writes tiny fixtures under its own temp root, and the
-  served-UI leg runs a real browser.
+  fresh temp root — no installs, nothing added to any environment):
+  * default interpreter (Python 3.13.5): **879 passed + 1 skipped**
+  * pinned review venv (Python 3.13.5, `PYTHON=/tmp/qwen-review.bIFHcI/venv/
+    bin/python PYTHONPATH=/work/src QWEN_DIFFUSERS_SRC=/tmp/v100_m0_ml/src/
+    diffusers QWEN_TRANSFORMERS_SRC=/tmp/v100_m0_ml/src/transformers`):
+    **880 passed**
+  * pinned review venv311 (Python **3.11.15**, same pinned env with
+    `PYTHON=/tmp/qwen-review.bIFHcI/venv311/bin/python`): **880 passed**
+  These are the writer's runs on the current HEAD, which additionally
+  unifies the export `too_large` branch (one guarded static regression
+  added: 878+1/879 → 879+1/880/880). The earlier "no Python 3.11 binary
+  exists here" claim was **wrong and is removed**: root directly verified
+  both the existing ML interpreter
+  (`/home/dev/.local/share/uv/python/cpython-3.11-linux-x86_64-gnu/bin/python3.11`,
+  Python 3.11.15) and the separate review venv
+  (`/tmp/qwen-review.bIFHcI/venv311/bin/python`, Python 3.11.15), and ran
+  the full pinned guarded suite with it on `08329c8`: **877 passed in
+  8.85 s, no installation** (root's independently verified baseline on that
+  commit was 876+1 skip / 877 pinned / 877 with venv311). These
+  no-socket/no-repo-write claims cover the guarded suites ONLY — the
+  integration check opens real loopback sockets and writes tiny fixtures
+  under its own temp root, and the served-UI leg runs a real browser.
 * Root's independent probes on `08329c8` (root-run, root-verified):
   `/tmp/v100-web-api-review.py` **7/7 PASS**, `/tmp/v100-web-wire-review.py`
-  **5/5 PASS**, root real-HTTP browser review JSON **35 items all PASS**
-  (item count taken programmatically from the recorded run — the earlier
-  "33" claim was wrong; the script has since gained further legs, so the
-  final count belongs to root's own rerun, not to this writer's claim).
+  **5/5 PASS**. CURRENT addendum from root's 16:42 server review: the wire
+  script has since been extended to **9 cases** — the original **5 still
+  PASS**, but **4 NEW legacy-request-version cases FAIL** (missing version,
+  explicit HTTP/0.9, broken legacy request line, HTTP/0.9 parse errors
+  return BARE bodies without status line/defensive headers). That is a
+  server-side all-responses contract blocker reported by root —
+  **unaddressed by this writer** (this fix round is scoped to the frontend
+  export cap branch), recorded here so the "5/5" line is not read as
+  current for the extended script. Root's independent real-Chrome reviewer session (16:31,
+  exited 0): **39/39 assertions PASS** — the extended script (27 DOM/behaviour
+  checks at 1440/375/320 px with no exceptions and no external requests,
+  valid + blank-plan schema legs ×2, **4 REAL-HTTP status-race checks**,
+  **2 explicitly controlled-backend unreadable-export checks**, and **2
+  REAL-HTTP 15 s partial-body timeout checks with no exceptions**). The
+  original pre-extension script had **35** items — the earlier "33" claim
+  was wrong. Root also viewed desktop/mobile screenshots (no horizontal
+  overflow, full 20-digit seed visible, honest empty preview / disabled
+  Generate). **PENDING, not passed:** root's new REAL oversized-export
+  HTTP case (making the set **40**) is deliberately held until the export
+  cap-branch unification below lands, and will be run by root
+  independently; it has NOT been run or passed yet.
 * Real Chrome, `file://` behaviour suite (`scripts/chrome_browser_check.mjs`):
-  **61/61 passed** after the restart (pre-final-fixes snapshot; the served
-  pass below covers the changed export/parse branches).
+  **61/61 passed** after the restart (pre-final-fixes snapshot; not rerun
+  for the cap fix — the served pass below and root's independent runs cover
+  the changed export/parse branches).
 * Served real-Chrome integration (`scripts/web_integration_check.mjs`,
   sandbox ENABLED, `QWEN_PYTHON` = pinned venv, `QWEN_RUN_CHROME=1`):
-  **96/96 executed checks passed** (0 NOT RUN), including the two
-  final-review legs — a controlled-backend export response without a
-  readable body is refused as a typed schema rejection with no download,
-  and `parsePlan` refuses blank/Python-whitespace-only echoed prompts
-  against the real served plan echo. This is the writer's run on the final
-  HEAD; root will re-run everything independently.
+  **96/96 executed checks passed** (0 NOT RUN) on the pre-cap-fix HEAD —
+  including the two final-review legs: a controlled-backend export response
+  without a readable body is refused as a typed schema rejection with no
+  download (explicitly a fixture, not real stalled-network proof), and
+  `parsePlan` refuses blank/Python-whitespace-only echoed prompts against
+  the real served plan echo. Per the review protocol the writer did not
+  relaunch Chrome for the cap fix; root's independent 40-check real-Chrome
+  run covers the final HEAD.
+* Export cap-branch unification (this writer, current HEAD): the early
+  `bodyError === 'too_large'` return in `exportConfig` that previously
+  refused the over-cap body WITHOUT invalidating availability is removed;
+  one unified `if (r.bodyError)` refusal now precedes both the HTTP-error
+  path and the raw-bytes download path — every bodyError (`too_large`,
+  `unsupported`, any unexpected decoding error) downloads nothing, keeps
+  the draft, invalidates the trusted availability and shows the distinct
+  'Status rejected' chip (never 'Not connected', never success) with the
+  accurate reason. Success still requires actual `Uint8Array` bytes; the
+  export bytes are never parsed or reserialized. Guarded static regression
+  added (`tests/test_web_static.py::
+  test_export_too_large_cannot_bypass_the_unified_refusal`).
 * Process hygiene: the two live orphan repro Chrome trees from the previous
   session (PIDs 3284/3410, profiles `/tmp/repro-WoE5LY`/`/tmp/repro-fdL5vs`)
   were closed through their OWN DevTools endpoints (`Browser.close`) after
