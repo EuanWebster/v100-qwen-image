@@ -23,7 +23,16 @@ Safety posture (reviewed W2 contract):
   read), rejects ``Transfer-Encoding``/chunked and unsupported ``Expect``.
 * Static serving is a fixed allowlist map over the packaged assets — no
   directory listing, no ``translate_path``, no arbitrary host paths. API and
-  error responses all carry the defensive header set.
+  error responses all carry the defensive header set. EVERY response —
+  including the early malformed/unsupported-version refusals emitted inside
+  ``parse_request`` before any valid version exists — carries a real
+  HTTP/1.x status line: the inherited stdlib framing suppresses ALL header
+  output while ``request_version`` is the HTTP/0.9 default, so that legacy
+  state is framed explicitly instead of shipping a bare body.
+* Legacy HTTP/0.9-class requests (no version token, or an explicit HTTP/0.x
+  token) are refused with a typed, FRAMED 400 BEFORE any dispatch decision
+  — never served, and their version is never normalized to make them
+  servable. Supported HTTP/1.0/1.1 handling is unchanged.
 * ``--help`` never binds, never writes, never imports ML.
 
 This is a *local* development server on loopback — explicitly not a
@@ -322,8 +331,49 @@ class _Handler(BaseHTTPRequestHandler):
             out.setdefault(key.lower(), []).append(value)
         return out
 
+    def _frame_method_token(self) -> str:
+        """Method token for body suppression. ``self.command`` is set only
+        once the stdlib parser has FULLY recognized the request; early
+        errors carry the RAW request line only, so fall back to the same
+        whitespace split the stdlib and this handler already use."""
+        if self.command:
+            return str(self.command)
+        raw = self.raw_requestline
+        if isinstance(raw, bytes):
+            raw = raw.decode("iso-8859-1", "replace")
+        parts = (raw or "").strip().split()
+        return parts[0] if parts else ""
+
     def _send(self, status: int, body: bytes, ctype: str,
               extra: tuple[tuple[str, str], ...] = ()) -> None:
+        if self.request_version == "HTTP/0.9":
+            # FRAMING NORMALIZATION FOR THE LEGACY/ERROR STATE ONLY. Every
+            # inherited header emitter (send_response_only/send_header/
+            # end_headers) suppresses ALL output while request_version is
+            # the HTTP/0.9 default — including the early errors emitted
+            # INSIDE parse_request before any valid version was recognized
+            # (broken request line, HTTP/2.x, header overflow) and the
+            # legacy-refusal gate below. Those refusals must still honour
+            # the all-responses contract, so frame them explicitly with a
+            # real HTTP/1.1 status line and the SHARED _DEFENSIVE_HEADERS
+            # constant (one builder, never a second header list). This is
+            # framing ONLY: no legacy request is normalized into a
+            # servable state — the parse_request gate refuses it BEFORE
+            # dispatch, so this branch can only ever carry a refusal.
+            try:
+                phrase = HTTPStatus(status).phrase
+            except ValueError:  # pragma: no cover - every code here is standard
+                phrase = "Error"
+            headless = self._frame_method_token() == "HEAD"
+            # HEAD framing contract: headers — including the honest
+            # Content-Length a GET would produce — but NEVER a payload.
+            frame = _framed_bytes(f"HTTP/1.1 {status} {phrase}",
+                                  b"" if headless else body,
+                                  body_len=len(body), ctype=ctype,
+                                  extra=extra, server=self.server_version)
+            self.wfile.write(frame)
+            self.close_connection = True
+            return
         self.send_response_only(status)
         self.send_header("Server", self.server_version)
         self.send_header("Content-Type", ctype)
@@ -334,7 +384,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.end_headers()
         self.close_connection = True
-        if self.command != "HEAD":  # pragma: no cover - HEAD is refused anyway
+        if self._frame_method_token() != "HEAD":  # HEAD: framed headers, no body
             self.wfile.write(body)
 
     def _send_api(self, resp: ApiResponse) -> None:
@@ -362,21 +412,42 @@ class _Handler(BaseHTTPRequestHandler):
 
     def parse_request(self) -> bool:
         ok = super().parse_request()
-        if ok:
-            # Keep the RAW wire target: the stdlib normalizes a leading '//'
-            # in self.path before we would see it — routing must consider
-            # both, so a real '//x' request is refused, never served.
-            # Split EXACTLY like the stdlib (str.split() on any run of
-            # whitespace): a TAB-separated request line must still yield the
-            # real target token, never fall back to the normalized path.
-            raw = self.raw_requestline
-            if isinstance(raw, bytes):
-                raw = raw.decode("iso-8859-1", "replace")
-            parts = (raw or "").strip().split()
-            # '' when the line was uncapturable or had no target token:
-            # resolve_route then refuses — there is NO normalized fallback.
-            self.raw_target = parts[1] if len(parts) >= 2 else ""
-        return ok
+        if not ok:
+            # The stdlib already emitted the error — through OUR send_error/
+            # _send, which frames it properly even in the HTTP/0.9 default
+            # state (see _send). Nothing more to decide here.
+            return False
+        # LEGACY REFUSAL GATE — BEFORE any dispatch decision. The stdlib
+        # returns True with request_version LEFT at the HTTP/0.9 default
+        # when the request line carries no version token (a bare
+        # 'GET /path'), and keeps an explicit 'HTTP/0.x' token verbatim.
+        # Serving anything in that state would emit a bare legacy body —
+        # no status, no headers — so HTTP/0.x-class requests are refused
+        # here with a typed, FRAMED 400. The request version is NEVER
+        # normalized to make a legacy request servable: dispatch happens
+        # only for HTTP/1.x. Supported HTTP/1.0/1.1 behavior is unchanged.
+        if not str(self.request_version).startswith("HTTP/1."):
+            self.close_connection = True
+            err = ApiError(400, "unsupported_request_version",
+                           "legacy HTTP/0.9-class requests are refused; "
+                           "every response needs an HTTP/1.x version")
+            self._send_api(ApiResponse(status=err.status,
+                                       payload=err.to_payload()))
+            return False
+        # Keep the RAW wire target: the stdlib normalizes a leading '//'
+        # in self.path before we would see it — routing must consider
+        # both, so a real '//x' request is refused, never served.
+        # Split EXACTLY like the stdlib (str.split() on any run of
+        # whitespace): a TAB-separated request line must still yield the
+        # real target token, never fall back to the normalized path.
+        raw = self.raw_requestline
+        if isinstance(raw, bytes):
+            raw = raw.decode("iso-8859-1", "replace")
+        parts = (raw or "").strip().split()
+        # '' when the line was uncapturable or had no target token:
+        # resolve_route then refuses — there is NO normalized fallback.
+        self.raw_target = parts[1] if len(parts) >= 2 else ""
+        return True
 
     def handle_expect_100(self) -> bool:
         # NO Expect extension is supported (including 100-continue): never
@@ -679,13 +750,30 @@ class _Server(HTTPServer):
 #: set every other response carries (CSP, nosniff, frame-deny, no-referrer,
 #: CORP, no-store, close). It must stay far below the kernel socket buffer:
 #: one sendall, never reading the (possibly oversize) request.
-def _raw_refusal_bytes(status_line: str, body: bytes) -> bytes:
-    lines = [status_line.encode("ascii"),
-             b"Content-Type: application/json; charset=utf-8"]
-    lines += [f"{name}: {value}".encode("ascii")
+def _framed_bytes(status_line: str, body: bytes, *,
+                  body_len: int | None = None,
+                  ctype: str = "application/json; charset=utf-8",
+                  extra: tuple[tuple[str, str], ...] = (),
+                  server: str | None = None) -> bytes:
+    """THE one status-line + shared-headers + body frame builder. Used by
+    the prebuilt overload refusal and by the handler's legacy/error-state
+    normalization (_send) — both from the SAME _DEFENSIVE_HEADERS constant,
+    so neither can drift. latin-1 like the stdlib header emitters."""
+    if body_len is None:
+        body_len = len(body)
+    lines = [status_line.encode("latin-1")]
+    if server is not None:
+        lines.append(f"Server: {server}".encode("latin-1"))
+    lines.append(f"Content-Type: {ctype}".encode("latin-1"))
+    lines += [f"{name}: {value}".encode("latin-1")
               for name, value in _DEFENSIVE_HEADERS]
-    lines.append(f"Content-Length: {len(body)}".encode("ascii"))
+    lines += [f"{name}: {value}".encode("latin-1") for name, value in extra]
+    lines.append(f"Content-Length: {body_len}".encode("latin-1"))
     return b"\r\n".join(lines) + b"\r\n\r\n" + body
+
+
+def _raw_refusal_bytes(status_line: str, body: bytes) -> bytes:
+    return _framed_bytes(status_line, body)
 
 
 _OVERLOAD_BODY = (
