@@ -356,3 +356,13 @@ and unsupported export; remaining early too_large bypass still must be unified.
 16:32 root spotted new R6 integration regression BEFORE acceptance: fetch target
 is /api/v1/config/plan, but the actual allowlisted route is /api/v1/plan. Fix this
 typo before its servedChrome pass; do not weaken parser/assertions to accept404.
+
+16:42 final peer server review + ROOT verified memory-socket handler probe: missing
+request version GET/app.js, explicitHTTP/0.9, BROKEN legacy requestline and HTTP/2.0
+refusal return BARE bodies without HTTP status/defensiveheaders. Stock inherited
+send_response/send_header/end_headers suppress framing for request_versionHTTP/0.9,
+including early parseerrors before recognizedversion. Need rejectlegacy0.9 with
+framedtyped400 and make ALL early malformed/unsupportedversion refusals framed+
+shareddefensiveheaders. PreserveHTTP1.0/1.1 behavior andHEADno-body. Root extended
+/tmp/v100-web-wire-review.py now9cases: original5PASS, new4FAIL (bareframes).
+This is a W2 all-responses contract blocker, not permission for broadserverrewrite.
