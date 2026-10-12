@@ -1,9 +1,12 @@
 """Pure W2 web contract: status / plan / editable-config-export (no sockets).
 
-Every function here is deterministic, ML-free and I/O-free at request time:
-the *only* filesystem knowledge enters through :class:`WebRuntime`, which the
-server canonicalises once at startup. Browser JSON can never select a runtime
-path — unknown path fields are refused, not stripped.
+Every function here is deterministic and ML-free; the RESPONSE path performs
+no filesystem I/O. (Startup validation and the shared config validator may
+stat configured path metadata — directories, never weight bytes; a plan or
+status call itself reads nothing.) The only filesystem knowledge enters
+through :class:`WebRuntime`, which the server validates and canonicalises
+once at startup. Browser JSON can never select a runtime path — unknown
+path fields are refused, not stripped.
 
 Wire rules that are load-bearing (reviewed W2 contract):
 
@@ -75,12 +78,14 @@ class ApiError(Exception):
     safe message (+ optional per-field list). Never carries raw internals."""
 
     def __init__(self, status: int, code: str, message: str,
-                 field_errors: tuple[tuple[str, str], ...] = ()) -> None:
+                 field_errors: tuple[tuple[str, str], ...] = (),
+                 headers: tuple[tuple[str, str], ...] = ()) -> None:
         super().__init__(f"{code}: {message}")
         self.status = status
         self.code = code
         self.message = _safe(message)
         self.field_errors = tuple((f, _safe(m)) for f, m in field_errors)
+        self.headers = headers  # e.g. Allow on 405; transport-relevant only
 
     def to_payload(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -235,9 +240,38 @@ def build_config(runtime: WebRuntime, data: Any) -> GenerationConfig:
     try:
         return GenerationConfig.from_dict(merged)
     except ConfigError as exc:
-        raise ApiError(422, "invalid_config",
-                       "configuration is invalid",
-                       tuple((e.field, e.message) for e in exc.errors)) from None
+        # Errors on browser-editable fields are reported verbatim (they
+        # describe only browser data). Runtime-path fields NEVER surface:
+        # startup validation is not a guarantee (TOCTOU — e.g. a configured
+        # dir replaced by a file afterwards), and ConfigError messages for
+        # path fields can contain the raw absolute path. A runtime-path
+        # mismatch is therefore ONE generic code with no path, no stat
+        # detail and no raw message.
+        public: list[tuple[str, str]] = []
+        runtime_hit = False
+        for err in exc.errors:
+            if err.field in RUNTIME_PATH_FIELDS:
+                runtime_hit = True
+            else:
+                public.append((err.field, err.message))
+        code = "invalid_config"
+        if runtime_hit:
+            code = "server_runtime_configuration"
+            public.append(("server_runtime_configuration",
+                           "one or more server runtime paths configured at "
+                           "startup no longer validate; a server operator "
+                           "must fix or restart qwen-web"))
+        # Final leak guard: no configured runtime path value may appear in
+        # any message, whatever upstream produced it.
+        path_values = [v for v in runtime.path_fields().values() if v]
+        if any(v in message for _, message in public for v in path_values):
+            public = [("server_runtime_configuration",
+                       "one or more server runtime paths configured at "
+                       "startup no longer validate; a server operator "
+                       "must fix or restart qwen-web")]
+            code = "server_runtime_configuration"
+        raise ApiError(422, code, "configuration is invalid",
+                       tuple(public)) from None
 
 
 def _seed_wire_to_int(value: Any) -> int | None:
@@ -303,7 +337,11 @@ def summarize_manifest_bytes(raw: bytes | None, unreadable: str | None = None) -
     base: dict[str, Any] = {"configured": True, "valid": False,
                             "verification": "not_performed"}
     if unreadable is not None:
-        base["reason"] = unreadable
+        # CLOSED reason codes only: whatever the caller's string was, an
+        # arbitrary value (which could embed a path) never reaches the wire.
+        base["reason"] = unreadable if unreadable in (
+            MANIFEST_FILE_MISSING, MANIFEST_INVALID, MANIFEST_UNREADABLE,
+            MANIFEST_UNCONFIGURED) else MANIFEST_UNREADABLE
         return base
     if raw is None:
         return {"configured": False, "valid": False, "reason": MANIFEST_UNCONFIGURED,
@@ -387,8 +425,10 @@ def _gates() -> dict[str, dict[str, str]]:
         "calibration": {
             "state": "unknown",
             "code": "calibration_unknown",
-            "reason": "no benchmark_result.v1 / calibration records exist "
-                      "yet; memory fitness is unknown, never guessed",
+            "reason": "calibration is not VERIFIED for this server: this "
+                      "status/plan path does not inspect any benchmark "
+                      "records; memory fitness is unknown here, never "
+                      "claimed established or absent",
         },
     }
 
@@ -450,8 +490,14 @@ def plan_response(runtime: WebRuntime, raw_body: bytes) -> ApiResponse:
         "config": editable_config_dict(config),
         "cfg_active": core_doc["cfg_active"],
         "latent_tokens": core_doc["latent_tokens"],
-        "hardware": core_doc["hardware"],
-        "calibration": core_doc["calibration"],
+        "hardware": {"status": core_doc["hardware"].get("status", "unknown"),
+                     "detail": "this qwen-web server has not probed hardware; "
+                               "unknown here, never claimed present, absent "
+                               "or verified"},
+        "calibration": {"status": core_doc["calibration"].get("status", "unknown"),
+                        "detail": "calibration is not verified for this "
+                                  "server; the status/plan path does not "
+                                  "inspect benchmark records"},
         "manifest": manifest_plan_state(runtime.manifest_summary),
         "generation_blockers": _blockers(runtime),
     }

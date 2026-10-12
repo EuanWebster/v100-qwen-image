@@ -314,3 +314,51 @@ def test_invalid_manifest_still_plans_with_blocker():
 def test_unconfigured_manifest_blocker():
     status = api.status_response(runtime()).payload
     assert "manifest_unconfigured" in status["generation_blockers"]
+
+
+# --------------------------------------------------- root-review regressions
+
+
+def test_runtime_path_never_leaks_after_startup_dir_becomes_file(tmp_path):
+    # TOCTOU: startup validation is not a guarantee. A configured runtime
+    # dir replaced by a file afterwards must fail with the GENERIC
+    # server_runtime_configuration code and no path in any field.
+    target = tmp_path / "private-runtime-path"
+    target.mkdir()
+    rt = runtime(output_dir=str(target))
+    assert api.plan_response(rt, plan_bytes({"prompt": "x"})).status == 200
+    target.rmdir()
+    target.touch()
+    for operation in (api.plan_response, api.export_response):
+        response = operation(rt, plan_bytes({"prompt": "x"}))
+        assert response.status == 422
+        text = json.dumps(response.payload)
+        assert str(target) not in text
+        assert response.payload["code"] == "server_runtime_configuration"
+        fields = {f["field"] for f in response.payload.get("fields", [])}
+        assert fields == {"server_runtime_configuration"}
+
+
+def test_manifest_unreadable_reason_is_a_closed_code():
+    # Whatever string the caller passed (which could embed a path), the
+    # projection only ever carries a closed reason code.
+    summary = api.summarize_manifest_bytes(
+        None, unreadable="/private/model/config.json: access denied")
+    rt = runtime(manifest_summary=summary)
+    for response in (api.status_response(rt),
+                     api.plan_response(rt, plan_bytes({"prompt": "x"}))):
+        text = json.dumps(response.payload)
+        assert "/private/" not in text
+        assert "manifest_unreadable" in text
+
+
+def test_calibration_honest_unknown_not_global_absence():
+    status = api.status_response(runtime()).payload
+    gate = status["gates"]["calibration"]
+    assert gate["code"] == "calibration_unknown"
+    assert "not VERIFIED for this server" in gate["reason"]
+    plan = api.plan_response(runtime(), plan_bytes({"prompt": "x"})).payload
+    assert plan["calibration"]["status"] == "unknown"
+    assert "not verified for this server" in plan["calibration"]["detail"]
+    assert plan["hardware"]["status"] == "unknown"
+    assert "has not probed hardware" in plan["hardware"]["detail"]
