@@ -161,9 +161,11 @@
                aria-label="Configuration and planning">
             <button type="button" class="btn-secondary" id="btn-check-config">
               Check configuration</button>
-            <button type="button" class="btn-secondary" id="btn-plan">
+            <button type="button" class="btn-secondary" id="btn-plan" disabled
+                    title="enabled after the server status is recognized; use Check configuration to reconnect">
               Plan</button>
-            <button type="button" class="btn-secondary" id="btn-export">
+            <button type="button" class="btn-secondary" id="btn-export" disabled
+                    title="enabled after the server status is recognized; use Check configuration to reconnect">
               Export editable configuration</button>
             <p class="api-status" id="api-message" role="status"
                aria-live="polite"></p>

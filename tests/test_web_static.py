@@ -301,9 +301,14 @@ def test_w2_status_is_strictly_validated_never_trusted_by_shape():
     body = m.group(1)
     assert "s.schema !== STATUS_SCHEMA" in body
     assert "s.planning_available !== true" in body          # strict boolean
-    assert "gen === false ? false : 'unexpected'" in body   # never trust 'true'
+    assert "s.generation_available !== false" in body       # literal false ONLY
+    assert "generation_blockers.length > 16" in body        # bounded shape
     assert "GATE_STATES" in js and "not_implemented" in js
-    assert "unrecognized" in js
+    # a schema-rejected status is a typed state, distinct from a disconnect
+    assert "Status rejected" in js and "Not connected" in js
+    # every fetch is bounded by an AbortController timeout; no polling
+    assert "AbortController" in js and "FETCH_TIMEOUT_MS" in js
+    assert "setInterval" not in js
 
 
 def test_w2_plan_response_seed_must_be_decimal_string_or_null():
@@ -335,8 +340,12 @@ def test_w2_export_downloads_raw_blob_without_reserialization():
     m = re.search(r"function exportConfig\(\)\s*\{([\s\S]*?)\n  \}", js)
     assert m, "exportConfig not found"
     body = m.group(1)
-    assert "res.blob()" in body, "export must download raw response bytes"
-    assert "JSON.parse" not in body and ".text()" not in body, \
+    assert "apiRequest(API_EXPORT" in body and "'raw'" in body, \
+        "export must consume the raw response bytes through the bounded core"
+    assert "new Blob([r.bytes])" in body, \
+        "export must download the complete raw bytes untouched"
+    assert "JSON.parse" not in body and ".text()" not in body and \
+           "res.json()" not in body, \
         "export bytes must never be parsed/reserialized on the success path"
     assert "URL.createObjectURL" in body and "URL.revokeObjectURL" in body
     assert "qwen-editable-config.json" in body
@@ -362,3 +371,156 @@ def test_w2_plan_panel_is_rendered_not_invented():
         assert f'id="{elem_id}"' in html, f"W2 UI element missing: {elem_id}"
     assert 'hidden' in re.search(r'<section class="plan-panel"[^>]*>', html).group(0), \
         "plan panel must start hidden (nothing rendered before a server answer)"
+
+
+def test_w2_actions_gated_until_recognized_status():
+    js = _read("app.js")
+    html = _read("index.html")
+    m = re.search(r"function setApiAvailable\(available\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "setApiAvailable not found"
+    body = m.group(1)
+    assert "$('btn-plan').disabled = !available" in body
+    assert "$('btn-export').disabled = !available" in body
+    assert "generate" not in body, "gating must never touch the Generate button"
+    for btn in ("btn-plan", "btn-export"):
+        m = re.search(rf'id="{btn}"[^>]*', html)
+        assert m and "disabled" in m.group(0), f"{btn} must start disabled"
+    # Check configuration is the reconnect path: it re-checks status first
+    assert re.search(r"'btn-check-config'\).addEventListener[\s\S]*?checkStatus\(\)", js)
+    # an initial hash must resolve by OWN property, never inherited names
+    assert "hasOwnProperty.call(VIEWS, name)" in js
+
+
+def test_w2_previous_plan_results_never_look_current():
+    js = _read("app.js")
+    m = re.search(r"function runPlan\(showFull\)\s*\{([\s\S]*?)\n  \}", js, re.S)
+    assert m, "runPlan not found"
+    body = m.group(1)
+    assert "$('plan-panel').hidden = true" in body, \
+        "previous results must be hidden while a new attempt runs"
+    assert "seq !== planSeq" in body, "out-of-order answers must be ignored"
+    assert "No planning result received" in body, \
+        "a failed plan must not claim nothing was sent"
+    # Invalidate BEFORE local validation: planSeq++ must happen before
+    # buildEnvelope() so an invalid NEW attempt still cancels a pending
+    # older one (which would otherwise clear the new errors and render an
+    # old success over them).
+    assert body.index("planSeq++") < body.index("buildEnvelope()"), \
+        "prior attempts must be invalidated before local validation"
+    assert "syncPlanStaleness()" in body, \
+        "an invalid draft must stale any visible result"
+    # a rendered result is bound to the signature of ITS snapshot
+    assert "planShownSignature = sentSignature" in body
+    # the success render must not clear errors of an edited draft
+    assert "renderValidation({})" not in body, \
+        "success must render the CURRENT draft errors, not blank them"
+    assert "renderValidation(validateForm().errors)" in body
+
+
+def test_w2_staleness_covers_preset_random_and_change_only_edits():
+    js = _read("app.js")
+    # syncPlanStaleness must be wired wherever the draft can change:
+    # text/number inputs, preset buttons, the Random seed button, and the
+    # change-only selects/checkbox (no inline errors, still stale).
+    m = re.search(r"function applyPreset\(name\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m and "syncPlanStaleness()" in m.group(1), "preset edits must stale"
+    m = re.search(r"\$\('random-seed'\)\.addEventListener[\s\S]*?\}\);", js)
+    assert m and "syncPlanStaleness()" in m.group(0), "random seed must stale"
+    m = re.search(r"\['quant', 'offload', 'attention', 'vae-tiling'\]"
+                  r"[\s\S]*?'change'[\s\S]*?syncPlanStaleness\(\);[\s\S]*?\}\);", js)
+    assert m, "change-only fields must also mark a visible result stale"
+    m = re.search(r"function syncPlanStaleness\(\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "syncPlanStaleness not found"
+    body = m.group(1)
+    assert "envelopeSignature(buildEnvelope()) !== planShownSignature" in body, \
+        "staleness must compare against the validated snapshot's signature"
+    assert "classList.add('stale')" in body and "STALE" in body, \
+        "a stale result must be clearly labelled, not left looking validated"
+    assert "classList.remove('stale')" in body
+    css = _read("app.css")
+    assert ".plan-panel.stale" in css, "stale state needs a visible style"
+
+
+def test_w2_request_bound_whole_operation_including_body():
+    js = _read("app.js")
+    # The timeout must cover the BODY, not just the headers: the timer is
+    # cleared in settle() AFTER body consumption — never in a .finally on
+    # the fetch promise alone.
+    m = re.search(r"function apiRequest\(url, opts, mode\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "apiRequest not found"
+    body = m.group(1)
+    assert "new AbortController()" in body and "controller.abort()" in body
+    assert "requestOpts.signal = controller.signal" in body
+    assert "readBodyLimited(res)" in body, "body consumption must run inside the timer scope"
+    assert "settle(" in body and "clearTimeout(timer); return value;" in body
+    assert ".finally(function () { clearTimeout(timer); })" not in js, \
+        "clearing on the fetch promise alone leaves the body untimed"
+    assert "timedOut = true" in body, "a timeout must be distinguishable"
+    # no unbounded bodies: a fixed cap, streaming-read and cancelled
+    m = re.search(r"function readBodyLimited\(res\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "readBodyLimited not found"
+    body = m.group(1)
+    assert "MAX_RESPONSE_BYTES" in body and "reader.cancel()" in body, \
+        "an over-cap body must be cancelled, never buffered"
+    m = re.search(r"var MAX_RESPONSE_BYTES = (\d+);", js)
+    assert m and 64 * 1024 < int(m.group(1)) <= 1024 * 1024, \
+        "the cap must exceed a valid 64 KiB request echo but stay fixed"
+    # raw export bytes preserved without reserialization
+    m = re.search(r"function apiRequest\(url, opts, mode\)\s*\{([\s\S]*?)\n  \}", js)
+    assert "if (mode === 'raw') return settle({ res: res, bytes: bytes });" in m.group(1)
+
+
+def test_w2_network_failure_and_schema_rejection_are_distinct_outcomes():
+    js = _read("app.js")
+    m = re.search(r"function apiRequest\(url, opts, mode\)\s*\{([\s\S]*?)\n  \}", js)
+    body = m.group(1)
+    # malformed/undecodable complete body -> schema rejection marker
+    assert "bodyError: 'json'" in body
+    # over-cap -> its own rejection marker, not a disconnect
+    assert "bodyError: 'too_large'" in body
+    # timeout / unreachable -> network marker (never a schema verdict)
+    assert "network: true, timedOut: timedOut" in body
+    # JSON null parses to the value null — rejected by the strict parser,
+    # never by a property access on null (no __not_json access at all)
+    assert "__not_json" not in js
+    m = re.search(r"function parseStatus\(s\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m.group(1).lstrip().startswith("if (!s || typeof s !== 'object') return null;"), \
+        "parseStatus must be null-safe (JSON null is a schema rejection)"
+
+
+def test_w2_parse_plan_bounds_aligned_with_server_contract():
+    js = _read("app.js")
+    m = re.search(r"function parsePlan\(raw\)\s*\{([\s\S]*?)\n  \}", js)
+    body = m.group(1)
+    # bounds ALIGNED with the 64 KiB request transport cap — no invented
+    # 4000-char generation limit that would reject server-valid echoes
+    assert "MAX_CONFIG_STRING_CHARS" in body
+    assert "c.prompt.length > 4000" not in body
+    assert "negative_prompt.length > 4000" not in body
+    m = re.search(r"var MAX_CONFIG_STRING_CHARS = (\d+);", js)
+    assert m and int(m.group(1)) == 65536, \
+        "string bound must match the server's 64 KiB request cap exactly"
+    # dimensions honoured as multiples of 32 (config.py DIM_MULTIPLE)
+    assert "c.width % 32 !== 0" in body and "c.height % 32 !== 0" in body
+    # cfg_active recomputed with PYTHON strip semantics, exactly
+    assert "pyStrip(c.negative_prompt)" in body
+    assert "raw.cfg_active !== cfgActive" in body
+    # latent_tokens consistent with the echoed dimensions (/16, C6)
+    assert "raw.latent_tokens !== (c.width / 16) * (c.height / 16)" in body
+    # manifest verification EXACT, not any bounded string
+    assert "m.verification !== 'not_performed'" in body
+    assert "m.fit !== 'not_evaluated'" in body
+    assert "m.ready !== false" in body
+    # closed blocker-code list, not arbitrary strings
+    assert "KNOWN_BLOCKER_CODES.indexOf" in body
+    m = re.search(r"var KNOWN_BLOCKER_CODES = \[([\s\S]*?)\];", js)
+    assert m, "KNOWN_BLOCKER_CODES missing"
+    from qwen_engine.web import api
+    codes = set(re.findall(r"'([a-z_]+)'", m.group(1)))
+    assert {"adapter_not_implemented", "hardware_not_probed",
+            "assets_unverified", "calibration_unknown"} <= codes
+    # the same closed list must gate status blockers too
+    m = re.search(r"function parseStatus\(s\)\s*\{([\s\S]*?)\n  \}", js)
+    assert "KNOWN_BLOCKER_CODES.indexOf" in m.group(1)
+    # gate CODES are exact too (closed per-gate contract)
+    assert "gate.code !== spec.code" in m.group(1)

@@ -21,6 +21,17 @@
  *   * No fake results, jobs, timings or thumbnails. No draft autosave,
  *     no storage APIs. User text and server values are only ever inserted
  *     via textContent — markup is never injected as parsed HTML.
+ *   * Every request is bounded END TO END: one AbortController timer covers
+ *     headers AND body consumption (a slow or truncated body can never hang
+ *     the page), and bodies are read with a fixed size cap — never
+ *     unbounded. A malformed/truncated-but-complete JSON body is a schema
+ *     REJECTION (chip: "Status rejected"); an unreachable or timed-out
+ *     request is a network failure (chip: "Not connected") — never mixed.
+ *   * A visible plan result is invalidated BEFORE the next attempt is
+ *     validated, and becomes clearly STALE as soon as the draft no longer
+ *     matches the validated snapshot (including preset/random/change-only
+ *     edits). An out-of-order answer never wins and never clears newer
+ *     validation errors.
  */
 'use strict';
 
@@ -45,12 +56,37 @@
   var ERROR_SCHEMA = 'qwen_engine.web_error.v1';
   var UI_HEADER = 'X-Qwen-UI';
 
+  // Closed gate contract: each gate has exactly one truthful state and one
+  // stable code (qwen_engine.web/api.py). An arbitrary bounded string is a
+  // schema rejection, never a trusted state.
   var GATE_STATES = {
-    adapter: ['not_implemented'],
-    hardware: ['unknown'],
-    assets: ['not_verified'],
-    calibration: ['unknown']
+    adapter:     { states: ['not_implemented'], code: 'adapter_not_implemented' },
+    hardware:    { states: ['unknown'],         code: 'hardware_not_probed' },
+    assets:      { states: ['not_verified'],    code: 'assets_unverified' },
+    calibration: { states: ['unknown'],         code: 'calibration_unknown' }
   };
+
+  // CLOSED blocker-code list — exactly what the real server can emit.
+  var KNOWN_BLOCKER_CODES = [
+    'adapter_not_implemented', 'hardware_not_probed', 'assets_unverified',
+    'calibration_unknown', 'manifest_unconfigured', 'manifest_file_missing',
+    'manifest_invalid', 'manifest_unreadable'
+  ];
+
+  // Public string bound, ALIGNED with the server's 64 KiB request cap: a
+  // UTF-8 body of at most 65536 bytes can never encode a JSON string longer
+  // than 65536 UTF-16 code units, so no server-valid echo is ever rejected
+  // here. This mirrors the transport contract — it is deliberately NOT an
+  // invented generation limit (config.py imposes no prompt-length limit).
+  var MAX_CONFIG_STRING_CHARS = 65536;
+
+  // CPython str.strip() whitespace set (JS trim() differs: it drops U+FEFF
+  // and keeps U+001C-U+001F / U+0085). parsePlan mirrors Python exactly so
+  // a server-valid cfg_active is never falsely rejected by JS whitespace
+  // rules.
+  function pyStrip(s) {
+    return s.replace(/[\x09\x0A\x0B\x0C\x0D\x1C\x1D\x1E\x1F\x85\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/g, '');
+  }
 
   var PRESETS = {
     square:    { width: 1024, height: 1024 },
@@ -253,83 +289,232 @@
 
   /* ---------------- Connection / status ---------------- */
 
-  var lastApiOk = false;   // did the last server call succeed?
+  var FETCH_TIMEOUT_MS = 15000;  // finite: every fetch aborts; no polling
+  // Fixed response cap. Every legitimate answer to a <=64 KiB request fits
+  // comfortably (static assets are small, the export echo of the editable
+  // fields is bounded by the request itself); an over-cap body is refused,
+  // never buffered. No unbounded bodies are ever read.
+  var MAX_RESPONSE_BYTES = 262144;
+  var apiConnected = false;      // a RECOGNIZED status document was seen
+
+  var BODY_TOO_LARGE = { bodyTooLarge: true };
+
+  // Complete body bytes, capped. The abort signal of the surrounding
+  // request also errors an in-flight body stream, so a stalled or
+  // truncated body cannot hang the page.
+  function readBodyLimited(res) {
+    if (!res.body || typeof res.body.getReader !== 'function') {
+      return res.arrayBuffer().then(function (buf) {
+        if (buf.byteLength > MAX_RESPONSE_BYTES) throw BODY_TOO_LARGE;
+        return new Uint8Array(buf);
+      });
+    }
+    var reader = res.body.getReader();
+    var chunks = [];
+    var total = 0;
+    function pump() {
+      return reader.read().then(function (r) {
+        if (r.done) {
+          var out = new Uint8Array(total);
+          var off = 0;
+          for (var i = 0; i < chunks.length; i++) {
+            out.set(chunks[i], off);
+            off += chunks[i].byteLength;
+          }
+          return out;
+        }
+        total += r.value.byteLength;
+        if (total > MAX_RESPONSE_BYTES) {
+          // Stop at once: an over-cap body is cancelled, never buffered.
+          return reader.cancel().then(function () { throw BODY_TOO_LARGE; });
+        }
+        chunks.push(r.value);
+        return pump();
+      });
+    }
+    return pump();
+  }
+
+  // One bounded same-origin exchange. The AbortController timer covers the
+  // WHOLE operation — fetch headers AND body consumption — and the timer is
+  // cleared in settle(), after the body has been consumed (or failed).
+  // Resolves (never rejects) with exactly one of:
+  //   { network: true, timedOut }      — unreachable, aborted or timed out
+  //                                    (headers OR body stage): an honest
+  //                                    network outcome, never a schema verdict
+  //   { res, json }                    — body decoded UTF-8, JSON-parsed
+  //                                    (json may be null — a parser value the
+  //                                    strict parsers reject, not a crash)
+  //   { res, bodyError: 'json' }       — complete body, malformed/undecodable
+  //                                    JSON: a schema rejection, NOT a
+  //                                    disconnect
+  //   { res, bodyError: 'too_large' }  — body exceeded the fixed cap
+  //   { res, bytes }                   — mode 'raw': the COMPLETE raw bytes,
+  //                                    untouched (export downloads these)
+  function apiRequest(url, opts, mode) {
+    var controller = new AbortController();
+    var timedOut = false;
+    var timer = setTimeout(function () {
+      timedOut = true;
+      controller.abort();
+    }, FETCH_TIMEOUT_MS);
+    var requestOpts = {};
+    if (opts) {
+      for (var k in opts) {
+        if (Object.prototype.hasOwnProperty.call(opts, k)) requestOpts[k] = opts[k];
+      }
+    }
+    requestOpts.signal = controller.signal;
+    function settle(value) { clearTimeout(timer); return value; }
+    return fetch(url, requestOpts).then(function (res) {
+      return readBodyLimited(res).then(function (bytes) {
+        if (mode === 'raw') return settle({ res: res, bytes: bytes });
+        var value;
+        try {
+          value = JSON.parse(new TextDecoder('utf-8', { fatal: true })
+            .decode(bytes));
+        } catch (err) {
+          return settle({ res: res, bodyError: 'json' });
+        }
+        return settle({ res: res, json: value });
+      }, function (err) {
+        // The body stage failed: the whole-operation timeout aborted the
+        // stream, the connection died, or the fixed cap was exceeded.
+        if (err === BODY_TOO_LARGE) {
+          return settle({ res: res, bodyError: 'too_large' });
+        }
+        return settle({ network: true, timedOut: timedOut });
+      });
+    }, function () {
+      // Never got past the headers stage: an honest network outcome.
+      return settle({ network: true, timedOut: timedOut });
+    });
+  }
 
   function renderChip(text, backendText) {
     setText('connection-chip', text);
     setText('stat-backend', backendText);
   }
 
-  // The status document is NOT trusted by shape alone: schema tag, strict
-  // booleans and the known bounded gate states must all match, or we treat
-  // the server as unrecognized — never as ready.
-  function parseStatus(s) {
-    if (!s || typeof s !== 'object') return null;
-    if (s.schema !== STATUS_SCHEMA) return null;
-    if (s.planning_available !== true) return null;
-    if (!s.gates || typeof s.gates !== 'object') return null;
-    var gates = Object.keys(GATE_STATES);
-    for (var i = 0; i < gates.length; i++) {
-      var gate = s.gates[gates[i]];
-      if (!gate || typeof gate.state !== 'string' ||
-          GATE_STATES[gates[i]].indexOf(gate.state) === -1) return null;
-    }
-    if (!Array.isArray(s.generation_blockers)) return null;
-    for (var j = 0; j < s.generation_blockers.length; j++) {
-      if (typeof s.generation_blockers[j] !== 'string') return null;
-    }
-    var gen = s.generation_available;
-    return { recognized: true, planning: true, generation: gen === false ? false : 'unexpected' };
+  // Plan/Export are only offered once a RECOGNIZED status has been seen;
+  // any disconnect or schema rejection takes them away again. Generate is
+  // NEVER touched here — it is and stays disabled (generation is W3).
+  function setApiAvailable(available) {
+    apiConnected = available;
+    $('btn-plan').disabled = !available;
+    $('btn-export').disabled = !available;
   }
 
-  function statusUnrecognizedText() {
+  // The status document is NOT trusted by shape alone: schema tag, strict
+  // literal booleans (generation_available must be the literal false), the
+  // exact known gates with their CLOSED states AND codes, blocker codes
+  // from the closed list only, and the exact manifest verification — ALL
+  // must match, or the whole document is rejected. A JSON null parses to
+  // the value null and is rejected here by the schema, never by a property
+  // access on null.
+  function parseStatus(s) {
+    if (!s || typeof s !== 'object') return null;   // null-safe by design
+    if (s.schema !== STATUS_SCHEMA) return null;
+    if (s.planning_available !== true) return null;
+    if (s.generation_available !== false) return null;  // literal false only
+    if (!s.gates || typeof s.gates !== 'object') return null;
+    var gates = Object.keys(GATE_STATES);
+    if (Object.keys(s.gates).length !== gates.length) return null;  // exact
+    for (var i = 0; i < gates.length; i++) {
+      var gate = s.gates[gates[i]];
+      var spec = GATE_STATES[gates[i]];
+      if (!gate || typeof gate.state !== 'string' || gate.state.length > 64 ||
+          gate.code !== spec.code ||
+          spec.states.indexOf(gate.state) === -1) return null;
+    }
+    if (!Array.isArray(s.generation_blockers) ||
+        s.generation_blockers.length > 16) return null;
+    for (var j = 0; j < s.generation_blockers.length; j++) {
+      // Known blocker codes only — an arbitrary bounded string is refused.
+      if (KNOWN_BLOCKER_CODES.indexOf(s.generation_blockers[j]) === -1) {
+        return null;
+      }
+    }
+    if (s.manifest !== undefined) {
+      var m = s.manifest;
+      if (!m || typeof m !== 'object' || typeof m.configured !== 'boolean' ||
+          typeof m.valid !== 'boolean' ||
+          m.verification !== 'not_performed') return null;
+    }
+    return { recognized: true, planning: true, generation: false };
+  }
+
+  function statusUnrecognizedText(reason) {
     return 'Connected, but the status document did not match the expected ' +
-           'schema — treated as unrecognized, nothing is trusted.';
+           'schema' + (reason ? ' (' + reason + ')' : '') +
+           ' — the whole document was rejected and nothing from it is ' +
+           'trusted.';
   }
 
   function checkStatus() {
-    return fetch(API_STATUS, { headers: { 'Accept': 'application/json' } })
-      .then(function (res) {
-        if (!res.ok) {
-          renderChip('Server error', 'Server error (status ' + res.status + ')');
+    return apiRequest(API_STATUS, { headers: { 'Accept': 'application/json' } },
+                      'json')
+      .then(function (r) {
+        if (r.network) {
+          // No server (file://, qwen-web not running) or the WHOLE request
+          // (headers and body) timed out — an honest disconnect, never a
+          // schema verdict and never an error storm.
+          setApiAvailable(false);
+          renderChip('Not connected',
+            r.timedOut ? 'Not connected — the request timed out'
+                       : 'Not connected — no local engine server');
+          setText('settings-backend',
+            'No local engine server was reachable from this page (or the ' +
+            'request timed out). Opened over file:// or without qwen-web, ' +
+            'the workspace is disconnected: planning and authoritative ' +
+            'validation are unavailable.');
+          setText('settings-generation',
+            'No authoritative status — generation availability unknown; ' +
+            'Generate stays disabled.');
           return null;
         }
-        return res.json();
-      })
-      .catch(function () {
-        // No server (file://, qwen-web not running) — honest, not an error storm.
-        renderChip('Not connected', 'Not connected — no local engine server');
-        setText('settings-backend',
-          'No local engine server was reachable from this page. Opened ' +
-          'over file:// or without qwen-web, the workspace is disconnected: ' +
-          'planning and authoritative validation are unavailable.');
-        return null;
-      })
-      .then(function (raw) {
-        if (raw === null) { lastApiOk = false; return null; }
-        var status = parseStatus(raw);
+        if (!r.res.ok) {
+          setApiAvailable(false);
+          renderChip('Server error', 'Server error (status ' + r.res.status + ')');
+          setText('settings-backend',
+            'The local engine server answered the status request with an ' +
+            'error; no authoritative information is available.');
+          setText('settings-generation',
+            'No authoritative status — generation availability unknown; ' +
+            'Generate stays disabled.');
+          return null;
+        }
+        if (r.bodyError) {
+          // A COMPLETE body that is not usable JSON (or over the fixed cap)
+          // is a REJECTED schema — explicitly not a disconnect.
+          setApiAvailable(false);
+          renderChip('Status rejected', 'Status rejected — ' +
+            (r.bodyError === 'too_large' ? 'body over the size cap'
+                                         : 'not decodable JSON'));
+          setText('settings-backend', statusUnrecognizedText(
+            r.bodyError === 'too_large' ? 'body over the size cap'
+                                        : 'body was not valid JSON'));
+          return null;
+        }
+        var status = parseStatus(r.json);   // JSON null rejects safely here
         if (!status) {
-          lastApiOk = false;
-          renderChip('Status unrecognized', 'Status unrecognized — not trusted');
-          setText('settings-backend', statusUnrecognizedText());
+          setApiAvailable(false);
+          renderChip('Status rejected', 'Status rejected — not trusted');
+          setText('settings-backend', statusUnrecognizedText(''));
           return null;
         }
-        lastApiOk = true;
+        setApiAvailable(true);
         renderChip('Connected — planning only', 'Connected — planning only');
         setText('settings-backend',
           'Connected to the local qwen-web server (planning only). ' +
           'Generation is not implemented; every gate below explains why.');
         setText('settings-gates',
           'adapter: not implemented · hardware: not probed (unknown) · ' +
-          'assets: not verified · calibration: unknown');
-        if (status.generation === 'unexpected') {
-          // A server claiming generation_available would contradict this
-          // build; refuse to trust it and keep Generate disabled.
-          renderChip('Connected — status unexpected', 'Status unexpected — not trusted');
-          setText('api-message',
-            'The server reported an unexpected generation state; Generate ' +
-            'stays disabled because generation is not implemented here.');
-        }
+          'assets: not verified · calibration: not verified for this ' +
+          'server (unknown)');
+        setText('settings-generation',
+          'Planning is available against the configured manifest. ' +
+          'Generation is NOT implemented — Generate stays disabled.');
         return status;
       });
   }
@@ -337,42 +522,165 @@
   /* ---------------- Typed API errors ---------------- */
 
   function renderApiError(res, payload) {
-    lastApiOk = false;
+    // Bounded rendering only: fixed-length code pattern, truncated strings,
+    // at most 8 field lines — server error text is never a rendering risk.
     var message = 'The server refused the request (HTTP ' + res.status + ').';
-    if (payload && payload.schema === ERROR_SCHEMA && typeof payload.code === 'string') {
+    if (payload && payload.schema === ERROR_SCHEMA &&
+        typeof payload.code === 'string' && /^[a-z0-9_]{1,64}$/.test(payload.code)) {
       message = payload.code + ': ' +
-                (typeof payload.message === 'string' ? payload.message : 'no message');
+                (typeof payload.message === 'string'
+                  ? payload.message.slice(0, 200) : 'no message');
       if (Array.isArray(payload.fields)) {
         var fieldTexts = [];
-        for (var i = 0; i < payload.fields.length; i++) {
+        for (var i = 0; i < payload.fields.length && fieldTexts.length < 8; i++) {
           var f = payload.fields[i];
-          if (f && typeof f.field === 'string' && typeof f.message === 'string') {
-            fieldTexts.push(f.field + ': ' + f.message);
+          if (f && typeof f.field === 'string' && f.field.length <= 32 &&
+              typeof f.message === 'string') {
+            fieldTexts.push(f.field.slice(0, 32) + ': ' + f.message.slice(0, 160));
           }
         }
         if (fieldTexts.length) message += ' — ' + fieldTexts.join('; ');
       }
     }
-    setText('api-message', message);
+    setText('api-message', message.slice(0, 600));
   }
 
-  function apiPost(url, envelope) {
-    return fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Qwen-UI': '1' },
-      body: JSON.stringify(envelope)
-    }).then(function (res) {
-      return res.json()
-        .catch(function () { return null; })
-        .then(function (payload) { return { res: res, payload: payload }; });
-    });
+  function apiErrorPayloadFromBytes(bytes) {
+    // Error-path only: a server error body is parsed defensively for
+    // bounded rendering. It never feeds a success render.
+    if (!bytes) return null;
+    try {
+      return JSON.parse(new TextDecoder('utf-8', { fatal: true })
+        .decode(bytes));
+    } catch (err) {
+      return null;
+    }
   }
 
   /* ---------------- Plan flow ----------------
    * Both "Check configuration" and "Plan" submit the snapshot; the server
    * verdict is authoritative. On ANY failure the draft stays exactly as
    * typed — nothing is auto-filled or overwritten from a failed response.
+   * Previous plan results never masquerade as current: the panel is hidden
+   * while a new attempt is in flight, out-of-order answers are ignored and
+   * a draft that changed meanwhile is labelled as a submitted snapshot.
    */
+
+  var planSeq = 0;
+  var planNoteBase = '';          // the note of the currently RENDERED result
+  var planShownSignature = null;  // draft signature that panel validated
+                                  // (null: no rendered result to keep fresh)
+
+  function envelopeSignature(built) {
+    return built.ok ? JSON.stringify(built.envelope) : null;
+  }
+
+  // A visible validated result must NEVER keep looking current after the
+  // draft changed — including preset, random and change-only fields that
+  // produce no inline errors. The panel stays visible but is clearly
+  // labelled stale; nothing is silently re-trusted.
+  function syncPlanStaleness() {
+    var panel = $('plan-panel');
+    if (panel.hidden || planShownSignature === null) return;
+    var stale = envelopeSignature(buildEnvelope()) !== planShownSignature;
+    if (!stale) {
+      panel.classList.remove('stale');
+      setText('plan-panel-note', planNoteBase);
+      return;
+    }
+    panel.classList.add('stale');
+    setText('plan-panel-note', planNoteBase + ' The draft changed after this ' +
+      'plan was computed — this result is STALE and does not validate the ' +
+      'current draft. Run Plan again.');
+  }
+
+  function runPlan(showFull) {
+    setText('api-message', '');
+    // Invalidate prior attempts BEFORE any validation: a newer attempt —
+    // even one that fails local validation — must cancel an in-flight
+    // older one, so it can never clear the new errors or render an old
+    // success over them.
+    planSeq++;
+    var seq = planSeq;
+    var built = buildEnvelope();
+    if (!built.ok) {
+      promptTouched = true;
+      renderValidation(built.errors);
+      syncPlanStaleness();   // an invalid draft stales any visible result
+      setText('api-message', 'The draft has local form errors — nothing was sent. ' +
+                             'The server verdict would be authoritative anyway.');
+      return Promise.resolve(false);
+    }
+    var sentSignature = JSON.stringify(built.envelope);
+    planShownSignature = null;
+    $('plan-panel').hidden = true;   // previous results are not current now
+    return apiRequest(API_PLAN, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Qwen-UI': '1' },
+      body: sentSignature
+    }, 'json').then(function (r) {
+      if (seq !== planSeq) return false;      // a newer attempt superseded this
+      if (r.network) {
+        setApiAvailable(false);
+        renderChip('Not connected',
+          r.timedOut ? 'Not connected — the request timed out'
+                     : 'Not connected — request failed');
+        setText('api-message', 'The request failed (no reachable local server, ' +
+                               'or it timed out). No planning result received; ' +
+                               'your draft is unchanged; nothing was generated.');
+        return false;
+      }
+      if (!r.res.ok) {
+        renderApiError(r.res, r.json === undefined ? null : r.json);
+        setText('api-message', $('api-message').textContent +
+          ' No planning result received; your draft is unchanged; nothing ' +
+          'was generated.');
+        return false;
+      }
+      if (r.bodyError) {
+        setText('api-message', 'The plan body was not usable (' +
+                               (r.bodyError === 'too_large'
+                                 ? 'over the fixed response cap'
+                                 : 'not decodable JSON') +
+                               ') — a schema rejection, not a disconnect; ' +
+                               'nothing is rendered or trusted.');
+        return false;
+      }
+      var plan = parsePlan(r.json);
+      if (!plan) {
+        setText('api-message', 'The plan document did not match the expected ' +
+                               'schema — nothing is rendered or trusted; ' +
+                               'previous results are hidden and your draft is ' +
+                               'unchanged.');
+        return false;
+      }
+      promptTouched = true;
+      // Render the CURRENT draft's inline validation — an answer arriving
+      // for a draft that changed meanwhile must NOT clear newer errors.
+      renderValidation(validateForm().errors);
+      planRenderFields(plan);
+      planNoteBase = showFull
+        ? 'Server plan (authoritative GenerationConfig validation) of the ' +
+          'submitted snapshot. Planning only — nothing was generated.'
+        : 'The server accepted this configuration (authoritative ' +
+          'validation) of the submitted snapshot. Nothing was generated.';
+      planShownSignature = sentSignature;
+      setText('plan-panel-note', planNoteBase);
+      $('plan-panel').classList.remove('stale');
+      $('plan-panel').hidden = false;
+      syncPlanStaleness();   // edited while awaiting the answer -> stale
+      if (!apiConnected) { checkStatus(); }  // server proved itself; refresh
+      return true;
+    }).catch(function () {
+      // Defensive: the network layer never rejects; anything reaching here
+      // is a client-side bug, reported honestly, never as a fake success.
+      if (seq !== planSeq) return false;
+      setText('api-message', 'An unexpected client-side error occurred while ' +
+                             'rendering the plan; no result is shown and ' +
+                             'your draft is unchanged.');
+      return false;
+    });
+  }
 
   function planRenderFields(plan) {
     setText('plan-seed', plan.config.seed === null ? 'null (random at run time)' : plan.config.seed);
@@ -388,10 +696,8 @@
       plan.manifest.ready === false && plan.manifest.verification === 'not_performed'
         ? 'metadata only — verification not performed, fit not evaluated, not ready'
         : 'manifest state unrecognized — not trusted');
-    setText('plan-hardware', plan.hardware && plan.hardware.status === 'unknown'
-      ? 'unknown — not probed' : 'unknown — unrecognized status field');
-    setText('plan-calibration', plan.calibration && plan.calibration.status === 'unknown'
-      ? 'unknown — no calibration records' : 'unknown — unrecognized status field');
+    setText('plan-hardware', 'unknown — this server has not probed hardware');
+    setText('plan-calibration', 'unknown — not verified for this server');
     var list = $('plan-blockers');
     while (list.firstChild) list.removeChild(list.firstChild);
     var blockers = Array.isArray(plan.generation_blockers) ? plan.generation_blockers : [];
@@ -402,61 +708,81 @@
     }
   }
 
+  var PLAN_ENUMS = {
+    quant: ['fp16', 'q8', 'q4'],
+    offload: ['resident', 'streamed', 'offload'],
+    attention_backend: ['auto', 'sdpa', 'efficient', 'eager']
+  };
+
+  // The WHOLE public plan response is validated before anything renders:
+  // exact editable keys, string lengths ALIGNED with the server's 64 KiB
+  // transport cap (no invented generation limits), integer ranges,
+  // dimensions multiples of 32, finite CFG, enums, boolean VAE, seed as
+  // decimal STRING/null in uint64 range (a numeric seed is refused — never
+  // rendered through Number), cfg_active and latent_tokens CONSISTENT with
+  // the echoed config (the server's own derivations recomputed exactly),
+  // the manifest EXACTLY verification not_performed / fit not_evaluated /
+  // ready false, unknown hardware/calibration, and blocker codes from the
+  // closed list only.
   function parsePlan(raw) {
     if (!raw || typeof raw !== 'object' || raw.schema !== PLAN_SCHEMA) return null;
+    if (raw.planning_available !== true || raw.generation_available !== false) return null;
     if (typeof raw.cfg_active !== 'boolean') return null;
     if (!Number.isInteger(raw.latent_tokens) || raw.latent_tokens < 0) return null;
     var c = raw.config;
     if (!c || typeof c !== 'object') return null;
+    var want = ['prompt', 'negative_prompt', 'width', 'height', 'steps',
+                'true_cfg_scale', 'seed', 'quant', 'offload',
+                'attention_backend', 'vae_tiled_decode'];
+    var have = Object.keys(c);
+    if (have.length !== want.length) return null;   // no extra runtime fields
+    for (var i = 0; i < want.length; i++) {
+      if (!Object.prototype.hasOwnProperty.call(c, want[i])) return null;
+    }
+    if (typeof c.prompt !== 'string' || c.prompt.length > MAX_CONFIG_STRING_CHARS) return null;
+    if (typeof c.negative_prompt !== 'string' ||
+        c.negative_prompt.length > MAX_CONFIG_STRING_CHARS) return null;
+    // config.py validates dimensions as multiples of DIM_MULTIPLE (32) in
+    // [64, 4096]; a validated echo must honour the same contract.
+    if (!Number.isInteger(c.width) || c.width < 64 || c.width > 4096 ||
+        c.width % 32 !== 0) return null;
+    if (!Number.isInteger(c.height) || c.height < 64 || c.height > 4096 ||
+        c.height % 32 !== 0) return null;
+    if (!Number.isInteger(c.steps) || c.steps < 1 || c.steps > 1000) return null;
+    if (typeof c.true_cfg_scale !== 'number' || !isFinite(c.true_cfg_scale) ||
+        c.true_cfg_scale < 1) return null;
     // Public seeds are decimal STRING/null — a numeric seed would mean the
     // browser is being handed a rounded JS Number. Refuse, never render it.
     if (!(c.seed === null || (typeof c.seed === 'string' && /^\d{1,20}$/.test(c.seed)))) return null;
-    if (raw.planning_available !== true || raw.generation_available !== false) return null;
-    return raw;
-  }
-
-  function runPlan(showFull) {
-    setText('api-message', '');
-    var built = buildEnvelope();
-    if (!built.ok) {
-      promptTouched = true;
-      renderValidation(built.errors);
-      setText('api-message', 'The draft has local form errors — nothing was sent. ' +
-                             'The server verdict would be authoritative anyway.');
-      return Promise.resolve(false);
+    if (c.seed !== null &&
+        BigInt(c.seed) > BigInt('18446744073709551615')) return null;
+    if (PLAN_ENUMS.quant.indexOf(c.quant) === -1) return null;
+    if (PLAN_ENUMS.offload.indexOf(c.offload) === -1) return null;
+    if (PLAN_ENUMS.attention_backend.indexOf(c.attention_backend) === -1) return null;
+    if (typeof c.vae_tiled_decode !== 'boolean') return null;
+    // cfg_active must EQUAL the server's single source of truth
+    // (config.py): a non-blank negative prompt under PYTHON strip rules
+    // AND a scale strictly above 1.0.
+    var cfgActive = pyStrip(c.negative_prompt).length > 0 && c.true_cfg_scale > 1;
+    if (raw.cfg_active !== cfgActive) return null;
+    // latent_tokens must equal the /16 compression of the echoed
+    // dimensions (config.py C6); multiples-of-32 make this division exact.
+    if (raw.latent_tokens !== (c.width / 16) * (c.height / 16)) return null;
+    var m = raw.manifest;
+    if (!m || typeof m !== 'object' || typeof m.configured !== 'boolean' ||
+        typeof m.valid !== 'boolean' || m.ready !== false ||
+        m.verification !== 'not_performed' || m.fit !== 'not_evaluated') return null;
+    if (!raw.hardware || raw.hardware.status !== 'unknown') return null;
+    if (!raw.calibration || raw.calibration.status !== 'unknown') return null;
+    if (!Array.isArray(raw.generation_blockers) ||
+        raw.generation_blockers.length > 16) return null;
+    for (var j = 0; j < raw.generation_blockers.length; j++) {
+      // Known blocker codes only — an arbitrary bounded string is refused.
+      if (KNOWN_BLOCKER_CODES.indexOf(raw.generation_blockers[j]) === -1) {
+        return null;
+      }
     }
-    return apiPost(API_PLAN, built.envelope).then(function (r) {
-      if (!r.res.ok) {
-        renderApiError(r.res, r.payload);
-        setText('plan-panel-note', 'Configuration rejected by the server. ' +
-                                   'Your draft was preserved exactly as typed.');
-        $('plan-panel').hidden = false;
-        return false;
-      }
-      var plan = parsePlan(r.payload);
-      if (!plan) {
-        lastApiOk = false;
-        setText('api-message', 'The plan document did not match the expected ' +
-                               'schema — not rendered, nothing is trusted.');
-        return false;
-      }
-      lastApiOk = true;
-      promptTouched = true;
-      renderValidation({});
-      planRenderFields(plan);
-      setText('plan-panel-note', showFull
-        ? 'Server plan (authoritative GenerationConfig validation). ' +
-          'Planning only — nothing was generated.'
-        : 'The server accepted this configuration (authoritative validation). ' +
-          'Nothing was generated.');
-      $('plan-panel').hidden = false;
-      return true;
-    }).catch(function () {
-      renderChip('Not connected', 'Not connected — request failed');
-      setText('api-message', 'The request failed (no reachable local server). ' +
-                             'Nothing was sent or changed.');
-      return false;
-    });
+    return raw;
   }
 
   /* ---------------- Export ----------------
@@ -477,35 +803,54 @@
                              'Nothing was downloaded.');
       return Promise.resolve(false);
     }
-    return fetch(API_EXPORT, {
+    return apiRequest(API_EXPORT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Qwen-UI': '1' },
       body: JSON.stringify(built.envelope)
-    }).then(function (res) {
-      if (!res.ok) {
-        return res.json().catch(function () { return null; })
-          .then(function (payload) { renderApiError(res, payload); return false; });
+    }, 'raw').then(function (r) {
+      if (r.network) {
+        setApiAvailable(false);
+        renderChip('Not connected',
+          r.timedOut ? 'Not connected — the request timed out'
+                     : 'Not connected — request failed');
+        setText('api-message', 'Export failed (no reachable local server, or ' +
+                               'it timed out). Nothing was downloaded; your ' +
+                               'draft is unchanged.');
+        return false;
       }
-      return res.blob().then(function (blob) {
-        var url = URL.createObjectURL(blob);
-        var a = document.createElement('a');
-        a.href = url;
-        a.download = 'qwen-editable-config.json';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        lastApiOk = true;
-        setText('api-message', 'Downloaded the editable configuration (raw ' +
-                               'bytes, no reserialization). Server runtime paths ' +
-                               'are excluded by design; import is a later ' +
-                               'milestone.');
-        return true;
-      });
+      if (r.bodyError === 'too_large') {
+        setText('api-message', 'Export refused: the response exceeded the ' +
+                               'fixed response cap — nothing was downloaded.');
+        return false;
+      }
+      if (!r.res.ok) {
+        renderApiError(r.res, apiErrorPayloadFromBytes(r.bytes));
+        return false;
+      }
+      // RAW bytes only — never parsed, never reserialized: the exact
+      // uint64 seed must survive byte-for-byte into the download.
+      var blob = new Blob([r.bytes]);
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'qwen-editable-config.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      if (!apiConnected) { checkStatus(); }  // server proved itself; refresh
+      setText('api-message', 'Downloaded the editable configuration (raw ' +
+                             'bytes, no reserialization). Server runtime paths ' +
+                             'are excluded by design; import is a later ' +
+                             'milestone.');
+      return true;
     }).catch(function () {
+      // Defensive: the network layer never rejects; anything reaching here
+      // is a client-side bug, reported honestly, never as a fake success.
+      setApiAvailable(false);
       renderChip('Not connected', 'Not connected — request failed');
-      setText('api-message', 'Export failed (no reachable local server). ' +
-                             'Nothing was downloaded.');
+      setText('api-message', 'Export failed unexpectedly. Nothing was ' +
+                             'downloaded; your draft is unchanged.');
       return false;
     });
   }
@@ -540,6 +885,7 @@
     syncPresetButtons();
     setPreviewAspect(preset.width, preset.height);
     renderValidation(validateForm().errors);
+    syncPlanStaleness();   // preset edits stale any visible result too
   }
 
   function setPreviewAspect(width, height) {
@@ -594,7 +940,12 @@
 
   function initialRoute() {
     var name = (location.hash || '').replace(/^#/, '');
-    renderView(VIEWS[name] ? name : 'create');   // no focus on load
+    // Own-property check only: inherited names like #constructor or
+    // #toString must NOT select a view (unknown hash falls back to Create).
+    if (!Object.prototype.hasOwnProperty.call(VIEWS, name)) {
+      name = 'create';
+    }
+    renderView(name);   // no focus on load
   }
 
   /* ---------------- Submission (generation refuses) ----------------
@@ -629,7 +980,13 @@
       }
     });
 
-    $('btn-check-config').addEventListener('click', function () { runPlan(false); });
+    // 'Check configuration' doubles as the reconnect/refresh action: it
+    // re-reads the authoritative status first, then validates the draft.
+    $('btn-check-config').addEventListener('click', function () {
+      checkStatus().then(function (status) {
+        return status ? runPlan(false) : false;
+      });
+    });
     $('btn-plan').addEventListener('click', function () { runPlan(true); });
     $('btn-export').addEventListener('click', function () { exportConfig(); });
 
@@ -643,9 +1000,10 @@
     $('random-seed').addEventListener('click', function () {
       $('seed').value = randomSeedString();
       renderValidation(validateForm().errors);
+      syncPlanStaleness();   // a random seed stale any visible result
     });
 
-    ['steps', 'seed', 'cfg', 'width', 'height', 'prompt'].forEach(function (id) {
+    ['steps', 'seed', 'cfg', 'width', 'height', 'prompt', 'negative'].forEach(function (id) {
       $(id).addEventListener('input', function () {
         if (id === 'width' || id === 'height') {
           setPreviewAspect(Number($('width').value), Number($('height').value));
@@ -653,6 +1011,16 @@
         }
         if (id === 'prompt') promptTouched = true;
         renderValidation(validateForm().errors);
+        syncPlanStaleness();
+      });
+    });
+
+    // Change-only fields (they never carry inline errors) must ALSO make a
+    // visible result clearly stale, not leave it looking validated.
+    ['quant', 'offload', 'attention', 'vae-tiling'].forEach(function (id) {
+      $(id).addEventListener('change', function () {
+        renderValidation(validateForm().errors);
+        syncPlanStaleness();
       });
     });
 
@@ -680,14 +1048,23 @@
 
   // Small explicit surface for manual inspection and the real-Chrome
   // checks. snapshot() is the UI wire format (not GenerationConfig JSON);
-  // buildEnvelope() is what the server receives.
+  // buildEnvelope() is what the server receives. The parsers are exposed so
+  // the browser checks can assert schema rejection without a live server;
+  // setFetchTimeoutForChecks is a TEST-ONLY knob (bounded to sane values)
+  // that shortens the whole-operation timeout so a stalled response BODY
+  // can be observed quickly — production code never calls it.
   window.QwenStudio = {
     version: 'w2-api',
     formSnapshot: formSnapshot,
     buildEnvelope: buildEnvelope,
     validateForm: validateForm,
     parseSeed: parseSeed,
+    parseStatus: parseStatus,
+    parsePlan: parsePlan,
     randomSeedString: randomSeedString,
-    checkStatus: checkStatus
+    checkStatus: checkStatus,
+    setFetchTimeoutForChecks: function (ms) {
+      if (Number.isInteger(ms) && ms > 0 && ms <= 60000) FETCH_TIMEOUT_MS = ms;
+    }
   };
 })();

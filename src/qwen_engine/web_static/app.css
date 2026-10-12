@@ -293,6 +293,11 @@ details.advanced > .help { margin-top: 10px; }
 .plan-panel { margin-top: 18px; padding: 14px 16px; border: 1px solid var(--border);
               border-radius: 10px; background: var(--bg-raised); }
 .plan-panel h3 { margin: 0 0 6px; font-size: 14px; }
+/* A result whose snapshot no longer matches the draft must LOOK stale:
+   dashed border and an explicit STALE marker, never a silent re-trust. */
+.plan-panel.stale { border-style: dashed; opacity: 0.85; }
+.plan-panel.stale h3::after { content: " — STALE"; color: var(--text-muted);
+                              font-weight: 400; }
 .plan-note { margin: 0 0 10px; font-size: 12.5px; color: var(--text-muted); }
 .plan-list { margin: 0; display: grid; gap: 6px; }
 .plan-list > div { display: grid; grid-template-columns: 220px minmax(0, 1fr);
