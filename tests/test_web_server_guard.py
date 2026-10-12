@@ -436,3 +436,76 @@ def test_raw_http_framing_selfcheck_pure():
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "FAIL" not in proc.stdout
     assert "pure framing checks" in proc.stdout        # honesty note present
+
+
+# ------------------------------------------- root-follow-up regressions
+
+def _memory_handler(raw: bytes):
+    """Drive _Handler.handle_one_request over an in-memory socket adapter —
+    NO real socket is created (the guarded suite forbids them), while the
+    FULL stdlib request-line path runs verbatim."""
+    import io
+    import types
+
+    h = server._Handler.__new__(server._Handler)
+    h.rfile = io.BytesIO(raw)
+    h.wfile = io.BytesIO()
+    h.connection = types.SimpleNamespace(
+        getsockname=lambda: ("127.0.0.1", 8765))
+    h.server = types.SimpleNamespace(bound_ip="127.0.0.1", bound_port=8765)
+    h.close_connection = False
+    h.request_version = "HTTP/1.1"
+    h.address_string = lambda: "127.0.0.1"
+    h.log_message = lambda *a, **k: None
+    h.handle_one_request()
+    return h.wfile.getvalue().decode("latin-1")
+
+
+def test_overlong_request_line_gets_typed_414_not_silent_close():
+    out = _memory_handler(b"GET /" + b"x" * 70000 + b" HTTP/1.1\r\n\r\n")
+    assert "HTTP/1.1 414" in out.split("\r\n")[0]
+    assert "malformed_request" in out              # typed JSON, not bare close
+    assert "X-Content-Type-Options: nosniff" in out  # defensive headers present
+
+
+def test_tab_separated_request_line_is_never_served_through_path_folding():
+    # The stdlib normalizes the FOLDED self.path ('\t//app.js' -> '/app.js'),
+    # but ROUTING uses the RAW target token: '//app.js' is an invalid form
+    # and must be a typed 400 — never a 200 of app.js.
+    out = _memory_handler(b"GET\t//app.js HTTP/1.1\r\n"
+                          b"Host: 127.0.0.1:8765\r\n\r\n")
+    first = out.split("\r\n")[0]
+    assert " 400 " in first, first
+    assert "malformed" in out.lower() or "target" in out.lower()
+
+
+def test_unknown_method_with_foreign_host_hits_host_policy_first():
+    out = _memory_handler(b"WEIRD / HTTP/1.1\r\nHost: evil.example:8765\r\n\r\n")
+    assert " 400 " in out.split("\r\n")[0]
+    assert "invalid_host" in out                    # policy BEFORE method typing
+
+
+def test_drain_connection_queue_recognizes_sentinels(tmp_path):
+    import queue as _queue
+
+    q: _queue.Queue = _queue.Queue()
+    socks = [_FakeSocket() for _ in range(3)]
+    for s in socks:
+        q.put((s, ("127.0.0.1", 50000)))
+    q.put(server._WORKER_SHUTDOWN)                  # leftover sentinel
+    assert server.drain_connection_queue(q) == 3    # only REAL connections
+    assert all(s.closed for s in socks)
+    assert q.unfinished_tasks == 0                  # sentinel task_done too
+    # a second drain over leftovers must not raise (no blind tuple unpack)
+    q.put(server._WORKER_SHUTDOWN)
+    assert server.drain_connection_queue(q) == 0
+
+
+def test_server_close_is_idempotent_and_never_double_signals():
+    import inspect
+    src = inspect.getsource(server._Server.server_close)
+    assert "if self._stopping:" in src and "return" in src, \
+        "second server_close must be a no-op, not a re-drain/re-stop"
+    assert "still_alive = stop_workers(self._queue, self._workers)" in src
+    assert "self._workers = still_alive" in src, \
+        "workers that failed to join keep references — no false all-joined claim"

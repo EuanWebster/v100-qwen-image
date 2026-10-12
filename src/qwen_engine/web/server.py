@@ -366,10 +366,15 @@ class _Handler(BaseHTTPRequestHandler):
             # Keep the RAW wire target: the stdlib normalizes a leading '//'
             # in self.path before we would see it — routing must consider
             # both, so a real '//x' request is refused, never served.
+            # Split EXACTLY like the stdlib (str.split() on any run of
+            # whitespace): a TAB-separated request line must still yield the
+            # real target token, never fall back to the normalized path.
             raw = self.raw_requestline
             if isinstance(raw, bytes):
                 raw = raw.decode("iso-8859-1", "replace")
-            parts = raw.strip().split(" ")
+            parts = (raw or "").strip().split()
+            # '' when the line was uncapturable or had no target token:
+            # resolve_route then refuses — there is NO normalized fallback.
             self.raw_target = parts[1] if len(parts) >= 2 else ""
         return ok
 
@@ -402,9 +407,15 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 self.raw_requestline = self.rfile.readline(65537)
                 if len(self.raw_requestline) > 65536:
+                    # The stock stdlib replies with a typed 414 here: keep
+                    # that (defensive JSON 414 via our send_error), with
+                    # request_version/command initialised so the stock
+                    # HTTP/0.9 header suppression can never hide it.
                     self.requestline = ""
-                    self.request = ""
+                    self.request_version = ""
+                    self.command = ""
                     self.close_connection = True
+                    self.send_error(HTTPStatus.REQUEST_URI_TOO_LONG)
                     return
                 if not self.raw_requestline:
                     self.close_connection = True
@@ -442,10 +453,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_api(ApiResponse(status=err.status, payload=err.to_payload(),
                                            headers=err.headers))
                 return
-            # Route on the RAW wire target (fall back to self.path only if
-            # the raw line could not be captured): the stdlib folds '//'
-            # targets before self.path, so checking raw closes that gap.
-            target = getattr(self, "raw_target", None) or self.path
+            # Route on the RAW wire target ONLY (never the stdlib-normalized
+            # self.path): the stdlib folds '//' in self.path before the app
+            # sees it, and TAB request lines reach self.path normalized too.
+            # An uncapturable/absent raw target is '' -> resolve_route refuses.
+            target = getattr(self, "raw_target", "")
             kind, arg = resolve_route(method, target)
             if kind == "static":
                 asset, ctype = STATIC_ROUTES[arg]
@@ -510,38 +522,49 @@ _WORKER_SHUTDOWN = object()
 
 
 def drain_connection_queue(conn_queue: "queue.Queue[Any]") -> int:
-    """Close every connection still WAITING in the queue without handling
-    it (graceful shutdown must not leave queued sockets dangling). Returns
-    the number closed. Pure: takes a queue, needs no sockets of its own."""
+    """Close every CONNECTION still WAITING in the queue without handling
+    it (graceful shutdown must not leave queued sockets dangling). Shutdown
+    SENTINELS are recognised and re-posted to task_done, never unpacked —
+    draining twice (or after a worker failed to consume its sentinel) is
+    safe. Returns the number of connections closed. Pure: takes a queue,
+    needs no sockets of its own."""
     closed = 0
     while True:
         try:
-            request, _client_address = conn_queue.get_nowait()
+            item = conn_queue.get_nowait()
         except queue.Empty:
             return closed
-        try:
-            request.close()
-        except OSError:  # pragma: no cover - already closed
-            pass
+        if item is not _WORKER_SHUTDOWN:
+            request, _client_address = item
+            try:
+                request.close()
+            except OSError:  # pragma: no cover - already closed
+                pass
+            closed += 1
         conn_queue.task_done()
-        closed += 1
 
 
 def stop_workers(conn_queue: "queue.Queue[Any]",
                  workers: list[threading.Thread],
                  put_timeout: float = 2.0,
-                 join_timeout: float = 5.0) -> None:
+                 join_timeout: float = 5.0) -> list[threading.Thread]:
     """Ask each started worker to exit (one sentinel per worker) and join
-    with FINITE timeouts — never blocking forever. A worker mid-request is
-    already bounded by the handler socket timeout; the threads are daemons
-    as the last-resort backstop. Pure except for thread join/put bounds."""
+    with FINITE timeouts — never blocking forever. Returns the workers
+    STILL ALIVE after their bounded join (the caller must keep references
+    to them — no false claim that everything joined). A worker
+    mid-request is already bounded by the handler socket timeout; the
+    threads are daemons as the last-resort backstop."""
     for _ in workers:
         try:
             conn_queue.put(_WORKER_SHUTDOWN, timeout=put_timeout)
         except Exception:  # full/broken queue: worker sees _stopping instead
             break
+    still_alive: list[threading.Thread] = []
     for t in workers:
         t.join(join_timeout)
+        if t.is_alive():
+            still_alive.append(t)
+    return still_alive
 
 
 class _Server(HTTPServer):
@@ -635,16 +658,20 @@ class _Server(HTTPServer):
                 self._queue.task_done()
 
     def server_close(self) -> None:
-        # Graceful shutdown must not leak its OWN pool: close the listening
+        # Graceful shutdown must not leak its OWN pool and must be IDEMPOTENT
+        # (server_close can be reached more than once): close the listening
         # socket, CLOSE every still-queued connection unhandled (never
-        # dangling), then ask each worker to exit and join with a finite
-        # timeout. Finite handler timeouts remain the only wait inside a
-        # worker; the threads are daemons as the last-resort backstop.
+        # dangling — sentinels are recognised, never unpacked), then ask
+        # each worker to exit and join with finite timeouts. Workers that
+        # did NOT join keep their references (no false 'all joined' claim);
+        # they are daemons, bounded by the handler socket timeout.
+        if self._stopping:
+            return
         self._stopping = True
         super().server_close()
         drain_connection_queue(self._queue)
-        stop_workers(self._queue, self._workers)
-        self._workers = []
+        still_alive = stop_workers(self._queue, self._workers)
+        self._workers = still_alive
 
 
 #: Prebuilt overload refusal — built ONCE from the shared _DEFENSIVE_HEADERS
