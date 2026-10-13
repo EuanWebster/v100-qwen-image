@@ -415,3 +415,23 @@ def test_executor_self_close_remains_truthfully_live_until_return(harness):
     release.set()
     assert controller.wait(record.job_id).state == jobs.JobState.CANCELLED
     assert observed == [False] and controller.close()
+
+
+def test_surrogate_input_is_typed_and_creates_no_job(harness):
+    controller = harness.create()
+    with pytest.raises(jobs.JobError, match="UTF-8 JSON"):
+        controller.submit(GenerationConfig(prompt="\ud800"))
+    assert not controller.snapshots() and not list(controller.root.iterdir())
+
+
+def test_request_snapshot_owns_builtin_values_not_mutable_subclasses(harness):
+    class Text(str):
+        pass
+    class Number(int):
+        pass
+    controller = harness.create()
+    original = GenerationConfig(prompt=Text("exact prompt"), steps=Number(40))
+    submitted = controller.submit(original)
+    assert type(submitted.config.prompt) is str and type(submitted.config.steps) is int
+    assert submitted.config.prompt == original.prompt and submitted.config.steps == original.steps
+    assert controller.wait(submitted.job_id).state == jobs.JobState.SUCCEEDED

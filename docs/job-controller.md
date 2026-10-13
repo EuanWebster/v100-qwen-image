@@ -54,7 +54,7 @@ does so at this milestone.
 
 ## CPU acceptance
 
-81 guarded tests: serial execution, queue/history/request bounds, immutable
+83 guarded tests: serial execution, queue/history/request bounds, immutable
 snapshot/scoped verified artifact, pending/running/racing cancellation,
 honest noncooperative timed-out shutdown, late save, phases, sanitized
 failure/recovery, BaseException fail-all, identifier/timeout validation,

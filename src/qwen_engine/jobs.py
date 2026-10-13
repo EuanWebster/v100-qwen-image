@@ -108,9 +108,15 @@ def _request(config):
     doc = config.to_dict()
     if sum(len(v) for v in doc.values() if isinstance(v, str)) > MAX_REQUEST_BYTES:
         raise JobError("job request byte cap exceeded")
-    raw = json.dumps(doc, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    try:
+        raw = json.dumps(doc, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError):
+        raise JobError("job request must be valid UTF-8 JSON") from None
     if len(raw) > MAX_REQUEST_BYTES:
         raise JobError("job request byte cap exceeded")
+    # Own builtin JSON values too: caller-supplied str/int subclasses must
+    # not carry custom mutable behavior into a supposedly frozen snapshot.
+    doc = json.loads(raw)
     # Copy immutable values and bind relative explicitly configured paths now,
     # preserving lexical '..'/symlink semantics (not abspath normalization).
     for name in ("models_dir", "manifest_path", "cache_dir", "log_dir", "benchmarks_dir"):
