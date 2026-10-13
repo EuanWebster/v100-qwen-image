@@ -99,18 +99,30 @@ nonfatal clocks and preserved worker errors. No live assets are mutated.
     1705passed+2skip each on Python3.11.15/3.13.5. This is a
     settled-tree structural snapshot, not byte verification or protection
     for a later loader against hostile simultaneous rewriting.
+12. **Fetcher staging/transport integrity**: absolute root bound before
+    callbacks; anchored no-follow directory creation and partial I/O;
+    nonblocking bounded rehash with identity checks; empty partial reuse
+    and same-size replacement refusal; publication from opened verified
+    inode rather than a replaceable staging name; owned cleanup with honest
+    outcomes and non-masking close faults; bounded ASCII Content-Range and
+    declared-body span, strict byte chunks and sanitized encoding errors;
+    file/directory durability reporting.30new offline regressions,
+    focused fetch129passed; full guarded suites1735passed+2skip each on
+    Python3.11.15/3.13.5. No real download/resume. Linux/proc-FD and
+    settled-tree/concurrency limits explicit in docs/fetch-review.md.
 
 ## Coverage / next work
 
 Fully read this pass: encoder_identity + runtime policy, encoder_worker, encoder_client,
 encoder_production (complete helper/codec), encoder_assets, mem_preflight, bench,
-manifest, log, config, CLI, core, adapters/base, _jsonsafe, _local_io, local_bundle and
+manifest, log, config, CLI, core, adapters/base, _jsonsafe, _local_io, local_bundle,
+fetch tool and
 generic encoder identity/request/payload, cache and worker lifecycle/response
 code. Identity/worker policy and
 source/asset/codec integration were also exercised by prior CPU milestones;
 that evidence does not substitute for reviewing all remaining source.
 
-Next: finish fetch tool corrections and regression checks, then web
+Next: web
 API/server and real-browser UI review. Follow up remaining path-binding/
 diagnostic edge cases proportionally; current full review is not complete.
 Keep reusable review evidence and environment setup in the repo/.review-envs;

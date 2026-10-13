@@ -26,7 +26,8 @@ Contract (see ``docs/models.md`` §4):
 * Bounded streaming: chunks of at most 1 MiB; never buffers a whole file.
   The expected byte count is enforced as an upper bound *while reading*.
 * Publish only on an exact size+SHA256 match, atomically and no-clobber
-  (``os.link`` of the verified ``<file>.partial`` next to the target, then
+  (Linux ``linkat`` of the opened verified inode via ``/proc/self/fd`` next
+  to the target, then
   unlink; never ``rename``/``replace`` over an existing file). A wrong,
   truncated or oversized response can never become a final asset.
 * Resume: a partial lives in the same asset directory as ``<file>.partial``.
@@ -52,7 +53,7 @@ Contract (see ``docs/models.md`` §4):
   any mkdir, network access or write, because a resolved symlinked root would
   otherwise define its own boundary.
   A symlinked partial or symlinked directory on the write path is refused;
-  partials are opened ``O_NOFOLLOW`` (where the platform provides it), a new
+  partials are opened ``O_NOFOLLOW | O_NONBLOCK``, a new
   partial is created ``O_EXCL`` (a concurrently appeared partial is refused,
   never truncated), and the opened FD is re-verified as the expected regular
   file at the expected resume size before any byte is written. The tool
@@ -61,10 +62,18 @@ Contract (see ``docs/models.md`` §4):
   refused (exit 6) before any transport or write — empty, partial-length
   or byte-complete alike, because resuming into a shared inode silently
   rewrites every other name sharing it, verified finals included — and the
-  link count is re-checked on the opened FD before truncate/seek/write so
+  link count is re-checked on the opened FD before seek/write so
   an ordinary concurrent ``link()`` cannot slip past the preflight.
   Publish-time linking of a fully verified partial is the one deliberate,
   integrity-checked exception (see the publish bullet above).
+* Fetch requires Linux no-follow directory FDs, ``/proc/self/fd``, hardlinks
+  and file/directory fsync. Directory creation and all partial operations
+  are anchored to inspected directory handles; the absolute root is bound
+  before callbacks. Empty existing partials are reused against their inode
+  snapshot, never unlinked/truncated to restart. Rehash reads at most the
+  expected size plus one byte and rejects observed mutation/replacement.
+  These are settled/cooperative-filesystem checks, not protection against
+  arbitrary simultaneous rewriting of open inodes or a compare/unlink race.
 * Manifest-safety preflight (static — no disk state, no network): before any
   mkdir/network/write the manifest is refused (usage error, exit 2) if one
   artifact's staged partial path ``<final>.partial`` equals another
@@ -93,8 +102,9 @@ Contract (see ``docs/models.md`` §4):
 
 Partial cleanup (the only deletions this tool performs, always on its own
 ``*.partial`` files, never on finals): an oversized stream or a failed final
-hash proves the partial is unrecoverable, so it is removed; an interrupted or
-truncated stream keeps the partial for resume.
+hash proves the partial is unrecoverable, so its still-matching owned name is
+removed if possible; changed names or cleanup failures are preserved and
+reported accurately. An interrupted or truncated stream keeps the partial.
 
 Exit codes (TOOL-SPECIFIC, deliberately distinct from the cli_gen.py engine
 contract): ``0`` success · ``2`` usage/manifest error · ``3`` insufficient
@@ -102,9 +112,9 @@ disk space · ``4`` network/HTTP error (including a refused Range response) ·
 ``5`` downloaded-bytes integrity failure (size/hash) · ``6`` refusal to
 clobber or an unsafe path.
 
-This assignment ships CODE + OFFLINE TESTS ONLY: no real 33.1 GB transfer has
-been executed; running ``--fetch`` against the live Hub is a separate
-lead/operator decision.
+This code-review pass uses OFFLINE TESTS ONLY. The separately approved
+earlier partial live fetch is recorded in docs/models.md; nothing here runs
+or resumes it. Live ``--fetch`` remains an explicit operator action.
 """
 from __future__ import annotations
 
@@ -119,6 +129,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -157,7 +168,7 @@ _REPO_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
 #: '<repo>/resolve/<revision>/<file>' shape, so they are never accepted.
 _DOT_SEGMENTS = frozenset({".", ".."})
 _CONTENT_RANGE_RE = re.compile(
-    r"^bytes (\d+)-(\d+)/(\d+|\*)$", re.IGNORECASE)
+    r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)", re.IGNORECASE)
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -361,15 +372,116 @@ def _default_disk_free(path: Path) -> int:
         raise UnsafePathError(f"cannot read free space near {probe}: {exc}") from None
 
 
-def _hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    fd = os.open(path, os.O_RDONLY)
+def _file_signature(info: os.stat_result) -> tuple[int, ...]:
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+
+
+def _named_stat(path: Path, parent_fd: int | None = None) -> os.stat_result:
+    return os.stat(path if parent_fd is None else path.name,
+                   dir_fd=parent_fd, follow_symlinks=False)
+
+
+def _close_owned(fd: int) -> None:
+    """Do not replace an active primary refusal with a descriptor-close fault."""
+    primary = sys.exception()
     try:
-        while chunk := os.read(fd, CHUNK_BYTES):
-            digest.update(chunk)
-    finally:
         os.close(fd)
-    return digest.hexdigest()
+    except OSError:
+        if primary is None:
+            raise
+
+
+def _warn(message: str) -> None:
+    """Cleanup diagnostics are best effort, including a broken stderr sink."""
+    try:
+        print(f"warning: {message}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _anchor_parent(dest: Path, *, create: bool = False):
+    """Open the absolute destination parent one no-follow directory at a time."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(dest.anchor, flags)
+    try:
+        for part in dest.parent.parts[1:]:
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, dir_fd=fd)
+                except FileExistsError:
+                    pass  # concurrent creation still must pass no-follow open
+                child = os.open(part, flags, dir_fd=fd)
+            try:
+                os.close(fd)
+            except BaseException:
+                _close_owned(child)
+                raise
+            fd = child
+        _require_parent_current(dest.parent, fd)
+        yield fd
+    finally:
+        _close_owned(fd)
+
+
+def _require_parent_current(parent: Path, fd: int) -> None:
+    _check_root_symlinks(parent)
+    opened, named = os.fstat(fd), parent.stat(follow_symlinks=False)
+    if (opened.st_dev, opened.st_ino, opened.st_mode) != (
+            named.st_dev, named.st_ino, named.st_mode):
+        raise UnsafePathError(f"destination directory changed: {parent}")
+
+
+def _require_partial_current(path: Path, info: os.stat_result,
+                             parent_fd: int | None = None) -> None:
+    if not _stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise UnsafePathError(f"partial {path} must be regular with one hard link")
+    if _file_signature(_named_stat(path, parent_fd)) != _file_signature(info):
+        raise RefuseClobberError(f"partial changed during this fetch: {path}")
+
+
+def _discard_owned_partial(path: Path, info: os.stat_result, parent_fd: int) -> str:
+    """Only remove the still-matching owned inode; cleanup never masks a refusal."""
+    try:
+        _require_parent_current(path.parent, parent_fd)
+        _require_partial_current(path, info, parent_fd)
+        os.unlink(path.name, dir_fd=parent_fd)
+    except (OSError, FetchError):
+        return "partial preserved (changed path or cleanup failed; inspect deliberately)"
+    return "unrecoverable partial removed"
+
+
+def _hash_file(path: Path, expected_bytes: int, expected: os.stat_result,
+               parent_fd: int) -> tuple[str, os.stat_result]:
+    """Bounded, nonblocking regular-file snapshot of the assembled partial."""
+    digest = hashlib.sha256()
+    fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                 dir_fd=parent_fd)
+    try:
+        before = os.fstat(fd)
+        _require_partial_current(path, before, parent_fd)
+        if _file_signature(before) != _file_signature(expected):
+            raise RefuseClobberError(f"partial changed before rehash: {path}")
+        if before.st_size != expected_bytes:
+            raise IntegrityError(f"partial size changed before rehash: {path}")
+        count = 0
+        while chunk := os.read(fd, min(CHUNK_BYTES, expected_bytes + 1 - count)):
+            count += len(chunk)
+            if count > expected_bytes:
+                raise IntegrityError(f"partial grew during rehash: {path}")
+            digest.update(chunk)
+        after = os.fstat(fd)
+        if count != expected_bytes or _file_signature(after) != _file_signature(before):
+            raise IntegrityError(f"partial changed during rehash: {path}")
+        _require_partial_current(path, after, parent_fd)
+        return digest.hexdigest(), after
+    finally:
+        _close_owned(fd)
 
 
 def _partial_path(dest: Path) -> Path:
@@ -433,16 +545,17 @@ def _check_write_path_symlinks(root: Path, filename: str) -> None:
             raise UnsafePathError(f"not a directory on the write path: {node}")
 
 
-def _resume_offset(art: ModelArtifact, partial: Path) -> tuple[int, bool]:
-    """Size of a resumable partial plus whether one exists at all; raises on
-    anything we refuse to append to. ``(0, False)`` means no partial. A
+def _partial_snapshot(art: ModelArtifact, partial: Path,
+                      parent_fd: int | None = None) -> os.stat_result | None:
+    """Snapshot of a resumable partial; None means no partial. Refuse
+    anything we cannot safely append to. A
     multiply hard-linked partial is refused BEFORE any transport/write —
     resume appends through the shared inode and would silently corrupt every
     other name linked to it (verified finals included)."""
     try:
-        st = partial.lstat()
+        st = _named_stat(partial, parent_fd)
     except FileNotFoundError:
-        return 0, False
+        return None
     except OSError as exc:
         raise UnsafePathError(f"cannot stat partial {partial}: {exc}") from None
     if _stat.S_ISLNK(st.st_mode):
@@ -463,31 +576,41 @@ def _resume_offset(art: ModelArtifact, partial: Path) -> tuple[int, bool]:
             f"partial for '{art.filename}' is {_human(st.st_size)} — larger "
             f"than the manifest's {_human(art.bytes)}; the partial is corrupt. "
             f"Delete it deliberately and rerun: {partial}")
-    return st.st_size, True
+    return st
 
 
-def _open_partial(partial: Path, start: int) -> int:
+def _resume_offset(art: ModelArtifact, partial: Path) -> tuple[int, bool]:
+    info = _partial_snapshot(art, partial)
+    return (0, False) if info is None else (info.st_size, True)
+
+
+def _open_partial(partial: Path, start: int, *, expected: os.stat_result | None = None,
+                  parent_fd: int | None = None) -> int:
     """Open the partial for writing WITHOUT ever following a symlink, and
     re-verify on the opened FD that it is a REGULAR, SOLELY LINKED file of
     exactly the expected resume size (ordinary concurrent filesystem changes
     between the earlier lstat and this open — a size drift or a new hard
     link — are refused, not truncated or appended over):
 
-    * ``start == 0``: create with ``O_CREAT | O_EXCL`` — a partial that
+    * No earlier snapshot and ``start == 0``: create with ``O_CREAT | O_EXCL`` — a partial that
       appeared concurrently is refused, never truncated;
-    * ``start  > 0``: open the existing file only (no ``O_CREAT``).
+    * Existing snapshot (including zero bytes) or ``start > 0``: open
+      the existing file only (no ``O_CREAT``), without truncate/delete.
 
-    ``O_NOFOLLOW`` (POSIX) closes the lstat→open symlink race; platforms
-    without it keep the pre-existing lstat-based refusal above."""
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if start == 0:
+    Requires Linux no-follow/nonblocking/dir-FD and /proc/self/fd support.
+    The proc FD path exposes the anchored parent to the CPython open audit
+    event, which otherwise omits dir_fd, so the CPU guard still checks the
+    real write destination; the final filename is opened O_NOFOLLOW."""
+    nofollow = os.O_NOFOLLOW | os.O_NONBLOCK
+    name = partial if parent_fd is None else Path(f"/proc/self/fd/{parent_fd}") / partial.name
+    if start == 0 and expected is None:
         try:
-            fd = os.open(partial,
+            fd = os.open(name,
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
                          0o644)
         except FileExistsError:
             try:
-                st = partial.lstat()
+                st = _named_stat(partial, parent_fd)
             except OSError:
                 st = None
             if st is not None and not _stat.S_ISREG(st.st_mode):
@@ -504,7 +627,7 @@ def _open_partial(partial: Path, start: int) -> int:
                 f"{type(exc).__name__} — refusing (symlink or path issue)") from None
     else:
         try:
-            fd = os.open(partial, os.O_WRONLY | nofollow)
+            fd = os.open(name, os.O_WRONLY | nofollow)
         except FileNotFoundError:
             raise RefuseClobberError(
                 f"the partial vanished while resuming: {partial} — refusing "
@@ -533,11 +656,13 @@ def _open_partial(partial: Path, start: int) -> int:
                 f"starting: expected {_human(start)} bytes, the opened file "
                 f"has {_human(st.st_size)} — refusing to truncate or append "
                 "over a file we no longer recognize")
-        os.ftruncate(fd, start)  # no-op on a verified match; no seek races
+        if expected is not None and _file_signature(st) != _file_signature(expected):
+            raise RefuseClobberError(f"partial replaced before writing: {partial}")
+        _require_partial_current(partial, st, parent_fd)
         if start:
             os.lseek(fd, start, os.SEEK_SET)  # append AFTER the verified prefix
     except BaseException:
-        os.close(fd)
+        _close_owned(fd)
         raise
     return fd
 
@@ -555,18 +680,21 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def _validate_response(art: ModelArtifact, stream: Stream, url: str,
-                       start: int) -> None:
+                       start: int) -> int:
     """Range/encoding gates applied BEFORE a single byte is written."""
-    encoding = (stream.headers.get("Content-Encoding") or "identity").strip()
-    if encoding.lower() not in ("identity",):
+    encoding = stream.headers.get("Content-Encoding")
+    if encoding is None:
+        encoding = "identity"
+    if not isinstance(encoding, str) or encoding.strip().lower() != "identity":
         raise NetworkError(
-            f"server applied Content-Encoding {encoding!r} for {_clean_url(url)}; "
+            f"server applied unsupported Content-Encoding for {_clean_url(url)} "
+            "(untrusted header value not echoed); "
             "refusing to hash transformed bytes")
     if start == 0:
         if stream.status != 200:
             raise NetworkError(
                 f"expected HTTP 200 for {_clean_url(url)}, got {stream.status}")
-        return
+        return art.bytes
     if stream.status != 206:
         raise NetworkError(
             f"server ignored the Range request for '{art.filename}' "
@@ -575,16 +703,22 @@ def _validate_response(art: ModelArtifact, stream: Stream, url: str,
             f"partial is preserved untouched — rerun after the server "
             f"supports Range, or delete the partial deliberately.")
     raw = stream.headers.get("Content-Range")
-    m = _CONTENT_RANGE_RE.match(raw.strip()) if isinstance(raw, str) else None
+    m = (_CONTENT_RANGE_RE.fullmatch(raw.strip())
+         if isinstance(raw, str) and len(raw) <= 512 else None)
     if m is None:
         raise NetworkError(
             f"missing or malformed Content-Range on the 206 resume response "
             f"for '{art.filename}' (header value not echoed — untrusted); "
             "refusing to guess the resume offset")
     first, last, total = m.group(1), m.group(2), m.group(3)
-    if int(first) != start:
+    try:
+        first_n, last_n = int(first), int(last)
+        total_n = None if total == "*" else int(total)
+    except ValueError:
+        raise NetworkError("invalid numeric Content-Range (header value not echoed)") from None
+    if first_n != start:
         raise NetworkError(
-            f"Content-Range starts at {first}, not the requested offset "
+            f"Content-Range starts at {first_n}, not the requested offset "
             f"{start}, for '{art.filename}' — refusing to concatenate a "
             "range the server did not actually resume from")
     if total == "*":
@@ -592,49 +726,53 @@ def _validate_response(art: ModelArtifact, stream: Stream, url: str,
             f"Content-Range total is the wildcard '*' for '{art.filename}': "
             f"refusing to resume against a server that hides the total size "
             f"(the manifest pins exactly {_human(art.bytes)} bytes)")
-    total_n = int(total)
     if total_n != art.bytes:
         raise NetworkError(
             f"Content-Range total disagrees with the manifest size "
             f"{art.bytes} for '{art.filename}' (header value not echoed)")
-    last_n = int(last)
     if not (start <= last_n < total_n):
         raise NetworkError(
             f"Content-Range is not a coherent byte span "
             f"(need start <= end < total, total {total_n}) for "
             f"'{art.filename}' (header value not echoed)")
+    return last_n - start + 1
 
 
 def _download(art: ModelArtifact, dest: Path, transport,
               disk_free_fn) -> str:
+    dest = Path(os.path.abspath(dest))
+    with _anchor_parent(dest, create=True) as parent_fd:
+        return _download_into(art, dest, transport, disk_free_fn, parent_fd)
+
+
+def _download_into(art: ModelArtifact, dest: Path, transport,
+                   disk_free_fn, parent_fd: int) -> str:
     """Fetch one artifact into ``dest`` (verify → stream → rehash → publish).
     Returns a short outcome string; raises FetchError on any refusal."""
     url = artifact_url(art)
     partial = _partial_path(dest)
-    start, present = _resume_offset(art, partial)
+    snapshot = _partial_snapshot(art, partial, parent_fd)
+    start = 0 if snapshot is None else snapshot.st_size
 
     # A partial that already holds every byte the manifest expects is
     # REHASHED, never "resumed" with an impossible Range from EOF: valid →
     # publish with no request at all; invalid → integrity failure, published
     # never, the unrecoverable partial removed deliberately.
-    if present and start == art.bytes:
+    if snapshot is not None and start == art.bytes:
         print(f"  partial '{art.filename}' already holds all "
               f"{_human(art.bytes)} — rehashing, no Range request", flush=True)
         try:
-            actual = _hash_file(partial)
+            actual, verified = _hash_file(partial, art.bytes, snapshot, parent_fd)
         except OSError as exc:
             raise IntegrityError(f"cannot rehash partial {partial}: {exc}") from None
         if actual != art.sha256:
-            try:
-                partial.unlink()
-            except OSError:
-                pass
+            cleanup = _discard_owned_partial(partial, verified, parent_fd)
             raise IntegrityError(
                 f"'{art.filename}': the byte-complete partial failed the "
                 f"full SHA256 rehash (expected {art.sha256}, computed "
-                f"{actual}) — no final written, the unrecoverable partial "
-                "removed")
-        _atomic_no_clobber_publish(partial, dest)
+                f"{actual}) — no final written; "
+                f"{cleanup}")
+        _atomic_no_clobber_publish(partial, dest, verified=verified, parent_fd=parent_fd)
         return "partial-complete-and-verified"
 
     # Disk estimate for THIS run's remaining bytes, bounded and honest:
@@ -648,15 +786,8 @@ def _download(art: ModelArtifact, dest: Path, transport,
             f"{_human(remaining)} + 1 MiB headroom) but only {_human(free)} "
             f"free on the filesystem holding {probe_dir} — nothing written")
 
-    if start == 0 and present:
-        # A 0-byte partial is the only present size that reaches here with
-        # start == 0: remove it so _open_partial can create the real file
-        # with O_EXCL. Anything that appeared concurrently is refused there,
-        # never truncated.
-        try:
-            partial.unlink()
-        except FileNotFoundError:
-            pass
+    # Existing empty partials are opened in place against their snapshot,
+    # never blindly unlinked to make room for an exclusive create.
     if start:
         print(f"  resume '{art.filename}' at offset {start:,} "
               f"of {_human(art.bytes)}", flush=True)
@@ -672,9 +803,11 @@ def _download(art: ModelArtifact, dest: Path, transport,
         raise NetworkError(f"transport failure for {_clean_url(url)}: "
                            f"{type(exc).__name__}") from None
     try:
-        _validate_response(art, stream, url, start)
-        fd = _open_partial(partial, start)
+        response_bytes = _validate_response(art, stream, url, start)
+        _require_parent_current(dest.parent, parent_fd)
+        fd = _open_partial(partial, start, expected=snapshot, parent_fd=parent_fd)
         try:
+            current = os.fstat(fd)
             while True:
                 try:
                     chunk = stream.read(CHUNK_BYTES)
@@ -685,20 +818,23 @@ def _download(art: ModelArtifact, dest: Path, transport,
                         f"connection interrupted mid-stream at {written:,} B "
                         f"for '{art.filename}': {type(exc).__name__} — the "
                         f"partial is preserved for resume") from None
-                if not chunk:
+                if not isinstance(chunk, bytes) or len(chunk) > CHUNK_BYTES:
+                    raise NetworkError("transport returned an invalid or oversized byte chunk")
+                if chunk == b"":
                     break
-                written += len(chunk)
-                if written > art.bytes:
-                    os.close(fd)
-                    fd = -1
-                    try:
-                        partial.unlink()
-                    except OSError:
-                        pass
+                _require_parent_current(dest.parent, parent_fd)
+                live = os.fstat(fd)
+                _require_partial_current(partial, live, parent_fd)
+                if _file_signature(live) != _file_signature(current):
+                    raise RefuseClobberError(f"partial changed while receiving bytes: {partial}")
+                if written + len(chunk) > art.bytes:
+                    cleanup = _discard_owned_partial(partial, live, parent_fd)
                     raise IntegrityError(
                         f"'{art.filename}': server sent more than the manifest's "
                         f"{_human(art.bytes)} bytes — response rejected, no "
-                        "final written and the unrecoverable partial removed")
+                        f"final written; {cleanup}")
+                if written + len(chunk) - start > response_bytes:
+                    raise NetworkError("response body exceeds its declared Content-Range; partial preserved")
                 try:
                     _write_all(fd, chunk)
                 except OSError as exc:
@@ -706,11 +842,21 @@ def _download(art: ModelArtifact, dest: Path, transport,
                         f"local write failure at {written:,} B for "
                         f"'{art.filename}': {type(exc).__name__} — the "
                         f"partial is preserved for resume") from None
+                written += len(chunk)
+                current = os.fstat(fd)
+                if current.st_size != written:
+                    raise RefuseClobberError(f"partial size changed while writing: {partial}")
+            os.fsync(fd)
+            current = os.fstat(fd)
+            _require_partial_current(partial, current, parent_fd)
         finally:
-            if fd != -1:
-                os.close(fd)
+            _close_owned(fd)
     finally:
-        stream.close()
+        try:
+            stream.close()
+        except Exception as exc:
+            _warn(f"stream cleanup failed ({type(exc).__name__}); "
+                  "untrusted error text not echoed")
 
     if written != art.bytes:
         raise NetworkError(
@@ -721,24 +867,23 @@ def _download(art: ModelArtifact, dest: Path, transport,
     # Final verification ALWAYS rehashes every byte on disk (existing partial
     # prefix included), never just the freshly streamed tail:
     try:
-        actual = _hash_file(partial)
+        actual, verified = _hash_file(partial, art.bytes, current, parent_fd)
     except OSError as exc:
         raise IntegrityError(f"cannot rehash partial {partial}: {exc}") from None
     if actual != art.sha256:
-        try:
-            partial.unlink()
-        except OSError:
-            pass
+        cleanup = _discard_owned_partial(partial, verified, parent_fd)
         raise IntegrityError(
             f"'{art.filename}': SHA256 mismatch after full rehash "
             f"(expected {art.sha256}, computed {actual}) — no final written, "
-            "the unrecoverable partial removed")
+            f"{cleanup}")
 
-    _atomic_no_clobber_publish(partial, dest)
+    _atomic_no_clobber_publish(partial, dest, verified=verified, parent_fd=parent_fd)
     return "resumed-and-verified" if start else "downloaded-and-verified"
 
 
-def _atomic_no_clobber_publish(partial: Path, dest: Path) -> None:
+def _atomic_no_clobber_publish(partial: Path, dest: Path, *,
+                               verified: os.stat_result | None = None,
+                               parent_fd: int | None = None) -> None:
     """os.link is atomic and fails on an existing target (no clobber, never
     rename/replace over anything); the partial link is then removed.
 
@@ -749,19 +894,57 @@ def _atomic_no_clobber_publish(partial: Path, dest: Path) -> None:
     therefore proves) the already-verified final's inode; a later fetch
     refuses to resume into a multiply-linked partial, and removing the stale
     name loses nothing while the final name stands."""
+    if parent_fd is None:
+        partial, dest = Path(os.path.abspath(partial)), Path(os.path.abspath(dest))
+        with _anchor_parent(dest) as anchored_fd:
+            return _atomic_no_clobber_publish(partial, dest, verified=verified,
+                                              parent_fd=anchored_fd)
+    if partial.parent != dest.parent:
+        raise UnsafePathError("publication requires a same-directory partial")
+    _require_parent_current(dest.parent, parent_fd)
+    if verified is None:
+        verified = _named_stat(partial, parent_fd)
+    _require_partial_current(partial, verified, parent_fd)
+    source_fd = os.open(partial.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                        dir_fd=parent_fd)
     try:
-        os.link(partial, dest)
+        if _file_signature(os.fstat(source_fd)) != _file_signature(verified):
+            raise RefuseClobberError("partial changed before publication")
+        os.fsync(source_fd)
+        # Linux linkat follows this kernel-owned FD alias to the inspected
+        # inode, NOT a staging filename that may now name a different file.
+        os.link(f"/proc/self/fd/{source_fd}", dest.name,
+                dst_dir_fd=parent_fd, follow_symlinks=True)
     except FileExistsError:
         raise RefuseClobberError(
             f"final file appeared during verification, refusing to clobber: "
             f"{dest} — the verified partial stays at {partial}") from None
     except OSError as exc:
         raise UnsafePathError(f"atomic publish failed for {dest}: {exc}") from None
+    finally:
+        _close_owned(source_fd)
+    _require_parent_current(dest.parent, parent_fd)
     try:
-        partial.unlink()
+        published = _named_stat(dest, parent_fd)
+        staged = _named_stat(partial, parent_fd)
     except OSError as exc:
-        print(f"warning: verified but could not remove partial {partial}: {exc}",
-              file=sys.stderr)
+        raise UnsafePathError("published but cannot recheck names; both names preserved for inspection") from exc
+    # link() legitimately changes ctime/nlink; all byte identity fields
+    # still must agree with the verified inode before removing its old name.
+    def byte_identity(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
+    if byte_identity(published) != byte_identity(verified):
+        raise UnsafePathError("published path no longer matches verified partial; inspect both names")
+    if byte_identity(staged) != byte_identity(published):
+        raise UnsafePathError("staging name changed after publication; it was preserved")
+    try:
+        os.unlink(partial.name, dir_fd=parent_fd)
+    except OSError as exc:
+        _warn(f"verified but could not remove partial {partial}: {type(exc).__name__}")
+    try:
+        os.fsync(parent_fd)
+    except OSError as exc:
+        raise UnsafePathError("verified final published, but directory durability is unconfirmed; inspect before retry") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -924,6 +1107,7 @@ def do_fetch(manifest_path: str, models_dir: str, transport,
     # normalization, mkdir, network access or write:
     _check_root_no_dotdot(root)
     _check_root_symlinks(root)
+    root = Path(os.path.abspath(root))
     print(f"fetch plan: {len(manifest.artifacts)} pinned artifact(s) from "
           f"https://{HF_HOST} at their pinned revisions into {root}",
           flush=True)
@@ -975,14 +1159,10 @@ def do_fetch(manifest_path: str, models_dir: str, transport,
             f"insufficient disk space: ~{_human(need)} needed, {_human(free)} "
             f"free on {probe} — nothing was written")
 
-    if not root.exists():
-        os.makedirs(root, exist_ok=True)
-
     done = 0
     for art in pending:
         dest = root / art.filename
         _check_write_path_symlinks(root, art.filename)
-        os.makedirs(dest.parent, exist_ok=True)
         if os.path.islink(dest):
             raise UnsafePathError(
                 f"final path is a symlink: {dest} — refusing to write through it")

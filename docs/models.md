@@ -166,6 +166,20 @@ unlinks the staging name immediately. If that unlink fails, the remaining
 later fetch refuses to resume into a multiply-linked partial, so the debris
 is inert, and removing the stale name loses nothing while the final name
 stands.
+The 2026-10-13 fetcher review strengthened these boundaries: partial and
+directory identity snapshots, nonblocking bounded rehashes, anchored
+directory creation/write/cleanup, existing empty-partial reuse (no blind
+unlink/truncate), and publication from the opened verified inode rather
+than a staging filename. Fetch now explicitly requires Linux directory-FD,
+no-follow, `/proc/self/fd`, hardlink and file/directory-fsync support.
+Changed cleanup targets are preserved; failed removals are reported as
+preserved, not "removed". A post-publication directory-sync failure reports
+the verified final as published but durability unconfirmed, never retries
+by overwriting it. These checks detect observed changes; they are not a
+security guarantee against arbitrary concurrent inode rewriting or the
+remaining compare/unlink interval. Full contracts and offline evidence are
+in [fetch-review.md](fetch-review.md). No live download was resumed by this
+review.
 An existing file that verifies is skipped; an existing file whose identity
 does **not** match is refused, never deleted or overwritten; symlinked
 paths on the write path are refused; an explicit `--models-dir` root

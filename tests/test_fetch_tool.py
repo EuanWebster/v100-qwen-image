@@ -1324,3 +1324,393 @@ def test_plan_reports_staging_ancestor_collision_read_only(tmp_path,
     assert "collision" in res.err
     assert not root.exists()
     assert not list(tmp_path.rglob("*.partial"))
+
+
+# Review: bounded snapshots, anchored staging, ownership and transport faults.
+
+def _prepared_download(tmp_path, blob=b"abcdefghij", prefix=None):
+    entry = art(blob)
+    manifest = write_manifest(tmp_path, [entry])
+    root = tmp_path / "assets"
+    (root / "a").mkdir(parents=True)
+    partial = root / "a" / "x.bin.partial"
+    if prefix is not None:
+        partial.write_bytes(prefix)
+    return entry, manifest, root, partial
+
+
+def test_empty_partial_is_reused_without_unlink_or_truncate(tmp_path):
+    entry, manifest, root, partial = _prepared_download(tmp_path, prefix=b"")
+    inode = partial.stat().st_ino
+    result = run(tmp_path, manifest, root,
+                 transport=FakeTransport({_url(entry): ok_stream(b"abcdefghij")}))
+    assert result.rc == 0, result.err
+    assert (root / "a" / "x.bin").stat().st_ino == inode
+
+
+@pytest.mark.parametrize("prefix", [b"", b"abcde"])
+def test_partial_replaced_during_transport_setup_is_preserved(tmp_path, prefix):
+    entry, manifest, root, partial = _prepared_download(tmp_path, prefix=prefix)
+    backup = partial.with_name("original")
+
+    def replace(start):
+        partial.rename(backup)
+        partial.write_bytes(b"PEER" if not prefix else b"PEERS")
+        return ok_stream(b"abcdefghij")(start)
+
+    result = run(tmp_path, manifest, root, transport=FakeTransport({_url(entry): replace}))
+    assert result.rc == fetch.EXIT_REFUSED, result.err
+    assert backup.read_bytes() == prefix
+    assert partial.read_bytes() == (b"PEER" if not prefix else b"PEERS")
+    assert not (root / "a" / "x.bin").exists()
+
+
+@pytest.mark.parametrize("kind", ["fifo", "symlink"])
+def test_hash_replaced_special_file_refuses_before_read(tmp_path, monkeypatch, kind):
+    path = tmp_path / "x.partial"
+    path.write_bytes(b"abcd")
+    snapshot = path.stat()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"sentinel")
+    real_open = os.open
+
+    def raced_open(name, flags, *args, **kwargs):
+        if name == path.name:
+            assert flags & os.O_NONBLOCK
+            assert flags & os.O_NOFOLLOW
+            path.unlink()
+            if kind == "fifo":
+                os.mkfifo(path)
+            else:
+                path.symlink_to(outside)
+        return real_open(name, flags, *args, **kwargs)
+
+    def no_read(*args):
+        raise AssertionError("special file read attempted")
+
+    monkeypatch.setattr(fetch.os, "open", raced_open)
+    monkeypatch.setattr(fetch.os, "read", no_read)
+    with fetch._anchor_parent(path) as parent_fd:
+        with pytest.raises((fetch.UnsafePathError, OSError)):
+            fetch._hash_file(path, 4, snapshot, parent_fd)
+    assert outside.read_bytes() == b"sentinel"
+
+
+def test_hash_growth_is_bounded_to_initial_size_plus_one(tmp_path, monkeypatch):
+    path = tmp_path / "x.partial"
+    path.write_bytes(b"abcd")
+    snapshot = path.stat()
+    real_read = os.read
+    requests, received = [], []
+
+    def grow(fd, size):
+        requests.append(size)
+        block = real_read(fd, size)
+        received.append(len(block))
+        if len(requests) == 1:
+            with path.open("ab") as out:
+                out.write(b"x" * 100)
+        return block
+
+    monkeypatch.setattr(fetch, "CHUNK_BYTES", 3)
+    monkeypatch.setattr(fetch.os, "read", grow)
+    with fetch._anchor_parent(path) as parent_fd:
+        with pytest.raises(fetch.IntegrityError, match="grew"):
+            fetch._hash_file(path, 4, snapshot, parent_fd)
+    assert max(requests) <= 3
+    assert sum(received) == 5
+
+
+def test_hash_same_size_mutation_with_restored_mtime_refuses(tmp_path, monkeypatch):
+    path = tmp_path / "x.partial"
+    path.write_bytes(b"abcd")
+    snapshot = path.stat()
+    real_read = os.read
+    changed = []
+
+    def mutate(fd, size):
+        block = real_read(fd, size)
+        if not changed:
+            changed.append(True)
+            path.write_bytes(b"WXYZ")
+            os.utime(path, ns=(snapshot.st_atime_ns, snapshot.st_mtime_ns))
+        return block
+
+    monkeypatch.setattr(fetch.os, "read", mutate)
+    with fetch._anchor_parent(path) as parent_fd:
+        with pytest.raises(fetch.IntegrityError, match="changed during rehash"):
+            fetch._hash_file(path, 4, snapshot, parent_fd)
+
+
+def test_replacement_after_hash_never_publishes_or_removes_peer(tmp_path, monkeypatch):
+    entry, manifest, root, partial = _prepared_download(tmp_path, prefix=b"abcdefghij")
+    real_hash = fetch._hash_file
+    backup = partial.with_name("original")
+
+    def replace(*args, **kwargs):
+        result = real_hash(*args, **kwargs)
+        partial.rename(backup)
+        partial.write_bytes(b"PEER_BYTES")
+        return result
+
+    monkeypatch.setattr(fetch, "_hash_file", replace)
+    result = run(tmp_path, manifest, root)
+    assert result.rc == fetch.EXIT_REFUSED, result.err
+    assert partial.read_bytes() == b"PEER_BYTES"
+    assert backup.read_bytes() == b"abcdefghij"
+    assert not (root / "a" / "x.bin").exists()
+
+
+def test_publication_links_verified_inode_not_replaced_staging_name(tmp_path, monkeypatch):
+    entry, manifest, root, partial = _prepared_download(tmp_path, prefix=b"abcdefghij")
+    real_link = os.link
+    backup = partial.with_name("original")
+
+    def replace_at_link(src, dst, *args, **kwargs):
+        partial.rename(backup)
+        partial.write_bytes(b"PEER_BYTES")
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(fetch.os, "link", replace_at_link)
+    result = run(tmp_path, manifest, root)
+    assert result.rc == fetch.EXIT_REFUSED, result.err
+    assert (root / "a" / "x.bin").read_bytes() == b"abcdefghij"
+    assert backup.read_bytes() == b"abcdefghij"
+    assert partial.read_bytes() == b"PEER_BYTES"
+    assert "staging name changed" in result.err
+
+
+@pytest.mark.parametrize("fault", ["replacement", "unlink"])
+def test_bad_hash_cleanup_preserves_changed_or_unremovable_partial(tmp_path, monkeypatch, fault):
+    entry, manifest, root, partial = _prepared_download(tmp_path, prefix=b"WRONG_DATA")
+    if fault == "replacement":
+        real_hash = fetch._hash_file
+
+        def replace(*args, **kwargs):
+            result = real_hash(*args, **kwargs)
+            partial.rename(partial.with_name("original"))
+            partial.write_bytes(b"PEER_BYTES")
+            return result
+
+        monkeypatch.setattr(fetch, "_hash_file", replace)
+    else:
+        def fail_unlink(*args, **kwargs):
+            raise PermissionError("fixture cleanup refusal")
+
+        monkeypatch.setattr(fetch.os, "unlink", fail_unlink)
+    result = run(tmp_path, manifest, root)
+    assert result.rc == fetch.EXIT_INTEGRITY, result.err
+    assert "partial preserved" in result.err
+    assert "partial removed" not in result.err
+    assert partial.read_bytes() == (b"PEER_BYTES" if fault == "replacement" else b"WRONG_DATA")
+    assert not (root / "a" / "x.bin").exists()
+
+
+@pytest.mark.parametrize("failed_body", [False, True])
+def test_stream_close_fault_never_masks_result_or_leaks_reason(tmp_path, failed_body):
+    entry, manifest, root, partial = _prepared_download(tmp_path)
+
+    class Stream(FakeStream):
+        def close(self):
+            raise RuntimeError("SECRET_SIGNED_URL")
+
+    stream = Stream(200, {}, b"abcdefghij", fail_at=0 if failed_body else None)
+    result = run(tmp_path, manifest, root, transport=FakeTransport({_url(entry): stream}))
+    assert result.rc == (fetch.EXIT_NETWORK if failed_body else fetch.EXIT_OK), result.err
+    assert "SECRET" not in result.err
+    assert "stream cleanup failed" in result.err
+    if failed_body:
+        assert "interrupted mid-stream" in result.err
+        assert partial.read_bytes() == b""
+
+
+@pytest.mark.parametrize("header", ["bytes " + "9" * 5000 + "-9/10",
+                                    "bytes ٥-9/10", "bytes 5-9/10 garbage"])
+def test_unbounded_non_ascii_or_trailing_content_range_is_typed_refusal(tmp_path, header):
+    entry, manifest, root, partial = _prepared_download(tmp_path, prefix=b"abcde")
+    stream = FakeStream(206, {"Content-Range": header}, b"fghij")
+    result = run(tmp_path, manifest, root, transport=FakeTransport({_url(entry): stream}))
+    assert result.rc == fetch.EXIT_NETWORK, result.err
+    assert partial.read_bytes() == b"abcde"
+    assert header not in result.err
+
+
+def test_range_body_cannot_exceed_declared_span(tmp_path):
+    entry, manifest, root, partial = _prepared_download(tmp_path, prefix=b"abcde")
+    stream = FakeStream(206, {"Content-Range": "bytes 5-6/10"}, b"fghij")
+    result = run(tmp_path, manifest, root, transport=FakeTransport({_url(entry): stream}))
+    assert result.rc == fetch.EXIT_NETWORK, result.err
+    assert "declared Content-Range" in result.err
+    assert partial.read_bytes() == b"abcde"
+
+
+@pytest.mark.parametrize("encoding", ["SECRET_ENCODING", ["SECRET_ENCODING"]])
+def test_unsupported_encoding_is_typed_and_never_echoed(tmp_path, encoding):
+    entry, manifest, root, partial = _prepared_download(tmp_path)
+    stream = FakeStream(200, {"Content-Encoding": encoding}, b"abcdefghij")
+    result = run(tmp_path, manifest, root, transport=FakeTransport({_url(entry): stream}))
+    assert result.rc == fetch.EXIT_NETWORK, result.err
+    assert "SECRET" not in result.err
+    assert not partial.exists()
+
+
+@pytest.mark.parametrize("chunk", [None, "not bytes", bytearray(b"x"), b"x" * (fetch.CHUNK_BYTES + 1)])
+def test_invalid_transport_chunks_are_typed_and_never_written(tmp_path, chunk):
+    entry, manifest, root, partial = _prepared_download(tmp_path)
+
+    class Stream(FakeStream):
+        def read(self, size):
+            return chunk
+
+    result = run(tmp_path, manifest, root,
+                 transport=FakeTransport({_url(entry): Stream(200, {}, b"")}))
+    assert result.rc == fetch.EXIT_NETWORK, result.err
+    assert partial.read_bytes() == b""
+    assert not (root / "a" / "x.bin").exists()
+
+
+def test_directory_replaced_during_transport_never_redirects_write(tmp_path):
+    entry, manifest, root, partial = _prepared_download(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original = root / "original"
+
+    def replace(start):
+        (root / "a").rename(original)
+        (root / "a").symlink_to(outside, target_is_directory=True)
+        return ok_stream(b"abcdefghij")(start)
+
+    result = run(tmp_path, manifest, root, transport=FakeTransport({_url(entry): replace}))
+    assert result.rc == fetch.EXIT_REFUSED, result.err
+    assert not list(outside.iterdir())
+    assert not list(original.iterdir())
+
+
+def test_directory_creation_race_cannot_follow_new_symlink(tmp_path, monkeypatch):
+    entry, manifest, root, partial = _prepared_download(tmp_path)
+    (root / "a").rmdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_mkdir = os.mkdir
+    transport = ExplodingTransport()
+
+    def replace(name, *args, **kwargs):
+        if name == "a" and kwargs.get("dir_fd") is not None:
+            os.symlink(outside, name, dir_fd=kwargs["dir_fd"])
+            return
+        return real_mkdir(name, *args, **kwargs)
+
+    monkeypatch.setattr(fetch.os, "mkdir", replace)
+    result = run(tmp_path, manifest, root, transport=transport)
+    assert result.rc == fetch.EXIT_REFUSED, result.err
+    assert not list(outside.iterdir())
+    assert transport.calls == []
+
+
+def test_relative_root_is_bound_before_callback_changes_cwd(tmp_path, monkeypatch):
+    entry = art(b"abcdefghij")
+    manifest = write_manifest(tmp_path, [entry])
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    def disk_free(path):
+        os.chdir(other)
+        return 1 << 40
+
+    result = run(tmp_path, manifest, Path("assets"), disk_free=disk_free,
+                 transport=FakeTransport({_url(entry): ok_stream(b"abcdefghij")}))
+    assert result.rc == 0, result.err
+    assert (tmp_path / "assets" / "a" / "x.bin").read_bytes() == b"abcdefghij"
+    assert not list(other.iterdir())
+
+
+def test_hash_read_fault_closes_owned_descriptors_and_keeps_primary_error(tmp_path, monkeypatch):
+    from collections import Counter
+
+    path = tmp_path / "x.partial"
+    path.write_bytes(b"abcd")
+    snapshot = path.stat()
+    real_open, real_close = os.open, os.close
+    opened, closed = [], []
+
+    def track_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def failing_close(fd):
+        closed.append(fd)
+        real_close(fd)
+        raise OSError("secondary close fault")
+
+    def failing_read(*args):
+        raise OSError("primary read fault")
+
+    # Anchor setup closes intermediate FDs normally; inject close faults only
+    # after its final parent has been opened.
+    monkeypatch.setattr(fetch.os, "open", track_open)
+    with fetch._anchor_parent(path) as parent_fd:
+        opened.clear()
+        monkeypatch.setattr(fetch.os, "close", failing_close)
+        monkeypatch.setattr(fetch.os, "read", failing_read)
+        with pytest.raises(OSError, match="primary read fault"):
+            fetch._hash_file(path, 4, snapshot, parent_fd)
+        assert Counter(opened) == Counter(closed)
+        monkeypatch.setattr(fetch.os, "close", real_close)
+
+
+def test_publish_cleanup_fault_keeps_verified_final_and_reports_debris(tmp_path, monkeypatch):
+    entry, manifest, root, partial = _prepared_download(tmp_path, prefix=b"abcdefghij")
+
+    def fail_unlink(*args, **kwargs):
+        raise PermissionError("SECRET_DIAGNOSTIC")
+
+    monkeypatch.setattr(fetch.os, "unlink", fail_unlink)
+    result = run(tmp_path, manifest, root)
+    assert result.rc == 0, result.err
+    assert "could not remove partial" in result.err
+    assert "SECRET" not in result.err
+    assert partial.read_bytes() == (root / "a" / "x.bin").read_bytes() == b"abcdefghij"
+    assert partial.stat().st_nlink == 2
+
+
+def test_publish_directory_fsync_fault_reports_published_but_not_durable(tmp_path, monkeypatch):
+    import stat
+
+    entry, manifest, root, partial = _prepared_download(tmp_path, prefix=b"abcdefghij")
+    real_fsync = os.fsync
+
+    def fail_directory(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("fixture directory sync failure")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(fetch.os, "fsync", fail_directory)
+    result = run(tmp_path, manifest, root)
+    assert result.rc == fetch.EXIT_REFUSED, result.err
+    assert "final published" in result.err and "durability is unconfirmed" in result.err
+    assert (root / "a" / "x.bin").read_bytes() == b"abcdefghij"
+    assert not partial.exists()
+
+
+def test_cleanup_warning_sink_fault_cannot_mask_primary_download_error(tmp_path, monkeypatch):
+    import builtins
+
+    entry, manifest, root, partial = _prepared_download(tmp_path)
+
+    class Stream(FakeStream):
+        def close(self):
+            raise OSError("secondary stream close fault")
+
+    def print_fault(*args, **kwargs):
+        if kwargs.get("file") is sys.stderr:
+            raise OSError("secondary warning sink fault")
+        return builtins.print(*args, **kwargs)
+
+    monkeypatch.setattr(fetch, "print", print_fault, raising=False)
+    transport = FakeTransport({_url(entry): Stream(200, {}, b"", fail_at=0)})
+    with pytest.raises(fetch.NetworkError, match="interrupted mid-stream"):
+        fetch._download(fetch.ModelArtifact(**entry), root / "a" / "x.bin",
+                        transport, lambda path: 1 << 40)
+    assert partial.read_bytes() == b""
