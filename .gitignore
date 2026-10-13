@@ -7,6 +7,8 @@ dist/
 
 # Virtualenv (project venv lives at /work/.venv — never committed)
 .venv/
+# Persistent, isolated ML review environments; never production dependencies.
+.review-envs/
 
 # Test / tool caches
 .pytest_cache/

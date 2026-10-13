@@ -1,9 +1,13 @@
 # Dependencies (task M0.1)
 
-Runtime dependency identity for the Qwen-Image-2.1 stack. Everything below was
-resolved/installed/verified **inside a task-specific temporary ML audit venv**
-(`/tmp/v100_m0_ml/`, not persisted — recreate it with the commands in §4).
-The repository environments stay torch-free: `/work/.venv` and the fresh
+Runtime dependency identity for the Qwen-Image-2.1 stack. The original audit
+used temporary environments under `/tmp/v100_m0_ml/`; those disappeared when
+the container was recreated. Since 2026-10-13, isolated review environments,
+their Python runtime, and their download cache live under the persistent
+project mount at `/work/.review-envs/` (gitignored). Recreate or synchronize
+them with `bash scripts/setup_review_envs.sh`. Reusable tests and check scripts
+are committed; only generated fixtures are temporary.
+The lightweight environments stay torch-free: `/work/.venv` and the fresh
 `run_cpu_tests.sh` environments contain no torch/diffusers/transformers, and
 the production package still imports nothing heavy (§6). No driver, GPU, or
 hardware change was made; nothing here proves GPU execution (§5).
@@ -134,22 +138,20 @@ uv pip compile requirements.in --python-version 3.13 \
     --generate-hashes -o /tmp/lock313.txt
 diff /tmp/lock311.txt /tmp/lock313.txt   # only the command-line comment may differ
 
-# audit venv (temporary; NEVER /work/.venv). uv pip sync enforces the recorded
+# isolated audit venvs (persistent; separate from /work/.venv).
+# uv pip sync enforces the recorded
 # wheel hashes; the two git entries are anchored by their commit SHA instead
 # (uv cannot hash a repo build; pip --require-hashes cannot process VCS
 # requirements at all — do not use pip here):
-uv venv --python 3.13 /tmp/v100_m0_ml/venv-ml313
-uv pip sync --python /tmp/v100_m0_ml/venv-ml313/bin/python \
-    --index-strategy unsafe-best-match requirements.lock
-uv pip check --python /tmp/v100_m0_ml/venv-ml313/bin/python
+bash scripts/setup_review_envs.sh
 
 # sm_70 build-flag check — invoke the SYNCED venv's python explicitly
 # (a bare `python` is the wrong environment):
-/tmp/v100_m0_ml/venv-ml313/bin/python -c \
+.review-envs/py313/bin/python -B -c \
     "import torch; print(torch.__version__, torch.cuda.get_arch_list())"
 
 # VCS identity of what actually got installed (commit must match §1):
-/tmp/v100_m0_ml/venv-ml313/bin/python -c \
+.review-envs/py313/bin/python -B -c \
     "import importlib.metadata as md, json; [print(n, md.version(n), json.loads(md.distribution(n).read_text('direct_url.json'))['url'], json.loads(md.distribution(n).read_text('direct_url.json'))['vcs_info']['commit_id']) for n in ('diffusers','transformers')]"
 ```
 
