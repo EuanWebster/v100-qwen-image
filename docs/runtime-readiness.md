@@ -70,6 +70,9 @@ and V100, not just enumeration/architecture strings; measured available
 VRAM, PCIe generation/width and transfer throughput; and BF16-storage→FP16
 execution numerics/finiteness. No GPU or quantization fitness claim exists
 until these measurements and model-specific tests pass.
+An explicit probe implementation now has CPU-only refusal/ABI witnesses
+([hardware-probe.md](hardware-probe.md)); its real success path is pending
+physical installation. It is not called by planning, CLI generation or web.
 
 ## Generation implementation sequence
 
