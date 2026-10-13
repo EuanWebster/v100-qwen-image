@@ -12,7 +12,9 @@ checks are accepted in `code-review.md`. Environments, tools and tests live
 on the persistent project mount. The web workspace remains planning/export
 only; generation adapter, GPU numerics/calibration and web jobs are not yet
 implemented/accepted. Real processor loading is accepted separately below;
-no actual encoder-checkpoint fidelity is claimed.
+no actual encoder-checkpoint fidelity is claimed. An internal stdlib-only
+bounded controller foundation is now tested ([job-controller.md](job-controller.md));
+it has no production executor, web wiring or forced thread cancellation.
 
 ## Runtime blockers independent of the card
 
@@ -72,9 +74,10 @@ until these measurements and model-specific tests pass.
    timings as unmeasured, not zero or invented throughput. Benchmark
    resident/streamed and higher-quality quant candidates against an actual
    reference; do not default to an unvalidated low-bit or distilled recipe.
-3. Add an owned bounded generation-job controller: validated immutable
+3. Complete the owned bounded generation-job executor/controller: validated immutable
    requests, explicit lifecycle/cancellation/errors, scoped artifacts and
-   worker cleanup. CPU fake adapters prove controller behavior only. Wire
+   worker cleanup. Internal CPU foundation exists; fixture executors prove
+   lifecycle behavior only, not production process cleanup or generation. Wire
    the web job API after the real adapter/gates can support it; no fake jobs,
    thumbnails, success, progress percentages or availability claims.
 4. Validate the full base recipe at1024² with measured resources and human
