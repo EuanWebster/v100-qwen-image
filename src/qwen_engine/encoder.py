@@ -91,6 +91,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -100,7 +101,7 @@ from qwen_engine._jsonsafe import (
     freeze_json,
     json_violations,
     plain_json,
-    reject_constant,
+    strict_json_loads,
 )
 from qwen_engine.errors import EngineError
 from qwen_engine.log import PhaseLogger
@@ -248,7 +249,7 @@ class ComponentIdentity:
         if not isinstance(data, Mapping):
             raise EncoderRequestError(
                 f"identity: must be an object, got {type(data).__name__}")
-        unknown = sorted(set(data) - {"revision", "sha256"})
+        unknown = sorted(set(data) - {"revision", "sha256"}, key=repr)
         for key in unknown:
             _err_list(errors, key, "unknown identity key")
         revision = data.get("revision")
@@ -356,7 +357,7 @@ class EncoderImplementationIdentity:
             raise EncoderRequestError(
                 "implementation_identity: must be an object, got "
                 f"{type(data).__name__}")
-        for key in sorted(set(data) - set(_IDENTITY_FIELDS)):
+        for key in sorted(set(data) - set(_IDENTITY_FIELDS), key=repr):
             _err_list(errors, f"implementation_identity.{key}",
                       "unknown implementation-identity key")
         for name in _IDENTITY_FIELDS:
@@ -427,8 +428,9 @@ def validate_implementation_identity_fields(obj: Any, at: str,
 @dataclass(frozen=True)
 class EncoderRequest:
     """Everything that determines an encoding — the cache-key inputs live
-    here, so an identical *result* is impossible from requests that differ in
-    any of them (:func:`cache_key` hashes the whole document). Validated
+    here, so requests differing in these inputs never intentionally reuse a
+    cache key (:func:`cache_key` hashes the whole document). Different keys
+    can still produce identical embeddings. Validated
     JSON values (``kwargs``) are deep-frozen snapshots taken at
     construction: the caller mutating its own (nested) mapping afterwards
     changes neither the cache key nor the wire document — they are computed
@@ -504,7 +506,7 @@ class EncoderRequest:
         known = {"schema", "request_id", "prompt", "negative_prompt", "dtype",
                  "model", "processor", "tokenizer", "chat_template", "kwargs",
                  "images", "implementation_identity"}
-        for key in sorted(set(data) - known):
+        for key in sorted(set(data) - known, key=repr):
             _err_list(errors, key, "unknown request key")
         rid = data.get("request_id")
         if not isinstance(rid, str) or not rid.strip():
@@ -513,7 +515,7 @@ class EncoderRequest:
         model_revision = model_sha = None
         model_repo: Any = None
         if isinstance(model, Mapping):
-            unknown = sorted(set(model) - {"repo", "revision", "sha256"})
+            unknown = sorted(set(model) - {"repo", "revision", "sha256"}, key=repr)
             for key in unknown:
                 _err_list(errors, f"model.{key}", "unknown model key")
             model_repo = model.get("repo")
@@ -529,7 +531,7 @@ class EncoderRequest:
                 _err_list(errors, comp, f"must be an identity object, got {value!r}")
                 continue
             comp_errors: list[str] = []
-            unknown = sorted(set(value) - {"revision", "sha256"})
+            unknown = sorted(set(value) - {"revision", "sha256"}, key=repr)
             for key in unknown:
                 _err_list(comp_errors, f"{comp}.{key}", "unknown identity key")
             validate_identity_fields(value.get("revision"), value.get("sha256"),
@@ -706,8 +708,13 @@ class EncodedPayload:
             bad = [f"blobs[{i}]: {type(b).__name__}"
                    for i, b in enumerate(self.blobs) if not isinstance(b, Blob)]
             errors.extend(bad)
-            names = [b.name for b in self.blobs if isinstance(b, Blob)]
-            dupes = sorted({n for n in names if names.count(n) > 1})
+            seen, duplicates = set(), set()
+            for blob in self.blobs:
+                if isinstance(blob, Blob):
+                    if blob.name in seen:
+                        duplicates.add(blob.name)
+                    seen.add(blob.name)
+            dupes = sorted(duplicates)
             if dupes:
                 _err_list(errors, "blobs",
                           f"duplicate blob names: {', '.join(dupes)}")
@@ -731,8 +738,7 @@ class EncodedPayload:
         if not sep:
             raise _EntryCorrupt("no header line terminator")
         try:
-            header = json.loads(head.decode("utf-8"),
-                                parse_constant=reject_constant)
+            header = strict_json_loads(head.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError,
                 RecursionError) as exc:
             # RecursionError: the decoder's nesting guard fires before the
@@ -843,7 +849,11 @@ class _RootState:
     def __init__(self) -> None:
         self.mutex = threading.RLock()   # mutations / quarantine / LRU
         self.keys_guard = threading.Lock()  # guards the key_locks table only
-        self.key_locks: dict[str, threading.Lock] = {}
+        # Only active callers/waiters keep locks alive. Retaining every prompt
+        # key forever would make a long-lived cache grow independently of LRU.
+        # Root state remains process-lived so a lock retained after its cache
+        # instance is dropped still shares the same root/key with new clients.
+        self.key_locks: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
 
 
 def _entry_identity(st: os.stat_result) -> tuple:
@@ -992,7 +1002,10 @@ class EmbeddingCache:
         # one root serialise on the same lock, so the same key is never
         # encoded twice in one process.
         with self._state.keys_guard:
-            return self._state.key_locks.setdefault(key, threading.Lock())
+            lock = self._state.key_locks.get(key)
+            if lock is None:
+                lock = self._state.key_locks[key] = threading.Lock()
+            return lock
 
     # -- ops -----------------------------------------------------------------
 
@@ -1133,9 +1146,10 @@ class EmbeddingCache:
                     os.fsync(fh.fileno())
                 os.replace(tmp, path)
             except OSError as exc:
-                # Clean up ONLY a temp this call actually created: a failed
-                # O_EXCL open means the name was somebody else's file —
-                # it stays untouched with its bytes.
+                raise EncoderError(f"cache write failed for {key}: {exc}") from exc
+            finally:
+                # Cleanup on interruptions as well as ordinary failures.
+                # A failed O_EXCL open still preserves somebody else's name.
                 if created:
                     try:
                         tmp.unlink(missing_ok=True)
@@ -1143,7 +1157,6 @@ class EmbeddingCache:
                         # A failed temp cleanup must not mask the actual
                         # publish failure that is being reported.
                         pass
-                raise EncoderError(f"cache write failed for {key}: {exc}") from exc
             self._enforce_lru(protect=key)
         return path
 
@@ -1761,7 +1774,7 @@ class EncoderWorker:
                 f"refusing to decode a bounded-prefix guess; captured "
                 f"stderr:\n{err_x}", stderr=err_x)
         try:
-            doc = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+            doc = strict_json_loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError,
                 RecursionError) as exc:
             # ValueError covers JSONDecodeError and the integer-string digit

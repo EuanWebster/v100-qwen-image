@@ -49,22 +49,42 @@ nonfatal clocks and preserved worker errors. No live assets are mutated.
    overflowing-float JSON; invalid inputs remain exit2, never an adapter
    invocation. Stable symlinks and valid override semantics preserved.
   38new regressions; both full guarded suites1572passed+2skip each.
+7. **Generic encoder/cache**: response/cache-header duplicate JSON now refuses
+   at the strict decoder, preserving stderr/quarantine behavior. Mixed-key
+   request mappings report typed errors. Blob-name duplicate detection is now
+   linear rather than quadratic (operation-count regression). Per-key locks
+   are weakly registered and retained by active callers/waiters, not forever
+   by every past prompt. Root state intentionally remains process-lived so a
+   retained lock stays shared even after its original cache instance is
+   dropped. Cache temp cleanup now runs on interrupts as well as OSError,
+   preserving the old published entry and exclusive-name ownership rules.
+  21new regressions; generic encoder222/222, both full guarded suites
+  1593passed+2skip and actual miniature worker12/12 each on both Python versions.
 
 ## Coverage / next work
 
 Fully read this pass: encoder_identity + runtime policy, encoder_worker,
 manifest, log, config, CLI, core, adapters/base, _jsonsafe, _local_io and
-generic encoder identity/request/payload and worker lifecycle/response code.
-Generic cache sections mostly read but finish rereading its publish section
-before claiming complete coverage. Identity/worker policy and
+generic encoder identity/request/payload, cache and worker lifecycle/response
+code. Identity/worker policy and
 source/asset/codec integration were also exercised by prior CPU milestones;
 that evidence does not substitute for reviewing all remaining source.
 
-Next: generic encoder JSON (cache headers/responses still accept duplicate
-keys), per-key/root lock registry lifetime and payload duplicate-name cost;
-review/fix with focused regressions. Then production parent/child identity-before-cache
-API and finish generic encoder transport/cache review,
+Next: production parent/child identity-before-cache API. Use a fresh **selected
+worker interpreter** for metadata-only projection, not parent-installed facts
+or a caller-maintained revision tag; no ML/model-root/asset reads or memory
+fit claim in projection. Always project/revalidate before any production cache
+lookup; only a miss launches the existing memory-gated loading worker, which
+rechecks identity and fresh narrow assets. Keep this separate from generation/
+web activation, and preserve generic opaque/fake transport behavior.
+Then review
 production helper/codec, encoder assets, memory preflight, local bundle,
 benchmark schemas/persistence, fetch tool, web API/server and real-browser UI.
 Keep reusable review evidence and environment setup in the repo/.review-envs;
 only disposable test fixtures belong in /tmp.
+
+Known generic limits to preserve honestly: root registry scales with configured
+roots and remains process-lived, not every prompt; captured child log **reads**
+are bounded, but scratch stdout/stderr **writes** are not disk-quota-limited;
+timeout/reaping provides the current ordinary child lifecycle. Cache/filesystem
+snapshots are not guarantees against hostile simultaneous rewriting.

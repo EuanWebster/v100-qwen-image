@@ -9,6 +9,7 @@ violations, scratch cleanup on every path, and the no-heavy-imports boundary.
 from __future__ import annotations
 
 import contextlib
+import gc
 import dataclasses
 import hashlib
 import json
@@ -20,6 +21,7 @@ import sys
 import threading
 import time
 import types
+import weakref
 from pathlib import Path
 
 import pytest
@@ -2139,3 +2141,142 @@ def test_injected_parser_failures_stay_typed_in_cache_and_worker(
         worker._result_from_files(_ExitedChild(), resp, "worker said hi",
                                   "0" * 64, "rid")
     assert "worker said hi" in exc.value.stderr  # diagnostics retained
+
+
+@pytest.mark.parametrize("field", ["schema", "key", "metadata", "blob-bytes", "blob-sha"])
+def test_duplicate_entry_json_is_corrupt_and_quarantined(tmp_path, field):
+    cache = EmbeddingCache(tmp_path / "cache")
+    key = cache_key(make_request())
+    payload = EncodedPayload(metadata={"m": 1}, blobs=(Blob("e", b"x"),))
+    head, _, body = payload.to_entry_bytes(key).partition(b"\n")
+    if field in ("schema", "key"):
+        head = ('{"' + field + '":"wrong",').encode() + head[1:]
+    elif field == "metadata":
+        head = head.replace(b'"m":1', b'"m":99,"m":1')
+    elif field == "blob-bytes":
+        head = head.replace(b'"bytes":1', b'"bytes":99,"bytes":1')
+    else:
+        head = head.replace(b'"sha256":', b'"sha256":"wrong","sha256":')
+    raw = head + b"\n" + body
+    with pytest.raises(_EntryCorrupt, match="duplicate"):
+        EncodedPayload.from_entry_bytes(raw, key)
+    cache.root.mkdir()
+    cache.entry_path(key).write_bytes(raw)
+    assert cache.get(key) is None
+    assert not cache.entry_path(key).exists()
+    assert next(cache.quarantine_dir.iterdir()).read_bytes() == raw
+
+
+@pytest.mark.parametrize("field", ["schema", "request_id", "status", "metadata", "blob"])
+def test_duplicate_response_json_is_typed_protocol_refusal(tmp_path, field):
+    worker = EncoderWorker(command=["x", "{request}", "{response}"], timeout_s=1, scratch_dir=tmp_path)
+    doc = {"schema": RESULT_SCHEMA, "request_id": "rid", "status": "ok",
+           "metadata": {"m": 1}, "blobs": [{"name": "e", "data_b64": "eA=="}]}
+    raw = json.dumps(doc, separators=(",", ":")).encode()
+    if field in ("schema", "request_id", "status"):
+        raw = ('{"' + field + '":"wrong",').encode() + raw[1:]
+    elif field == "metadata":
+        raw = raw.replace(b'"m":1', b'"m":99,"m":1')
+    else:
+        raw = raw.replace(b'"data_b64":', b'"data_b64":"AA==","data_b64":')
+    path = tmp_path / "response.json"
+    path.write_bytes(raw)
+    with pytest.raises(EncoderProtocolError, match="duplicate") as caught:
+        worker._result_from_files(_ExitedChild(), path, "diagnostic survived", "0" * 64, "rid")
+    assert caught.value.stderr == "diagnostic survived"
+
+
+def test_inactive_prompt_key_locks_do_not_accumulate(tmp_path):
+    cache = EmbeddingCache(tmp_path / "cache", max_entries=1)
+    held = cache.lock_for("a" * 64)
+    for i in range(10000):
+        with cache.lock_for(f"{i:064x}"):
+            pass
+    gc.collect()
+    assert list(cache._state.key_locks) == ["a" * 64]
+    assert cache.lock_for("a" * 64) is held
+    ref = weakref.ref(held)
+    del held
+    gc.collect()
+    assert ref() is None and not cache._state.key_locks
+
+
+def test_retained_key_lock_still_shared_after_cache_instance_dropped(tmp_path):
+    root = tmp_path / "cache"
+    cache = EmbeddingCache(root)
+    held = cache.lock_for("a" * 64)
+    del cache
+    gc.collect()
+    assert EmbeddingCache(root).lock_for("a" * 64) is held
+
+
+def test_waiting_same_key_callers_keep_shared_lock_alive(tmp_path):
+    cache, second = EmbeddingCache(tmp_path / "cache"), EmbeddingCache(tmp_path / "cache")
+    held = cache.lock_for("a" * 64)
+    held.acquire()
+    entered, acquired = threading.Event(), threading.Event()
+    def waiter():
+        lock = second.lock_for("a" * 64)
+        assert lock is held
+        entered.set()
+        with lock:
+            acquired.set()
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        gc.collect()
+        assert cache.lock_for("a" * 64) is held and not acquired.is_set()
+    finally:
+        held.release()
+        thread.join(5)
+    assert acquired.is_set() and not thread.is_alive()
+
+
+@pytest.mark.parametrize("point", ["fsync", "replace"])
+def test_cache_temp_cleanup_on_interrupt_preserves_old_entry(tmp_path, monkeypatch, point):
+    cache = EmbeddingCache(tmp_path / "cache")
+    key = cache_key(make_request())
+    payload = EncodedPayload(blobs=(Blob("e", b"old"),))
+    path = cache.put(key, payload)
+    previous = path.read_bytes()
+    error = KeyboardInterrupt()
+    def interrupted(*a):
+        raise error
+    monkeypatch.setattr(os, point, interrupted)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        cache.put(key, EncodedPayload(blobs=(Blob("e", b"new"),)))
+    assert caught.value is error
+    assert path.read_bytes() == previous
+    assert list(cache.root.iterdir()) == [path]
+
+
+def test_large_payload_unique_names_checked_linearly():
+    # Deterministic operation-count regression, not a timing-sensitive benchmark.
+    class Name(str):
+        comparisons = 0
+        __hash__ = str.__hash__
+        def __eq__(self, other):
+            type(self).comparisons += 1
+            return str.__eq__(self, other)
+    blobs = tuple(Blob(Name(f"b{i}"), b"") for i in range(3000))
+    payload = EncodedPayload(blobs=blobs)
+    assert len(payload.blobs) == 3000 and Name.comparisons < 12000
+
+
+@pytest.mark.parametrize("part", ["component", "implementation", "request", "model", "processor"])
+def test_mixed_mapping_keys_are_typed_encoder_request_errors(part):
+    data = make_request(implementation_identity=make_identity()).to_request_dict("rid")
+    if part == "component":
+        value = {"sha256": SHA_A, 1: "wrong", None: "wrong"}
+        action = lambda: ComponentIdentity.from_dict(value)
+    elif part == "implementation":
+        value = dict(data["implementation_identity"])
+        value[1], value[None] = "wrong", "wrong"
+        action = lambda: EncoderImplementationIdentity.from_dict(value)
+    else:
+        value = data if part == "request" else data[part]
+        value[1], value[None] = "wrong", "wrong"
+        action = lambda: EncoderRequest.from_request_dict(data)
+    with pytest.raises(EncoderRequestError, match="unknown"):
+        action()
