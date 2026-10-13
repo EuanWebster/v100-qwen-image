@@ -28,4 +28,9 @@ for python_version in 3.11.15 3.13.5; do
     uv pip check --python "$review_env/bin/python"
 done
 
+# A separate torch-free 3.11 environment for the guarded regression suite.
+UV_PROJECT_ENVIRONMENT="$review_root/test311" uv sync --locked \
+    --project "$project_root" --python "$review_root/py311/bin/python"
+
 printf 'Review environments: %s/py311 and %s/py313\n' "$review_root" "$review_root"
+printf 'Guarded Python 3.11 tests: PYTHON=%s/test311/bin/python bash run_cpu_tests.sh\n' "$review_root"

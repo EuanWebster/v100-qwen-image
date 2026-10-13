@@ -5,7 +5,9 @@ used temporary environments under `/tmp/v100_m0_ml/`; those disappeared when
 the container was recreated. Since 2026-10-13, isolated review environments,
 their Python runtime, and their download cache live under the persistent
 project mount at `/work/.review-envs/` (gitignored). Recreate or synchronize
-them with `bash scripts/setup_review_envs.sh`. Reusable tests and check scripts
+them with `bash scripts/setup_review_envs.sh`. This also creates the separate
+torch-free `.review-envs/test311` environment for guarded Python 3.11 tests.
+Reusable tests and check scripts
 are committed; only generated fixtures are temporary.
 The lightweight environments stay torch-free: `/work/.venv` and the fresh
 `run_cpu_tests.sh` environments contain no torch/diffusers/transformers, and
@@ -167,6 +169,6 @@ import-level fact.
 
 Unchanged and re-checked: `qwen_engine` imports stdlib only; `cli_gen.py
 --help` / `--dry-run` pass with torch/diffusers/transformers absent (guarded
-suite, `run_cpu_tests.sh`). The ML stack exists only in the temporary audit
+suite, `run_cpu_tests.sh`). The ML stack exists only in the isolated review
 venvs; nothing in this milestone installed a heavy import into `/work/.venv`
 or the fresh test environments.
