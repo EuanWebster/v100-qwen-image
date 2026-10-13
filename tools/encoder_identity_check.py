@@ -10,6 +10,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+if sys.flags.optimize:
+    raise SystemExit("Verification assertions must be enabled; unset PYTHONOPTIMIZE and do not use -O/-OO")
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 

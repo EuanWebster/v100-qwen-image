@@ -13,6 +13,9 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+if sys.flags.optimize:
+    raise SystemExit("Verification assertions must be enabled; unset PYTHONOPTIMIZE and do not use -O/-OO")
+
 from qwen_engine import encoder_identity as ei, encoder_worker as ew, encoder_production as ep
 from qwen_engine.encoder import EncodedPayload, Blob, cache_key
 

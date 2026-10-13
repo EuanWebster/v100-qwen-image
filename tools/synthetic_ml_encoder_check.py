@@ -21,6 +21,9 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 
+if sys.flags.optimize:
+    raise SystemExit("Verification assertions must be enabled; unset PYTHONOPTIMIZE and do not use -O/-OO")
+
 
 def main():
     for name in ("torch", "safetensors", "diffusers", "transformers"):
