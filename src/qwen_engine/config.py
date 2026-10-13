@@ -190,7 +190,8 @@ class GenerationConfig:
         for name in (*_DIR_FIELDS, *_FILE_FIELDS):
             value = getattr(self, name)
             if isinstance(value, Path):
-                object.__setattr__(self, name, str(value))
+                value = str(value)
+                object.__setattr__(self, name, value)
             elif value is not None and not isinstance(value, str):
                 errors.append(
                     FieldError(name, f"must be a path string or null, got {value!r}")
