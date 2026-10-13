@@ -8,12 +8,17 @@ no-heavy-imports boundary.
 from __future__ import annotations
 
 import json
+import math
+import os
 import subprocess
 import sys
 import threading
 import types
+from pathlib import Path
 
 import pytest
+
+import qwen_engine.bench as bm
 
 from qwen_engine.bench import (
     AGGREGATE_SCHEMA,
@@ -43,6 +48,203 @@ HEAVY_MODULES = ("torch", "diffusers", "transformers")
 
 REV = "a" * 40
 SHA = "b" * 64
+
+
+@pytest.mark.parametrize("loader", [load_result, load_calibration])
+@pytest.mark.parametrize("kind", ["fifo", "directory", "oversized"])
+def test_bench_inputs_are_bounded_regular_without_blocking(tmp_path, monkeypatch, loader, kind):
+    monkeypatch.setattr(bm, "MAX_BENCH_FILE_BYTES", 64)
+    path = tmp_path / "input.json"
+    if kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        path.write_bytes(b" " * 65)
+    with pytest.raises(BenchSchemaError, match="bounded regular"):
+        loader(path)
+
+
+@pytest.mark.parametrize("kind", ["result", "calibration"])
+def test_duplicate_bench_json_is_typed_refusal(tmp_path, kind):
+    if kind == "result":
+        raw = '{"schema":"wrong",' + result().to_json()[1:]
+        with pytest.raises(BenchSchemaError, match="duplicate"):
+            BenchmarkResult.from_json(raw)
+        loader = load_result
+    else:
+        raw = '{"schema":"wrong",' + CalibrationLog().to_json()[1:]
+        loader = load_calibration
+    path = tmp_path / "input.json"
+    path.write_text(raw)
+    with pytest.raises(BenchSchemaError, match="duplicate"):
+        loader(path)
+
+
+@pytest.mark.parametrize("kind", ["result", "calibration"])
+def test_bench_write_cap_refuses_before_filesystem(tmp_path, monkeypatch, kind):
+    monkeypatch.setattr(bm, "MAX_BENCH_FILE_BYTES", 1)
+    target = tmp_path / "uncreated"
+    with pytest.raises(BenchSchemaError, match="byte cap"):
+        if kind == "result":
+            save_result(result(), target)
+        else:
+            save_calibration(CalibrationLog(), target / "calibration.json")
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("kind", ["result", "calibration"])
+def test_bench_exact_write_read_cap_and_stable_symlink(tmp_path, monkeypatch, kind):
+    path = save_result(result(), tmp_path) if kind == "result" else save_calibration(CalibrationLog(), tmp_path / "c.json")
+    loader = load_result if kind == "result" else load_calibration
+    monkeypatch.setattr(bm, "MAX_BENCH_FILE_BYTES", path.stat().st_size)
+    link = tmp_path / "link.json"
+    link.symlink_to(path)
+    assert loader(link) == loader(path)
+    monkeypatch.setattr(bm, "MAX_BENCH_FILE_BYTES", path.stat().st_size - 1)
+    with pytest.raises(BenchSchemaError):
+        loader(path)
+
+
+@pytest.mark.parametrize("kind", ["result", "calibration"])
+def test_bench_setup_failure_closes_owned_descriptor(tmp_path, monkeypatch, kind):
+    primary = OSError("fdopen setup failed")
+    def fail(*a, **kw):
+        raise primary
+    monkeypatch.setattr(bm.os, "fdopen", fail)
+    before = len(list(Path("/proc/self/fd").iterdir()))
+    with pytest.raises(OSError) as caught:
+        if kind == "result":
+            save_result(result(), tmp_path)
+        else:
+            save_calibration(CalibrationLog(), tmp_path / "c.json")
+    assert caught.value is primary
+    assert len(list(Path("/proc/self/fd").iterdir())) == before
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("kind", ["result", "calibration"])
+def test_bench_cleanup_failure_does_not_mask_publish_failure(tmp_path, monkeypatch, kind):
+    primary = OSError("publish failed")
+    def fail_publish(*a):
+        raise primary
+    def fail_cleanup(*a, **kw):
+        raise PermissionError("cleanup failed")
+    monkeypatch.setattr(bm.os, "replace", fail_publish)
+    monkeypatch.setattr(Path, "unlink", fail_cleanup)
+    with pytest.raises(OSError) as caught:
+        if kind == "result":
+            save_result(result(), tmp_path)
+        else:
+            save_calibration(CalibrationLog(), tmp_path / "c.json")
+    assert caught.value is primary
+
+
+def test_phase_median_does_not_overflow_finite_values():
+    agg = aggregate_results([result("a", phases={"load": 1e308}), result("b", phases={"load": 1e308})])
+    assert agg["phases"]["load"]["median"] == 1e308
+    json.dumps(agg, allow_nan=False)
+
+
+@pytest.mark.parametrize("value", [2**53 + 1, 10**400])
+def test_memory_median_uses_exact_integer_arithmetic(value):
+    agg = aggregate_results([result("a", peak_host_rss_bytes=value), result("b", peak_host_rss_bytes=value + 2)])
+    assert agg["peak_host_rss_bytes"]["median"] == value + 1
+
+
+def test_large_positive_steps_do_not_overflow_derived_timing():
+    measured = result(phases={"denoise": 1e308}, steps=10**400)
+    assert math.isfinite(measured.denoise_ms_per_step)
+    assert measured.denoise_ms_per_step == pytest.approx(1e-92, rel=1e-14, abs=0)
+
+
+@pytest.mark.parametrize("point", ["start", "end"])
+@pytest.mark.parametrize("body_error", [False, True])
+def test_collector_clock_fault_never_aborts_body_or_masks_failure(point, body_error):
+    calls = 0
+    def clock():
+        nonlocal calls
+        calls += 1
+        if calls == (1 if point == "start" else 2):
+            raise OSError("clock failed")
+        return 0.0
+    collector = PhaseCollector(clock=clock)
+    primary = RuntimeError("model failed")
+    def body():
+        with collector.phase("denoise"):
+            if body_error:
+                raise primary
+    if body_error:
+        with pytest.raises(RuntimeError) as caught:
+            body()
+        assert caught.value is primary
+    else:
+        body()
+    assert collector.timings() == {} and collector.unmeasured_phases() == ("denoise",)
+
+
+def test_repeated_phase_with_missing_timing_never_reports_partial_total():
+    ticks = iter((0.0, 1.0, 2.0, float("nan"), 3.0, 4.0))
+    collector = PhaseCollector(clock=lambda: next(ticks))
+    for _ in range(3):
+        with collector.phase("denoise"):
+            pass
+    assert collector.timings() == {} and collector.unmeasured_phases() == ("denoise",)
+
+
+@pytest.mark.parametrize("ticks", [(1.0, 0.0), (0.0, float("inf")), (-1e308, 1e308)])
+def test_invalid_or_overflowing_clock_durations_are_unmeasured(ticks):
+    values = iter(ticks)
+    collector = PhaseCollector(clock=lambda: next(values))
+    with collector.phase("load"):
+        pass
+    assert collector.timings() == {} and collector.unmeasured_phases() == ("load",)
+
+
+def test_calibration_append_alias_preserves_link_and_updates_canonical_target(tmp_path):
+    real = save_calibration(CalibrationLog(), tmp_path / "real.json")
+    alias = tmp_path / "alias.json"
+    alias.symlink_to(real)
+    first, second = observation(observed_at=1), observation(observed_at=2)
+    add_observation(alias, first)
+    add_observation(real, second)
+    assert alias.is_symlink()
+    assert load_calibration(alias).observations == (first, second) == load_calibration(real).observations
+
+
+def test_calibration_append_io_cannot_follow_a_later_cwd_change(tmp_path, monkeypatch):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    monkeypatch.chdir(first)
+    lock_for = bm._calibration_lock
+    def moved_after_lock(path):
+        lock = lock_for(path)
+        monkeypatch.chdir(second)
+        return lock
+    monkeypatch.setattr(bm, "_calibration_lock", moved_after_lock)
+    add_observation("calibration.json", observation())
+    assert (first / "calibration.json").is_file() and not (second / "calibration.json").exists()
+
+
+@pytest.mark.parametrize("kind", ["environment", "result", "model", "observation", "calibration", "cuda-info"])
+def test_bench_mixed_unknown_mapping_keys_are_typed(kind):
+    if kind == "environment":
+        data, action = env().to_dict(), BenchmarkEnvironment.from_dict
+    elif kind == "result":
+        data, action = result().to_dict(), BenchmarkResult.from_dict
+    elif kind == "model":
+        data = model_entry()
+        action = lambda entry: result(model=(entry,))
+    elif kind == "observation":
+        data, action = observation().to_dict(), CalibrationObservation.from_dict
+    elif kind == "calibration":
+        data, action = CalibrationLog().to_dict(), CalibrationLog.from_dict
+    else:
+        data, action = {}, capture_environment
+    data[1], data[None] = "wrong", "wrong"
+    with pytest.raises(BenchSchemaError):
+        action(data)
 
 
 def env(**overrides) -> BenchmarkEnvironment:

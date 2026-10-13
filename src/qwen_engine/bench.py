@@ -34,17 +34,18 @@ import os
 import platform as platform_module
 import re
 import socket
-import statistics
 import sys
 import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from qwen_engine._jsonsafe import freeze_json, json_violations, plain_json
+from qwen_engine._jsonsafe import freeze_json, json_violations, plain_json, strict_json_loads
+from qwen_engine._local_io import read_bounded_file
 from qwen_engine.manifest import ModelManifest
 
 try:
@@ -56,6 +57,7 @@ BENCHMARK_SCHEMA = "benchmark_result.v1"
 AGGREGATE_SCHEMA = "benchmark_aggregate.v1"
 OBSERVATION_SCHEMA = "calibration_observation.v1"
 CALIBRATION_FILE_SCHEMA = "qwen_engine.calibration.v1"
+MAX_BENCH_FILE_BYTES = 16 * 1024 * 1024
 
 #: Conventional phase names (the schema does not restrict to these — a run
 #: may record extra phases; they aggregate the same way).
@@ -165,7 +167,7 @@ class BenchmarkEnvironment:
                 f"environment: must be an object, got {type(data).__name__}")
         known = {"python", "platform", "hostname", "torch", "cuda", "driver",
                  "arch_list"}
-        for key in sorted(set(data) - known):
+        for key in sorted(set(data) - known, key=repr):
             _bad(errors, key, "unknown environment key")
         arch = data.get("arch_list")
         if arch is not None and (isinstance(arch, (str, bytes))
@@ -194,9 +196,9 @@ def capture_environment(cuda_info: Mapping[str, Any] | None = None) -> Benchmark
     except OSError:  # pragma: no cover - exotic containers
         hostname = None
     info = dict(cuda_info or {})
-    unknown = sorted(set(info) - {"torch", "cuda", "driver", "arch_list"})
+    unknown = sorted(set(info) - {"torch", "cuda", "driver", "arch_list"}, key=repr)
     if unknown:
-        raise BenchSchemaError("cuda_info keys not recognised: " + ", ".join(unknown))
+        raise BenchSchemaError("cuda_info keys not recognised: " + ", ".join(map(str, unknown)))
     arch = info.get("arch_list")
     return BenchmarkEnvironment(
         python=platform_module.python_version(),
@@ -294,7 +296,7 @@ class BenchmarkResult:
     def denoise_ms_per_step(self) -> float | None:
         """Derived only when both parts were measured — never stored."""
         if self.steps and "denoise" in self.phases:
-            return float(self.phases["denoise"]) / self.steps
+            return float(Fraction(float(self.phases["denoise"])) / self.steps)
         return None
 
     def to_dict(self) -> dict[str, Any]:
@@ -320,7 +322,7 @@ class BenchmarkResult:
         if not isinstance(data, Mapping):
             raise BenchSchemaError(
                 f"benchmark result: must be a JSON object, got {type(data).__name__}")
-        for key in sorted(set(data) - _RESULT_KEYS):
+        for key in sorted(set(data) - _RESULT_KEYS, key=repr):
             _bad(errors, key, "unknown benchmark result key")
         # The explicit schema tag is REQUIRED and must be exactly v1: a
         # missing, older or newer document is refused, never silently
@@ -364,8 +366,8 @@ class BenchmarkResult:
     @classmethod
     def from_json(cls, text: str) -> "BenchmarkResult":
         try:
-            data = json.loads(text)
-        except (ValueError, RecursionError) as exc:
+            data = strict_json_loads(text)
+        except (ValueError, RecursionError, TypeError) as exc:
             # ValueError subsumes JSONDecodeError and covers the
             # integer-string digit limit; RecursionError covers deeply
             # nested input the decoder refuses before any schema check.
@@ -390,7 +392,7 @@ def _check_model_list(model: Any) -> list[str]:
         if not isinstance(m, Mapping):
             _bad(errors, f"model[{i}]", f"must be an object, got {m!r}")
             continue
-        for key in sorted(set(m) - {"role", "repo", "revision", "filename", "sha256"}):
+        for key in sorted(set(m) - {"role", "repo", "revision", "filename", "sha256"}, key=repr):
             _bad(errors, f"model[{i}].{key}", "unknown model identifier key")
         for key in ("role", "repo", "filename"):
             value = m.get(key)
@@ -473,26 +475,47 @@ def save_result(result: BenchmarkResult, directory: str | Path,
     # Windows path reinterpretation from turning "a\\b" into a path here.
     if "/" in rid or "\\" in rid or "\0" in rid or rid.startswith("."):
         raise BenchSchemaError(f"run_id for file name: unsafe, got {rid!r}")
-    target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{rid}.benchmark.json"
-    fd, tmp = tempfile.mkstemp(dir=target_dir, prefix=".bench-", suffix=".tmp")
+    _save_document_atomic(target, result.to_dict(), prefix=".bench-", indent=2)
+    return target
+
+
+def _save_document_atomic(target: Path, document: dict, *, prefix: str, indent=None):
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(result.to_dict(), sort_keys=True, indent=2) + "\n")
+        raw = (json.dumps(document, sort_keys=True, indent=indent) + "\n").encode("utf-8")
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise BenchSchemaError(f"benchmark document is not serializable JSON: {exc}") from exc
+    if len(raw) > MAX_BENCH_FILE_BYTES:
+        raise BenchSchemaError("benchmark/calibration document exceeds the persistence byte cap")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=prefix, suffix=".tmp")
+    fh = None
+    try:
+        fh = os.fdopen(fd, "wb")
+        with fh:
+            fh.write(raw)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, target)
     except BaseException:
-        Path(tmp).unlink(missing_ok=True)
+        try:
+            Path(tmp).unlink(missing_ok=True)
+        except OSError:
+            pass  # cleanup cannot mask the primary persistence failure
         raise
-    return target
+    finally:
+        if fh is None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass  # already closed, preserve the setup failure
 
 
 def load_result(path: str | Path) -> BenchmarkResult:
     p = Path(path)
     try:
-        raw = p.read_bytes()
-    except OSError as exc:
+        raw = read_bounded_file(p, MAX_BENCH_FILE_BYTES)
+    except (OSError, ValueError, RuntimeError) as exc:
         raise BenchSchemaError(f"benchmark file not readable: {p}: {exc}") from exc
     try:
         return BenchmarkResult.from_json(raw.decode("utf-8"))
@@ -507,9 +530,13 @@ def load_result(path: str | Path) -> BenchmarkResult:
 
 def _stats(values: Sequence[float]) -> dict[str, Any]:
     vals = sorted(float(v) for v in values)
+    middle = len(vals) // 2
+    # Valid wall times are nonnegative. This midpoint cannot overflow from
+    # summing two individually finite values, unlike (lower + upper) / 2.
+    median = vals[middle] if len(vals) % 2 else vals[middle - 1] + (vals[middle] - vals[middle - 1]) / 2
     return {"n": len(vals),
             "min": vals[0],
-            "median": float(statistics.median(vals)),
+            "median": median,
             "max": vals[-1]}
 
 
@@ -519,8 +546,10 @@ def _optional_stats(values: Sequence[int]) -> dict[str, Any]:
         # null means *not measured* — it must never aggregate into a 0.
         return {"n_measured": 0, "max": None, "median": None}
     present.sort()
+    middle = len(present) // 2
+    median = present[middle] if len(present) % 2 else (present[middle - 1] + present[middle]) // 2
     return {"n_measured": len(present), "max": present[-1],
-            "median": int(statistics.median(present))}
+            "median": median}
 
 
 def aggregate_results(results: Sequence[BenchmarkResult]) -> dict[str, Any]:
@@ -564,10 +593,20 @@ def aggregate_results(results: Sequence[BenchmarkResult]) -> dict[str, Any]:
 class PhaseCollector:
     """Accumulate wall-clock ms per phase name; injectable clock makes test
     timings exact. Repeated phases of the same name accumulate (denoise steps
-    into ``denoise``)."""
+    into ``denoise``). Ordinary clock faults never replace body exceptions;
+    incomplete/invalid timings are omitted and listed by unmeasured_phases,
+    never substituted by zero or a partially measured total."""
 
     clock: Callable[[], float] = time.monotonic
     _timings: dict[str, float] = field(default_factory=dict, repr=False)
+    _unmeasured: set[str] = field(default_factory=set, repr=False)
+
+    def _clock_value(self):
+        try:
+            value = self.clock()
+            return float(value) if type(value) in (int, float) and math.isfinite(value) else None
+        except Exception:
+            return None
 
     def phase(self, name: str):
         if not isinstance(name, str) or not name.strip():
@@ -576,14 +615,25 @@ class PhaseCollector:
 
     @contextmanager
     def _phase(self, name: str):
-        start = self.clock()
+        start = self._clock_value()
         try:
             yield self
         finally:
-            self._timings[name] = self._timings.get(name, 0.0) + (self.clock() - start) * 1000.0
+            end = self._clock_value() if start is not None else None
+            elapsed = (end - start) * 1000.0 if end is not None else None
+            total = self._timings.get(name, 0.0) + elapsed if elapsed is not None else None
+            if (total is None or elapsed < 0 or not math.isfinite(total)):
+                self._unmeasured.add(name)
+                self._timings.pop(name, None)
+            elif name not in self._unmeasured:
+                self._timings[name] = total
 
     def timings(self) -> dict[str, float]:
         return {k: self._timings[k] for k in sorted(self._timings)}
+
+    def unmeasured_phases(self) -> tuple[str, ...]:
+        """Incomplete/invalid timing, omitted rather than invented or partial."""
+        return tuple(sorted(self._unmeasured))
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +714,7 @@ class CalibrationObservation:
         if not isinstance(data, Mapping):
             raise BenchSchemaError(
                 f"observation: must be an object, got {type(data).__name__}")
-        for key in sorted(set(data) - _OBS_KEYS):
+        for key in sorted(set(data) - _OBS_KEYS, key=repr):
             _bad(errors, key, "unknown observation key")
         # The observation schema tag must be EXPLICIT on deserialization: a
         # record without it is not silently assumed to be v1.
@@ -771,7 +821,7 @@ class CalibrationLog:
         if not isinstance(data, Mapping):
             raise BenchSchemaError(
                 f"calibration: must be an object, got {type(data).__name__}")
-        for key in sorted(set(data) - {"schema", "observations"}):
+        for key in sorted(set(data) - {"schema", "observations"}, key=repr):
             _bad(errors, key, "unknown calibration key")
         if data.get("schema") != CALIBRATION_FILE_SCHEMA:
             _bad(errors, "schema",
@@ -794,11 +844,11 @@ class CalibrationLog:
 def load_calibration(path: str | Path) -> CalibrationLog:
     p = Path(path)
     try:
-        raw = p.read_bytes()
-    except OSError as exc:
+        raw = read_bounded_file(p, MAX_BENCH_FILE_BYTES)
+    except (OSError, ValueError, RuntimeError) as exc:
         raise BenchSchemaError(f"calibration file not readable: {p}: {exc}") from exc
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = strict_json_loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         # ValueError subsumes UnicodeDecodeError/JSONDecodeError and covers
         # the integer-string digit limit; RecursionError covers deeply
@@ -810,17 +860,7 @@ def load_calibration(path: str | Path) -> CalibrationLog:
 def save_calibration(log: CalibrationLog, path: str | Path) -> Path:
     """Atomic write (temp + ``os.replace``) of the whole document."""
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".calib-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(log.to_json() + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, target)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    _save_document_atomic(target, log.to_dict(), prefix=".calib-")
     return target
 
 
@@ -846,12 +886,18 @@ def add_observation(path: str | Path,
 
     The whole transaction runs under an in-process lock per canonical path,
     so simultaneous threads cannot lose entries to a load/save interleave.
+    The I/O path is the same once-resolved absolute path as the lock: CWD
+    changes do not redirect an append, and a deliberate file symlink remains
+    a symlink to the chosen canonical target, rather than being replaced.
     **Scope:** the cross-PROCESS guarantee is not required at this
     milestone — concurrent *processes* appending to one calibration file
     can still lose an append (documented limitation; atomic writes keep the
     file itself intact).
     """
-    p = Path(path)
+    try:
+        p = Path(path).resolve()
+    except (OSError, RuntimeError, ValueError, TypeError) as exc:
+        raise BenchSchemaError(f"invalid calibration append path: {exc}") from exc
     with _calibration_lock(p):
         try:
             log = load_calibration(p)

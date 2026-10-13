@@ -80,6 +80,14 @@ nonfatal clocks and preserved worker errors. No live assets are mutated.
    1661passed+2skip. Actual narrow-verifier memory-refusal checks3/3 each.
    Root-completeness refusal and exact pure budget arithmetic unchanged;
    no real-memory approval or public verifier/worker override added.
+10. **Benchmark/calibration**: strict16MiB bounded snapshot input/output;
+    duplicate JSON and mixed-key schema errors typed; atomic-write raw-FD/
+    cleanup error handling; overflow-safe finite phase medians and exact
+    integer byte medians; huge-step timing derivation; nonfatal clocks with
+    explicit unmeasured phases, never partial/zero invented totals; canonical
+    append I/O aligned with its lock, preserving aliases/CWD stability.
+    36new tests; benchmark132, both full suites1697passed+2skip. No calibration
+    evidence/production fit claim. Contracts/limits: docs/benchmark-review.md.
 
 ## Coverage / next work
 
@@ -91,11 +99,9 @@ code. Identity/worker policy and
 source/asset/codec integration were also exercised by prior CPU milestones;
 that evidence does not substitute for reviewing all remaining source.
 
-Next: fix confirmed benchmark issues before acceptance: blocking/unbounded
-result/calibration reads, duplicate JSON and mixed-key mapping errors, median
-overflow/byte rounding, phase-timing faults masking body exceptions, canonical
-calibration append lock paths disagreeing with lexical I/O after CWD changes.
-Then finish local_bundle, fetch tool, web API/server and real-browser UI.
+Next: finish local_bundle (only intro/layout read this pass), fetch tool, web
+API/server and real-browser UI review. Follow up remaining path-binding/
+diagnostic edge cases proportionally; current full review is not complete.
 Keep reusable review evidence and environment setup in the repo/.review-envs;
 only disposable test fixtures belong in /tmp.
 
