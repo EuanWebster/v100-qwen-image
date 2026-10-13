@@ -180,6 +180,10 @@ class MemorySnapshot:
     advisory_visible_available_bytes: int | None = None
 
     def __post_init__(self) -> None:
+        if (not isinstance(self.notes, (tuple, list))
+                or any(not isinstance(note, str) for note in self.notes)):
+            raise MemoryPreflightError("notes must be a list/tuple of diagnostic strings")
+        object.__setattr__(self, "notes", tuple(self.notes))
         if self.cgroup_state not in (CGROUP_FINITE, CGROUP_UNLIMITED,
                                      CGROUP_UNKNOWN):
             raise MemoryPreflightError(
@@ -264,26 +268,26 @@ def read_host_available(meminfo_path: str | Path = "/proc/meminfo"
                                             errors="replace")
     except (OSError, ValueError) as exc:
         return None, (f"meminfo unreadable: {exc}",)
-    for line in text.splitlines():
-        if line.startswith("MemAvailable:"):
-            parts = line.split()
-            if (len(parts) == 3 and parts[1].isascii() and parts[1].isdigit()
-                    and parts[2] == "kB"):
-                try:
-                    return int(parts[1]) * 1024, ()
-                except ValueError:
-                    # Unit-correct digits beyond CPython's int-str
-                    # conversion safety limit: a typed LOCAL catch — the
-                    # interpreter's limit is never raised to accommodate a
-                    # counter this implausible, and the value is never
-                    # approximated into a budget.
-                    return None, (
-                        f"MemAvailable exceeds this interpreter's safe "
-                        f"integer-conversion limit ({len(parts[1])} "
-                        f"digits): unknown, never approximated",)
-            return None, (
-                f"MemAvailable missing/malformed or not in its documented "
-                f"kB unit (expected '<integer> kB'): {line!r}",)
+    lines = [line for line in text.splitlines() if line.startswith("MemAvailable:")]
+    if len(lines) > 1:
+        return None, ("meminfo has ambiguous duplicate MemAvailable lines",)
+    if lines:
+        line = lines[0]
+        parts = line.split()
+        if (len(parts) == 3 and parts[1].isascii() and parts[1].isdigit()
+                and parts[2] == "kB"):
+            try:
+                return int(parts[1]) * 1024, ()
+            except ValueError:
+                # Conversion-limit failures are unknown, never approximated.
+                # Do not relax the interpreter's integer-string safety limit.
+                return None, (
+                    f"MemAvailable exceeds this interpreter's safe "
+                    f"integer-conversion limit ({len(parts[1])} "
+                    f"digits): unknown, never approximated",)
+        return None, (
+            f"MemAvailable missing/malformed or not in its documented "
+            f"kB unit (expected '<integer> kB'): {line!r}",)
     return None, ("meminfo has no MemAvailable line",)
 
 
@@ -426,17 +430,20 @@ def read_cgroup_budget(proc_cgroup_path: str | Path = "/proc/self/cgroup",
                              f"explicitly unlimited at this level (ancestor "
                              f"caps still checked)")
                 continue
+            if not raw.isascii() or not raw.isdigit():
+                return _refuse(f"memory.max at {directory} is not an unsigned ASCII integer "
+                               f"or 'max' (negative/sign-prefixed/noncanonical counter): {raw!r}")
             try:
                 limit = int(raw)
             except ValueError:
                 return _refuse(f"memory.max at {directory} is neither an "
                                f"integer nor 'max': {raw!r}")
-            if limit < 0:
-                return _refuse(f"memory.max negative at {directory}: "
-                               f"{raw!r}")
             try:
                 cur_raw = (directory / "memory.current").read_text(
                     encoding="utf-8", errors="replace").strip()
+                if not cur_raw.isascii() or not cur_raw.isdigit():
+                    return _refuse(f"memory.current at {directory} is not an unsigned ASCII integer "
+                                   f"(negative/sign-prefixed/noncanonical counter): {cur_raw!r}")
                 current = int(cur_raw)
             except FileNotFoundError:
                 return _refuse(
@@ -447,9 +454,6 @@ def read_cgroup_budget(proc_cgroup_path: str | Path = "/proc/self/cgroup",
                 return _refuse(f"memory.current unreadable/unparseable at "
                                f"{directory} against a finite cap: "
                                f"{exc or cur_raw!r}")
-            if current < 0:
-                return _refuse(f"memory.current negative at {directory}: "
-                               f"{cur_raw!r}")
             notes.append(f"cgroup level {directory}: finite cap {limit} B, "
                          f"current {current} B "
                          f"(available {max(0, limit - current)} B)")
@@ -599,6 +603,8 @@ def encoder_memory_preflight(checkpoint_bytes: int, *,
     snap = snapshot if snapshot is not None else read_memory_snapshot(
         meminfo_path=meminfo_path, proc_cgroup_path=proc_cgroup_path,
         cgroup_fs_root=cgroup_fs_root)
+    if not isinstance(snap, MemorySnapshot):
+        raise MemoryPreflightError("snapshot must be a MemorySnapshot or None")
     budget, reasons = snap.budget()
     cgroup_available = None
     if snap.cgroup_state == CGROUP_FINITE:

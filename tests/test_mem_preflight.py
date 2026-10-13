@@ -48,6 +48,45 @@ CGROUP_CAP_16GIB = 17_179_869_184
 GIB = 1024 ** 3
 
 
+def test_snapshot_notes_defensively_frozen():
+    original = ["observed diagnostic"]
+    snapshot = MemorySnapshot(1024, CGROUP_UNLIMITED, notes=original)
+    original.append("caller mutation")
+    assert snapshot.notes == ("observed diagnostic",)
+    assert "caller mutation" not in snapshot.budget()[1]
+
+
+@pytest.mark.parametrize("notes", ["not a sequence of notes", None, (123,), [float("nan")]])
+def test_invalid_snapshot_notes_are_typed(notes):
+    with pytest.raises(MemoryPreflightError, match="notes"):
+        MemorySnapshot(1024, CGROUP_UNLIMITED, notes=notes)
+
+
+@pytest.mark.parametrize("snapshot", [{}, "unknown", 0, False])
+def test_invalid_injected_snapshot_is_typed(snapshot):
+    with pytest.raises(MemoryPreflightError, match="snapshot"):
+        encoder_memory_preflight(1, checkpoint_dtype="fp16", target_dtype="fp16",
+                                 headroom_bytes=0, snapshot=snapshot)
+
+
+@pytest.mark.parametrize("counter", ["+1024", "1_024", "１０２４", "-0"])
+@pytest.mark.parametrize("field", ["memory.max", "memory.current"])
+def test_noncanonical_cgroup_counters_refuse_without_advisory_guess(tmp_path, counter, field):
+    env = make_env(tmp_path, mem_max=1024, mem_current=0)
+    (env["cgroup_fs_root"] / field).write_text(counter)
+    snapshot = read_memory_snapshot(**env)
+    assert snapshot.cgroup_state == CGROUP_UNKNOWN
+    assert snapshot.advisory_visible_available_bytes is None
+    assert "unsigned ASCII" in " ".join(snapshot.notes)
+
+
+@pytest.mark.parametrize("second", ["0", "1048576"])
+def test_duplicate_host_available_lines_are_unknown(tmp_path, second):
+    env = make_env(tmp_path, raw_meminfo=f"MemAvailable: 1048576 kB\nMemAvailable: {second} kB\n")
+    available, notes = read_host_available(env["meminfo_path"])
+    assert available is None and "duplicate MemAvailable" in " ".join(notes)
+
+
 def make_env(tmp_path, *, host_kb=40 * 1024 * 1024, cgroup_path="/",
              mem_max=None, mem_current=None, raw_meminfo=None,
              raw_cgroup=None):

@@ -73,19 +73,29 @@ nonfatal clocks and preserved worker errors. No live assets are mutated.
    each direction with real metadata but PRIVATE synthetic vision/payload seams;
    no real model/fit claim. Actual identity6, helper36 and miniature worker12
    passed per interpreter. See docs/encoder-client.md for contracts and limits.
+9. **Memory snapshot/counter integrity**: diagnostic notes now own an immutable
+   string-only snapshot; invalid supplied snapshot types refuse typed. Duplicate
+   MemAvailable lines and sign-prefixed/underscored/non-ASCII cgroup counters
+   are unknown, not advisory numeric guesses.19new tests; both full suites
+   1661passed+2skip. Actual narrow-verifier memory-refusal checks3/3 each.
+   Root-completeness refusal and exact pure budget arithmetic unchanged;
+   no real-memory approval or public verifier/worker override added.
 
 ## Coverage / next work
 
 Fully read this pass: encoder_identity + runtime policy, encoder_worker, encoder_client,
+encoder_production (complete helper/codec), encoder_assets, mem_preflight, bench,
 manifest, log, config, CLI, core, adapters/base, _jsonsafe, _local_io and
 generic encoder identity/request/payload, cache and worker lifecycle/response
 code. Identity/worker policy and
 source/asset/codec integration were also exercised by prior CPU milestones;
 that evidence does not substitute for reviewing all remaining source.
 
-Next: finish reviewing
-production helper/codec, encoder assets, memory preflight, local bundle,
-benchmark schemas/persistence, fetch tool, web API/server and real-browser UI.
+Next: fix confirmed benchmark issues before acceptance: blocking/unbounded
+result/calibration reads, duplicate JSON and mixed-key mapping errors, median
+overflow/byte rounding, phase-timing faults masking body exceptions, canonical
+calibration append lock paths disagreeing with lexical I/O after CWD changes.
+Then finish local_bundle, fetch tool, web API/server and real-browser UI.
 Keep reusable review evidence and environment setup in the repo/.review-envs;
 only disposable test fixtures belong in /tmp.
 
