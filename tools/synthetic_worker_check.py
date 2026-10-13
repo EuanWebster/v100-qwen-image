@@ -83,11 +83,7 @@ def checks(run):
 
     observe = ei.observe_installed_packages
     observed = observe()
-    assert observed.packages["torchvision"].version is None
-    ei.PINNED_TORCHVISION_VERSION = "synthetic-test-vision"
-    ei.observe_installed_packages = lambda: replace(observed, packages={
-        **observed.packages, "torchvision": ei.PackageObservation("synthetic-test-vision")})
-    ei.validate_installed_packages(ei.observe_installed_packages())  # actual other pins/VCS checked
+    ei.validate_installed_packages(observed)  # real pins/VCS, including vision
     def memory(size, **kwargs):
         return require_encoder_memory_fit(size, **kwargs, snapshot=MemorySnapshot(
             host_available_bytes=1024 ** 3, cgroup_state="unlimited"))
@@ -252,15 +248,9 @@ def checks(run):
                for f in attempts[0][1]), attempts
     assert not list(run.glob(".qwen-encoder-response-*.tmp"))
     print("PASS only expected denied urllib3 probe; no forbidden writes; response temps cleaned")
-    ei.PINNED_TORCHVISION_VERSION = None
     ei.observe_installed_packages = observe
-    try:
-        ei.project_encoder_request(GenerationConfig(), manifest, encoder_dtype="fp16")
-    except EncoderSetupError as exc:
-        assert "no reviewed pin" in str(exc)
-    else:
-        raise AssertionError("production vision refusal was bypassed")
-    print("PASS restored real production policy refuses unlocked/missing torchvision")
+    ei.project_encoder_request(GenerationConfig(), manifest, encoder_dtype="fp16")
+    print("PASS real production metadata policy accepts reviewed pins; no real model fit claim")
     print(f"12 synthetic worker checks passed on Python {sys.version.split()[0]}; miniature generated weights only, no downloaded checkpoint/processor")
     return 0
 

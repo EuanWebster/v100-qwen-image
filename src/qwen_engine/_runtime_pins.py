@@ -8,6 +8,7 @@ from types import MappingProxyType
 
 RUNTIME_PACKAGE_VERSIONS = MappingProxyType({
     "torch": "2.14.1+cu126",
+    "torchvision": "0.29.1+cu126",
     "diffusers": "0.41.0.dev0",
     "transformers": "5.17.0",
     "safetensors": "0.8.0",

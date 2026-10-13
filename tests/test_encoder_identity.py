@@ -23,7 +23,7 @@ from qwen_engine.local_bundle import (
 from qwen_engine.manifest import ModelManifest, ModelArtifact, load_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
-VISION_FIXTURE = "test-only-reviewed-vision"
+VISION_FIXTURE = ei.PACKAGE_VERSIONS["torchvision"]
 
 
 def package_facts(vision=VISION_FIXTURE):
@@ -41,8 +41,7 @@ def manifest():
 
 @pytest.fixture
 def reviewed_fixture(monkeypatch):
-    # Synthetic policy only: never installs torchvision or relaxes the product gate.
-    monkeypatch.setattr(ei, "PINNED_TORCHVISION_VERSION", VISION_FIXTURE)
+    # Synthetic observations only: the real immutable version policy is used.
     monkeypatch.setattr(ei, "observe_installed_packages", package_facts)
     return package_facts()
 
@@ -122,10 +121,9 @@ def test_keyboard_interrupt_is_never_wrapped(monkeypatch):
         ei.observe_installed_packages()
 
 
-@pytest.mark.parametrize("vision", [None, VISION_FIXTURE, "arbitrary-installed-version"])
-def test_unlocked_torchvision_always_blocks_production(vision):
-    assert ei.PINNED_TORCHVISION_VERSION is None
-    with pytest.raises(EncoderSetupError, match="no reviewed pin"):
+@pytest.mark.parametrize("vision", [None, "0.29.1", "0.29.1+cu128", "arbitrary-installed-version"])
+def test_missing_or_unreviewed_torchvision_blocks_production(vision):
+    with pytest.raises(EncoderSetupError, match="torchvision: expected"):
         ei.validate_installed_packages(package_facts(vision))
 
 
@@ -179,7 +177,7 @@ def test_runtime_policy_matches_complete_reviewed_lock():
         match = re.match(r"([a-z0-9-]+) @ git\+([^@]+)@([a-f0-9]{40})$", line)
         if match:
             vcs[match[1]] = (match[2], match[3])
-    assert len(registry) + len(vcs) == 63
+    assert len(registry) + len(vcs) == 64
     assert vcs == dict(ei.VCS_PINS)
     assert registry == {n: v for n, v in ei.PACKAGE_VERSIONS.items() if n not in vcs}
     assert set(ei.PACKAGE_VERSIONS) == set(registry) | set(vcs)
@@ -550,11 +548,11 @@ def test_bad_projection_seeds_refused_before_runtime_observation(manifest, monke
         ei.complete_encoder_seed(replace(seed, **{field: value}), manifest)
 
 
-def test_projection_refuses_completed_requests_and_real_vision_gate(manifest, reviewed_fixture, monkeypatch):
+def test_projection_refuses_completed_requests_and_missing_vision(manifest, reviewed_fixture, monkeypatch):
     seed = ei.project_encoder_seed(GenerationConfig(), manifest, encoder_dtype="fp16")
     completed = ei.complete_encoder_seed(seed, manifest)
     with pytest.raises(EncoderRequestError, match="without implementation identity"):
         ei.complete_encoder_seed(completed, manifest)
-    monkeypatch.setattr(ei, "PINNED_TORCHVISION_VERSION", None)
-    with pytest.raises(EncoderSetupError, match="no reviewed pin"):
+    monkeypatch.setattr(ei, "observe_installed_packages", lambda: package_facts(None))
+    with pytest.raises(EncoderSetupError, match="torchvision: expected"):
         ei.complete_encoder_seed(seed, manifest)

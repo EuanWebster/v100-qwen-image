@@ -11,7 +11,8 @@
 #     (Volta) kernels. The +cu126 local version label only exists on
 #     download.pytorch.org, so the exact pin below cannot silently fall back
 #     to a plain-PyPI or cu13 wheel.
-#   * Everything else resolves from PyPI. IMPORTANT: uv must be run with
+#   * torchvision also uses the exact reviewed +cu126 wheel. Remaining
+#     registry dependencies resolve from PyPI. IMPORTANT: uv must be run with
 #     `--index-strategy unsafe-best-match` (a CLI-only flag; uv 0.12.1 does
 #     not accept it inside a requirements file). With uv's default
 #     first-index strategy the torch extra index takes precedence over PyPI
@@ -44,6 +45,9 @@
 --extra-index-url https://download.pytorch.org/whl/cu126
 
 torch==2.14.1+cu126
+# Reviewed matching CUDA-series vision wheel; real Qwen3VLProcessor's video
+# component requires this even for the text-only path. See docs/vision-review.md.
+torchvision==0.29.1+cu126
 # Exact source commit per PLAN M0.1 (verified 2026-10-07: `git ls-remote
 # …refs/tags/v5.17.0^{}` dereferences v5.17.0 — an annotated tag object
 # 595ff117… that must NOT be pinned — to this commit; its __init__ reports

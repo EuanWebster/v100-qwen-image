@@ -2,8 +2,11 @@
 
 Codex direct review, 2026-10-13. This is a coverage/findings ledger, not a
 claim that the whole project is accepted or that generation works. All prior
-hardware/real-processor/memory/torchvision gates remain. No model downloads,
-dependency/lock changes, service changes, Qwen jobs or generation activation.
+hardware/real-model/memory gates remain. The separate2026-10-13 vision
+milestone updates dependency/lock/policy and accepts real offline processor
+loading ([vision-review.md](vision-review.md)); earlier review rows describe
+their historical scope. No model downloads, service changes, Qwen jobs or
+generation activation.
 
 ## Corrections verified
 

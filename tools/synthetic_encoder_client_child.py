@@ -1,8 +1,9 @@
 """PRIVATE test bootstrap, never a product entrypoint or a runtime override.
 
 The client check redirects fixed commands to this file only inside its test
-process. Observe actual selected-child metadata, patch a synthetic vision pin
-only here, and emit tiny hand-built payloads instead of any model loading.
+process. Observe actual selected-child metadata; optionally corrupt one
+observation for a refusal test, and emit tiny hand-built payloads instead of
+any model loading. The real version policy is never relaxed.
 """
 from __future__ import annotations
 
@@ -50,11 +51,10 @@ def main():
     assert not set(ei.ML_MODULE_NAMES) & set(sys.modules)
     ew.install_offline_guard()
     facts = ei.observe_installed_packages()
-    assert facts.packages["torchvision"].version is None
-    if os.environ.get("QWEN_CLIENT_TEST_APPROVE_VISION") == "1":
-        ei.PINNED_TORCHVISION_VERSION = "synthetic-client-vision"
+    ei.validate_installed_packages(facts)
+    if os.environ.get("QWEN_CLIENT_TEST_CORRUPT_VISION") == "1":
         facts = replace(facts, packages={**facts.packages,
-            "torchvision": ei.PackageObservation("synthetic-client-vision")})
+            "torchvision": ei.PackageObservation("synthetic-wrong-vision")})
         ei.observe_installed_packages = lambda: facts
     if "--project-identity" in sys.argv:
         # Actual versions/VCS and Python observed in this interpreter.

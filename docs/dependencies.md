@@ -21,6 +21,13 @@ hardware change was made; nothing here proves GPU execution (§5).
 
 ## 1. Pins
 
+2026-10-13 update: `torchvision==0.29.1+cu126` added from the official
+cu126 index; all original63 pins/artifact hashes retained (64 packages).
+Both persistent ML envs accept exact metadata, native CPU vision ops and
+real offline Qwen3VLProcessor loading. [vision-review.md](vision-review.md)
+records the decision and tests. No CUDA or actual checkpoint fit/fidelity
+is implied. The absent-vision findings and temporary envs below are historical.
+
 | Package | Pinned identity | Where it installs from |
 |---|---|---|
 | torch | `2.14.1+cu126` (distribution name/version exactly that; build against CUDA **12.6**) | official cu126 wheel index `https://download.pytorch.org/whl/cu126` — the `+cu126` local label exists only there, so plain-PyPI or cu13 torch can never satisfy this pin |
@@ -46,8 +53,8 @@ is not a bit-reproducible *build* — the resolved artifacts and their source
 commits are what is guaranteed identical.
 That mix is precisely why the lock installs with `uv pip sync` only:
 `pip install --require-hashes -r requirements.lock` cannot handle VCS
-requirements at all and is **not** a supported path here. `torchvision`
-is absent from **both pinned ML envs** and is **not** needed for the
+requirements at all and is **not** a supported path here. Historically,
+`torchvision` was absent from **both pinned ML envs** and was **not** needed for the
 text-to-image *import* path: `transformers`' `Qwen3VLProcessor` and the
 pipeline module import cleanly without it (verified 2026-10-07). But its
 absence is a **known runtime blocker, not a hypothetical future optional
@@ -57,7 +64,8 @@ need** (verified 2026-10-09): the actual socket-denied local
 (`ModuleNotFoundError`). A tokenizer-only local load succeeded
 (Qwen2Tokenizer); there is still **no** real encoder parity, RAM-fit or
 GPU proof. Any fix joins via an explicit requirements change, never
-silently — none was made for this finding.
+silently. The explicit2026-10-13 requirements/lock/policy update above now
+resolves this finding with real offline processor-load evidence.
 
 No `requirements.in`/lock change touches the **developer-only CPU
 environment**: `pyproject.toml` + `uv.lock` remain the pinned pytest-only env

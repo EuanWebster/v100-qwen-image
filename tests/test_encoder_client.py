@@ -223,7 +223,7 @@ def test_actual_fresh_child_package_refusal_happens_before_cache(client, monkeyp
         monkeypatch.setattr(client.cache, name, lambda *a: pytest.fail("cache after actual refusal"))
     with pytest.raises(EncoderWorkerError) as caught:
         client.encode(GenerationConfig(), encoder_dtype="fp16")
-    assert caught.value.exit_code == 1 and "torchvision: no reviewed pin" in caught.value.stderr
+    assert caught.value.exit_code == 1 and "torchvision: expected" in caught.value.stderr
     assert not client.models_dir.exists()
     assert not list(Path(client._projector.scratch_dir).glob("qwen-enc-*"))
 

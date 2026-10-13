@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Check real installed identity without ML imports; current vision gate expected.
+"""Check real installed identity without ML imports or model access.
 
 Run with each persistent pinned ML interpreter and -B. Exit zero means the
-metadata/source checks and the EXPECTED production refusal were verified,
-not that production loading is enabled. Unexpected failures exit nonzero.
+metadata/source checks passed, not that model loading, fit or CUDA is proved.
 """
 from __future__ import annotations
 
@@ -22,25 +21,15 @@ def main():
         ML_MODULE_NAMES, PACKAGE_VERSIONS, observe_installed_packages, validate_installed_packages,
         worker_source_digest, runtime_metadata_digest,
     )
-    from qwen_engine.encoder import EncoderSetupError
     from qwen_engine.local_bundle import reference_bundle_fingerprints
     from qwen_engine.manifest import load_manifest
 
     assert not any(name.split(".")[0] in ML_MODULE_NAMES for name in sys.modules)
     facts = observe_installed_packages()
     assert facts.executable == sys.executable
-    assert facts.packages["torchvision"].version is None
     print(f"PASS package metadata observed in Python {'.'.join(map(str, facts.python_version))}")
-    expected = ("installed encoder packages refused: torchvision: no reviewed pin "
-                "in requirements.lock (observed absent); production loading is blocked")
-    try:
-        validate_installed_packages(facts)
-    except EncoderSetupError as exc:
-        assert str(exc) == expected, str(exc)
-    else:
-        raise AssertionError("current production torchvision gate was bypassed")
-    print(f"PASS all {len(PACKAGE_VERSIONS)} reviewed package pins match; "
-          "missing/unlocked torchvision explicitly refuses production")
+    validate_installed_packages(facts)
+    print(f"PASS all {len(PACKAGE_VERSIONS)} reviewed package pins match, including torchvision")
     assert runtime_metadata_digest(facts) == runtime_metadata_digest(observe_installed_packages())
     print("PASS complete distribution inventory and Python runtime digest stable")
     first = worker_source_digest()
@@ -51,7 +40,7 @@ def main():
     print("PASS pinned full-reference manifest identity projected without reading model files")
     assert not any(name.split(".")[0] in ML_MODULE_NAMES for name in sys.modules)
     print("PASS no ML imports during real installed-package/source/manifest checks")
-    print("6 identity checks passed; production loading remains BLOCKED")
+    print("6 identity checks passed; model memory/asset/fidelity and CUDA gates remain separate")
     return 0
 
 

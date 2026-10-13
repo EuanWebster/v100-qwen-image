@@ -3,7 +3,7 @@
 
 Run with each pinned ML interpreter, optionally choosing the OTHER pinned
 interpreter with --child-python. No ML imports, models, GPU or downloads.
-Vision approval/fake payload producer are private test-process seams only;
+Corrupted observation/fake payload producer are private test-process seams only;
 product commands/policy have no bypass flag. Fixtures alone are temporary.
 """
 from __future__ import annotations
@@ -39,7 +39,7 @@ def main():
 def checks(run, child_python):
     os.environ.update(QWEN_CPU_TMP_ROOTS=str(run), QWEN_CPU_TEST_GUARD="1",
         QWEN_CPU_DENY_IMPORT="torch,diffusers,transformers,safetensors,torchvision",
-        PYTHONDONTWRITEBYTECODE="1", QWEN_CLIENT_TEST_ROOT=str(run), QWEN_CLIENT_TEST_APPROVE_VISION="1")
+        PYTHONDONTWRITEBYTECODE="1", QWEN_CLIENT_TEST_ROOT=str(run), QWEN_CLIENT_TEST_CORRUPT_VISION="0")
     for variable, sub in {"HOME": "home", "XDG_CACHE_HOME": "cache", "XDG_CONFIG_HOME": "config",
                           "XDG_DATA_HOME": "data", "HF_HOME": "hf", "TMPDIR": "tmp"}.items():
         (run / sub).mkdir()
@@ -107,7 +107,7 @@ def checks(run, child_python):
     assert not client.models_dir.exists() and not list(run.glob("qwen-enc-*"))
     assert not set(ei.ML_MODULE_NAMES) & set(sys.modules)
     print("PASS no model-root access/heavy imports; scratch processes reaped/cleaned")
-    os.environ["QWEN_CLIENT_TEST_APPROVE_VISION"] = "0"
+    os.environ["QWEN_CLIENT_TEST_CORRUPT_VISION"] = "1"
     def no_cache(*a, **kw):
         raise AssertionError("cache touched after actual child policy refusal")
     for name in ("lock_for", "get", "put"):
@@ -115,12 +115,12 @@ def checks(run, child_python):
     try:
         client.encode(config, encoder_dtype="fp16")
     except EncoderWorkerError as exc:
-        assert exc.exit_code == 1 and "torchvision: no reviewed pin" in exc.stderr
+        assert exc.exit_code == 1 and "torchvision: expected" in exc.stderr
     else:
-        raise AssertionError("unreviewed actual vision policy was bypassed")
+        raise AssertionError("corrupted child observation bypassed the real vision policy")
     assert not list(run.glob("qwen-enc-*"))
-    print("PASS restored real child policy refuses before cache, including a previously valid hit")
-    print("8 selected-child client checks passed; synthetic policy/payloads only, no model/processor/GPU/fit claim")
+    print("PASS real child policy refuses corrupted observation before cache, including a previously valid hit")
+    print("8 selected-child client checks passed; synthetic payload/refusal fixture only, no model/processor/GPU/fit claim")
     return 0
 
 

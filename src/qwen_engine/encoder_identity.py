@@ -46,10 +46,7 @@ VCS_PINS = MappingProxyType({
     "diffusers": ("https://github.com/huggingface/diffusers.git", PINNED_DIFFUSERS_COMMIT),
     "transformers": ("https://github.com/huggingface/transformers.git", PINNED_TRANSFORMERS_COMMIT),
 })
-# No reviewed torchvision artifact is in requirements.lock. Never infer a
-# compatible version or permit one merely because somebody installed it.
-PINNED_TORCHVISION_VERSION: str | None = None
-PACKAGE_NAMES = (*PACKAGE_VERSIONS, "torchvision")
+PACKAGE_NAMES = tuple(PACKAGE_VERSIONS)
 ML_MODULE_NAMES = frozenset({"torch", "diffusers", "transformers", "safetensors", "torchvision"})
 SOURCE_DIGEST_SCHEMA = "qwen_engine.worker-source.v1"
 RUNTIME_DIGEST_SCHEMA = "qwen_engine.runtime-metadata.v1"
@@ -217,7 +214,7 @@ def runtime_metadata_digest(packages: InstalledEncoderPackages) -> str:
 
 
 def validate_installed_packages(packages: InstalledEncoderPackages) -> None:
-    """Fail closed on wrong versions/provenance or the unreviewed vision gate."""
+    """Fail closed on wrong versions/provenance, including the vision wheel."""
     if not isinstance(packages, InstalledEncoderPackages):
         raise EncoderSetupError("an InstalledEncoderPackages snapshot is required")
     errors = []
@@ -233,13 +230,6 @@ def validate_installed_packages(packages: InstalledEncoderPackages) -> None:
                 errors.append(f"{name}: expected exact reviewed git URL/commit")
         elif any(v is not None for v in (got.url, got.vcs, got.commit)):
             errors.append(f"{name}: unexpected direct-source installation")
-    vision = packages.packages["torchvision"]
-    if PINNED_TORCHVISION_VERSION is None:
-        errors.append("torchvision: no reviewed pin in requirements.lock "
-                      f"(observed {vision.version or 'absent'}); production loading is blocked")
-    elif vision.version != PINNED_TORCHVISION_VERSION or any(
-            v is not None for v in (vision.url, vision.vcs, vision.commit)):
-        errors.append("torchvision: installed identity does not match the reviewed pin")
     if errors:
         raise EncoderSetupError("installed encoder packages refused: " + "; ".join(errors))
 

@@ -11,18 +11,17 @@ the main guarded suites, pinned synthetic checks and real-browser workspace
 checks are accepted in `code-review.md`. Environments, tools and tests live
 on the persistent project mount. The web workspace remains planning/export
 only; generation adapter, GPU numerics/calibration and web jobs are not yet
-implemented/accepted. No real processor/checkpoint fidelity is claimed.
+implemented/accepted. Real processor loading is accepted separately below;
+no actual encoder-checkpoint fidelity is claimed.
 
 ## Runtime blockers independent of the card
 
-1. **Vision dependency**: the actual63locked distribution versions/sources
-   match, but torchvision is absent and has no reviewed lock pin. Real
-   Qwen3VLProcessor loading was previously observed to require that chain.
-   Next: review an exact compatible artifact against the pinned Torch/CUDA,
-   Python3.11/3.13 and processor interfaces; update the requirements/lock and
-   immutable runtime policy together, then test import AND real local
-   processor loading offline. No automatic latest-version install, optional
-   silent fallback, fake approved metadata or cache-hit bypass.
+1. **Vision dependency resolved**: all64 reviewed packages match, including
+   torchvision0.29.1+cu126. Native CPU ops and real nine-file local
+   Qwen3VLProcessor loading passed offline on3.11/3.13. Processor/upstream/
+   codec checks used a tiny synthetic model, not actual encoder weights.
+   Artifact/lock/policy decision and checks: [vision-review.md](vision-review.md).
+   No CUDA or real encoder fidelity follows from processor acceptance.
 2. **CPU memory**: the committed four encoder shards total17,534,339,488B
    (~16.33GiB). A fresh actual preflight observed a visible16GiB cgroup cap;
    the weights alone exceed it even before runtime/load/conversion headroom.
@@ -37,9 +36,10 @@ implemented/accepted. No real processor/checkpoint fidelity is claimed.
    be relabelled quantized or given an invented memory pass. Merely installing
    the V100, rewriting orchestration in C++, or changing fp16/bf16 storage
    does not remove this raw-weight lower bound. FP32 CPU expansion is larger.
-3. **Actual model fidelity/assets**: the separately approved earlier fetch
+3. **Actual model fidelity/assets**: processor files now freshly verified;
+   other assets from the separately approved earlier fetch
    was partial. This review did not rehash/resume real assets or certify their
-   current completeness. After dependency/memory readiness, verify the exact
+   current completeness. After memory readiness, verify the exact
    supplied settled encoder tree, run the real processor/checkpoint and
    compare extraction/templates/masks and tensors against the pinned
    upstream path; measure CPU dtype accuracy, timing and peak memory. Tiny
