@@ -490,7 +490,11 @@ def test_chrome_lifecycle_protocol_selfcheck_pure():
                           text=True, timeout=180)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "FAIL" not in proc.stdout
-    assert "remains explicitly pending" in proc.stdout  # honesty note present
+    # Pure protocol success must point to separate browser evidence, without
+    # making a stale global claim that independently completed checks are pending.
+    assert "PURE protocol checks only" in proc.stdout
+    assert "chrome_browser_check.mjs" in proc.stdout
+    assert "web_integration_check.mjs" in proc.stdout
 
 
 def test_raw_http_framing_selfcheck_pure():

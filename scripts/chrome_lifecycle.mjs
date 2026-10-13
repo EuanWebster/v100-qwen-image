@@ -132,15 +132,17 @@ export function makeCdp(ws) {
   const cdp = {
     onEvent: null,
     dead: false,
+    abort() { killAll('aborted'); },
     send(method, params = {}, sessionId) {
       if (cdp.dead) return Promise.reject(new Error('cdp socket is dead (previous timeout)'));
       return new Promise((res, rej) => {
         const id = nextId++;
+        const timeoutMs = DEFAULTS.sendMs;
         const timer = setTimeout(() => {
-          pending.delete(id);
-          cdp.dead = true;   // never leave a dangling request: the run is over
-          rej(new Error(`CDP send ${method} timed out after ${DEFAULTS.sendMs} ms`));
-        }, DEFAULTS.sendMs);
+          // One timed-out exchange makes the whole connection unusable.
+          // Reject/clear every other pending exchange immediately too.
+          killAll(`CDP send ${method} timed out after ${timeoutMs} ms`);
+        }, timeoutMs);
         pending.set(id, { res, rej, timer });
         try {
           ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
@@ -169,6 +171,17 @@ export function watchdog(ms, label = 'whole check') {
   return promise;
 }
 
+async function boundedWait(promise, ms, timeoutValue) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise, new Promise((res) => { timer = setTimeout(() => res(timeoutValue), ms); }),
+    ]);
+  } finally {
+    clearTimeout(timer); // a completed child must not leave a live deadline behind
+  }
+}
+
 /**
  * Cleanup, scoped to OUR OWN spawned child only (never a broad kill):
  *  1. Browser.close over the live WebSocket (Chrome reaps its own children);
@@ -180,12 +193,10 @@ export function watchdog(ms, label = 'whole check') {
 export async function shutdownChrome(chrome, ws, cdp) {
   if (chrome && ws && ws.readyState === 1 && cdp && !cdp.dead) {
     try {
-      await Promise.race([
-        cdp.send('Browser.close'),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('Browser.close timed out')), DEFAULTS.browserCloseMs)),
-      ]);
+      await boundedWait(cdp.send('Browser.close'), DEFAULTS.browserCloseMs, false);
     } catch { /* fall through to the signal path */ }
   }
+  cdp?.abort?.(); // terminate any remaining own protocol waits even without a close event
   try { ws?.close(); } catch {}
   if (!chrome) return;
   const exited = new Promise((res) => {
@@ -193,17 +204,11 @@ export async function shutdownChrome(chrome, ws, cdp) {
     else chrome.once('exit', () => res(true));
   });
   try { chrome.unref(); } catch {}
-  const gotExit = await Promise.race([
-    exited,
-    new Promise((res) => setTimeout(() => res(false), DEFAULTS.childExitMs)),
-  ]);
+  const gotExit = await boundedWait(exited, DEFAULTS.childExitMs, false);
   if (!gotExit && Number.isInteger(chrome.pid)) {
     for (const sig of ['SIGTERM', 'SIGKILL']) {
       try { process.kill(-chrome.pid, sig); } catch { /* already gone */ }
-      const gone = await Promise.race([
-        exited,
-        new Promise((res) => setTimeout(() => res(false), 3000)),
-      ]);
+      const gone = await boundedWait(exited, 3000, false);
       if (gone) break;
     }
   }

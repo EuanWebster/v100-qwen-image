@@ -67,6 +67,52 @@ await check('websocket close rejects every pending immediately', async () => {
   assert(/closed/.test(rejected || ''), 'pending must reject with the close cause');
 });
 
+await check('first send timeout rejects all concurrent waits without waiting for later deadlines', async () => {
+  const ws = new FakeSocket();
+  const cdp = makeCdp(ws);
+  const previous = DEFAULTS.sendMs;
+  const started = Date.now();
+  try {
+    DEFAULTS.sendMs = 25;
+    const first = cdp.send('First.timeout').catch((e) => e.message);
+    DEFAULTS.sendMs = 2000;
+    const second = cdp.send('Second.wait').catch((e) => e.message);
+    const errors = await Promise.all([first, second]);
+    assert(errors.every((e) => /timed out after 25 ms/.test(e)), 'all waits use the first timeout cause');
+    assert(Date.now() - started < 1000, 'later 2s deadline must not remain pending');
+    assert(cdp.dead, 'timeout invalidates the shared connection');
+  } finally {
+    DEFAULTS.sendMs = previous;
+  }
+});
+
+await check('explicit cleanup abort clears protocol waits without needing a WebSocket close event', async () => {
+  const cdp = makeCdp(new FakeSocket());
+  const pending = cdp.send('Unanswered').catch((e) => e.message);
+  cdp.abort();
+  assert(/aborted/.test(await pending), 'cleanup cause must reject the pending exchange');
+  assert(cdp.dead, 'aborted connection cannot accept new exchanges');
+});
+
+await check('successful browser/child cleanup clears every losing deadline timer', async () => {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const created = [], cleared = [];
+  globalThis.setTimeout = (...args) => { const id = realSetTimeout(...args); created.push(id); return id; };
+  globalThis.clearTimeout = (id) => { cleared.push(id); return realClearTimeout(id); };
+  try {
+    const chrome = { exitCode: 0, signalCode: null, unref() {} };
+    const ws = { readyState: 1, close() {} };
+    await shutdownChrome(chrome, ws, { dead: false, send: () => Promise.resolve({}) });
+    assert(created.length === 2, 'browser-close and exit deadlines were both exercised');
+    assert(created.every((id) => cleared.includes(id)), 'no losing timer may keep Node alive');
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+    created.forEach(realClearTimeout);
+  }
+});
+
 await check('synchronous send failure clears the pending entry', async () => {
   const ws = new FakeSocket();
   ws.throwOnSend = true;
