@@ -143,6 +143,9 @@ class GenerationProcessExecutor:
         self._lease = threading.Lock()
         self._closing = threading.Event()
         self._active = None
+        self._pending_process = None
+        self._pending_scratch = None
+        self.last_cleanup_error = None
 
     @property
     def active_pid(self):
@@ -160,9 +163,53 @@ class GenerationProcessExecutor:
                     self._stop(self._active, deadline=deadline)
                 except GenerationProcessError:
                     return False
-            return self._active is None
+            try:
+                self._cleanup_owned()
+            except Exception:
+                return False
+            return self._active is None and self._pending_process is None and self._pending_scratch is None
         finally:
             self._lease.release()
+
+    def _cleanup_owned(self):
+        """Keep handles and scratch identity until cleanup is actually done.
+
+        Never remove scratch belonging to a still-live child or a replacement
+        peer. Closed admission remains closed even after successful retry.
+        """
+        if self._active is not None:
+            return
+        if self._pending_process is not None:
+            failed = False
+            for stream in (self._pending_process.stdout, self._pending_process.stderr):
+                try:
+                    stream.close()
+                except Exception:
+                    failed = True
+            if failed:
+                self.last_cleanup_error = "worker_pipe_cleanup_failed"
+                raise GenerationProcessError(self.last_cleanup_error)
+            self._pending_process = None
+        if self._pending_scratch is not None:
+            scratch, owned = self._pending_scratch
+            try:
+                current = scratch.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                # Already removed: do not invent a peer target to clean up.
+                self._pending_scratch = None
+                return
+            except OSError:
+                self.last_cleanup_error = "scratch_cleanup_failed"
+                raise GenerationProcessError(self.last_cleanup_error) from None
+            if (current.st_dev, current.st_ino, current.st_mode) != (owned.st_dev, owned.st_ino, owned.st_mode):
+                self.last_cleanup_error = "scratch_directory_changed"
+                raise GenerationProcessError(self.last_cleanup_error)
+            try:
+                shutil.rmtree(scratch)
+            except Exception:
+                self.last_cleanup_error = "scratch_cleanup_failed"
+                raise GenerationProcessError(self.last_cleanup_error) from None
+            self._pending_scratch = None
 
     def _stop(self, proc, *, deadline=None):
         def remaining(bound):
@@ -200,8 +247,10 @@ class GenerationProcessExecutor:
             raise GenerationProcessError("executor_busy")
         scratch = proc = None
         primary = None
+        completed = False
         try:
-            if self._closing.is_set() or self._active is not None:
+            if (self._closing.is_set() or self._active is not None
+                    or self._pending_process is not None or self._pending_scratch is not None):
                 raise GenerationProcessError("executor_unavailable")
             current = self.scratch_dir.stat(follow_symlinks=False)
             if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != self._scratch_identity:
@@ -213,6 +262,7 @@ class GenerationProcessExecutor:
                 raise GenerationProcessError("process_request_byte_cap")
             scratch = Path(tempfile.mkdtemp(prefix="qwen-gen-", dir=self.scratch_dir))
             owned = scratch.stat(follow_symlinks=False)
+            self._pending_scratch = scratch, owned
             request, response = scratch / "request.json", scratch / "response.json"
             with request.open("xb") as stream:
                 stream.write(raw)
@@ -221,7 +271,10 @@ class GenerationProcessExecutor:
             proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, start_new_session=True)
             self._active = proc
-            return self._await(proc, response, context)
+            self._pending_process = proc
+            result = self._await(proc, response, context)
+            completed = True  # clean worker publication; controller still verifies artifact
+            return result
         except BaseException as exc:
             primary = exc
             raise
@@ -229,18 +282,17 @@ class GenerationProcessExecutor:
             try:
                 if proc is not None:
                     self._stop(proc)
-                    proc.stdout.close()
-                    proc.stderr.close()
-                if scratch is not None and self._active is None:
-                    current = scratch.stat(follow_symlinks=False)
-                    if (current.st_dev, current.st_ino, current.st_mode) != (owned.st_dev, owned.st_ino, owned.st_mode):
-                        raise GenerationProcessError("scratch_directory_changed")
-                    shutil.rmtree(scratch)
+                self._cleanup_owned()
             except Exception:
-                if primary is None:
+                self._closing.set()
+                if self.last_cleanup_error is None:
+                    self.last_cleanup_error = "worker_cleanup_pending"
+                if primary is None and not completed:
                     raise
-                # Preserve caller interrupts/errors; retained active Popen
-                # blocks any new execution if it could not be reaped.
+                # Preserve primary failures/interrupts and a coherent clean
+                # worker result. The controller still freshly verifies files.
+                # Retained ownership + closed admission make failed cleanup
+                # visible/retryable, not a claim that resources were released.
             finally:
                 self._lease.release()
 

@@ -40,28 +40,37 @@ inherit the session and must be reaped **by the worker** before normal exit.
 Group signals alone are not a promise to reap arbitrary grandchildren or
 hostile code escaping sessions. No global subreaper/foreign process cleanup.
 
-If reaping cannot finish (e.g. kernel uninterruptible I/O), keep the Popen
-and scratch ownership, refuse another spawn, and report unsuccessful close;
+If reaping cannot finish (e.g. kernel uninterruptible I/O), keep the Popen,
+pipe handles and scratch identity, refuse another spawn, and report unsuccessful close;
 never claim cancellation with a still-live direct child. A later finite
-close can retry. Default process timeout600s, grace15s; operator can choose
+close can retry reaping, pipe closure and exact owned-scratch cleanup. Default process timeout600s, grace15s; operator can choose
 bounded values. Close has its own finite deadline, including retry reaping.
 
 Coherent committed success with clean exit wins a late cancellation/close/
 timeout. Forced termination without a coherent clean result cannot establish
 success even if files exist; completed/partial output files are retained,
-not automatically deleted. Scratch cleanup checks the owned directory identity
+not automatically deleted. Ordinary cleanup failure does not mask a coherent
+clean worker result (the controller must still freshly verify its artifact).
+It closes admission, retains exact resources for retry, exposes only a fixed
+`last_cleanup_error` code and makes close return False until cleanup completes.
+A replacement peer is preserved, never deleted on retry. Successful cleanup
+retry does not reopen admission. The close deadline bounds lock/reaping waits;
+filesystem syscalls are not hard real-time bounded.
+Scratch cleanup checks the owned directory identity
 and never deletes a replacement peer. This is cooperative local ownership,
 not a hostile filesystem or executable-attestation sandbox. Queue bounds
 remain distinct from disk quotas.
 
 ## CPU acceptance
 
-58 executor +19 worker guarded tests on each Python3.11/3.13: fixed command,
+64 executor +19 worker guarded tests on each Python3.11/3.13: fixed command,
 real process startup/reaping, success/phases/artifacts, cooperative and
 TERM-ignoring cancellation, timeout, flood bounds, malformed/special results,
 actual descendant cleanup, late publication, self/finite close, primary
 callback errors, retained synthetic unreapable owner, PID-reuse refusal,
 strict schemas/coherence/JSON, setup bounds, root replacement and signal
 restoration. A real product child refuses missing assets with ML unavailable.
+Cleanup-fault regressions cover committed-save/primary-error preservation,
+retained pipe/scratch retry, missing owned scratch and replacement-peer refusal.
 Synthetic successful backend appears only in the isolated private fixtures.
 No actual image generation, CUDA, live API or hardware/memory-fit evidence.

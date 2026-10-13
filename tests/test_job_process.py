@@ -259,6 +259,129 @@ def test_precancel_refuses_without_scratch_or_child(tmp_path, monkeypatch):
     assert not list(tmp_path.iterdir()) and executor.close()
 
 
+def test_committed_success_survives_retryable_scratch_cleanup_failure(harness, monkeypatch):
+    create, children, commands = harness
+    executor, controller = create()
+    original = p.shutil.rmtree
+    def refuse(path, *args, **kwargs):
+        if Path(path).parent == executor.scratch_dir:
+            raise OSError("private scratch fixture cleanup failure")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(p.shutil, "rmtree", refuse)
+    record = controller.submit(GenerationConfig())
+    done = controller.wait(record.job_id)
+    assert done.state == JobState.SUCCEEDED and done.artifact is not None
+    assert children[0].returncode == 0 and executor.active_pid is None
+    assert executor.last_cleanup_error == "scratch_cleanup_failed"
+    assert executor._pending_scratch is not None and not executor.close(timeout_s=0)
+    context = JobContext("b" * 32, GenerationConfig(output_dir=controller.root),
+                         threading.Event(), lambda phase: None)
+    with pytest.raises(p.GenerationProcessError, match="unavailable"):
+        executor(context)
+    assert len(children) == 1
+    monkeypatch.setattr(p.shutil, "rmtree", original)
+    assert executor.close() and executor._pending_scratch is None
+    assert not list(executor.scratch_dir.iterdir())
+
+
+def test_primary_callback_error_survives_cleanup_failure(harness, monkeypatch):
+    create, children, commands = harness
+    executor, controller = create()
+    original = p.shutil.rmtree
+    monkeypatch.setattr(p.shutil, "rmtree", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cleanup")))
+    def failed_report(phase):
+        raise RuntimeError("owned callback primary")
+    context = JobContext("b" * 32, GenerationConfig(output_dir=controller.root), threading.Event(), failed_report)
+    with pytest.raises(RuntimeError, match="owned callback primary"):
+        executor(context)
+    assert executor.active_pid is None and executor._pending_scratch is not None
+    assert executor.last_cleanup_error == "scratch_cleanup_failed"
+    monkeypatch.setattr(p.shutil, "rmtree", original)
+    assert executor.close()
+
+
+def test_close_retries_both_pipe_and_scratch_ownership_after_reaping(tmp_path):
+    executor = p.GenerationProcessExecutor(scratch_dir=tmp_path)
+    scratch = tmp_path / "owned"
+    scratch.mkdir()
+    (scratch / "fixture.bin").write_bytes(b"owned")
+    executor._pending_scratch = scratch, scratch.stat()
+    class Stream:
+        def __init__(self, fail):
+            self.fail, self.calls = fail, 0
+        def close(self):
+            self.calls += 1
+            if self.fail:
+                self.fail = False
+                raise OSError("private pipe close fault")
+    class Reaped:
+        pid = 123456
+        stdout, stderr = Stream(True), Stream(False)
+        def poll(self):
+            return 0
+    proc = Reaped()
+    executor._active = executor._pending_process = proc
+    assert not executor.close(timeout_s=0)
+    assert executor.active_pid is None and executor._pending_process is proc and scratch.exists()
+    assert proc.stdout.calls == proc.stderr.calls == 1
+    assert executor.last_cleanup_error == "worker_pipe_cleanup_failed"
+    assert executor.close() and executor._pending_process is executor._pending_scratch is None
+    assert proc.stdout.calls == proc.stderr.calls == 2 and not scratch.exists()
+
+
+def test_close_never_cleans_replacement_peer(tmp_path):
+    executor = p.GenerationProcessExecutor(scratch_dir=tmp_path)
+    scratch = tmp_path / "owned"
+    scratch.mkdir()
+    executor._pending_scratch = scratch, scratch.stat()
+    preserved = tmp_path / "original"
+    scratch.rename(preserved)
+    scratch.mkdir()
+    (scratch / "peer.bin").write_bytes(b"peer")
+    assert not executor.close() and executor.last_cleanup_error == "scratch_directory_changed"
+    assert (scratch / "peer.bin").read_bytes() == b"peer" and preserved.is_dir()
+    # The test restores its original directory; product never removes peers.
+    scratch.rename(tmp_path / "peer-preserved")
+    preserved.rename(scratch)
+    assert executor.close() and (tmp_path / "peer-preserved/peer.bin").is_file()
+
+
+def test_close_accepts_owned_scratch_already_removed(tmp_path):
+    executor = p.GenerationProcessExecutor(scratch_dir=tmp_path)
+    scratch = tmp_path / "owned"
+    scratch.mkdir()
+    executor._pending_scratch = scratch, scratch.stat()
+    scratch.rmdir()
+    assert executor.close() and executor._pending_scratch is None
+
+
+def test_reap_retry_retains_scratch_and_pipes_until_child_is_reaped(tmp_path, monkeypatch):
+    executor = p.GenerationProcessExecutor(scratch_dir=tmp_path)
+    scratch = tmp_path / "owned"
+    scratch.mkdir()
+    executor._pending_scratch = scratch, scratch.stat()
+    class Stream:
+        closed = False
+        def close(self):
+            self.closed = True
+    class Child:
+        pid, reaped = 123456, False
+        stdout, stderr = Stream(), Stream()
+        def poll(self):
+            return 0 if self.reaped else None
+        def wait(self, *, timeout):
+            raise subprocess.TimeoutExpired("synthetic", timeout)
+    child = Child()
+    executor._active = executor._pending_process = child
+    monkeypatch.setattr(p.os, "killpg", lambda *args: None)
+    assert not executor.close(timeout_s=0)
+    assert executor._active is child and scratch.is_dir()
+    assert not child.stdout.closed and not child.stderr.closed
+    child.reaped = True
+    assert executor.close() and not scratch.exists()
+    assert child.stdout.closed and child.stderr.closed
+
+
 def test_pending_reap_retains_owner_and_refuses_new_execution(tmp_path, monkeypatch):
     executor = p.GenerationProcessExecutor(scratch_dir=tmp_path)
     signals = []
