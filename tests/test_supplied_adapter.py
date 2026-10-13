@@ -213,6 +213,16 @@ def test_conditioning_requires_owned_object(setup):
     supplied.close()
 
 
+def test_fp32_execution_cannot_become_an_unreviewed_gpu_profile(setup):
+    setup.pipe._execution_device = "cuda:0"
+    for model in (setup.pipe.transformer, setup.pipe.vae):
+        model.parameter.device, model.parameter.dtype = "cuda:0", "fp32"
+    supplied = setup.make(execution_dtype="fp32")
+    with pytest.raises(EngineError, match="CPU-witness-only"):
+        supplied.load(setup.config, setup.bundle.to_assets())
+    supplied.close()
+
+
 def test_png_writer_caps_extent_and_refuses_fileno(monkeypatch):
     monkeypatch.setattr(module, "MAX_PNG_BYTES", 8)
     with module._BoundedPNG() as stream:

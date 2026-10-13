@@ -47,7 +47,7 @@ flushing global allocators. This single-use API is serial, not thread-safe.
 
 ## CPU acceptance, 2026-10-13
 
-41 ML-free regressions cover metadata/layout/policy rejection before heavy import,
+42 ML-free regressions cover metadata/layout/policy rejection before heavy import,
 exact component classes, model placement/dtype/hooks, native attention/tiling,
 phase/config ownership, cancellation acknowledgement, cleanup and PNG cap.
 Run using the persistent test environments through `run_cpu_tests.sh`.

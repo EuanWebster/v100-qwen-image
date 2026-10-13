@@ -114,6 +114,8 @@ class SuppliedQwen21Adapter:
             raise EngineError("resident generation must not retain an encoder/offload hooks")
         dtype = {"fp16": torch.float16, "fp32": torch.float32}[self.execution_dtype]
         device = pipe._execution_device
+        if self.execution_dtype == "fp32" and str(device).split(":", 1)[0] != "cpu":
+            raise EngineError("fp32 supplied execution is CPU-witness-only")
         for model in (pipe.transformer, pipe.vae):
             if any(getattr(module, "_hf_hook", None) is not None for module in model.modules()):
                 raise EngineError("resident components must not have dispatch/offload hooks")
