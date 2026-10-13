@@ -565,6 +565,9 @@ def preflight_closed_tree(root: str | Path) -> tuple[str, ...]:
     in-flight ``*.partial`` is refused here by design — the preflight is for
     the *settled* tree. Performs no network access, no mkdir, no writes;
     refusals are typed :class:`BundleTreeError` before any ML import.
+    Entries are streamed through no-follow directory FDs; observed directory
+    or root replacement/mutation refuses. This is a settled-tree snapshot,
+    not protection for subsequent loads or hostile simultaneous rewrites.
     Returns the sorted tuple of all checked relative paths.
     """
     root_path = Path(root)
@@ -577,55 +580,83 @@ def preflight_closed_tree(root: str | Path) -> tuple[str, ...]:
             f"model root is not a directory: {root_resolved}")
     expected = _closed_tree_entries()
     seen: set[str] = set()
-    stack: list[Path] = [root_resolved]
-    while stack:
-        directory = stack.pop()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+
+    def signature(info: os.stat_result) -> tuple[int, ...]:
+        return (info.st_dev, info.st_ino, info.st_mode,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    def visit(directory_fd: int, prefix: str) -> None:
+        before = os.fstat(directory_fd)
+        # Stream the directory: the first unexpected entry refuses immediately,
+        # instead of allocating/sorting an unbounded list of unrelated files.
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                rel = f"{prefix}/{entry.name}" if prefix else entry.name
+                info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                is_link = stat_module.S_ISLNK(info.st_mode)
+                is_dir = stat_module.S_ISDIR(info.st_mode)
+                kind = expected.get(rel)
+                if kind is None:
+                    what = ("a symlink (even one pointing inside the root — "
+                            "closed-tree policy refuses links outright)"
+                            if is_link else "a directory" if is_dir
+                            else "a regular file"
+                            if stat_module.S_ISREG(info.st_mode)
+                            else "another entry type (special file)")
+                    raise BundleTreeError(
+                        f"{rel}: found {what}, but it is NOT part of the closed "
+                        f"{LOCAL_REFERENCE_PROFILE} tree (the {LAYOUT_FILE_COUNT}"
+                        f"-file allowlist and its required directories only) — "
+                        "a future from_pretrained() over this root could open "
+                        "it; remove the stray entry (fetch debris like "
+                        "'*.partial' counts) before any ML import")
+                if is_link:
+                    raise BundleTreeError(
+                        f"{rel}: an allowlisted path is a symlink; the closed "
+                        "tree requires the real entry, not a pointer elsewhere "
+                        "(stricter than the resolver by design)")
+                if kind == "dir":
+                    if not is_dir:
+                        raise BundleTreeError(
+                            f"{rel}: the required component directory is a "
+                            f"regular file or special entry, not a directory")
+                    # Anchor traversal to the inspected directory, never to a
+                    # pathname that could now be a symlink to a different tree.
+                    child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
+                    try:
+                        if signature(os.fstat(child_fd)) != signature(info):
+                            raise BundleTreeError(f"{rel}: directory changed before enumeration")
+                        visit(child_fd, rel)
+                        if signature(os.fstat(child_fd)) != signature(
+                                os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)):
+                            raise BundleTreeError(f"{rel}: directory path changed during enumeration")
+                    finally:
+                        os.close(child_fd)
+                else:
+                    if is_dir or not stat_module.S_ISREG(info.st_mode):
+                        raise BundleTreeError(
+                            f"{rel}: an allowlisted file path is a "
+                            f"{'directory' if is_dir else 'non-regular entry'}, "
+                            "not a regular file")
+                seen.add(rel)
+        if signature(before) != signature(os.fstat(directory_fd)):
+            raise BundleTreeError(f"{prefix or '.'}: directory changed during enumeration")
+
+    try:
+        root_fd = os.open(root_resolved, flags)
         try:
-            entries = sorted(os.scandir(directory), key=lambda e: e.name)
-        except OSError as exc:
-            raise BundleTreeError(
-                f"cannot enumerate directory "
-                f"{os.path.relpath(directory, root_resolved) or '.'} under "
-                f"the model root: errno {exc.errno} "
-                f"({exc.strerror or type(exc).__name__})") from exc
-        for entry in entries:
-            rel = os.path.relpath(entry.path, root_resolved)
-            rel = rel.replace(os.sep, "/")
-            is_link = entry.is_symlink()
-            is_dir = entry.is_dir(follow_symlinks=False)
-            kind = expected.get(rel)
-            if kind is None:
-                what = ("a symlink (even one pointing inside the root — "
-                        "closed-tree policy refuses links outright)"
-                        if is_link else "a directory" if is_dir
-                        else "a regular file"
-                        if entry.is_file(follow_symlinks=False)
-                        else "another entry type (special file)")
-                raise BundleTreeError(
-                    f"{rel}: found {what}, but it is NOT part of the closed "
-                    f"{LOCAL_REFERENCE_PROFILE} tree (the {LAYOUT_FILE_COUNT}"
-                    f"-file allowlist and its required directories only) — "
-                    "a future from_pretrained() over this root could open "
-                    "it; remove the stray entry (fetch debris like "
-                    "'*.partial' counts) before any ML import")
-            if is_link:
-                raise BundleTreeError(
-                    f"{rel}: an allowlisted path is a symlink; the closed "
-                    "tree requires the real entry, not a pointer elsewhere "
-                    "(stricter than the resolver by design)")
-            if kind == "dir":
-                if not is_dir:
-                    raise BundleTreeError(
-                        f"{rel}: the required component directory is a "
-                        f"regular file or special entry, not a directory")
-                stack.append(Path(entry.path))
-            else:
-                if is_dir or not entry.is_file(follow_symlinks=False):
-                    raise BundleTreeError(
-                        f"{rel}: an allowlisted file path is a "
-                        f"{'directory' if is_dir else 'non-regular entry'}, "
-                        "not a regular file")
-            seen.add(rel)
+            initial = os.fstat(root_fd)
+            visit(root_fd, "")
+            if (signature(initial) != signature(root_resolved.stat(follow_symlinks=False))
+                    or root_path.resolve() != root_resolved):
+                raise BundleTreeError("model root changed during enumeration")
+        finally:
+            os.close(root_fd)
+    except OSError as exc:
+        raise BundleTreeError(
+            f"cannot enumerate directory under model root {root_resolved}: "
+            f"errno {exc.errno} ({exc.strerror or type(exc).__name__})") from exc
     missing = sorted(set(expected) - seen)
     if missing:
         raise BundleTreeError(

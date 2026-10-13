@@ -88,18 +88,29 @@ nonfatal clocks and preserved worker errors. No live assets are mutated.
     append I/O aligned with its lock, preserving aliases/CWD stability.
     36new tests; benchmark132, both full suites1697passed+2skip. No calibration
     evidence/production fit claim. Contracts/limits: docs/benchmark-review.md.
+11. **Local bundle closed-tree preflight**: eager sorted directory listings
+    could allocate unbounded unrelated entries; path-based traversal could
+    follow a component replaced after inspection, and entry stat faults
+    escaped the typed error boundary. Enumeration now streams through
+    anchored no-follow directory FDs, checks inspected/opened/published
+    directory and root snapshots, closes owned handles on refusal, and
+    reports I/O faults as BundleTreeError. Stable root aliases still work.
+    Eight new regressions; focused bundle suite65passed; full guarded suites
+    1705passed+2skip each on Python3.11.15/3.13.5. This is a
+    settled-tree structural snapshot, not byte verification or protection
+    for a later loader against hostile simultaneous rewriting.
 
 ## Coverage / next work
 
 Fully read this pass: encoder_identity + runtime policy, encoder_worker, encoder_client,
 encoder_production (complete helper/codec), encoder_assets, mem_preflight, bench,
-manifest, log, config, CLI, core, adapters/base, _jsonsafe, _local_io and
+manifest, log, config, CLI, core, adapters/base, _jsonsafe, _local_io, local_bundle and
 generic encoder identity/request/payload, cache and worker lifecycle/response
 code. Identity/worker policy and
 source/asset/codec integration were also exercised by prior CPU milestones;
 that evidence does not substitute for reviewing all remaining source.
 
-Next: finish local_bundle (only intro/layout read this pass), fetch tool, web
+Next: finish fetch tool corrections and regression checks, then web
 API/server and real-browser UI review. Follow up remaining path-binding/
 diagnostic edge cases proportionally; current full review is not complete.
 Keep reusable review evidence and environment setup in the repo/.review-envs;

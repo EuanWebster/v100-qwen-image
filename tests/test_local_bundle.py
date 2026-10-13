@@ -1022,6 +1022,144 @@ def test_preflight_missing_root_refused(tmp_path):
         lb.preflight_closed_tree(tmp_path / "nowhere")
 
 
+def test_preflight_streams_and_closes_on_first_unexpected_entry(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    root = tmp_path / "assets"
+    build_tiny_tree(root)
+    (root / "stray").write_bytes(b"x")
+    closed = []
+
+    class Entries:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            closed.append(True)
+
+        def __iter__(self):
+            yield SimpleNamespace(name="stray")
+            raise AssertionError("unbounded eager enumeration")
+
+    monkeypatch.setattr(lb.os, "scandir", lambda fd: Entries())
+    with pytest.raises(lb.BundleTreeError, match="NOT part of the closed"):
+        lb.preflight_closed_tree(root)
+    assert closed == [True]
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "directory"])
+def test_preflight_refuses_directory_replaced_before_open(tmp_path, monkeypatch, replacement):
+    root = tmp_path / "assets"
+    build_tiny_tree(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_open = lb.os.open
+    real_scandir = lb.os.scandir
+    enumerated = []
+
+    def raced_open(path, flags, *args, **kwargs):
+        if path == "processor" and kwargs.get("dir_fd") is not None:
+            (root / "processor").rename(tmp_path / "original-processor")
+            if replacement == "symlink":
+                (root / "processor").symlink_to(outside, target_is_directory=True)
+            else:
+                (root / "processor").mkdir()
+        return real_open(path, flags, *args, **kwargs)
+
+    def track_scandir(fd):
+        enumerated.append(lb.os.fstat(fd).st_ino)
+        return real_scandir(fd)
+
+    monkeypatch.setattr(lb.os, "open", raced_open)
+    monkeypatch.setattr(lb.os, "scandir", track_scandir)
+    with pytest.raises(lb.BundleTreeError, match="cannot enumerate|changed before"):
+        lb.preflight_closed_tree(root)
+    assert outside.stat().st_ino not in enumerated
+    assert (root / "processor").stat().st_ino not in enumerated
+
+
+def test_preflight_refuses_root_replaced_after_open(tmp_path, monkeypatch):
+    root = tmp_path / "assets"
+    build_tiny_tree(root)
+    real_open = lb.os.open
+
+    def raced_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if path == root:
+            root.rename(tmp_path / "original-root")
+            root.mkdir()
+        return fd
+
+    monkeypatch.setattr(lb.os, "open", raced_open)
+    with pytest.raises(lb.BundleTreeError, match="model root changed"):
+        lb.preflight_closed_tree(root)
+
+
+def test_preflight_refuses_directory_mutated_after_enumeration(tmp_path, monkeypatch):
+    root = tmp_path / "assets"
+    build_tiny_tree(root)
+    inode = (root / "processor").stat().st_ino
+    real_scandir = lb.os.scandir
+
+    class Entries:
+        def __init__(self, fd):
+            self.iterator = real_scandir(fd)
+
+        def __enter__(self):
+            return self.iterator
+
+        def __exit__(self, *args):
+            self.iterator.close()
+            (root / "processor" / "late-file").write_bytes(b"x")
+
+    monkeypatch.setattr(lb.os, "scandir", lambda fd: (
+        Entries(fd) if lb.os.fstat(fd).st_ino == inode else real_scandir(fd)))
+    with pytest.raises(lb.BundleTreeError, match="changed during enumeration"):
+        lb.preflight_closed_tree(root)
+
+
+@pytest.mark.parametrize("fault", ["scandir", "stat"])
+def test_preflight_io_faults_are_typed_and_close_owned_descriptors(tmp_path, monkeypatch, fault):
+    root = tmp_path / "assets"
+    build_tiny_tree(root)
+    opened = []
+    closed = []
+    real_open, real_close, real_stat = lb.os.open, lb.os.close, lb.os.stat
+
+    def track_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def track_close(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    def fail(*args, **kwargs):
+        raise PermissionError(13, "fixture fault")
+
+    def fail_child_stat(path, *args, **kwargs):
+        if kwargs.get("dir_fd") is not None:
+            return fail()
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(lb.os, "open", track_open)
+    monkeypatch.setattr(lb.os, "close", track_close)
+    monkeypatch.setattr(lb.os, fault, fail if fault == "scandir" else fail_child_stat)
+    with pytest.raises(lb.BundleTreeError, match="cannot enumerate"):
+        lb.preflight_closed_tree(root)
+    assert opened
+    assert sorted(opened) == sorted(closed)
+
+
+def test_preflight_stable_root_alias_remains_supported(tmp_path):
+    root = tmp_path / "assets"
+    build_tiny_tree(root)
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    assert lb.preflight_closed_tree(alias) == lb.preflight_closed_tree(root)
+
+
 # ---------------------------------------------------------------------------
 # Constructor / fingerprint-input invariants (review item 5): typed refusals
 # at the API surface, without claiming resolver verification
