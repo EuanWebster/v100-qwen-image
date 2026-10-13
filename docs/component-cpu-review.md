@@ -45,3 +45,13 @@ Remaining: real encoder fidelity/RAMcapacity, adapter lifecycle and
 conditioning integration, process-owned job execution, real resource probe/
 calibration, offload/quant equivalence and human quality acceptance. The
 CPU probes reduce interface uncertainty; they do not close those gates.
+
+Final post-review acceptance:2089passed+2skips each guarded Python3.11/3.13;
+controller83, pure memory policy113, processor snapshot18, header38 tests.
+Exact real metadata6 and memory refusal3 each; real offline processor6 each;
+synthetic helper36/miniature worker12/cross-version client8 each. Real served
+Chrome105checks each backend, generation disabled. Earlier logged totals
+remain historical. Review fixes additionally own builtin request primitives,
+refuse invalid UTF-8 before job creation and separate warm-cache calibration
+from cold encoder allocation. Source is committed, reusable tests/envs remain
+persistent; only the user-owned sandbox.yaml change is intentionally dirty.

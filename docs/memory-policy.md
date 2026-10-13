@@ -17,6 +17,13 @@ policy; embedding-cache hit/miss (cold miss by default); model revision; complet
 identity digest. Missing token lengths do not become zero or inferred text
 length. AUTO is not a resolved backend. Current execution profile is T2I,
 batch1, FP16 Volta; other profiles need a separate reviewed implementation.
+The future runtime-identity producer must include platform/CPU/host execution
+identity, precision/allocator/backend settings and relevant thread/environment
+configuration as well as package/source identity. The encoder's current
+package-metadata digest alone is **not** this broader generation identity.
+A warm embedding-cache observation cannot authorize a cold encoder miss;
+the actual validated branch must match, otherwise use conservative cold
+evidence or refuse. These identity producers/collectors remain unimplemented.
 
 Device identity includes UUID, architecture, driver and CUDA build. The
 resource provider must independently verify actual CUDA kernel execution
