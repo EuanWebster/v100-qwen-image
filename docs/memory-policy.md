@@ -13,7 +13,7 @@ Every descriptor includes phase; exact denoise step index; resolution/token
 grid; total steps; measured positive/active-negative prompt lengths; CFG
 activity (not an assumed doubled batch); resolved attention backend; exact
 quant-format label; residency; VAE tiling; encoder/execution dtypes; KV-cache
-policy; model revision; complete asset-set digest; runtime/implementation
+policy; embedding-cache hit/miss (cold miss by default); model revision; complete asset-set digest; runtime/implementation
 identity digest. Missing token lengths do not become zero or inferred text
 length. AUTO is not a resolved backend. Current execution profile is T2I,
 batch1, FP16 Volta; other profiles need a separate reviewed implementation.
@@ -60,7 +60,7 @@ fragmentation freedom, numerical quality or resource reservation against
 other services. Caller code must still enforce all hardware/assets/fidelity
 gates. Unknown/unmeasured fields never enable a pass.
 
-111 guarded pure tests cover every descriptor/device drift, unresolved
+113 guarded pure tests cover every descriptor/device/cache drift, unresolved
 backend/dtypes/steps, staleness/future/clock faults, conditioning unknowns,
 incomplete/old records, parent-only/Torch-only peaks, finite/zero/unknown
 cgroup constraints, exact2K refusal, bounds, worst-case/headroom arithmetic

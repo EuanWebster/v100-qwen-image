@@ -46,7 +46,7 @@ def test_exact_complete_trusted_fixture_arithmetic(evidence):
     ("prompt_tokens", 26), ("negative_prompt_tokens", 11), ("backend", "efficient"),
     ("quant_format", "gguf-q8_0"), ("residency", "streamed"), ("vae_tiled_decode", True),
     ("encoder_dtype", "bf16"), ("use_kv_cache", False), ("model_revision", "d" * 40),
-    ("artifact_set_sha256", "d" * 64), ("runtime_identity_sha256", "d" * 64),
+    ("artifact_set_sha256", "d" * 64), ("runtime_identity_sha256", "d" * 64), ("embedding_cache_hit", True),
 ])
 def test_every_execution_conditioning_identity_drift_refuses(evidence, field, value):
     descriptor, resources, sample = evidence
@@ -174,7 +174,7 @@ def test_clock_fault_refuses_without_masking_or_fake_time(evidence, monkeypatch)
     ("execution_dtype", "bf16"), ("use_kv_cache", None), ("model_revision", "main"),
     ("artifact_set_sha256", "z" * 64), ("runtime_identity_sha256", None),
     ("prompt_tokens", 0), ("prompt_tokens", True), ("negative_prompt_tokens", 1_000_001),
-    ("step_index", 0)])
+    ("step_index", 0), ("embedding_cache_hit", 1)])
 def test_invalid_or_unresolved_descriptor_typed_refusal(evidence, field, value):
     with pytest.raises(m.MemoryPolicyError):
         replace(evidence[0], **{field: value})

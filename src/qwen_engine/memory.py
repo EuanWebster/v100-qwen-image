@@ -68,6 +68,7 @@ class PolicyDescriptor:
     artifact_set_sha256: str
     runtime_identity_sha256: str
     step_index: int | None = None
+    embedding_cache_hit: bool = False
     schema: str = POLICY_SCHEMA
 
     def __post_init__(self):
@@ -77,7 +78,8 @@ class PolicyDescriptor:
                 or any(not _integer(v, positive=True) or not DIM_MIN <= v <= DIM_MAX or v % DIM_MULTIPLE
                        for v in (self.width, self.height))
                 or not _integer(self.steps, positive=True) or self.steps > 1000
-                or any(type(v) is not bool for v in (self.cfg_active, self.vae_tiled_decode, self.use_kv_cache))
+                or any(type(v) is not bool for v in (self.cfg_active, self.vae_tiled_decode,
+                                                    self.use_kv_cache, self.embedding_cache_hit))
                 or self.backend not in ("sdpa", "efficient", "eager")
                 or not _label(self.quant_format) or self.residency not in ("resident", "streamed", "offload")
                 or self.encoder_dtype not in ("fp16", "bf16", "fp32") or self.execution_dtype != "fp16"
