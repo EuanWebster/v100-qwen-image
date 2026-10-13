@@ -91,7 +91,9 @@ invariance for generation-only settings and unrelated VAE changes, and cache
 invalidation for encoder/tokenizer/template changes. Both full guarded suites
 passed: **1063 passed, 2 skipped**, Python 3.11.15 and 3.13.5.
 
-Next: narrow closed-subtree verification, then local-only loader/worker CLI
+The follow-on `encoder_assets.py` supplies narrow closed-subtree and fresh
+byte verification after the actual memory prerequisite (see
+`docs/encoder-assets.md`). Next: local-only loader/worker CLI
 with required runtime headroom and memory checks before ML imports or shard
 hashing/loading. Real processor, checkpoint parity, host/GPU fit, CUDA execution
 and generation remain unvalidated. The V100 is still unavailable according
