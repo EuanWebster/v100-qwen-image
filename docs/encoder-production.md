@@ -88,9 +88,11 @@ for. Other network attempts and writes outside owned fixtures fail the check.
 
 ## Remaining gates
 
-The helper trusts supplied components/environment; a package validator and
-verified-bundle request factory must bind actual assets and installed packages
-before production wiring. Local-only loading, host-memory preflight integration,
+The helper trusts supplied components/environment. The follow-on
+`encoder_identity.py` provides package validation, manifest/bundle request
+projection and full executing-worker identity comparison (see
+`docs/encoder-identity.md`); these must be wired into the production boundary.
+Actual asset bytes still need fresh verification. Local-only loading, host-memory preflight integration,
 worker CLI and adapter wiring remain separate milestones. Locks are unchanged;
 real processor loading still needs the previously identified torchvision
 dependency fix. No real checkpoint, numerical checkpoint parity, GPU kernel,
