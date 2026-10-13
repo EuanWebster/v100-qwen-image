@@ -578,6 +578,194 @@ def test_direct_encoder_forward_classifier_exact_calls():
         assert not mod._is_direct_encoder_forward(_call(negative)), negative
 
 
+@pytest.mark.parametrize("changed", [
+    PIPELINE + "\nclass QwenImage21Pipeline:\n    pass\n",
+    "def factory():\n" + "\n".join("    " + line for line in PIPELINE.splitlines()),
+    PIPELINE + "\nQwenImage21Pipeline = object()\n",
+    PIPELINE + "\ndef QwenImage21Pipeline():\n    pass\n",
+    PIPELINE.replace("    def __call__(self, prompt=None", "    encode_prompt = object()\n\n    def __call__(self, prompt=None"),
+    PIPELINE.replace("    def __call__(self, prompt=None", "    def encode_prompt(self):\n        pass\n\n    def __call__(self, prompt=None"),
+])
+def test_nested_duplicate_or_overwritten_definitions_are_not_accepted(tmp_path, changed):
+    rc, out, err = _run(_load_checker(), tmp_path, pipeline=changed)
+    assert rc == 1, out + err
+    assert "[FAIL][code]" in out
+
+
+def test_singlefile_converter_must_be_a_unique_direct_definition(tmp_path):
+    duplicate = SF_UTIL + "\ndef convert_qwen_image21_transformer_checkpoint_to_diffusers():\n    pass\n"
+    rc, out, err = _run(_load_checker(), tmp_path, sf_util=duplicate)
+    assert rc == 1, out + err
+    assert "[FAIL][code] singlefile: converter function exists" in out
+
+
+@pytest.mark.parametrize("literal", ["True", "1.0"])
+def test_default_literal_type_is_part_of_the_pinned_shape(tmp_path, literal):
+    changed = PIPELINE.replace("num_images_per_prompt=1", "num_images_per_prompt=" + literal)
+    rc, out, err = _run(_load_checker(), tmp_path, pipeline=changed)
+    assert rc == 1, out + err
+    assert any("pinned defaults" in line for line in out.splitlines() if "[FAIL]" in line)
+
+
+@pytest.mark.parametrize("old,new", [
+    ("args[0]", "args[False]"),
+    ("args[0]", "args[0.0]"),
+    ("text_model.norm.register_forward_hook", "unrelated.norm.register_forward_hook"),
+    ("text_model.norm.register_forward_hook", "text_model.norm.helper.register_forward_hook"),
+    ("lambda module, args, output", "lambda args, module, output"),
+    ("        try:\n", "        handle = other_handle\n        try:\n"),
+])
+def test_hook_lookalikes_and_reassigned_handle_are_not_evidence(tmp_path, old, new):
+    changed = PIPELINE.replace(old, new)
+    assert changed != PIPELINE
+    rc, out, err = _run(_load_checker(), tmp_path, pipeline=changed)
+    assert rc == 1, out + err
+    assert "[FAIL][code] pre-RMSNorm hook: forward hook" in out
+
+
+@pytest.mark.parametrize("call", ["unrelated", "helper.dispatch_attention_fn"])
+def test_backend_none_requires_exact_dispatch_calls(tmp_path, call):
+    changed = TRANSFORMER.replace("dispatch_attention_fn(", call + "(")
+    rc, out, err = _run(_load_checker(), tmp_path, transformer=changed)
+    assert rc == 1, out + err
+    assert "[FAIL][code] segmented processor:" in out
+
+
+@pytest.mark.parametrize("changed", [
+    TRANSFORMER.replace("QwenImage21FlexAttnProcessor]", "QwenImage21FlexAttnProcessor, None]"),
+    TRANSFORMER.replace("class QwenImage21Transformer2DModel:",
+        "    _default_processor_cls: object = wrong_processor\n\nclass QwenImage21Transformer2DModel:"),
+])
+def test_processor_list_cannot_hide_extra_entries_or_overwrites(tmp_path, changed):
+    rc, out, err = _run(_load_checker(), tmp_path, transformer=changed)
+    assert rc == 1, out + err
+    assert any("transformer:" in line for line in out.splitlines() if "[FAIL]" in line)
+
+
+def test_ast_parser_recursion_failure_is_a_typed_contract_failure(tmp_path, monkeypatch):
+    mod = _load_checker()
+
+    def fail(*args, **kwargs):
+        raise RecursionError("fixture recursion")
+
+    monkeypatch.setattr(mod.ast, "parse", fail)
+    rc, out, err = _run(mod, tmp_path)
+    assert rc == 1, out + err
+    assert "parser recursion budget exceeded" in out
+    assert "Traceback" not in err
+
+
+@pytest.mark.parametrize("method", ["__init__", "encode_prompt", "__call__", "_get_qwen_prompt_embeds"])
+def test_async_methods_are_not_the_reviewed_synchronous_abi(tmp_path, method):
+    changed = PIPELINE.replace("def " + method + "(", "async def " + method + "(")
+    rc, out, err = _run(_load_checker(), tmp_path, pipeline=changed)
+    assert rc == 1, out + err
+    assert "[FAIL][code]" in out
+
+
+def test_ast_analysis_recursion_failure_is_typed_contract_drift(tmp_path, monkeypatch):
+    mod = _load_checker()
+
+    def fail(*args):
+        raise RecursionError("fixture AST analysis failure")
+
+    monkeypatch.setattr(mod, "check_pipeline", fail)
+    rc, out, err = _run(mod, tmp_path)
+    assert rc == 1, out + err
+    assert "AST analysis recursion budget exceeded" in out
+    assert "Traceback" not in err
+
+
+def test_source_cap_rejects_before_any_read(tmp_path, monkeypatch):
+    mod = _load_checker()
+    path = tmp_path / "large.py"
+    path.write_bytes(b" " * (mod.MAX_SOURCE_BYTES + 1))
+
+    def no_read(*args):
+        raise AssertionError("oversized source read attempted")
+
+    monkeypatch.setattr(mod.os, "read", no_read)
+    with pytest.raises(mod.InputError, match="regular file <="):
+        mod.read_file(str(path))
+
+
+@pytest.mark.parametrize("special", ["fifo", "directory"])
+def test_source_reader_refuses_special_files_without_blocking(tmp_path, monkeypatch, special):
+    mod = _load_checker()
+    path = tmp_path / "source.py"
+    if special == "fifo":
+        os.mkfifo(path)
+    else:
+        path.mkdir()
+    real_open = os.open
+
+    def check_open(path, flags, *args, **kwargs):
+        assert flags & os.O_NONBLOCK
+        assert flags & os.O_NOFOLLOW
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(mod.os, "open", check_open)
+    with pytest.raises(mod.InputError, match="regular file"):
+        mod.read_file(str(path))
+
+
+@pytest.mark.parametrize("change", ["grow", "shrink", "replace", "restore-mtime"])
+def test_source_reader_detects_changes_and_bounds_bytes(tmp_path, monkeypatch, change):
+    mod = _load_checker()
+    path = tmp_path / "source.py"
+    path.write_bytes(b"abcdef")
+    before = path.stat()
+    real_read = os.read
+    changed, received = [], []
+
+    def mutate(fd, size):
+        block = real_read(fd, size)
+        received.append(len(block))
+        if not changed:
+            changed.append(True)
+            if change == "grow":
+                with path.open("ab") as out:
+                    out.write(b"x" * 100)
+            elif change == "shrink":
+                path.write_bytes(b"x")
+            elif change == "replace":
+                path.rename(tmp_path / "original")
+                path.write_bytes(b"ABCDEF")
+            else:
+                path.write_bytes(b"ABCDEF")
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return block
+
+    monkeypatch.setattr(mod.os, "read", mutate)
+    with pytest.raises(mod.InputError, match="grew|changed"):
+        mod.read_file(str(path))
+    assert sum(received) <= before.st_size + 1
+
+
+def test_source_reader_stable_alias_and_primary_error_cleanup(tmp_path, monkeypatch):
+    mod = _load_checker()
+    path, alias = tmp_path / "source.py", tmp_path / "alias.py"
+    path.write_text("value = 1\n")
+    alias.symlink_to(path)
+    assert mod.read_file(str(alias)) == "value = 1\n"
+    real_close = os.close
+    closed = []
+
+    def fail_read(*args):
+        raise OSError("primary source read fault")
+
+    def fail_close(fd):
+        closed.append(fd)
+        real_close(fd)
+        raise OSError("secondary close fault")
+
+    monkeypatch.setattr(mod.os, "read", fail_read)
+    monkeypatch.setattr(mod.os, "close", fail_close)
+    with pytest.raises(mod.InputError, match="primary source read fault"):
+        mod.read_file(str(alias))
+    assert len(closed) == 1
+
+
 # --- 2. optional external pinned-tree check (explicit skip when env absent) -
 
 @pytest.mark.skipif(

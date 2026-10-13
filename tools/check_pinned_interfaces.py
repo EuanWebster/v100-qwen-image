@@ -27,6 +27,12 @@ Every check carries an evidence kind:
           shape is still present. Behavioural proof belongs to
           adapter-level tests (M4+), not to this checker.
 
+Required inputs are read as regular, nonblocking/no-follow snapshots capped
+at 2 MiB per source file; stable explicit source aliases remain supported.
+Definitions must be unique/direct and methods synchronous; hook/processor
+targets and default literal types must match the surveyed source shape.
+These checks still are NOT general binding/control-flow analysis.
+
 Inputs are explicit — there are NO implicit task-specific defaults:
 
     python tools/check_pinned_interfaces.py --diffusers-src DIR --transformers-src DIR
@@ -51,9 +57,11 @@ from __future__ import annotations
 import argparse
 import ast
 import os
+import stat
 import sys
 
 _TRY_NODES = tuple(getattr(ast, n) for n in ("Try", "TryStar") if hasattr(ast, n))
+MAX_SOURCE_BYTES = 2 * 1024 * 1024
 
 
 class InputError(Exception):
@@ -71,11 +79,35 @@ class Report:
 
 
 def read_file(path: str) -> str:
+    """Bounded regular-file snapshot; stable explicit source aliases are allowed."""
     try:
-        if not os.path.isfile(path):
-            raise InputError(f"{path}: not a regular file")
-        with open(path, encoding="utf-8") as fh:
-            return fh.read()
+        original = os.path.abspath(path)
+        canonical = os.path.realpath(original, strict=True)
+        fd = os.open(canonical, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_SOURCE_BYTES:
+                raise InputError(f"{path}: source must be a regular file <= {MAX_SOURCE_BYTES} bytes")
+            data = bytearray()
+            while block := os.read(fd, min(65536, before.st_size + 1 - len(data))):
+                data.extend(block)
+                if len(data) > before.st_size:
+                    raise InputError(f"{path}: source grew during read")
+            def signature(info):
+                return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                        info.st_mtime_ns, info.st_ctime_ns)
+            if (len(data) != before.st_size or signature(before) != signature(os.fstat(fd))
+                    or signature(before) != signature(os.stat(canonical, follow_symlinks=False))
+                    or os.path.realpath(original, strict=True) != canonical):
+                raise InputError(f"{path}: source changed during read")
+            return data.decode("utf-8")
+        finally:
+            primary = sys.exception()
+            try:
+                os.close(fd)
+            except OSError:
+                if primary is None:
+                    raise
     except OSError as exc:
         raise InputError(f"{path}: cannot read ({exc.strerror or exc})") from exc
     except UnicodeDecodeError as exc:
@@ -96,23 +128,40 @@ def parse_source(src: str, key: str, rep: Report) -> ast.Module | None:
         rep.check("code", f"{key}: source parses", False,
                   f"{type(exc).__name__}: {exc}")
         return None
+    except RecursionError:
+        rep.check("code", f"{key}: source parses", False, "parser recursion budget exceeded")
+        return None
 
 
 # ---------------------------------------------------------------------------
 # small AST helpers
 
 def find_class(tree: ast.AST, name: str) -> ast.ClassDef | None:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == name:
-            return node
-    return None
+    return _unique_definition(tree, name, (ast.ClassDef,))
 
 
 def find_func(node: ast.AST, name: str) -> ast.FunctionDef | None:
-    for child in ast.iter_child_nodes(node):
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == name:
-            return child
-    return None
+    # Async methods return coroutines and are not the surveyed synchronous ABI.
+    return _unique_definition(node, name, (ast.FunctionDef,))
+
+
+def _unique_definition(scope: ast.AST, name: str, kinds):
+    """One direct definition, not a nested/duplicate/directly overwritten lookalike.
+
+    This remains a shape tripwire, not general binding/control-flow analysis.
+    """
+    body = getattr(scope, "body", ())
+    matches = [child for child in body if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+               and child.name == name]
+    if len(matches) != 1 or not isinstance(matches[0], kinds):
+        return None
+    for stmt in body:
+        targets = (stmt.targets if isinstance(stmt, ast.Assign)
+                   else [stmt.target] if isinstance(stmt, (ast.AnnAssign, ast.AugAssign)) else [])
+        if any(isinstance(target, ast.Name) and target.id == name
+               for root in targets for target in ast.walk(root)):
+            return None
+    return matches[0]
 
 
 def param_map(fn: ast.FunctionDef) -> dict[str, ast.expr | None]:
@@ -162,7 +211,7 @@ def check_signature(rep: Report, label: str, fn: ast.FunctionDef,
     names = [x.arg for x in a.posonlyargs + a.args + a.kwonlyargs]
     defaults = {n: const_of(d) for n, d in param_map(fn).items()}
     drift = {k: (defaults.get(k, "<missing>"), v) for k, v in defaults_expected.items()
-             if defaults.get(k, "<missing>") != v}
+             if type(defaults.get(k)) is not type(v) or defaults.get(k, "<missing>") != v}
     missing_names = [n for n in pos_names if n not in names]
     rep.check("code", f"{label}: pinned defaults, no dropped parameters",
               not drift and not missing_names, f"drift={drift} missing={missing_names}")
@@ -222,7 +271,7 @@ def _is_is_not_none(v: ast.expr, names: set[str]) -> bool:
 
 def _is_zero_index(x) -> bool:
     if isinstance(x, ast.Constant):
-        return x.value == 0
+        return type(x.value) is int and x.value == 0
     index = getattr(ast, "Index", None)
     if index is not None and isinstance(x, index):
         return _is_zero_index(x.value)
@@ -238,12 +287,19 @@ def hook_targets(node: ast.AST) -> set[str]:
                 and isinstance(n.value, ast.Call)
                 and isinstance(n.value.func, ast.Attribute)
                 and n.value.func.attr == "register_forward_hook"
-                and any(isinstance(m, ast.Attribute) and m.attr == "norm"
-                        for m in ast.walk(n.value.func))
+                and isinstance(n.value.func.value, ast.Attribute)
+                and n.value.func.value.attr == "norm"
+                and isinstance(n.value.func.value.value, ast.Name)
+                and n.value.func.value.value.id == "text_model"
+                and len(n.value.args) == 1 and not n.value.keywords
                 and any(isinstance(a, ast.Lambda) and isinstance(a.body, ast.Subscript)
+                        and [p.arg for p in a.args.args] == ["module", "args", "output"]
+                        and not (a.args.posonlyargs or a.args.kwonlyargs or a.args.defaults
+                                 or a.args.vararg or a.args.kwarg)
                         and isinstance(a.body.value, ast.Name) and a.body.value.id == "args"
                         and _is_zero_index(a.body.slice) for a in n.value.args)):
-            out.add(n.targets[0].id)
+            if len(assignments_to(node, n.targets[0].id)) == 1:
+                out.add(n.targets[0].id)
     return out
 
 
@@ -404,6 +460,7 @@ def check_pipeline(src: str, rep: Report) -> None:
                 and isinstance(c.ops[0], ast.Gt)
                 and isinstance(c.left, ast.Name) and c.left.id == "true_cfg_scale"
                 and isinstance(c.comparators[0], ast.Constant)
+                and type(c.comparators[0].value) in (int, float)
                 and c.comparators[0].value in (1, 1.0))
 
     def _is_hn(c: ast.expr) -> bool:
@@ -483,12 +540,10 @@ def check_transformer(src: str, rep: Report) -> None:
     attn = find_class(tree, "QwenImage21Attention")
     rep.check("code", "transformer: QwenImage21Attention exists", attn is not None)
     if attn is not None:
-        defaults = {t.targets[0].id: t.value
-                    for t in attn.body
-                    if isinstance(t, ast.Assign) and len(t.targets) == 1
-                    and isinstance(t.targets[0], ast.Name)}
-        dflt = defaults.get("_default_processor_cls")
-        avail = defaults.get("_available_processors")
+        default_values = assignments_to(attn, "_default_processor_cls")
+        available_values = assignments_to(attn, "_available_processors")
+        dflt = default_values[0] if len(default_values) == 1 else None
+        avail = available_values[0] if len(available_values) == 1 else None
         rep.check("code", "transformer: default processor is the segmented "
                           "QwenImage21AttnProcessor",
                   isinstance(dflt, ast.Name) and dflt.id == "QwenImage21AttnProcessor",
@@ -498,7 +553,8 @@ def check_transformer(src: str, rep: Report) -> None:
         else:
             ids = []
         rep.check("code", "transformer: processors = [segmented, flex-optional]",
-                  ids == ["QwenImage21AttnProcessor", "QwenImage21FlexAttnProcessor"],
+                  ids == ["QwenImage21AttnProcessor", "QwenImage21FlexAttnProcessor"]
+                  and len(avail.elts) == 2,
                   str(ids))
 
     model = find_class(tree, "QwenImage21Transformer2DModel")
@@ -522,11 +578,13 @@ def check_transformer(src: str, rep: Report) -> None:
 
     seg = find_class(tree, "QwenImage21AttnProcessor")
     n_none = 0
-    if seg is not None:
-        for c in ast.walk(seg):
-            if isinstance(c, ast.Call) and any(
+    seg_call = find_func(seg, "__call__") if seg is not None else None
+    if seg_call is not None:
+        for c in ast.walk(seg_call):
+            if (isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+                    and c.func.id == "dispatch_attention_fn" and any(
                     k.arg == "backend" and isinstance(k.value, ast.Constant)
-                    and k.value.value is None for k in c.keywords):
+                    and k.value.value is None for k in c.keywords)):
                 n_none += 1
     rep.check("code", "segmented processor: >=2 dispatch calls pass "
                       "backend=None explicitly (real call nodes, not text)",
@@ -583,10 +641,7 @@ def check_singlefile(map_src: str, util_src: str, rep: Report) -> None:
     util_tree = parse_source(util_src, "singlefile util", rep)
     if util_tree is None:
         return
-    fn = next((n for n in ast.walk(util_tree)
-               if isinstance(n, ast.FunctionDef)
-               and n.name == "convert_qwen_image21_transformer_checkpoint_to_diffusers"),
-              None)
+    fn = find_func(util_tree, "convert_qwen_image21_transformer_checkpoint_to_diffusers")
     rep.check("code", "singlefile: converter function exists (transformer-only; "
                       "NO pipeline entry)", fn is not None)
     if fn is not None:
@@ -674,12 +729,16 @@ def main(argv: list[str]) -> int:
         return 2
 
     rep = Report()
-    check_pipeline(sources["pipeline"], rep)
-    check_transformer(sources["transformer"], rep)
-    check_vae(sources["vae"], rep)
-    check_gguf(sources["gguf"], rep)
-    check_singlefile(sources["sf_map"], sources["sf_util"], rep)
-    check_transformers_side(sources["tvl"], rep)
+    for checker, keys in (
+        (check_pipeline, ("pipeline",)), (check_transformer, ("transformer",)),
+        (check_vae, ("vae",)), (check_gguf, ("gguf",)),
+        (check_singlefile, ("sf_map", "sf_util")), (check_transformers_side, ("tvl",)),
+    ):
+        try:
+            checker(*(sources[key] for key in keys), rep)
+        except RecursionError:
+            rep.check("code", f"{','.join(keys)}: AST analysis fits recursion budget",
+                      False, "AST analysis recursion budget exceeded")
 
     failed = sum(1 for r in rep.rows if r[0] == "FAIL")
     code_n = sum(1 for r in rep.rows if r[1] == "code")
