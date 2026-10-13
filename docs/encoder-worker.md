@@ -111,7 +111,8 @@ refusal verified at the end.
 There is no downloaded reference-checkpoint load, real processor fidelity,
 RAM/VRAM fit, GPU kernel or generation acceptance. Actual memory discovery and
 missing/unlocked torchvision continue to refuse production. Full-project
-review is next; it must include transitive-runtime/cache identity completeness
-(the current identity policy checks the named direct packages, not every
-locked transitive distribution) before any production activation, plus parent/
-child runtime handoff and all existing modules. Web generation stays disabled.
+review is ongoing. The transitive-runtime/cache identity gap has been corrected:
+all 63 locked runtime versions are now validated, and Python patch/optional
+distribution/source metadata enter identity (see `docs/encoder-identity.md`).
+Parent/child runtime handoff and review of all existing modules remain before
+production activation. Web generation stays disabled.

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 from dataclasses import replace
@@ -46,7 +47,7 @@ def reviewed_fixture(monkeypatch):
     return package_facts()
 
 
-def fake_distributions(monkeypatch, *, documents=None, missing=(), versions=None):
+def fake_distributions(monkeypatch, *, documents=None, missing=(), versions=None, extra=()):
     documents = {} if documents is None else documents
     versions = {} if versions is None else versions
     calls = []
@@ -58,10 +59,14 @@ def fake_distributions(monkeypatch, *, documents=None, missing=(), versions=None
         url, commit = ei.VCS_PINS.get(name, (None, None))
         default = None if url is None else json.dumps({"url": url, "vcs_info": {
             "vcs": "git", "commit_id": commit, "requested_revision": commit}})
-        return SimpleNamespace(version=versions.get(name, ei.PACKAGE_VERSIONS.get(name, VISION_FIXTURE)),
+        return SimpleNamespace(metadata={"Name": name},
+                               version=versions.get(name, ei.PACKAGE_VERSIONS.get(name, VISION_FIXTURE)),
                                read_text=lambda field: documents.get(name, default))
 
     monkeypatch.setattr(ei.metadata, "distribution", lookup)
+    inventory = [lookup(name) for name in (*ei.PACKAGE_NAMES, *extra) if name not in missing]
+    calls.clear()
+    monkeypatch.setattr(ei.metadata, "distributions", lambda: iter(inventory))
     return calls
 
 
@@ -99,6 +104,7 @@ def test_observer_missing_all_packages(monkeypatch):
 
 
 def test_read_failure_is_not_misreported_as_missing_distribution(monkeypatch):
+    fake_distributions(monkeypatch)
     def read(_):
         raise ei.metadata.PackageNotFoundError("broken metadata file")
     monkeypatch.setattr(ei.metadata, "distribution", lambda _: SimpleNamespace(
@@ -108,6 +114,7 @@ def test_read_failure_is_not_misreported_as_missing_distribution(monkeypatch):
 
 
 def test_keyboard_interrupt_is_never_wrapped(monkeypatch):
+    fake_distributions(monkeypatch)
     def interrupted(_):
         raise KeyboardInterrupt()
     monkeypatch.setattr(ei.metadata, "distribution", interrupted)
@@ -160,6 +167,121 @@ def test_observations_and_snapshot_defensively_frozen():
         ei.PackageObservation(None, url="x")
     with pytest.raises(EncoderSetupError):
         replace(facts, packages={})
+
+
+def test_runtime_policy_matches_complete_reviewed_lock():
+    registry, vcs = {}, {}
+    for line in (ROOT / "requirements.lock").read_text().splitlines():
+        match = re.match(r"([a-z0-9-]+)==([^\s]+)", line)
+        if match:
+            assert match[1] not in registry
+            registry[match[1]] = match[2]
+        match = re.match(r"([a-z0-9-]+) @ git\+([^@]+)@([a-f0-9]{40})$", line)
+        if match:
+            vcs[match[1]] = (match[2], match[3])
+    assert len(registry) + len(vcs) == 63
+    assert vcs == dict(ei.VCS_PINS)
+    assert registry == {n: v for n, v in ei.PACKAGE_VERSIONS.items() if n not in vcs}
+    assert set(ei.PACKAGE_VERSIONS) == set(registry) | set(vcs)
+
+
+def test_optional_inventory_observed_without_imports(monkeypatch):
+    fake_distributions(monkeypatch, extra=("optional-kernel", "qwen-engine"),
+                       versions={"optional-kernel": "1.0", "qwen-engine": "0.1.0"})
+    facts = ei.observe_installed_packages()
+    assert dict(facts.extra_packages) == {"optional-kernel": ei.PackageObservation("1.0")}
+    with pytest.raises(TypeError):
+        facts.extra_packages["optional-kernel"] = ei.PackageObservation("2.0")
+
+
+@pytest.mark.parametrize("names", [("Torch", "torch"), ("some_lib", "some.lib"),
+                                  ("bad/name",), (None,), ("",), ("x" * 129,)])
+def test_ambiguous_or_invalid_distribution_inventory_refused(monkeypatch, names):
+    monkeypatch.setattr(ei.metadata, "distributions", lambda: iter(
+        SimpleNamespace(metadata={"Name": name}) for name in names))
+    with pytest.raises(EncoderSetupError, match="inventory"):
+        ei.observe_installed_packages()
+
+
+def test_inventory_bound_and_interrupt(monkeypatch):
+    fake_distributions(monkeypatch)
+    monkeypatch.setattr(ei, "MAX_DISTRIBUTIONS", 1)
+    with pytest.raises(EncoderSetupError, match="count cap"):
+        ei.observe_installed_packages()
+    def interrupted():
+        raise KeyboardInterrupt()
+    monkeypatch.setattr(ei.metadata, "distributions", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        ei.observe_installed_packages()
+
+
+def test_direct_source_metadata_canonical_and_complete(monkeypatch):
+    first = {"url": "file:///fixture", "dir_info": {"editable": True}}
+    fake_distributions(monkeypatch, extra=("optional-kernel",),
+                       documents={"optional-kernel": json.dumps(first)})
+    original = ei.runtime_metadata_digest(ei.observe_installed_packages())
+    fake_distributions(monkeypatch, extra=("optional-kernel",), documents={
+        "optional-kernel": json.dumps(first, sort_keys=True, indent=4)})
+    assert original == ei.runtime_metadata_digest(ei.observe_installed_packages())
+    first["dir_info"]["editable"] = False
+    fake_distributions(monkeypatch, extra=("optional-kernel",), documents={
+        "optional-kernel": json.dumps(first)})
+    assert original != ei.runtime_metadata_digest(ei.observe_installed_packages())
+
+
+def test_runtime_digest_canonical_anchor_and_relocation(reviewed_fixture):
+    facts = reviewed_fixture
+    rows = [[n, v.version, v.url, v.vcs, v.commit, v.direct_url_sha256]
+            for n, v in sorted(facts.packages.items())]
+    doc = {"schema": "qwen_engine.runtime-metadata.v1", "python_version": [3, 11, 15],
+           "packages": rows}
+    expected = hashlib.sha256(json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert ei.runtime_metadata_digest(facts) == expected
+    relocated = replace(facts, executable="/relocated/python",
+                        packages=dict(reversed(list(facts.packages.items()))))
+    assert ei.runtime_metadata_digest(relocated) == expected
+
+
+@pytest.mark.parametrize("change", ["patch", "minor", "extra", "extra-version", "extra-source"])
+def test_runtime_change_invalidates_cache_and_worker_request(manifest, reviewed_fixture, monkeypatch, change):
+    facts = replace(reviewed_fixture, extra_packages={"optional-kernel": ei.PackageObservation("1.0")})
+    monkeypatch.setattr(ei, "observe_installed_packages", lambda: facts)
+    config = GenerationConfig()
+    original = ei.project_encoder_request(config, manifest, encoder_dtype="fp16")
+    if change in ("patch", "minor"):
+        facts = replace(facts, python_version=(3, 11, 16) if change == "patch" else (3, 13, 5))
+    elif change == "extra":
+        facts = replace(facts, extra_packages={})
+    else:
+        facts = replace(facts, extra_packages={"optional-kernel": ei.PackageObservation(
+            "2.0" if change == "extra-version" else "1.0",
+            url="file:///different-source" if change == "extra-source" else None)})
+    other = ei.project_encoder_request(config, manifest, encoder_dtype="fp16")
+    assert cache_key(original) != cache_key(other)
+    with pytest.raises(EncoderRequestError, match="disagrees"):
+        ei.validate_worker_request_identity(original, manifest)
+
+
+@pytest.mark.parametrize("name", ["tokenizers", "jinja2", "numpy", "nvidia-cublas-cu12"])
+def test_transitive_drift_refuses_before_cache_identity(manifest, reviewed_fixture, monkeypatch, name):
+    original = ei.project_encoder_request(GenerationConfig(), manifest, encoder_dtype="fp16")
+    facts = dict(reviewed_fixture.packages)
+    facts[name] = ei.PackageObservation("unreviewed")
+    monkeypatch.setattr(ei, "observe_installed_packages", lambda: replace(reviewed_fixture, packages=facts))
+    with pytest.raises(EncoderSetupError, match=name):
+        ei.project_encoder_request(GenerationConfig(), manifest, encoder_dtype="fp16")
+    with pytest.raises(EncoderSetupError, match=name):
+        ei.validate_worker_request_identity(original, manifest)
+
+
+@pytest.mark.parametrize("extras", [{"torch": ei.PackageObservation("1.0")},
+                                   {"qwen-engine": ei.PackageObservation("1.0")},
+                                   {"bad_name": ei.PackageObservation("1.0")},
+                                   {"optional": ei.PackageObservation(None)},
+                                   {"optional": "invalid"}])
+def test_invalid_extra_snapshots_refused(extras):
+    with pytest.raises(EncoderSetupError, match="extra"):
+        replace(package_facts(), extra_packages=extras)
 
 
 def source_tree(root):

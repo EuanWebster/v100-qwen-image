@@ -16,15 +16,17 @@ import hashlib
 import importlib.metadata as metadata
 import json
 import os
+import re
 import stat
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 from qwen_engine._jsonsafe import reject_constant
+from qwen_engine._runtime_pins import RUNTIME_PACKAGE_VERSIONS
 from qwen_engine.config import GenerationConfig
 from qwen_engine.encoder import (
     REQUEST_SCHEMA, ComponentIdentity, EncoderImplementationIdentity,
@@ -39,10 +41,7 @@ from qwen_engine.local_bundle import (
 )
 from qwen_engine.manifest import ModelManifest
 
-PACKAGE_VERSIONS = MappingProxyType({
-    "torch": "2.14.1+cu126", "diffusers": "0.41.0.dev0",
-    "transformers": "5.17.0", "safetensors": "0.8.0",
-})
+PACKAGE_VERSIONS = RUNTIME_PACKAGE_VERSIONS
 VCS_PINS = MappingProxyType({
     "diffusers": ("https://github.com/huggingface/diffusers.git", PINNED_DIFFUSERS_COMMIT),
     "transformers": ("https://github.com/huggingface/transformers.git", PINNED_TRANSFORMERS_COMMIT),
@@ -51,12 +50,16 @@ VCS_PINS = MappingProxyType({
 # compatible version or permit one merely because somebody installed it.
 PINNED_TORCHVISION_VERSION: str | None = None
 PACKAGE_NAMES = (*PACKAGE_VERSIONS, "torchvision")
+ML_MODULE_NAMES = frozenset({"torch", "diffusers", "transformers", "safetensors", "torchvision"})
 SOURCE_DIGEST_SCHEMA = "qwen_engine.worker-source.v1"
+RUNTIME_DIGEST_SCHEMA = "qwen_engine.runtime-metadata.v1"
 PROMPT_EXTRACTION_REVISION = "qwen-image21.upstream-pre-norm.t2i.v1"
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_TOTAL_BYTES = 16 * 1024 * 1024
 MAX_SOURCE_FILES = 256
 MAX_DIRECT_URL_CHARS = 16 * 1024
+MAX_DISTRIBUTIONS = 512
+_PACKAGE_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 TOKENIZER_FILES = frozenset({
     "processor/added_tokens.json", "processor/merges.txt",
     "processor/special_tokens_map.json", "processor/tokenizer.json",
@@ -70,12 +73,21 @@ class PackageObservation:
     url: str | None = None
     vcs: str | None = None
     commit: str | None = None
+    direct_url_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if any(v is not None and (not isinstance(v, str) or not v or v != v.strip())
                for v in (self.version, self.url, self.vcs, self.commit)):
             raise EncoderSetupError("invalid installed package observation")
-        if self.version is None and any(v is not None for v in (self.url, self.vcs, self.commit)):
+        if self.version is not None and len(self.version) > 128:
+            raise EncoderSetupError("oversized installed package version")
+        if self.direct_url_sha256 is not None and (
+                not isinstance(self.direct_url_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", self.direct_url_sha256) is None
+                or self.url is None):
+            raise EncoderSetupError("invalid installed direct-source digest")
+        if self.version is None and any(v is not None for v in (
+                self.url, self.vcs, self.commit, self.direct_url_sha256)):
             raise EncoderSetupError("absent package cannot carry source metadata")
 
 
@@ -84,6 +96,7 @@ class InstalledEncoderPackages:
     executable: str
     python_version: tuple[int, int, int]
     packages: Mapping[str, PackageObservation]
+    extra_packages: Mapping[str, PackageObservation] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if (not isinstance(self.executable, str) or not self.executable
@@ -94,7 +107,15 @@ class InstalledEncoderPackages:
                 or set(self.packages) != set(PACKAGE_NAMES)
                 or any(not isinstance(v, PackageObservation) for v in self.packages.values())):
             raise EncoderSetupError("invalid installed encoder package snapshot")
+        if (not isinstance(self.extra_packages, Mapping)
+                or len(self.packages) + len(self.extra_packages) > MAX_DISTRIBUTIONS
+                or any(not isinstance(k, str) or len(k) > 128 or not _PACKAGE_NAME.fullmatch(k)
+                       or k in PACKAGE_NAMES or k == "qwen-engine"
+                       or not isinstance(v, PackageObservation) or v.version is None
+                       for k, v in self.extra_packages.items())):
+            raise EncoderSetupError("invalid extra installed package snapshot")
         object.__setattr__(self, "packages", MappingProxyType(dict(self.packages)))
+        object.__setattr__(self, "extra_packages", MappingProxyType(dict(self.extra_packages)))
 
 
 def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -113,10 +134,27 @@ def observe_installed_packages() -> InstalledEncoderPackages:
     setup error rather than being relabelled as absent. No other interpreter
     is inspected and no dependency is installed by this function.
     """
-    observed = {}
-    for name in PACKAGE_NAMES:
+    # Inventory optional distributions as well: their presence can affect ML
+    # feature detection even without a lock change. Duplicate normalized names
+    # make lookup ambiguous and are refused, including our own distribution.
+    inventory = {}
+    try:
+        for dist in metadata.distributions():
+            raw_name = dist.metadata.get("Name")
+            if not isinstance(raw_name, str) or len(raw_name) > 128:
+                raise ValueError("invalid distribution name")
+            name = re.sub(r"[-_.]+", "-", raw_name).lower()
+            if not _PACKAGE_NAME.fullmatch(name) or name in inventory:
+                raise ValueError("invalid/duplicate normalized distribution name")
+            inventory[name] = dist
+            if len(inventory) > MAX_DISTRIBUTIONS:
+                raise ValueError("installed distribution-count cap exceeded")
+    except Exception as exc:
+        raise EncoderSetupError(f"cannot inventory installed distributions: {exc}") from exc
+    observed, extras = {}, {}
+    for name in (*PACKAGE_NAMES, *sorted(set(inventory) - set(PACKAGE_NAMES) - {"qwen-engine"})):
         try:
-            dist = metadata.distribution(name)
+            dist = metadata.distribution(name) if name in PACKAGE_NAMES else inventory[name]
         except metadata.PackageNotFoundError:
             observed[name] = PackageObservation(None)
             continue
@@ -127,7 +165,7 @@ def observe_installed_packages() -> InstalledEncoderPackages:
             if not isinstance(version, str) or not version.strip():
                 raise ValueError("missing package version")
             direct = dist.read_text("direct_url.json")
-            url = vcs = commit = None
+            url = vcs = commit = source_digest = None
             if direct is not None:
                 if not isinstance(direct, str) or len(direct) > MAX_DIRECT_URL_CHARS:
                     raise ValueError("oversized/invalid direct_url metadata")
@@ -136,6 +174,9 @@ def observe_installed_packages() -> InstalledEncoderPackages:
                 if not isinstance(doc, dict) or not isinstance(doc.get("url"), str):
                     raise ValueError("direct_url needs an object and URL string")
                 url = doc["url"]
+                source_digest = hashlib.sha256(json.dumps(
+                    doc, sort_keys=True, separators=(",", ":"), allow_nan=False,
+                ).encode()).hexdigest()
                 info = doc.get("vcs_info")
                 if info is not None:
                     if set(doc) - {"url", "vcs_info"}:
@@ -145,10 +186,28 @@ def observe_installed_packages() -> InstalledEncoderPackages:
                     vcs, commit = info.get("vcs"), info.get("commit_id")
                     if not isinstance(vcs, str) or not isinstance(commit, str):
                         raise ValueError("vcs_info needs vcs/commit_id strings")
-            observed[name] = PackageObservation(version, url, vcs, commit)
+            target = observed if name in PACKAGE_NAMES else extras
+            target[name] = PackageObservation(version, url, vcs, commit, source_digest)
         except Exception as exc:
             raise EncoderSetupError(f"cannot inspect installed {name} metadata: {exc}") from exc
-    return InstalledEncoderPackages(sys.executable, tuple(sys.version_info[:3]), observed)
+    return InstalledEncoderPackages(sys.executable, tuple(sys.version_info[:3]), observed, extras)
+
+
+def runtime_metadata_digest(packages: InstalledEncoderPackages) -> str:
+    """Fingerprint Python patch version and the whole observed distribution set.
+
+    This is metadata identity, not installed-byte attestation or an approval of
+    optional packages. The executable path is deliberately excluded. Our own
+    distribution is excluded from inventory because its source is hashed
+    independently (including editable installs without path-fragmented keys).
+    """
+    if not isinstance(packages, InstalledEncoderPackages):
+        raise EncoderSetupError("an InstalledEncoderPackages snapshot is required")
+    rows = [[name, fact.version, fact.url, fact.vcs, fact.commit, fact.direct_url_sha256]
+            for name, fact in sorted({**packages.packages, **packages.extra_packages}.items())]
+    doc = {"schema": RUNTIME_DIGEST_SCHEMA, "python_version": list(packages.python_version),
+           "packages": rows}
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def validate_installed_packages(packages: InstalledEncoderPackages) -> None:
@@ -260,7 +319,8 @@ def _implementation_identity(manifest: ModelManifest) -> EncoderImplementationId
     return EncoderImplementationIdentity(
         encoder_artifact_set_sha256=reference_bundle_fingerprints(manifest).encoder,
         worker_protocol_revision=REQUEST_SCHEMA,
-        worker_implementation_revision=f"{SOURCE_DIGEST_SCHEMA}:{worker_source_digest()}",
+        worker_implementation_revision=(f"{RUNTIME_DIGEST_SCHEMA}:{runtime_metadata_digest(packages)}:"
+                                        f"{SOURCE_DIGEST_SCHEMA}:{worker_source_digest()}"),
         prompt_extraction_revision=PROMPT_EXTRACTION_REVISION,
         diffusers_commit=facts["diffusers"].commit,
         transformers_commit=facts["transformers"].commit,

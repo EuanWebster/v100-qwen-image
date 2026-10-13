@@ -36,12 +36,29 @@ without requiring unrelated DiT/VAE assets.
 `observe_installed_packages()` uses stdlib distribution metadata in the current
 interpreter. It records absence explicitly, refuses corrupt metadata and does
 not confuse a metadata read failure with a missing distribution.
-`validate_installed_packages` requires the exact reviewed torch, diffusers,
-transformers and safetensors versions. The two VCS packages must also match
+`validate_installed_packages` requires all **63 exact reviewed runtime versions**,
+including tokenizers, Jinja, NumPy and CUDA distributions, from the wheel-shipped
+`_runtime_pins.py` policy. A guarded test compares its complete name/version and
+VCS source set with `requirements.lock`; production does not need a checkout or
+a caller-selected lock path. The two VCS packages must also match
 their exact git URL/full commit; subdirectory/mixed-source metadata is refused.
 Supported Python minor versions are 3.11 and 3.13. Metadata is evidence of
 declared source/version, not cryptographic attestation of installed bytes or
 proof that imports, CUDA, or model loading will succeed.
+
+`runtime_metadata_digest()` includes the exact Python patch version, all
+required-package observations (including explicit absence), and optional installed
+distributions, with version and direct-source provenance. Canonical full
+`direct_url.json` hashes catch source metadata changes beyond URL/commit. Duplicate
+normalized distribution names, invalid metadata and oversized inventories are
+refused. Optional presence/version/source changes conservatively invalidate
+identity; fingerprinting an optional package is **not approval of its code**.
+Our own `qwen-engine` distribution metadata is excluded because its sources are
+hashed independently; editable checkout paths do not fragment these keys.
+Both runtime and source digests enter the worker implementation revision.
+Absolute interpreter paths and distribution enumeration order are excluded.
+Same-version installed-byte tampering and environment-variable changes are not
+attested by distribution metadata.
 
 There is **no reviewed torchvision pin in the current lock**. Production
 identity creation therefore fails closed whether torchvision is absent or
@@ -96,7 +113,18 @@ byte verification after the actual memory prerequisite (see
 `docs/encoder-assets.md`). The local-only loader/worker now integrates these
 boundaries (`docs/encoder-worker.md`), with required runtime headroom and memory
 checks before ML imports or shard hashing/loading. Full-project review,
-including transitive-runtime identity completeness, remains before activation.
+including parent/child runtime handoff and the other modules, remains before activation.
 Real processor, checkpoint parity, host/GPU fit, CUDA execution
 and generation remain unvalidated. The V100 is still unavailable according
 to the last user confirmation.
+
+Review correction, 2026-10-13: the original four-package policy could miss
+transitive drift. Complete lock validation and runtime identity now close that
+gap at request projection/worker validation; generic opaque cache hits still
+require a freshly projected executing-runtime request at the production boundary.
+Identity tests now total **400**, including all 64 required names/vision-gate
+drift combinations, lock-policy consistency, optional inventory/source drift,
+Python patch drift, canonical digest anchors and stale worker refusal. Both
+guarded full suites: **1480 passed, 2 skipped**, Python 3.11.15/3.13.5.
+Real identity checks: **6/6 each**, with all 63 locked packages matching and the
+unreviewed torchvision gate still refusing production. Locks were not modified.

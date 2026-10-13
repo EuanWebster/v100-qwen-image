@@ -16,14 +16,14 @@ sys.path.insert(0, str(ROOT / "src"))
 
 def main():
     from qwen_engine.encoder_identity import (
-        PACKAGE_NAMES, observe_installed_packages, validate_installed_packages,
-        worker_source_digest,
+        ML_MODULE_NAMES, PACKAGE_VERSIONS, observe_installed_packages, validate_installed_packages,
+        worker_source_digest, runtime_metadata_digest,
     )
     from qwen_engine.encoder import EncoderSetupError
     from qwen_engine.local_bundle import reference_bundle_fingerprints
     from qwen_engine.manifest import load_manifest
 
-    assert not any(name.split(".")[0] in PACKAGE_NAMES for name in sys.modules)
+    assert not any(name.split(".")[0] in ML_MODULE_NAMES for name in sys.modules)
     facts = observe_installed_packages()
     assert facts.executable == sys.executable
     assert facts.packages["torchvision"].version is None
@@ -36,16 +36,19 @@ def main():
         assert str(exc) == expected, str(exc)
     else:
         raise AssertionError("current production torchvision gate was bypassed")
-    print("PASS all reviewed package pins match; missing/unlocked torchvision explicitly refuses production")
+    print(f"PASS all {len(PACKAGE_VERSIONS)} reviewed package pins match; "
+          "missing/unlocked torchvision explicitly refuses production")
+    assert runtime_metadata_digest(facts) == runtime_metadata_digest(observe_installed_packages())
+    print("PASS complete distribution inventory and Python runtime digest stable")
     first = worker_source_digest()
     assert first == worker_source_digest() and len(first) == 64
     print(f"PASS own-source digest stable: {first}")
     manifest = load_manifest(ROOT / "models/manifest.json")
     assert len(reference_bundle_fingerprints(manifest).encoder) == 64
     print("PASS pinned full-reference manifest identity projected without reading model files")
-    assert not any(name.split(".")[0] in PACKAGE_NAMES for name in sys.modules)
+    assert not any(name.split(".")[0] in ML_MODULE_NAMES for name in sys.modules)
     print("PASS no ML imports during real installed-package/source/manifest checks")
-    print("5 identity checks passed; production loading remains BLOCKED")
+    print("6 identity checks passed; production loading remains BLOCKED")
     return 0
 
 
