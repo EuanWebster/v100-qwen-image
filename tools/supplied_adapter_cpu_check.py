@@ -127,6 +127,37 @@ def checks(run, models_dir):
                 assert supplied.actual_seed == 11 and supplied._state == "closed" and supplied._pipeline is None
                 print(f"PASS tiny RANDOM bridge PNG, encoder={enc_dtype} execution=fp32 CFG={active} KV={cache}")
 
+    for active in (False, True):
+        for cache in (False, True):
+            generation = replace(base, negative_prompt="synthetic negative" if active else "",
+                                 true_cfg_scale=2 if active else 1)
+            supplied = adapter(dtype="fp16", cache=cache)
+            result = generate(generation, supplied, bundle.to_assets())
+            with Image.open(result.output_path) as image:
+                assert image.format == "PNG" and image.mode == "RGBA" and image.size == (64, 64)
+                image.load()
+            assert supplied._state == "closed"
+            print(f"PASS tiny RANDOM fp16 CPU sampler/VAE/PNG CFG={active} KV={cache}, NOT V100 numerics")
+
+    supplied = adapter()
+    tiled_calls = []
+    from unittest.mock import patch
+    vae = supplied._pipeline.vae
+    original_tiled = vae.tiled_decode
+    def traced_tiled(*args, **kwargs):
+        tiled_calls.append(True)
+        return original_tiled(*args, **kwargs)
+    # Above the upstream's DEFAULT 256px threshold: actually enter tiling,
+    # rather than merely testing the enable flag on a 64px image.
+    with patch.object(vae, "tiled_decode", traced_tiled):
+        result = generate(replace(base, width=320, height=320, vae_tiled_decode=True),
+                          supplied, bundle.to_assets())
+    with Image.open(result.output_path) as image:
+        assert image.mode == "RGBA" and image.size == (320, 320)
+        image.load()
+    assert tiled_calls == [True]
+    print("PASS tiny RANDOM actual default-threshold tiled VAE decode/320px PNG, NOT accepted reference quality")
+
     supplied = adapter()
     result = generate(replace(base, seed=None), supplied, bundle.to_assets())
     assert type(supplied.actual_seed) is int and 0 <= supplied.actual_seed < 2**64
@@ -177,7 +208,6 @@ def checks(run, models_dir):
         supplied.close()
     print("PASS mutable conditioning revalidated immediately before sampling")
 
-    from unittest.mock import patch
     original = QwenImage21Pipeline.__call__
     event = threading.Event()
     seen = []

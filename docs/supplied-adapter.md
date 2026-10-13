@@ -57,6 +57,8 @@ socket denial and fixture-only writes installed before ML import. Only bounded,
 hash-checked configs and the nine real processor files are read, never real
 checkpoint tensor bodies. Tiny random DiT/VAE and synthetic full-identity
 embeddings exercise CFG/KV on/off, encoder fp16/bf16/fp32 to fp32 execution,
+FP16 CPU sampler/VAE/PNG witnesses and an actual tiled decode above the default
+256px threshold also run; neither establishes V100 numerics or tile quality.
 PNG save and real Pillow reload, seed handling, stale identity and conversion
 overflow refusal, nonfinite VAE refusal, no-clobber PNG collision handling,
 mutable-mask rejection and cancellation in an actual sampler
