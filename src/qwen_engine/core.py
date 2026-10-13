@@ -11,6 +11,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from collections.abc import Callable
+import threading
 
 from qwen_engine.adapters.base import (
     CALIBRATION_UNKNOWN,
@@ -18,7 +20,7 @@ from qwen_engine.adapters.base import (
     GenerationAdapter,
 )
 from qwen_engine.config import ConfigError, FieldError, GenerationConfig
-from qwen_engine.errors import EngineError
+from qwen_engine.errors import EngineError, GenerationCancelled
 from qwen_engine.log import PhaseLogger
 
 #: Schema tag of the dry-run document (versioned like the bench schemas, R6).
@@ -99,6 +101,9 @@ def generate(
     adapter: GenerationAdapter,
     assets: Assets,
     logger: PhaseLogger | None = None,
+    *,
+    cancel_event: threading.Event | None = None,
+    phase_callback: Callable[[str], None] | None = None,
 ) -> GenerationResult:
     """Run the full pipeline through the adapter protocol, logging phases.
 
@@ -112,21 +117,62 @@ def generate(
     pipeline failures propagate.
     """
     require_run_config(config)
+    if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+        raise ConfigError(FieldError("cancel_event", "must be a threading.Event or None"))
+    if phase_callback is not None and not callable(phase_callback):
+        raise ConfigError(FieldError("phase_callback", "must be callable or None"))
     logger = logger or PhaseLogger()
     conditioning: Any = None
     latents: Any = None
     image: Any = None
-    with logger.phase("load"):
-        adapter.load(config, assets)
-    with logger.phase("encode"):
-        conditioning = adapter.encode(config)
-    with logger.phase("denoise"):
-        latents = adapter.denoise(config, conditioning)
-    with logger.phase("decode"):
-        image = adapter.decode(latents)
-    with logger.phase("save"):
-        output = adapter.save(image, config)
-        output_path = _validate_output(output, config)
+    def phase(name):
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled("generation cancelled before verified save")
+        if phase_callback is not None:
+            phase_callback(name)
+        # A callback may request cancellation itself.
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled("generation cancelled before verified save")
+        return logger.phase(name)
+
+    primary = None
+    saved = False
+    try:
+        binder = getattr(adapter, "set_cancel_event", None)
+        if binder is not None:
+            binder(cancel_event)
+        with phase("load"):
+            adapter.load(config, assets)
+        with phase("encode"):
+            conditioning = adapter.encode(config)
+        with phase("denoise"):
+            latents = adapter.denoise(config, conditioning)
+        with phase("decode"):
+            image = adapter.decode(latents)
+        with phase("save"):
+            output = adapter.save(image, config)
+            output_path = _validate_output(output, config)
+            saved = True
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        # Drop intermediates before releasing model references. Production
+        # adapters own device teardown; never touch global allocators here.
+        conditioning = latents = image = None
+        try:
+            closer = getattr(adapter, "close", None)
+            if closer is not None:
+                closer()
+        except Exception:
+            if primary is None and not saved:
+                raise
+            # Preserve the primary failure (including interrupts), and a
+            # verified saved result. Cleanup failure is diagnostic only there.
+            try:
+                logger.event("cleanup_failed")
+            except Exception:
+                pass
     try:
         logger.event("complete", latent_tokens=config.latent_tokens,
                      steps=config.steps)

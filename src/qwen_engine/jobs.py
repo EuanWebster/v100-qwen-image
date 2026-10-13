@@ -25,6 +25,7 @@ from pathlib import Path
 
 from qwen_engine.config import GenerationConfig
 from qwen_engine.core import GenerationResult
+from qwen_engine.errors import GenerationCancelled
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
@@ -343,7 +344,7 @@ class JobController:
                     result = self._executor(context)
                     artifact = self._artifact(result, record)
                     state = JobState.SUCCEEDED  # verified save wins a late cancellation request
-                except JobCancelled:
+                except (JobCancelled, GenerationCancelled):
                     if not context.cancel_requested:
                         state, error = JobState.FAILED, "invalid_cancellation_acknowledgment"
                     else:

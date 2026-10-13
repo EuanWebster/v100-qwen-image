@@ -29,3 +29,7 @@ class MemoryGuardError(EngineError):
 
 class HardwareAbsentError(EngineError):
     """Reserved (M3/M5.3): required hardware absent or unverified. Exit 5."""
+
+
+class GenerationCancelled(EngineError):
+    """Cooperative cancellation acknowledged before a verified save."""

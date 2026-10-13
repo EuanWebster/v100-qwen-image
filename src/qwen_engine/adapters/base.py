@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+import threading
 
 from qwen_engine.config import (
     AttentionBackend,
@@ -56,6 +57,22 @@ class GenerationAdapter(Protocol):
 
     def save(self, image: Any, config: GenerationConfig) -> Any:
         """Persist the image under ``config.output_dir``; return its path."""
+        ...
+
+
+@runtime_checkable
+class ManagedGenerationAdapter(GenerationAdapter, Protocol):
+    """Production lifecycle extension; legacy fixture adapters remain valid.
+
+    close must be safe after partial load and repeated calls. Bind the cancel
+    event before load; child encoders and sampler callbacks must honour it.
+    The core cannot forcibly stop a Python call: process ownership is separate.
+    """
+
+    def set_cancel_event(self, event: threading.Event | None) -> None:
+        ...
+
+    def close(self) -> None:
         ...
 
 
