@@ -15,6 +15,9 @@ implemented/accepted. Real processor loading is accepted separately below;
 no actual encoder-checkpoint fidelity is claimed. An internal stdlib-only
 bounded controller foundation is now tested ([job-controller.md](job-controller.md));
 it has no production executor, web wiring or forced thread cancellation.
+Pure exact-match memory-policy groundwork is also tested
+([memory-policy.md](memory-policy.md)); no real probe/calibration or guard
+integration is claimed.
 
 ## Runtime blockers independent of the card
 
@@ -68,8 +71,10 @@ until these measurements and model-specific tests pass.
    and explicit verified assets. Consume only full-identity encoder payloads
    through the tensor/value/mask decoder. Unit-test lifecycle/refusals with
    injected fixtures; real component and image tests remain separate gates.
-2. Implement phase/backend/conditioning/runtime/device-aware memory policy
-   and calibrated measurements. Existing calibration matching is a
+2. Complete phase/backend/conditioning/runtime/device-aware memory policy
+   integration and calibrated measurements. Pure typed exact-match policy
+   groundwork exists; it requires whole-device/process-tree peaks and fresh
+   complete resource evidence, and does not collect those facts. Existing calibration matching is a
    staleness prefilter only, never authority to grant fit. Record unavailable
    timings as unmeasured, not zero or invented throughput. Benchmark
    resident/streamed and higher-quality quant candidates against an actual
