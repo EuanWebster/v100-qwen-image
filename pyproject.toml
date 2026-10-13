@@ -16,6 +16,7 @@ dependencies = []
 [project.scripts]
 qwen-engine = "qwen_engine.cli:main"
 qwen-web = "qwen_engine.web.server:main"
+qwen-encoder-worker = "qwen_engine.encoder_worker:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

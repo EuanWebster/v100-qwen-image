@@ -71,12 +71,10 @@ Both full guarded regressions passed: **1102 passed, 2 skipped** on Python
 
 ## Remaining worker scope
 
-Local-only loader/worker CLI, bounded request reads, socket/offline confinement,
-exact runtime identity comparison and atomic no-clobber response publication
-still need wiring. Before loading, validate the verified safetensors index's
-referenced shard names against the allowlist; verified manifest claims alone
-are not permission for a library to open arbitrary index references. Use fixed
-upstream processor/model classes, explicit local directories, no remote code,
-safetensors/weights-only, CPU dtype/eval/inference, never DiT/VAE/full pipeline.
+`encoder_worker.py` now wires the local-only loader/worker CLI, bounded reads,
+offline socket guard, exact runtime identity comparison, index shard-reference
+allowlisting and atomic no-clobber publication. See `docs/encoder-worker.md`
+for its actual miniature-loader evidence and limitations. Production activation
+and the complete project review remain separate from this CPU milestone.
 Current torchvision and real memory gates remain; no actual checkpoint,
 CUDA/V100, numerical parity, performance, fit or generation is validated.

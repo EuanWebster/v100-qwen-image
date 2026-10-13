@@ -93,8 +93,10 @@ passed: **1063 passed, 2 skipped**, Python 3.11.15 and 3.13.5.
 
 The follow-on `encoder_assets.py` supplies narrow closed-subtree and fresh
 byte verification after the actual memory prerequisite (see
-`docs/encoder-assets.md`). Next: local-only loader/worker CLI
-with required runtime headroom and memory checks before ML imports or shard
-hashing/loading. Real processor, checkpoint parity, host/GPU fit, CUDA execution
+`docs/encoder-assets.md`). The local-only loader/worker now integrates these
+boundaries (`docs/encoder-worker.md`), with required runtime headroom and memory
+checks before ML imports or shard hashing/loading. Full-project review,
+including transitive-runtime identity completeness, remains before activation.
+Real processor, checkpoint parity, host/GPU fit, CUDA execution
 and generation remain unvalidated. The V100 is still unavailable according
 to the last user confirmation.

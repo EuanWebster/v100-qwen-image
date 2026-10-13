@@ -1351,3 +1351,19 @@ standing rule that executed plans stay honest.)*
   layout only — no code/asset/ComfyUI reuse) with honest disconnected states;
   server + generation deferred to W2/W3. No dependency, entrypoint or
   packaging changes; `sandbox.yaml` and ML locks untouched.
+
+- 2026-10-13 **M2.2b CPU boundary follow-ons (Codex direct implementation,
+  after the user ended Qwen writing)**: supplied upstream helper/codec accepted
+  8eefa81; manifest/request/executing-runtime identity accepted 172cbc8; narrow
+  actual-memory-gated 16-file verifier accepted 0390f0d; local-only CPU worker
+  now connects these boundaries with strict bounded reads, safe index references,
+  fixed-class local CPU/safetensors loading, offline socket guard, bounded wire
+  response and atomic no-clobber publication. Full guarded suites 1160/2skip on
+  Python3.11.15/3.13.5; real pinned worker checks12/12 each, including actual
+  generated miniature checkpoint loads in all three dtypes (no downloaded real
+  processor/checkpoint, no GPU). Full-project review, runtime/transitive cache
+  identity audit and production activation are still pending; torchvision and
+  actual memory prerequisites continue to refuse. Web generation stays disabled.
+  One stdlib-only worker entrypoint added, ML locks and user sandbox.yaml unchanged.
+  Review envs/runtime/cache and reusable checks persist under /work, not /tmp;
+  disposable generated fixtures alone are temporary. See docs/encoder-worker.md.

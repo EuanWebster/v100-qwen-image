@@ -91,9 +91,10 @@ for. Other network attempts and writes outside owned fixtures fail the check.
 The helper trusts supplied components/environment. The follow-on
 `encoder_identity.py` provides package validation, manifest/bundle request
 projection and full executing-worker identity comparison (see
-`docs/encoder-identity.md`); these must be wired into the production boundary.
-Actual asset bytes still need fresh verification. Local-only loading, host-memory preflight integration,
-worker CLI and adapter wiring remain separate milestones. Locks are unchanged;
+`docs/encoder-identity.md`). The follow-on asset verifier and local-only worker
+now integrate these CPU boundaries (`docs/encoder-assets.md` and
+`docs/encoder-worker.md`). Production activation, full-project review and
+adapter wiring remain separate. Locks are unchanged;
 real processor loading still needs the previously identified torchvision
 dependency fix. No real checkpoint, numerical checkpoint parity, GPU kernel,
 VRAM/RAM fit, performance or image-generation claim is made. The V100 remains
