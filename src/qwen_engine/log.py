@@ -37,9 +37,12 @@ def file_sink(path: str | Path) -> Sink:
     """A sink that appends JSONL lines to ``path`` and nowhere else.
 
     Parent directories are created on first write; each line is flushed so a
-    crashed run keeps the events it logged.
+    crashed run keeps the events it logged. Relative paths bind to the CWD
+    at construction, without resolving symlinks or collapsing '..'.
     """
     target = Path(path)
+    if not target.is_absolute():
+        target = Path.cwd() / target
 
     def sink(line: str) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)

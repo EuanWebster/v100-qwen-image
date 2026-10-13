@@ -224,6 +224,35 @@ def test_file_sink_writes_only_to_configured_path(tmp_path):
     assert [p for p in tmp_path.rglob("*") if p.is_file()] == [target]
 
 
+def test_relative_file_sink_binds_cwd_without_eager_writes(tmp_path, monkeypatch):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    monkeypatch.chdir(first)
+    sink = file_sink("logs/engine.jsonl")
+    assert not list(first.iterdir())
+    monkeypatch.chdir(second)
+    sink('{"event":"bound"}')
+    assert (first / "logs" / "engine.jsonl").read_text().splitlines() == ['{"event":"bound"}']
+    assert not list(second.iterdir())
+
+
+def test_relative_file_sink_preserves_symlink_dotdot_semantics(tmp_path, monkeypatch):
+    first, second = tmp_path / "first", tmp_path / "second"
+    target = tmp_path / "target" / "deep"
+    first.mkdir()
+    second.mkdir()
+    target.mkdir(parents=True)
+    (first / "alias").symlink_to(target, target_is_directory=True)
+    monkeypatch.chdir(first)
+    sink = file_sink("alias/../logs/engine.jsonl")
+    monkeypatch.chdir(second)
+    sink('{"event":"lexical"}')
+    assert (target.parent / "logs" / "engine.jsonl").read_text().splitlines() == ['{"event":"lexical"}']
+    assert not (first / "logs").exists()
+    assert not list(second.iterdir())
+
+
 def test_human_sink_gets_readable_phase_lines(tmp_path):
     human = ListSink()
     ticks = iter([0.0, 2.0])
