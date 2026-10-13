@@ -1,0 +1,88 @@
+# Runtime readiness and next implementation gates
+
+Verified inside this sandbox on2026-10-13; physical host/card state was not
+measured. This checklist keeps software acceptance separate from model fit,
+hardware bring-up and usable image generation. It does not change any guard.
+
+## Current foundation
+
+The production-source review and focused tooling corrections are complete;
+the main guarded suites, pinned synthetic checks and real-browser workspace
+checks are accepted in `code-review.md`. Environments, tools and tests live
+on the persistent project mount. The web workspace remains planning/export
+only; generation adapter, GPU numerics/calibration and web jobs are not yet
+implemented/accepted. No real processor/checkpoint fidelity is claimed.
+
+## Runtime blockers independent of the card
+
+1. **Vision dependency**: the actual63locked distribution versions/sources
+   match, but torchvision is absent and has no reviewed lock pin. Real
+   Qwen3VLProcessor loading was previously observed to require that chain.
+   Next: review an exact compatible artifact against the pinned Torch/CUDA,
+   Python3.11/3.13 and processor interfaces; update the requirements/lock and
+   immutable runtime policy together, then test import AND real local
+   processor loading offline. No automatic latest-version install, optional
+   silent fallback, fake approved metadata or cache-hit bypass.
+2. **CPU memory**: the committed four encoder shards total17,534,339,488B
+   (~16.33GiB). A fresh actual preflight observed a visible16GiB cgroup cap;
+   the weights alone exceed it even before runtime/load/conversion headroom.
+   Host MemAvailable was about28.9GiB at that instant, but does not override
+   the container cap or prove a complete applicable budget. Cgroup root
+   visibility remains unknown, and hidden ancestors can only tighten it;
+   actual loading correctly refuses before model access.
+   Next: establish trusted complete host/container budget evidence and
+   explicitly provide enough bounded capacity for measured peaks while
+   preserving existing services, OR review a separate genuinely smaller
+   encoder profile. The current fixed-class full-reference profile cannot
+   be relabelled quantized or given an invented memory pass. Merely installing
+   the V100, rewriting orchestration in C++, or changing fp16/bf16 storage
+   does not remove this raw-weight lower bound. FP32 CPU expansion is larger.
+3. **Actual model fidelity/assets**: the separately approved earlier fetch
+   was partial. This review did not rehash/resume real assets or certify their
+   current completeness. After dependency/memory readiness, verify the exact
+   supplied settled encoder tree, run the real processor/checkpoint and
+   compare extraction/templates/masks and tensors against the pinned
+   upstream path; measure CPU dtype accuracy, timing and peak memory. Tiny
+   synthetic and miniature generated checkpoints are not substitutes.
+
+## GPU bring-up after physical installation
+
+Last physical-install confirmation was the user's "not installed" report;
+current presence is unknown. Recheck actual host/card access before doing
+driver/container work. Preserve the user-owned sandbox configuration and
+existing AMD/services. Driver choice and hardware/tool support must be
+reverified against current primary documentation at bring-up, not assumed
+from the old plan's dated version example.
+
+Acceptance requires real CUDA kernel execution with the supported runtime
+and V100, not just enumeration/architecture strings; measured available
+VRAM, PCIe generation/width and transfer throughput; and BF16-storage→FP16
+execution numerics/finiteness. No GPU or quantization fitness claim exists
+until these measurements and model-specific tests pass.
+
+## Generation implementation sequence
+
+1. Build the adapter around the reviewed upstream QwenImage21 model code
+   and explicit verified assets. Consume only full-identity encoder payloads
+   through the tensor/value/mask decoder. Unit-test lifecycle/refusals with
+   injected fixtures; real component and image tests remain separate gates.
+2. Implement phase/backend/conditioning/runtime/device-aware memory policy
+   and calibrated measurements. Existing calibration matching is a
+   staleness prefilter only, never authority to grant fit. Record unavailable
+   timings as unmeasured, not zero or invented throughput. Benchmark
+   resident/streamed and higher-quality quant candidates against an actual
+   reference; do not default to an unvalidated low-bit or distilled recipe.
+3. Add an owned bounded generation-job controller: validated immutable
+   requests, explicit lifecycle/cancellation/errors, scoped artifacts and
+   worker cleanup. CPU fake adapters prove controller behavior only. Wire
+   the web job API after the real adapter/gates can support it; no fake jobs,
+   thumbnails, success, progress percentages or availability claims.
+4. Validate the full base recipe at1024² with measured resources and human
+   evaluation across portraits/landscapes/illustration/product/text. Turbo
+   stays an optional separately reviewed recipe/profile; 2K remains an
+   experimental measured opt-in. Keep CLI and browser contracts consistent.
+
+Remote web access is its own bind/auth-policy milestone; current literal
+loopback service is not claimed reachable from a host/Tailscale peer.
+Hardware, dependency, memory, assets and implementation gaps are independent:
+the V100 is **not** the only remaining blocker, and the project is not done.

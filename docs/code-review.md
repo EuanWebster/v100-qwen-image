@@ -1,4 +1,4 @@
-# CPU code/design review — in progress
+# CPU code/design review — current pass complete
 
 Codex direct review, 2026-10-13. This is a coverage/findings ledger, not a
 claim that the whole project is accepted or that generation works. All prior
@@ -124,6 +124,28 @@ nonfatal clocks and preserved worker errors. No live assets are mutated.
     deliberate symlink/`..` filesystem semantics (no lexical collapse or
     symlink sandbox claim). Two new regressions; logger49passed, covered by
     both full suites1762/2skip.
+15. **Interface-source audit** (`9a526b8`): bounded2MiB regular snapshot reads
+    and typed parser/analysis recursion failures; unique direct synchronous
+    definitions, typed pinned literals, exact norm/lambda/index/handle and
+    dispatch/processor-list checks.33new tests; focused52/1skip; actual cached
+    upstream HEADs separately verified against both pins, tracked-source
+    diffs empty, checker53/53. AST/marker evidence is not behavior proof.
+16. **Persistent setup and witnesses** (`482008e`, `16e0ba7`): preflight all
+    fixed targets before sync, refuse aliases/nonisolated/wrong interpreters,
+    add non-synchronizing --check (actual three envs passed); six assertion
+    witnesses refuse -O/-OO/PYTHONOPTIMIZE before work.17+18new tests.
+    The stale footer assertion left after17e5b7c's post-suite diagnostic
+    polish was found by this round's full run and updated to the accurate
+    pure-check disclaimer; no product/browser failure was suppressed.
+17. **Browser lifecycle**: first CDP timeout/cleanup abort clears every
+    pending exchange, and successful child/browser races clear losing
+    timers rather than unnecessarily keeping Node alive. Nine pure checks
+    pass (three new). Fresh real Chrome served105 against each Python backend
+    and standalone61 pass;
+    final guarded1830passed+2skip each on Python3.11.15/3.13.5.
+
+Tooling correction contracts and evidence: docs/tooling-review.md. Current
+runtime blockers and exact next implementation gates: docs/runtime-readiness.md.
 
 Final actual pinned checks this round: identity6 and actual-memory refusal3
 per interpreter; synthetic helper/codec36 and miniature four-shard worker12
@@ -143,10 +165,13 @@ modules. Identity/worker policy and
 source/asset/codec integration were also exercised by prior CPU milestones;
 that evidence does not substitute for reviewing all remaining source.
 
-The current production-source pass is complete; next finish the ancillary
-diagnostic/review-tool and setup audit and runtime-readiness checklist.
-The whole project/full tooling review is not complete. Real processor,
-memory scope, reviewed vision dependency and hardware gates remain.
+The current production-source pass and focused diagnostic/setup/browser-helper
+audit are complete; this is not final project acceptance. Next resolve the
+reviewed vision dependency and complete memory-budget evidence/capacity;
+then actual processor/model fidelity and adapter/job implementation with
+hardware-gated integration/numerics/calibration. See runtime-readiness.md.
+Real processor, memory scope, reviewed vision dependency and hardware gates
+remain. No real assets were rehashed or downloaded by this review.
 Keep reusable review evidence and environment setup in the repo/.review-envs;
 only disposable test fixtures belong in /tmp.
 

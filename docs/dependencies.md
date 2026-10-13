@@ -7,6 +7,11 @@ their Python runtime, and their download cache live under the persistent
 project mount at `/work/.review-envs/` (gitignored). Recreate or synchronize
 them with `bash scripts/setup_review_envs.sh`. This also creates the separate
 torch-free `.review-envs/test311` environment for guarded Python 3.11 tests.
+Use `bash scripts/setup_review_envs.sh --check` for a non-synchronizing
+path/interpreter/dependency-consistency check. Setup preflights all fixed
+targets and refuses redirected/non-isolated environments before sync;
+these checks do not approve exact ML pins, torchvision, model fit or GPU
+execution. See [tooling-review.md](tooling-review.md).
 Reusable tests and check scripts
 are committed; only generated fixtures are temporary.
 The lightweight environments stay torch-free: `/work/.venv` and the fresh
