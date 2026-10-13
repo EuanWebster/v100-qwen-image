@@ -23,7 +23,10 @@ configuration as well as package/source identity. The encoder's current
 package-metadata digest alone is **not** this broader generation identity.
 A warm embedding-cache observation cannot authorize a cold encoder miss;
 the actual validated branch must match, otherwise use conservative cold
-evidence or refuse. These identity producers/collectors remain unimplemented.
+evidence or refuse. The current-process runtime fingerprint now has a CPU
+witness ([runtime-identity.md](runtime-identity.md)), including explicit
+uninitialized-CUDA/unknown-workspace state. Actual CUDA identity acceptance,
+resource/peak collectors and default-loader integration remain unimplemented.
 
 Device identity includes UUID, architecture, driver and CUDA build. The
 resource provider must independently verify actual CUDA kernel execution
