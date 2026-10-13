@@ -17,6 +17,7 @@ wire document.
 from __future__ import annotations
 
 import math
+import json
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
@@ -98,3 +99,28 @@ def reject_constant(name: str) -> Any:
     ``NaN``/``Infinity``/-``Infinity`` literals into a typed parse failure
     instead of non-finite floats."""
     raise ValueError(f"non-finite JSON constant {name!r}")
+
+
+def _unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("JSON float is non-finite/unrepresentable")
+    return value
+
+
+def strict_json_loads(text: str | bytes | bytearray) -> Any:
+    """Reject duplicate keys and nonfinite literals/overflowing JSON floats.
+
+    Byte/depth budgets and typed parse-error translation belong to callers.
+    """
+    return json.loads(text, object_pairs_hook=_unique_pairs,
+                      parse_constant=reject_constant, parse_float=_finite_float)

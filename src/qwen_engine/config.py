@@ -21,6 +21,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, ClassVar
 
+from qwen_engine._jsonsafe import strict_json_loads
+
 #: Linear spatial compression factor of the VAE latent grid (C6).
 SPATIAL_COMPRESSION = 16
 
@@ -311,8 +313,8 @@ class GenerationConfig:
     @classmethod
     def from_json(cls, text: str) -> "GenerationConfig":
         try:
-            data = json.loads(text)
-        except (ValueError, RecursionError) as exc:
+            data = strict_json_loads(text)
+        except (ValueError, RecursionError, TypeError) as exc:
             # JSONDecodeError subclasses ValueError; the integer-string digit
             # limit raises plain ValueError and pathologically deep nesting
             # RecursionError — both are typed parse failures, never crashes.

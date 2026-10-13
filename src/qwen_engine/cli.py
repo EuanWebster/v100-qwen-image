@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from qwen_engine import __version__
+from qwen_engine._jsonsafe import strict_json_loads
+from qwen_engine._local_io import read_bounded_file
 from qwen_engine.adapters.base import (
     ATTENTION_BACKEND_CHOICES,
     OFFLOAD_CHOICES,
@@ -58,6 +60,7 @@ _OVERRIDES = {
     "models_dir": "models_dir",
     "manifest": "manifest_path",
 }
+MAX_CONFIG_BYTES = 1 << 20
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -106,13 +109,13 @@ def _load_config(args: argparse.Namespace) -> GenerationConfig:
     data: dict[str, Any] = {}
     if args.config is not None:
         try:
-            raw = args.config.read_bytes()
+            raw = read_bounded_file(args.config, MAX_CONFIG_BYTES)
         except OSError as exc:
             raise ConfigError(
                 f'config: config file not readable: {args.config}: {exc.strerror or exc}'
             ) from exc
-        except ValueError as exc:  # embedded NUL in path
-            raise ConfigError(f"config: config path invalid: {args.config}: {exc}") from exc
+        except (ValueError, RuntimeError) as exc:
+            raise ConfigError(f"config: config input invalid: {args.config}: {exc}") from exc
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -120,7 +123,7 @@ def _load_config(args: argparse.Namespace) -> GenerationConfig:
                 f"config: config file is not valid UTF-8: {args.config}: {exc}"
             ) from exc
         try:
-            loaded = json.loads(text)
+            loaded = strict_json_loads(text)
         except (ValueError, RecursionError) as exc:
             # JSONDecodeError subclasses ValueError; the integer-string digit
             # limit raises plain ValueError and pathologically deep nesting

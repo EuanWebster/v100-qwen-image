@@ -285,3 +285,15 @@ def test_injected_parser_failures_wrap_as_config_errors(monkeypatch, boom):
     monkeypatch.setattr("json.loads", raiser)
     with pytest.raises(ConfigError):
         GenerationConfig.from_json('{"prompt": "p"}')
+
+
+@pytest.mark.parametrize("doc", [
+    '{"prompt":"first","prompt":"second"}',
+    '{"seed":-1,"seed":0}', '{"output_dir":null,"output_dir":"chosen"}',
+    '{"true_cfg_scale":NaN}', '{"true_cfg_scale":Infinity}',
+    '{"true_cfg_scale":1e999}', '{"true_cfg_scale":-1e999}',
+    None, 123, {},
+])
+def test_ambiguous_nonfinite_or_wrong_type_config_json_is_typed(doc):
+    with pytest.raises(ConfigError, match="invalid JSON"):
+        GenerationConfig.from_json(doc)

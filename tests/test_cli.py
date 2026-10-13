@@ -4,6 +4,7 @@ contract (import/--help/--dry-run without heavy modules; exit-code contract
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -682,3 +683,61 @@ def test_cli_config_giant_integer_seed_is_exit_two(tmp_path, capsys):
     assert run_cli(tmp_path, ["--config", cfg, "--dry-run"]) == 2
     err = capsys.readouterr().err
     assert "config error:" in err and "Traceback" not in err
+
+
+@pytest.mark.parametrize("kind", ["fifo", "directory", "oversized"])
+def test_cli_config_input_is_bounded_regular_and_never_blocks(tmp_path, capsys, kind):
+    path = tmp_path / "config.json"
+    if kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        path.write_bytes(b" " * (cli.MAX_CONFIG_BYTES + 1))
+    assert run_cli(tmp_path, ["--config", path, "--dry-run"]) == 2
+    err = capsys.readouterr().err
+    assert "bounded regular" in err and "Traceback" not in err
+
+
+@pytest.mark.parametrize("raw", ['{"prompt":"first","prompt":"second"}',
+                                 '{"steps":0,"steps":40}',
+                                 '{"true_cfg_scale":NaN}', '{"true_cfg_scale":1e999}'])
+def test_cli_duplicate_or_nonfinite_config_is_exit_two_even_with_override(tmp_path, capsys, raw):
+    path = tmp_path / "config.json"
+    path.write_text(raw)
+    assert run_cli(tmp_path, ["--config", path, "--dry-run", "--prompt", "override", "--steps", "40"]) == 2
+    err = capsys.readouterr().err
+    assert "not valid JSON" in err and "Traceback" not in err
+
+
+def test_cli_valid_input_symlink_and_override_semantics_preserved(tmp_path, capsys, monkeypatch):
+    path = tmp_path / "config.json"
+    path.write_text('{"prompt":"file prompt","steps":20}')
+    link = tmp_path / "link.json"
+    link.symlink_to(path)
+    monkeypatch.setattr(cli, "MAX_CONFIG_BYTES", path.stat().st_size)
+    assert run_cli(tmp_path, ["--config", link, "--dry-run", "--prompt", "override", "--steps", "40"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["config"]["prompt"] == "override" and doc["config"]["steps"] == 40
+    monkeypatch.setattr(cli, "MAX_CONFIG_BYTES", path.stat().st_size - 1)
+    assert run_cli(tmp_path, ["--config", link, "--dry-run"]) == 2
+
+
+def test_cli_config_replacement_during_read_is_typed_and_no_adapter(tmp_path, capsys, monkeypatch):
+    path = tmp_path / "config.json"
+    path.write_text('{"prompt":"p"}')
+    original = os.read
+    changed = False
+    def read(fd, size):
+        nonlocal changed
+        raw = original(fd, size)
+        if raw and not changed:
+            changed = True
+            other = tmp_path / "other.json"
+            other.write_bytes(path.read_bytes())
+            other.replace(path)
+        return raw
+    monkeypatch.setattr(cli, "_make_adapter", lambda: pytest.fail("adapter after input refusal"))
+    monkeypatch.setattr(os, "read", read)
+    assert run_cli(tmp_path, ["--config", path, "--run"]) == 2
+    assert "changed during read" in capsys.readouterr().err

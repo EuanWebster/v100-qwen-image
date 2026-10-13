@@ -16,7 +16,6 @@ version, a branch-name "revision", or an unsafe filename.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import stat as stat_module
@@ -26,7 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from qwen_engine._jsonsafe import reject_constant
+from qwen_engine._jsonsafe import strict_json_loads
+from qwen_engine._local_io import read_bounded_file
 
 #: Schema version of ``models/manifest.json`` (finalize values in task 2.1).
 MANIFEST_SCHEMA_VERSION = 1
@@ -365,29 +365,7 @@ def manifest_from_dict(data: Any) -> ModelManifest:
 def load_manifest(path: str | Path) -> ModelManifest:
     path = Path(path)
     try:
-        # Intentional manifest symlinks are accepted after canonicalization;
-        # no-follow/nonblocking final open prevents a swapped link/FIFO read.
-        canonical = path.resolve(strict=True)
-        fd = os.open(canonical, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        try:
-            before = os.fstat(fd)
-            if not stat_module.S_ISREG(before.st_mode) or before.st_size > MAX_MANIFEST_BYTES:
-                raise ValueError("manifest must be a bounded regular file (1 MiB cap)")
-            data = bytearray()
-            while True:
-                block = os.read(fd, min(65536, MAX_MANIFEST_BYTES + 1 - len(data)))
-                if not block:
-                    break
-                data.extend(block)
-                if len(data) > MAX_MANIFEST_BYTES:
-                    raise ValueError("manifest byte cap exceeded")
-            if (len(data) != before.st_size or _stat_signature(before) != _stat_signature(os.fstat(fd))
-                    or _stat_signature(before) != _stat_signature(canonical.stat(follow_symlinks=False))
-                    or path.resolve(strict=True) != canonical):
-                raise ValueError("manifest changed during read")
-            raw = bytes(data)
-        finally:
-            os.close(fd)
+        raw = read_bounded_file(path, MAX_MANIFEST_BYTES)
     except (OSError, ValueError, RuntimeError) as exc:
         raise ManifestFormatError(
             f"manifest file not readable: {path}: {exc.strerror or exc if isinstance(exc, OSError) else exc}"
@@ -397,7 +375,7 @@ def load_manifest(path: str | Path) -> ModelManifest:
     except UnicodeDecodeError as exc:
         raise ManifestFormatError(f"manifest file is not valid UTF-8: {path}: {exc}") from exc
     try:
-        data = json.loads(text, object_pairs_hook=_unique_pairs, parse_constant=reject_constant)
+        data = strict_json_loads(text)
     except (ValueError, RecursionError) as exc:
         # ValueError subsumes JSONDecodeError and covers the integer-string
         # digit limit; RecursionError covers deeply nested input, which the
@@ -417,15 +395,6 @@ class _FileChangedDuringHash(OSError):
 
 def _stat_signature(info: os.stat_result) -> tuple[int, ...]:
     return tuple(getattr(info, field) for field in _STAT_FIELDS)
-
-
-def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key {key!r}")
-        result[key] = value
-    return result
 
 
 @contextmanager

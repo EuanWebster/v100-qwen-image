@@ -41,17 +41,29 @@ parent symlink refusal before any read, descriptor cleanup, growth read cap,
 mtime-reset mutation, alias/root replacement, strict input boundaries,
 nonfatal clocks and preserved worker errors. No live assets are mutated.
 
+6. **Config input boundary**: CLI config was a blocking/unbounded file read,
+   and CLI/GenerationConfig JSON silently accepted duplicate keys. The
+   stdlib `_local_io` snapshot helper now supplies the same bounded regular
+   no-follow/nonblocking final-FD read to config and manifest inputs. CLI
+   config cap1MiB, mutation/identity checks and strict duplicate/nonfinite/
+   overflowing-float JSON; invalid inputs remain exit2, never an adapter
+   invocation. Stable symlinks and valid override semantics preserved.
+  38new regressions; both full guarded suites1572passed+2skip each.
+
 ## Coverage / next work
 
 Fully read this pass: encoder_identity + runtime policy, encoder_worker,
-manifest, log, config, CLI, core and adapters/base. Identity/worker policy and
+manifest, log, config, CLI, core, adapters/base, _jsonsafe, _local_io and
+generic encoder identity/request/payload and worker lifecycle/response code.
+Generic cache sections mostly read but finish rereading its publish section
+before claiming complete coverage. Identity/worker policy and
 source/asset/codec integration were also exercised by prior CPU milestones;
 that evidence does not substitute for reviewing all remaining source.
 
-Next confirmed gap: CLI config uses an unbounded blocking read; both config
-JSON entrypoints accept duplicate keys. Fix input boundaries without changing
-override/default semantics. Then production parent/child identity-before-cache
-API and review the generic encoder transport/cache (read only partial so far),
+Next: generic encoder JSON (cache headers/responses still accept duplicate
+keys), per-key/root lock registry lifetime and payload duplicate-name cost;
+review/fix with focused regressions. Then production parent/child identity-before-cache
+API and finish generic encoder transport/cache review,
 production helper/codec, encoder assets, memory preflight, local bundle,
 benchmark schemas/persistence, fetch tool, web API/server and real-browser UI.
 Keep reusable review evidence and environment setup in the repo/.review-envs;
