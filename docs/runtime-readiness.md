@@ -41,10 +41,13 @@ integration is claimed.
    be relabelled quantized or given an invented memory pass. Merely installing
    the V100, rewriting orchestration in C++, or changing fp16/bf16 storage
    does not remove this raw-weight lower bound. FP32 CPU expansion is larger.
-3. **Actual model fidelity/assets**: processor files now freshly verified;
-   other assets from the separately approved earlier fetch
-   was partial. This review did not rehash/resume real assets or certify their
-   current completeness. After memory readiness, verify the exact
+3. **Assets complete, model fidelity pending**: the explicitly approved base
+   fetch continuation now verifies all24files (33,131,601,593B); settled
+   closed-tree preflight passes29entries with no partials. Full DiT/VAE META
+   architecture shapes match actual checkpoint headers; tiny random CPU
+   sampler/VAE probes pass ([component-cpu-review.md](component-cpu-review.md)).
+   These are disk/interface checks, not real-weight fidelity or fit. After
+   memory readiness, freshly verify the exact
    supplied settled encoder tree, run the real processor/checkpoint and
    compare extraction/templates/masks and tensors against the pinned
    upstream path; measure CPU dtype accuracy, timing and peak memory. Tiny

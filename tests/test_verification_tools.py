@@ -11,6 +11,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 ASSERTION_TOOLS = ("encoder_identity_check", "encoder_assets_check",
                    "local_processor_check",
+                   "component_cpu_check",
                    "synthetic_ml_encoder_check", "synthetic_worker_check",
                    "synthetic_encoder_client_check", "synthetic_encoder_client_child")
 

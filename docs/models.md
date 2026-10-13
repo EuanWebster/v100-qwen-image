@@ -1,6 +1,21 @@
 # Model assets (M2.1 manifest + explicit fetch tool; M2.2a local reference-bundle contract)
 
-Status: the **manifest is committed**; root's **explicitly approved pinned
+Current status (2026-10-13): the previously approved explicit fetch was
+resumed and completed. All24 pinned base files in `models/assets` are
+size/SHA256 verified (33,131,601,593B); five missing files fetched, nineteen
+verified/skipped, including resume from the6,302,990,336B DiT partial.
+Settled closed-tree preflight passes29entries (24files+5directories), no
+partial remains. This establishes local disk integrity, NOT RAM/GPU fit.
+Real processor loading and full META architecture/header-shape checks now
+pass on both pinned CPU environments; tiny random sampler/VAE tests are
+not full-checkpoint inference or accepted images. Details:
+[component-cpu-review.md](component-cpu-review.md),
+[runtime-readiness.md](runtime-readiness.md). No V100 execution or real
+encoder model fidelity accepted; current hardware presence remains unmeasured.
+
+## Historical fetch checkpoint (2026-10-07)
+
+At that checkpoint the **manifest was committed**; root's **explicitly approved pinned
 fetch into `models/assets/` ended at 2026-10-07 21:53 UTC with a timeout on
 the first transformer shard**. An independent offline resolver/plan over
 that root found **19 of the 24 final files present and size+SHA256-

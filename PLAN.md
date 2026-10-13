@@ -1367,3 +1367,20 @@ standing rule that executed plans stay honest.)*
   One stdlib-only worker entrypoint added, ML locks and user sandbox.yaml unchanged.
   Review envs/runtime/cache and reusable checks persist under /work, not /tmp;
   disposable generated fixtures alone are temporary. See docs/encoder-worker.md.
+
+- 2026-10-13 **CPU readiness progression (Codex direct work)**: exact
+  torchvision0.29.1+cu126 joins the hashed runtime lock/unified64-package
+  policy; all prior63pins/hashes retained. Native CPU vision operations and
+  actual local nine-file processor loading accepted on both pinned Python
+  versions (docs/vision-review.md), not full encoder fidelity. Internal
+  stdlib-only bounded job controller and exact phase/runtime/device memory
+  policy groundwork are tested, NOT wired to CLI/web and NOT a production
+  executor or fit override (docs/job-controller.md, docs/memory-policy.md).
+  Previously approved base fetch resumed/completed: all24files verified,
+  33,131,601,593B, settled29-entry tree/no partials. Actual config/full META
+  DiT/VAE shapes match checkpoint headers; tiny random CPU sampler/CFG/KV/VAE
+  checks pass (docs/component-cpu-review.md), not accepted real images.
+  Actual encoder memory still refuses17.53GB weights against16GiB cap and
+  unproven cgroup scope. Real adapter/process executor/calibration, full
+  model fidelity and V100/numerics/quality acceptance remain pending;
+  Generate stays disabled and user-owned sandbox.yaml remains untouched.

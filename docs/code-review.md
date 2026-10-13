@@ -5,8 +5,12 @@ claim that the whole project is accepted or that generation works. All prior
 hardware/real-model/memory gates remain. The separate2026-10-13 vision
 milestone updates dependency/lock/policy and accepts real offline processor
 loading ([vision-review.md](vision-review.md)); earlier review rows describe
-their historical scope. No model downloads, service changes, Qwen jobs or
-generation activation.
+their historical scope. No service changes, Qwen jobs or generation
+activation. Later CPU milestones add an internal tested controller
+and pure memory policy, and complete the previously approved base asset fetch;
+their scoped acceptance is documented in job-controller.md, memory-policy.md
+and component-cpu-review.md. Current guarded suites are recorded there/in the
+handoff, without relabelling historical counts as present proof.
 
 ## Corrections verified
 
