@@ -14,6 +14,8 @@ from types import SimpleNamespace
 import pytest
 
 from qwen_engine import encoder_worker as ew, encoder_assets as ea
+from qwen_engine import encoder_identity as ei
+from qwen_engine.config import GenerationConfig
 from qwen_engine.encoder import (
     Blob, EncodedPayload, EncoderWorker, EncoderWorkerError, EncoderRequestError,
     EncoderSetupError, EncoderProtocolError,
@@ -384,6 +386,54 @@ def test_actual_worker_memory_refusal_through_generic_parent(tmp_path):
     assert caught.value.exit_code == 3
     assert "MemoryPreflightError" in caught.value.stderr
     assert not list(tmp_path.iterdir())  # parent reaps child and cleans scratch
+
+
+def test_projection_uses_no_loading_memory_or_model_root_api(inputs, monkeypatch):
+    seed = ei.project_encoder_seed(GenerationConfig(), inputs.manifest, encoder_dtype="fp16")
+    inputs.request.write_text(json.dumps(seed.to_request_dict("projection-id")))
+    def completed(request, manifest):
+        assert request == seed and manifest == inputs.manifest
+        return replace(seed, implementation_identity=inputs.req.implementation_identity)
+    monkeypatch.setattr(ew, "complete_encoder_seed", completed)
+    for name in ("_encode_request", "require_encoder_memory_fit", "verify_encoder_assets", "_load_classes"):
+        monkeypatch.setattr(ew, name, lambda *a, **k: pytest.fail("loading during projection"))
+    ew.execute_projection(inputs.request, inputs.response, inputs.manifest_path)
+    doc = json.loads(inputs.response.read_bytes())
+    assert doc["metadata"]["schema"] == ew.PROJECTION_SCHEMA and doc["blobs"] == []
+    assert doc["metadata"]["request"]["request_id"] == "projection-id"
+    assert doc["metadata"]["request"]["implementation_identity"] is not None
+
+
+def test_projection_dependency_refusal_never_publishes(inputs, monkeypatch):
+    def refused(*a):
+        raise EncoderSetupError("unreviewed child packages")
+    monkeypatch.setattr(ew, "complete_encoder_seed", refused)
+    with pytest.raises(EncoderSetupError, match="unreviewed child"):
+        ew.execute_projection(inputs.request, inputs.response, inputs.manifest_path)
+    assert not inputs.response.exists()
+
+
+@pytest.mark.parametrize("extra", [["--models-dir", "d"], ["--headroom-bytes", "0"]])
+def test_projection_cli_refuses_loading_flags_before_guard(monkeypatch, extra):
+    monkeypatch.setattr(ew, "install_offline_guard", lambda: pytest.fail("guard on invalid profile"))
+    with pytest.raises(SystemExit) as caught:
+        ew.main(["--project-identity", "--request", "r", "--response", "s", "--manifest", "m", *extra])
+    assert caught.value.code == 2
+
+
+def test_projection_cli_dispatches_only_metadata_executor(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ew, "execute_projection", lambda *a: calls.append(a))
+    monkeypatch.setattr(ew, "execute_worker", lambda *a, **k: pytest.fail("loading executor"))
+    assert ew.main(["--project-identity", "--request", "r", "--response", "s", "--manifest", "m"]) == 0
+    assert calls == [("r", "s", "m")]
+
+
+def test_loading_cli_still_requires_both_resource_flags(monkeypatch):
+    monkeypatch.setattr(ew, "install_offline_guard", lambda: pytest.fail("guard on missing flags"))
+    with pytest.raises(SystemExit) as caught:
+        ew.main(["--request", "r", "--response", "s", "--manifest", "m"])
+    assert caught.value.code == 2
 
 
 def test_offline_guard_child_without_outer_guard(tmp_path):

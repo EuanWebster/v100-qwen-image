@@ -113,7 +113,8 @@ byte verification after the actual memory prerequisite (see
 `docs/encoder-assets.md`). The local-only loader/worker now integrates these
 boundaries (`docs/encoder-worker.md`), with required runtime headroom and memory
 checks before ML imports or shard hashing/loading. Full-project review,
-including parent/child runtime handoff and the other modules, remains before activation.
+including remaining module review, remains before activation. Parent/child
+runtime handoff is implemented (`docs/encoder-client.md`).
 Real processor, checkpoint parity, host/GPU fit, CUDA execution
 and generation remain unvalidated. The V100 is still unavailable according
 to the last user confirmation.
@@ -121,7 +122,9 @@ to the last user confirmation.
 Review correction, 2026-10-13: the original four-package policy could miss
 transitive drift. Complete lock validation and runtime identity now close that
 gap at request projection/worker validation; generic opaque cache hits still
-require a freshly projected executing-runtime request at the production boundary.
+require a freshly projected executing-runtime request. `ProductionEncoder`
+supplies this boundary, including seed/completed-request coherence and manifest
+fingerprint checks (`docs/encoder-client.md`).
 Identity tests now total **400**, including all 64 required names/vision-gate
 drift combinations, lock-policy consistency, optional inventory/source drift,
 Python patch drift, canonical digest anchors and stale worker refusal. Both

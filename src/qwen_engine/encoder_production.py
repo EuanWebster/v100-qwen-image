@@ -965,18 +965,8 @@ def _expected_names(cfg_active: bool,
     return plan
 
 
-def payload_to_branches(payload: EncodedPayload, *,
-                        expect_request: EncoderRequest | None = None
-                        ) -> BranchBundle:
-    """Recover the branch records from a tensor payload.
-
-    Validation order is the point: byte/header bounds FIRST (stdlib), then
-    the safetensors deserialization, then the actual tensor dtypes/shapes/
-    values against the declared descriptors — no casts, no reshapes, no
-    silent mask substitution. A null attention mask stays null (its tensor is
-    simply absent). When ``expect_request`` is given, the payload identity
-    must match its cache key and canonical request document exactly.
-    """
+def _inspect_payload(payload: EncodedPayload, expect_request: EncoderRequest | None):
+    """Common stdlib-only identity/codec/header checks, before tensor loading."""
     if not isinstance(payload, EncodedPayload):
         raise _proto(f"payload must be an EncodedPayload, got "
                      f"{type(payload).__name__}")
@@ -1075,6 +1065,30 @@ def payload_to_branches(payload: EncodedPayload, *,
                 mask_spec = header_tensors[side + suffix]
                 if mask_spec["dtype"] != code or mask_spec["shape"] != [1, shape[1]]:
                     raise _proto(f"{side + suffix}: header mask shape/dtype disagrees with embeddings")
+
+    return plan, by_name, header_names, dtype, cfg_active, blob
+
+
+def validate_serialized_payload(payload: EncodedPayload, *, expect_request: EncoderRequest) -> None:
+    """Validate request/codec/header structure without ML imports or tensors.
+
+    Does NOT validate actual embedding finiteness/mask values; consumers must
+    still call payload_to_branches with this same expected request before use.
+    """
+    if not isinstance(expect_request, EncoderRequest):
+        raise EncoderRequestError("expect_request must be an EncoderRequest")
+    _inspect_payload(payload, expect_request)
+
+
+def payload_to_branches(payload: EncodedPayload, *,
+                        expect_request: EncoderRequest | None = None) -> BranchBundle:
+    """Recover branches: stdlib bounds/identity first, then tensor values.
+
+    No casts/reshapes/mask substitution. Actual dtypes/shapes/finiteness and
+    mask values are validated after deserialization. Null masks remain null.
+    With expect_request, identity must match its cache key/document exactly.
+    """
+    plan, by_name, header_names, dtype, cfg_active, blob = _inspect_payload(payload, expect_request)
 
     # --- library deserialization (only now) ---------------------------------
     st = _load_safetensors()

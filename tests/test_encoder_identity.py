@@ -194,6 +194,16 @@ def test_optional_inventory_observed_without_imports(monkeypatch):
         facts.extra_packages["optional-kernel"] = ei.PackageObservation("2.0")
 
 
+def test_own_editable_dist_and_checkout_metadata_do_not_create_false_ambiguity(monkeypatch):
+    fake_distributions(monkeypatch)
+    original = ei.metadata.distributions
+    monkeypatch.setattr(ei.metadata, "distributions", lambda: iter([
+        *original(), SimpleNamespace(metadata={"Name": "qwen-engine"}),
+        SimpleNamespace(metadata={"Name": "qwen_engine"})]))
+    facts = ei.observe_installed_packages()
+    assert not facts.extra_packages and "qwen-engine" not in facts.packages
+
+
 @pytest.mark.parametrize("names", [("Torch", "torch"), ("some_lib", "some.lib"),
                                   ("bad/name",), (None,), ("",), ("x" * 129,)])
 def test_ambiguous_or_invalid_distribution_inventory_refused(monkeypatch, names):
@@ -508,3 +518,43 @@ def test_verified_bundle_coherence(tmp_path, reviewed_fixture):
         ei.request_from_verified_bundle(config, manifest, replace(bundle, assets={}), encoder_dtype="fp16")
     with pytest.raises(EncoderRequestError, match="paths/roles"):
         ei.request_from_verified_bundle(config, manifest, replace(bundle, component_dirs={}), encoder_dtype="fp16")
+
+
+def test_projection_seed_has_no_runtime_claim_or_package_source_reads(manifest, monkeypatch):
+    monkeypatch.setattr(ei, "observe_installed_packages", lambda: pytest.fail("seed package observation"))
+    monkeypatch.setattr(ei, "worker_source_digest", lambda: pytest.fail("seed source read"))
+    seed = ei.project_encoder_seed(GenerationConfig(negative_prompt="ignored"), manifest, encoder_dtype="bf16")
+    assert seed.implementation_identity is None and seed.negative_prompt == "ignored"
+    with pytest.raises(EncoderRequestError, match="implementation_identity"):
+        ei.validate_production_request(seed)
+
+
+def test_seed_completed_in_current_runtime_parent_coherence_does_not_reobserve(manifest, reviewed_fixture, monkeypatch):
+    config = GenerationConfig(negative_prompt="bad", true_cfg_scale=2)
+    seed = ei.project_encoder_seed(config, manifest, encoder_dtype="fp16")
+    completed = ei.complete_encoder_seed(seed, manifest)
+    assert completed == ei.project_encoder_request(config, manifest, encoder_dtype="fp16")
+    monkeypatch.setattr(ei, "observe_installed_packages", lambda: pytest.fail("parent observation"))
+    ei.validate_completed_seed(seed, completed, manifest)
+    with pytest.raises(EncoderRequestError, match="disagrees"):
+        ei.validate_completed_seed(seed, replace(completed, prompt="different"), manifest)
+
+
+@pytest.mark.parametrize("field,value", [("images", ("f" * 64,)), ("kwargs", {}),
+    ("kwargs", {"cfg_active": "yes"}), ("model_repo", "wrong/repo"),
+    ("dtype", "FP16"), ("processor", ComponentIdentity(sha256="f" * 64))])
+def test_bad_projection_seeds_refused_before_runtime_observation(manifest, monkeypatch, field, value):
+    seed = ei.project_encoder_seed(GenerationConfig(), manifest, encoder_dtype="fp16")
+    monkeypatch.setattr(ei, "observe_installed_packages", lambda: pytest.fail("bad seed observation"))
+    with pytest.raises(EncoderRequestError):
+        ei.complete_encoder_seed(replace(seed, **{field: value}), manifest)
+
+
+def test_projection_refuses_completed_requests_and_real_vision_gate(manifest, reviewed_fixture, monkeypatch):
+    seed = ei.project_encoder_seed(GenerationConfig(), manifest, encoder_dtype="fp16")
+    completed = ei.complete_encoder_seed(seed, manifest)
+    with pytest.raises(EncoderRequestError, match="without implementation identity"):
+        ei.complete_encoder_seed(completed, manifest)
+    monkeypatch.setattr(ei, "PINNED_TORCHVISION_VERSION", None)
+    with pytest.raises(EncoderSetupError, match="no reviewed pin"):
+        ei.complete_encoder_seed(seed, manifest)

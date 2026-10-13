@@ -27,7 +27,7 @@ from qwen_engine.encoder_assets import (
     CHECKPOINT_DTYPE, EncoderAssetError, VerifiedEncoderAssets,
     preflight_encoder_tree, verify_encoder_assets,
 )
-from qwen_engine.encoder_identity import validate_worker_request_identity
+from qwen_engine.encoder_identity import complete_encoder_seed, validate_worker_request_identity
 from qwen_engine.encoder_production import encode_with_supplied_model, validate_production_request
 from qwen_engine.local_bundle import ENCODER_ROLES, validate_local_reference_layout
 from qwen_engine.manifest import ManifestError, ManifestFormatError, manifest_from_dict
@@ -38,6 +38,8 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_INDEX_BYTES = 4 * 1024 * 1024
 MAX_JSON_DEPTH = 40
 MAX_JSON_NODES = 20000
+PROJECTION_SCHEMA = "qwen_engine.encoder_projection.v1"
+MAX_PROJECTION_RESPONSE_BYTES = 512 * 1024
 _STAT_FIELDS = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
 _OFFLINE_INSTALLED = False
 
@@ -302,27 +304,59 @@ def _publish_response(parent: Path, name: str, directory: int, raw: bytes):
             os.unlink(temporary, dir_fd=directory)
 
 
-def execute_worker(request_path, response_path, manifest_path, models_dir, *, headroom_bytes: int):
-    """Run only in a fresh child: offline guard lifetime is process-wide."""
-    install_offline_guard()
+def _read_request(request_path):
     doc, _ = read_bounded_json(request_path, MAX_REQUEST_BYTES, "encoder request")
     request, rid = EncoderRequest.from_request_dict(doc)
-    validate_production_request(request)
     if len(rid) > 128:
         raise EncoderRequestError("request_id exceeds 128 characters")
+    return request, rid
+
+
+def _read_manifest(manifest_path):
     try:
         manifest_doc, _ = read_bounded_json(manifest_path, MAX_MANIFEST_BYTES, "model manifest")
     except EncoderRequestError as exc:
         raise ManifestFormatError(str(exc)) from exc
-    manifest = manifest_from_dict(manifest_doc)
+    return manifest_from_dict(manifest_doc)
+
+
+@contextmanager
+def _response_destination(response_path):
     with ExitStack() as stack:
         try:
             parent, name, directory = stack.enter_context(_parent(response_path))
         except (OSError, ValueError, TypeError, RuntimeError) as exc:
             raise EncoderSetupError(f"invalid worker response destination: {exc}") from exc
         _require_absent(name, directory)
+        yield parent, name, directory
+
+
+def execute_worker(request_path, response_path, manifest_path, models_dir, *, headroom_bytes: int):
+    """Run only in a fresh child: offline guard lifetime is process-wide."""
+    install_offline_guard()
+    request, rid = _read_request(request_path)
+    validate_production_request(request)
+    manifest = _read_manifest(manifest_path)
+    with _response_destination(response_path) as (parent, name, directory):
         payload = _encode_request(request, manifest, models_dir, headroom_bytes)
         _publish_response(parent, name, directory, result_bytes(payload, rid))
+
+
+def execute_projection(request_path, response_path, manifest_path):
+    """Fresh-child metadata-only projection: no ML, model-root or byte reads.
+
+    Does not assert memory fit or asset verification. Package policy remains
+    enforced; the real loading worker still performs all its existing gates.
+    """
+    install_offline_guard()
+    seed, rid = _read_request(request_path)
+    manifest = _read_manifest(manifest_path)
+    with _response_destination(response_path) as (parent, name, directory):
+        request = complete_encoder_seed(seed, manifest)
+        payload = EncodedPayload(metadata={"schema": PROJECTION_SCHEMA,
+            "request": request.to_request_dict(rid)})
+        _publish_response(parent, name, directory,
+                          result_bytes(payload, rid, cap=MAX_PROJECTION_RESPONSE_BYTES))
 
 
 def _headroom_arg(value: str) -> int:
@@ -337,13 +371,24 @@ def _headroom_arg(value: str) -> int:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Local-only CPU encoder worker; memory/package gates enforced")
-    for flag in ("request", "response", "manifest", "models-dir"):
+    for flag in ("request", "response", "manifest"):
         parser.add_argument(f"--{flag}", required=True)
-    parser.add_argument("--headroom-bytes", required=True, type=_headroom_arg)
+    parser.add_argument("--project-identity", action="store_true",
+                        help="metadata-only seed projection; no ML/model-root access or loading")
+    parser.add_argument("--models-dir")
+    parser.add_argument("--headroom-bytes", type=_headroom_arg)
     args = parser.parse_args(argv)
+    if args.project_identity:
+        if args.models_dir is not None or args.headroom_bytes is not None:
+            parser.error("--project-identity refuses loading flags --models-dir/--headroom-bytes")
+    elif args.models_dir is None or args.headroom_bytes is None:
+        parser.error("loading requires --models-dir and --headroom-bytes")
     try:
-        execute_worker(args.request, args.response, args.manifest, args.models_dir,
-                       headroom_bytes=args.headroom_bytes)
+        if args.project_identity:
+            execute_projection(args.request, args.response, args.manifest)
+        else:
+            execute_worker(args.request, args.response, args.manifest, args.models_dir,
+                           headroom_bytes=args.headroom_bytes)
         return 0
     except MemoryPreflightError as exc:
         return _report_failure(3, exc)

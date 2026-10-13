@@ -20,7 +20,7 @@ import re
 import stat
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -136,19 +136,25 @@ def observe_installed_packages() -> InstalledEncoderPackages:
     """
     # Inventory optional distributions as well: their presence can affect ML
     # feature detection even without a lock change. Duplicate normalized names
-    # make lookup ambiguous and are refused, including our own distribution.
+    # make lookup ambiguous and are refused. Our own unused metadata is excluded:
+    # editable installs routinely expose both dist-info and checkout egg-info;
+    # the executing package's own source is fingerprinted independently.
     inventory = {}
     try:
-        for dist in metadata.distributions():
+        for count, dist in enumerate(metadata.distributions(), 1):
+            if count > MAX_DISTRIBUTIONS:
+                raise ValueError("installed distribution-count cap exceeded")
             raw_name = dist.metadata.get("Name")
             if not isinstance(raw_name, str) or len(raw_name) > 128:
                 raise ValueError("invalid distribution name")
             name = re.sub(r"[-_.]+", "-", raw_name).lower()
-            if not _PACKAGE_NAME.fullmatch(name) or name in inventory:
+            if not _PACKAGE_NAME.fullmatch(name):
+                raise ValueError("invalid normalized distribution name")
+            if name == "qwen-engine":
+                continue
+            if name in inventory:
                 raise ValueError("invalid/duplicate normalized distribution name")
             inventory[name] = dist
-            if len(inventory) > MAX_DISTRIBUTIONS:
-                raise ValueError("installed distribution-count cap exceeded")
     except Exception as exc:
         raise EncoderSetupError(f"cannot inventory installed distributions: {exc}") from exc
     observed, extras = {}, {}
@@ -331,8 +337,8 @@ def _implementation_identity(manifest: ModelManifest) -> EncoderImplementationId
     )
 
 
-def _project_request(manifest: ModelManifest, *, prompt: str, negative: str,
-                     dtype: str, cfg_active: bool) -> EncoderRequest:
+def _projection_fields(manifest: ModelManifest, *, prompt: str, negative: str,
+                       dtype: str, cfg_active: bool) -> dict:
     if not isinstance(manifest, ModelManifest):
         raise EncoderRequestError("a full-reference ModelManifest is required")
     repo, revision = validate_local_reference_layout(manifest)
@@ -344,14 +350,55 @@ def _project_request(manifest: ModelManifest, *, prompt: str, negative: str,
     processor_digest = artifact_set_fingerprint(a for a in artifacts if a.role == "processor")
     tokenizer_digest = artifact_set_fingerprint(a for a in artifacts if a.identity in TOKENIZER_FILES)
     template = next(a for a in artifacts if a.identity == "processor/chat_template.jinja")
-    fields = dict(prompt=prompt, negative_prompt=negative, dtype=dtype,
+    return dict(prompt=prompt, negative_prompt=negative, dtype=dtype,
                   kwargs={"cfg_active": cfg_active}, model_repo=repo, model_revision=revision,
                   processor=ComponentIdentity(revision=revision, sha256=processor_digest),
                   tokenizer=ComponentIdentity(revision=revision, sha256=tokenizer_digest),
                   chat_template=ComponentIdentity(revision=revision, sha256=template.sha256))
+
+
+def _project_request(manifest: ModelManifest, *, prompt: str, negative: str,
+                     dtype: str, cfg_active: bool) -> EncoderRequest:
+    fields = _projection_fields(manifest, prompt=prompt, negative=negative, dtype=dtype, cfg_active=cfg_active)
     request = EncoderRequest(**fields, implementation_identity=_implementation_identity(manifest))
     validate_production_request(request)
     return request
+
+
+def project_encoder_seed(config: GenerationConfig, manifest: ModelManifest, *,
+                         encoder_dtype: str) -> EncoderRequest:
+    """Manifest-only projection seed, with NO claimed runtime identity.
+
+    No package inspection or asset/source reads. Never encode/cache this seed
+    in production: a fresh selected child must complete its identity first.
+    """
+    if not isinstance(config, GenerationConfig):
+        raise EncoderRequestError("a GenerationConfig is required")
+    return EncoderRequest(**_projection_fields(manifest, prompt=config.prompt,
+        negative=config.negative_prompt, dtype=encoder_dtype, cfg_active=config.cfg_active))
+
+
+def complete_encoder_seed(seed: EncoderRequest, manifest: ModelManifest) -> EncoderRequest:
+    """Complete a coherent seed using THIS interpreter's observed identity."""
+    if (not isinstance(seed, EncoderRequest) or seed.implementation_identity is not None
+            or seed.images or set(seed.kwargs) != {"cfg_active"}
+            or type(seed.kwargs["cfg_active"]) is not bool):
+        raise EncoderRequestError("identity projection requires a T2I seed without implementation identity")
+    fields = _projection_fields(manifest, prompt=seed.prompt, negative=seed.negative_prompt,
+                               dtype=seed.dtype, cfg_active=seed.kwargs["cfg_active"])
+    if EncoderRequest(**fields).key_document() != seed.key_document():
+        raise EncoderRequestError("projection seed disagrees with the manifest identity")
+    return _project_request(manifest, prompt=seed.prompt, negative=seed.negative_prompt,
+                            dtype=seed.dtype, cfg_active=seed.kwargs["cfg_active"])
+
+
+def validate_completed_seed(seed: EncoderRequest, request: EncoderRequest, manifest: ModelManifest) -> None:
+    """Parent-side coherence only; never substitute parent package facts."""
+    validate_production_request(request)
+    if (not isinstance(seed, EncoderRequest) or seed.implementation_identity is not None
+            or replace(request, implementation_identity=None).key_document() != seed.key_document()
+            or request.implementation_identity.encoder_artifact_set_sha256 != reference_bundle_fingerprints(manifest).encoder):
+        raise EncoderRequestError("completed request disagrees with its projection seed")
 
 
 def project_encoder_request(config: GenerationConfig, manifest: ModelManifest, *,

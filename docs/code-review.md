@@ -14,7 +14,7 @@ dependency/lock changes, service changes, Qwen jobs or generation activation.
    corrupt/bounded inventory refused. Lock-policy consistency is tested.
    Both guarded suites1480/2skip; actual metadata6/6 and miniature worker12/12
    on each Py3.11.15/3.13.5. Generic opaque cache requires fresh production
-   identity BEFORE lookup; parent/child projection boundary remains pending.
+   identity BEFORE lookup; parent/child projection boundary added in item8.
 2. **Logger timing**: startup/elapsed clock failures could abort work or mask
    a primary body error despite nonfatal logging policy. Timing now becomes
    null/unavailable on ordinary failures/invalid/nonfinite values; stack and
@@ -60,24 +60,30 @@ nonfatal clocks and preserved worker errors. No live assets are mutated.
    preserving the old published entry and exclusive-name ownership rules.
   21new regressions; generic encoder222/222, both full guarded suites
   1593passed+2skip and actual miniature worker12/12 each on both Python versions.
+8. **Selected-child identity before production cache**: new ProductionEncoder
+   completes a metadata-only seed in a fresh selected interpreter before every
+   cache hit/miss. Parent never substitutes its package facts; checks request
+   coherence/encoder-manifest fingerprint and wire budget. Model-root access
+   and actual memory/asset gates remain in the separate loading child. Shared
+   stdlib codec inspection validates hits and misses before return/store;
+   full tensor values still require the consumer decoder. Harmless own
+   editable dist-info+egg-info duplication is excluded from unused metadata;
+   executing source still hashed; ML duplicate names still refuse.
+   49new tests; both full suites1642/2skip. Actual cross-version child checks8/8
+   each direction with real metadata but PRIVATE synthetic vision/payload seams;
+   no real model/fit claim. Actual identity6, helper36 and miniature worker12
+   passed per interpreter. See docs/encoder-client.md for contracts and limits.
 
 ## Coverage / next work
 
-Fully read this pass: encoder_identity + runtime policy, encoder_worker,
+Fully read this pass: encoder_identity + runtime policy, encoder_worker, encoder_client,
 manifest, log, config, CLI, core, adapters/base, _jsonsafe, _local_io and
 generic encoder identity/request/payload, cache and worker lifecycle/response
 code. Identity/worker policy and
 source/asset/codec integration were also exercised by prior CPU milestones;
 that evidence does not substitute for reviewing all remaining source.
 
-Next: production parent/child identity-before-cache API. Use a fresh **selected
-worker interpreter** for metadata-only projection, not parent-installed facts
-or a caller-maintained revision tag; no ML/model-root/asset reads or memory
-fit claim in projection. Always project/revalidate before any production cache
-lookup; only a miss launches the existing memory-gated loading worker, which
-rechecks identity and fresh narrow assets. Keep this separate from generation/
-web activation, and preserve generic opaque/fake transport behavior.
-Then review
+Next: finish reviewing
 production helper/codec, encoder assets, memory preflight, local bundle,
 benchmark schemas/persistence, fetch tool, web API/server and real-browser UI.
 Keep reusable review evidence and environment setup in the repo/.review-envs;

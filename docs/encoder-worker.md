@@ -3,7 +3,7 @@
 CPU worker/loader milestone, 2026-10-13. `qwen-encoder-worker` or
 `python -B -m qwen_engine.encoder_worker` executes a fresh child. It is separate
 from the image-generation adapter/web service and does not enable generation.
-Import/`--help` remain ML-free. All five flags are mandatory:
+Import/`--help` remain ML-free. All five flags are mandatory for loading:
 
 ```text
 --request /absolute/request.json
@@ -19,6 +19,11 @@ No test loader, memory bypass, source-root override or dependency auto-install
 is exposed through the CLI. Use the existing `EncoderWorker` subprocess runner
 with `{python}`, `{request}` and `{response}` placeholders; run request identity
 creation in the selected worker interpreter, not a different parent runtime.
+`ProductionEncoder` now supplies fresh-child projection before cache lookup
+(`docs/encoder-client.md`). Metadata-only `--project-identity` requires only
+request/response/manifest and **refuses** loading flags; it reads no model
+directory/asset bytes, imports no ML and makes no memory-fit claim. Loading
+still requires explicit models/headroom and all existing gates below.
 Never call `execute_worker` in the web/server parent: its socket guard is
 irreversible and process-wide.
 
@@ -114,5 +119,6 @@ missing/unlocked torchvision continue to refuse production. Full-project
 review is ongoing. The transitive-runtime/cache identity gap has been corrected:
 all 63 locked runtime versions are now validated, and Python patch/optional
 distribution/source metadata enter identity (see `docs/encoder-identity.md`).
-Parent/child runtime handoff and review of all existing modules remain before
-production activation. Web generation stays disabled.
+Parent/child runtime handoff is implemented and tested, including cache hits.
+Remaining module review and real runtime acceptance remain before production
+activation. Web generation stays disabled.
