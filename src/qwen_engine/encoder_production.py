@@ -597,13 +597,9 @@ def _element_product(shape: tuple[int, ...], at: str) -> int:
     return product
 
 
-def serialize_branches(validated: ValidatedProductionRequest,
-                       bundle: BranchBundle) -> EncodedPayload:
-    """Serialize a validated branch bundle for a validated request into one
-    :class:`EncodedPayload`: exactly one blob of safetensors bytes with
-    versioned metadata, the full request identity and the exact tensor
-    descriptors. No value is cast — tensors are handed to the library
-    unchanged."""
+def validate_branch_bundle(validated: ValidatedProductionRequest,
+                           bundle: BranchBundle) -> None:
+    """Recheck mutable tensors without casting or allocating serialized bytes."""
     if not isinstance(validated, ValidatedProductionRequest):
         raise EncoderRequestError("a ValidatedProductionRequest is required")
     checked = validate_production_request(validated.request)
@@ -626,6 +622,13 @@ def serialize_branches(validated: ValidatedProductionRequest,
         if hidden is not None and width != hidden:
             raise _proto("branches disagree on hidden width")
         hidden = width
+
+
+def serialize_branches(validated: ValidatedProductionRequest,
+                       bundle: BranchBundle) -> EncodedPayload:
+    """Serialize exact, validated tensor values with full request identity."""
+    validate_branch_bundle(validated, bundle)
+    req = validated.request
     tensors = _branch_tensors(bundle)
     descriptors = _tensor_descriptors(tensors)
     if sum(d["bytes"] for d in descriptors) > MAX_TENSOR_BLOB_BYTES - MAX_SAFETENSORS_HEADER_BYTES - 8:

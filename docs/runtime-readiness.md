@@ -10,11 +10,14 @@ The production-source review and focused tooling corrections are complete;
 the main guarded suites, pinned synthetic checks and real-browser workspace
 checks are accepted in `code-review.md`. Environments, tools and tests live
 on the persistent project mount. The web workspace remains planning/export
-only; generation adapter, GPU numerics/calibration and web jobs are not yet
-implemented/accepted. Real processor loading is accepted separately below;
+only; a trusted supplied-component adapter is CPU-witnessed, but the default
+loader, GPU numerics/calibration and web jobs are not yet accepted.
+Real processor loading is accepted separately below;
 no actual encoder-checkpoint fidelity is claimed. An internal stdlib-only
 bounded controller foundation is now tested ([job-controller.md](job-controller.md));
-it has no production executor, web wiring or forced thread cancellation.
+The fixed offline process executor/worker boundary is now tested
+([generation-process.md](generation-process.md)), including scoped cancellation
+and direct-child reaping. Neither is wired to web generation.
 Pure exact-match memory-policy groundwork is also tested
 ([memory-policy.md](memory-policy.md)); no real probe/calibration or guard
 integration is claimed.
@@ -70,10 +73,11 @@ until these measurements and model-specific tests pass.
 
 ## Generation implementation sequence
 
-1. Build the adapter around the reviewed upstream QwenImage21 model code
-   and explicit verified assets. Consume only full-identity encoder payloads
-   through the tensor/value/mask decoder. Unit-test lifecycle/refusals with
-   injected fixtures; real component and image tests remain separate gates.
+1. The managed lifecycle and trusted preloaded component bridge are implemented
+   ([supplied-adapter.md](supplied-adapter.md)). Full-identity conditioning,
+   upstream sampling/VAE/save and refusal paths have tiny CPU witnesses only.
+   Next build the gated default local loader; real full-component and accepted
+   reference images remain separate gates, not implied by synthetic PNGs.
 2. Complete phase/backend/conditioning/runtime/device-aware memory policy
    integration and calibrated measurements. Pure typed exact-match policy
    groundwork exists; it requires whole-device/process-tree peaks and fresh
@@ -84,8 +88,9 @@ until these measurements and model-specific tests pass.
    reference; do not default to an unvalidated low-bit or distilled recipe.
 3. Complete the owned bounded generation-job executor/controller: validated immutable
    requests, explicit lifecycle/cancellation/errors, scoped artifacts and
-   worker cleanup. Internal CPU foundation exists; fixture executors prove
-   lifecycle behavior only, not production process cleanup or generation. Wire
+   worker cleanup. Internal controller and fixed process protocol now have
+   actual owned-subprocess cleanup witnesses, but default model generation
+   remains unavailable. Wire
    the web job API after the real adapter/gates can support it; no fake jobs,
    thumbnails, success, progress percentages or availability claims.
 4. Validate the full base recipe at1024² with measured resources and human
