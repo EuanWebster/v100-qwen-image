@@ -25,9 +25,11 @@
  * and horizontal overflow at 1440/375/320. The served-UI (real status/plan)
  * browser checks live in scripts/web_integration_check.mjs.
  *
- * STATUS: not run to green inside the 2026-10-12 review container (the
+ * Historical status: not run to green inside the 2026-10-12 review container (the
  * cgroup pids controller was saturated by processes from earlier sessions;
- * that cause is REPORTED, not verified). Must be run on a clean sandbox.
+ * that cause is REPORTED, not verified). On 2026-10-13 this check passed
+ * 61/61 on the clean sandbox; details in docs/web-review.md. Every new run
+ * still performs its own capacity preflight and reports actual outcomes.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

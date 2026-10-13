@@ -696,6 +696,8 @@ def test_manifest_core_and_blocker_contract_shared_and_exact():
     assert "m.valid && !m.configured" in body          # valid implies configured
     assert "MANIFEST_REASON_CODES.indexOf(m.reason)" in body
     assert "m.schema_version" in body and "m.artifact_count" in body
+    assert "m.schema_version !== 1" in body
+    assert "m.artifact_count < 1" in body
     # exact required set mirrors the REAL server gates
     from qwen_engine.web import api
     m2 = re.search(r"var REQUIRED_BLOCKER_CODES = \[([\s\S]*?)\];", js)

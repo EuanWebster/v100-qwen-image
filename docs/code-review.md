@@ -110,6 +110,26 @@ nonfatal clocks and preserved worker errors. No live assets are mutated.
     focused fetch129passed; full guarded suites1735passed+2skip each on
     Python3.11.15/3.13.5. No real download/resume. Linux/proc-FD and
     settled-tree/concurrency limits explicit in docs/fetch-review.md.
+13. **Web API/server/frontend**: strict manifest metadata JSON; owned frozen
+    startup summary and closed public fields/reasons with consistent blockers;
+    initial-size/cap/identity-checked startup read; typed programmatic keys;
+    exactly schema-v1/nonempty frontend metadata; full editable request/plan
+    echo equality before current/stale labels; idle-worker shutdown fallback
+    and bounded auxiliary port conversion.25new regressions; focused web142;
+    full guarded1762passed+2skip each. Real Chrome105/105 against each Python
+    backend, separate static file://61/61; raw framing7 and lifecycle6 pure
+    checks. Complete contracts and local-server limits: docs/web-review.md.
+14. **Configured log path** (`adcb96d`): relative sinks previously followed
+    later CWD changes. Bind CWD when constructed, keeping lazy writes and
+    deliberate symlink/`..` filesystem semantics (no lexical collapse or
+    symlink sandbox claim). Two new regressions; logger49passed, covered by
+    both full suites1762/2skip.
+
+Final actual pinned checks this round: identity6 and actual-memory refusal3
+per interpreter; synthetic helper/codec36 and miniature four-shard worker12
+per interpreter; selected-child/cache8 per cross-version direction. Private
+test seams only, real vision/memory refusals restored; no real model/fit
+evidence. All diagnostics completed, no background implementation jobs.
 
 ## Coverage / next work
 
@@ -118,13 +138,15 @@ encoder_production (complete helper/codec), encoder_assets, mem_preflight, bench
 manifest, log, config, CLI, core, adapters/base, _jsonsafe, _local_io, local_bundle,
 fetch tool and
 generic encoder identity/request/payload, cache and worker lifecycle/response
-code. Identity/worker policy and
+code; complete web API/server/static JS/CSS/HTML, errors and package/entrypoint
+modules. Identity/worker policy and
 source/asset/codec integration were also exercised by prior CPU milestones;
 that evidence does not substitute for reviewing all remaining source.
 
-Next: web
-API/server and real-browser UI review. Follow up remaining path-binding/
-diagnostic edge cases proportionally; current full review is not complete.
+The current production-source pass is complete; next finish the ancillary
+diagnostic/review-tool and setup audit and runtime-readiness checklist.
+The whole project/full tooling review is not complete. Real processor,
+memory scope, reviewed vision dependency and hardware gates remain.
 Keep reusable review evidence and environment setup in the repo/.review-envs;
 only disposable test fixtures belong in /tmp.
 
@@ -133,3 +155,5 @@ roots and remains process-lived, not every prompt; captured child log **reads**
 are bounded, but scratch stdout/stderr **writes** are not disk-quota-limited;
 timeout/reaping provides the current ordinary child lifecycle. Cache/filesystem
 snapshots are not guarantees against hostile simultaneous rewriting.
+The local HTTP socket timeout is an idle timeout, not a total slow-trickle
+request deadline; finite shutdown joins retain any still-live daemon refs.

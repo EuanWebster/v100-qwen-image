@@ -5,7 +5,7 @@
  * promise/timeout protocol of the shared helpers with small fixtures, plus
  * a documented source check for the one upstream fact (zygote + sandbox is
  * an explicitly-exiting combination, so --no-zygote must not appear).
- * Real-browser verification stays explicitly pending on a clean sandbox.
+ * Real-browser acceptance is a separate command; this check never claims it.
  *
  * Usage: node scripts/chrome_lifecycle_selfcheck.mjs   (exits 0/1)
  */
@@ -128,6 +128,6 @@ for (const [status, line] of results) {
   if (status === 'FAIL') failed++;
   console.log(`${status} ${line}`);
 }
-console.log('NOTE: these are PURE protocol checks — real-Chrome verification ' +
-            'remains explicitly pending on a clean sandbox.');
+console.log('NOTE: PURE protocol checks only — run chrome_browser_check.mjs ' +
+            'and web_integration_check.mjs separately for real-Chrome evidence.');
 process.exit(failed ? 1 : 0);

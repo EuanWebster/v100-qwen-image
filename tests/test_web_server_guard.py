@@ -254,6 +254,27 @@ def test_server_close_owns_its_worker_pool_lifecycle():
     assert "_stopping" in close_src, "connections after stop must not queue"
 
 
+def test_idle_worker_stops_without_sentinel_after_queue_put_failure(monkeypatch):
+    import queue
+    from types import SimpleNamespace
+
+    timeouts = []
+
+    class EmptyQueue:
+        def get(self, *, timeout):
+            timeouts.append(timeout)
+            raise queue.Empty
+
+    owner = SimpleNamespace(_queue=EmptyQueue(), _stopping=True)
+    server._Server._worker(owner)
+    assert timeouts == [server.WORKER_QUEUE_POLL_SECONDS]
+
+
+@pytest.mark.parametrize("port", ["9" * 10000, "65536", "01", "٥", "", "123456"])
+def test_auxiliary_port_check_bounds_conversion_and_refuses_invalid(port):
+    assert server._port_ok(port) is False
+
+
 def test_every_method_obeyes_common_policy_before_typing_the_rejection():
     # The catch-all routes ANY method through header_policy first: an
     # unsupported method with a foreign Origin is 403, not a 501 page.
@@ -350,6 +371,50 @@ def test_read_manifest_limited_bounded_and_hang_free(tmp_path):
     big = tmp_path / "big.json"
     big.write_bytes(b"{ " + b" " * (1 << 20) + b"}")
     assert server.read_manifest_limited(str(big)) == (None, "manifest_too_large")
+
+
+def test_manifest_reader_rejects_initial_oversize_without_read(tmp_path, monkeypatch):
+    path = tmp_path / "large.json"
+    path.write_bytes(b"x" * (server._MANIFEST_LIMIT + 1))
+
+    def no_read(*args):
+        raise AssertionError("oversized input was read")
+
+    monkeypatch.setattr(server.os, "read", no_read)
+    assert server.read_manifest_limited(str(path)) == (None, "manifest_too_large")
+
+
+@pytest.mark.parametrize("change", ["grow", "shrink", "replace", "restore-mtime"])
+def test_manifest_reader_refuses_observed_changes(tmp_path, monkeypatch, change):
+    path = tmp_path / "manifest.json"
+    path.write_bytes(b"abcdef")
+    before = path.stat()
+    real_read = server.os.read
+    changed, requests, received = [], [], []
+
+    def mutate(fd, size):
+        requests.append(size)
+        block = real_read(fd, size)
+        received.append(len(block))
+        if not changed:
+            changed.append(True)
+            if change == "grow":
+                with path.open("ab") as out:
+                    out.write(b"x" * 100)
+            elif change == "shrink":
+                path.write_bytes(b"a")
+            elif change == "replace":
+                path.rename(tmp_path / "original.json")
+                path.write_bytes(b"ABCDEF")
+            else:
+                path.write_bytes(b"ABCDEF")
+                server.os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return block
+
+    monkeypatch.setattr(server.os, "read", mutate)
+    assert server.read_manifest_limited(str(path)) == (None, api.MANIFEST_UNREADABLE)
+    assert sum(received) <= before.st_size + 1
+    assert max(requests) <= before.st_size + 1
 
 
 # ------------------------------------------------------------- entrypoint

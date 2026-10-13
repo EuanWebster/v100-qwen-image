@@ -504,9 +504,8 @@
       blocker = m.reason;
     } else {
       if (m.reason !== undefined) return null;      // reason only when invalid
-      if (!Number.isInteger(m.schema_version) || m.schema_version < 1 ||
-          m.schema_version > 64) return null;
-      if (!Number.isInteger(m.artifact_count) || m.artifact_count < 0 ||
+      if (m.schema_version !== 1) return null;
+      if (!Number.isInteger(m.artifact_count) || m.artifact_count < 1 ||
           m.artifact_count > 1000000) return null;
     }
     return { configured: m.configured, valid: m.valid, blocker: blocker };
@@ -742,12 +741,18 @@
         return false;
       }
       var plan = parsePlan(r.json);
+      // A coherent plan for DIFFERENT settings is not validation of the
+      // submitted snapshot. Compare the complete editable echo, independent
+      // of JSON key order, before granting any current/stale plan label.
+      if (plan && Object.keys(built.envelope.config).some(function (key) {
+        return plan.config[key] !== built.envelope.config[key];
+      })) plan = null;
       if (!plan) {
         setApiAvailable(false);
         renderChip('Status rejected',
           'Status rejected — server contract broken');
         setText('api-message', 'The plan document did not match the expected ' +
-                               'schema — nothing is rendered or trusted; ' +
+                               'schema or submitted configuration — nothing is rendered or trusted; ' +
                                'previous results are hidden and your draft is ' +
                                'unchanged. Use "Check configuration" to ' +
                                're-establish a recognized status before ' +

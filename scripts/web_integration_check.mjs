@@ -888,6 +888,68 @@ async function chromeChecks() {
         blankPrompt.zwspAccepted === true && blankPrompt.interiorAccepted === true,
         JSON.stringify(blankPrompt));
 
+  // Reviewed metadata policy is exactly schema-v1 with a nonempty artifact
+  // set. Use real served status/plan documents, then mutate only metadata.
+  const metadataPolicy = await evaluate(`(async function () {
+    var status = await (await fetch('/api/v1/status', { cache: 'no-store' })).json();
+    var build = window.QwenStudio.buildEnvelope();
+    var plan = await (await fetch('/api/v1/plan', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Qwen-UI': '1' },
+      body: JSON.stringify(build.envelope), cache: 'no-store'
+    })).json();
+    var accepted = [];
+    [status, plan].forEach(function (original, index) {
+      ['version', 'empty'].forEach(function (fault) {
+        var doc = JSON.parse(JSON.stringify(original));
+        if (fault === 'version') doc.manifest.schema_version = 2;
+        else doc.manifest.artifact_count = 0;
+        var parser = index === 0 ? window.QwenStudio.parseStatus : window.QwenStudio.parsePlan;
+        if (parser(doc) !== null) accepted.push(index + ':' + fault);
+      });
+    });
+    return { baseline: window.QwenStudio.parseStatus(status) !== null &&
+                       window.QwenStudio.parsePlan(plan) !== null, accepted: accepted };
+  })()`);
+  check('status/plan refuse unreviewed manifest schema and empty valid artifact set',
+        metadataPolicy.baseline && metadataPolicy.accepted.length === 0, JSON.stringify(metadataPolicy));
+
+  // A semantically coherent echo for OTHER settings must not be labelled
+  // authoritative validation of our submitted snapshot. This is a controlled
+  // backend response mutation in real Chrome, not a server generation run.
+  await evaluate(`(function () {
+    window.__echoPlainFetch = window.fetch;
+    window.fetch = function (url, options) {
+      return window.__echoPlainFetch(url, options).then(function (res) {
+        if (String(url) !== '/api/v1/plan' || !res.ok) return res;
+        return res.json().then(function (doc) {
+          doc.config.prompt = 'different but valid prompt';
+          window.__coherentDifferentPlan = window.QwenStudio.parsePlan(doc) !== null;
+          return new Response(JSON.stringify(doc), { status: 200,
+            headers: { 'Content-Type': 'application/json' } });
+        });
+      });
+    };
+    document.getElementById('btn-plan').click();
+  })()`);
+  await waitUntil(async () => /submitted configuration/.test(await evaluate(
+    'document.getElementById("api-message").textContent')), 15000, 'mismatched plan echo refusal');
+  const mismatched = await evaluate(`({ coherent: window.__coherentDifferentPlan,
+    hidden: document.getElementById('plan-panel').hidden,
+    chip: document.getElementById('connection-chip').textContent,
+    disabled: document.getElementById('btn-plan').disabled,
+    prompt: document.getElementById('prompt').value })`);
+  check('coherent plan for a different request is rejected without modifying the draft (controlled response mutation)',
+        mismatched.coherent === true && mismatched.hidden && mismatched.disabled &&
+        mismatched.chip === 'Status rejected' && mismatched.prompt !== 'different but valid prompt',
+        JSON.stringify(mismatched));
+  await evaluate('window.fetch = window.__echoPlainFetch; window.QwenStudio.checkStatus();');
+  await waitUntil(async () => !await evaluate('document.getElementById("btn-plan").disabled'),
+                  15000, 'reconnect after mismatched echo');
+  await evaluate('document.getElementById("btn-plan").click();');
+  await waitUntil(async () => !await evaluate('document.getElementById("plan-panel").hidden'),
+                  15000, 'matching real plan after restoring backend');
+  check('matching real-server plan works again after request-echo refusal', true);
+
   // every network-origin request the page made was same-origin (CSP
   // connect-src 'self' holds in practice; data:/blob: URLs are local)
   const foreign = netUrls.filter((n) => /^https?:/i.test(n.url) && !n.url.startsWith(ORIGIN + '/'));

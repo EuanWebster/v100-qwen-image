@@ -119,6 +119,13 @@ class WebRuntime:
     manifest_path: str | None = None
     manifest_summary: Mapping[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        errors: list[str] = []
+        summary = _jsonsafe.freeze_json(self.manifest_summary, "manifest_summary", errors)
+        if errors or not isinstance(summary, Mapping):
+            raise ValueError("web manifest summary must be a strict JSON mapping")
+        object.__setattr__(self, "manifest_summary", summary)
+
     def path_fields(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in RUNTIME_PATH_FIELDS}
 
@@ -213,6 +220,8 @@ def build_config(runtime: WebRuntime, data: Any) -> GenerationConfig:
         raise ApiError(400, "invalid_envelope",
                        "request must be a JSON object with exactly the keys "
                        "'schema' and 'config'")
+    if any(not isinstance(key, str) for key in data):
+        raise ApiError(400, "invalid_envelope", "request keys must be strings")
     missing = sorted({"schema", "config"} - set(data))
     extra = sorted(set(data) - {"schema", "config"})
     if missing or extra:
@@ -229,6 +238,8 @@ def build_config(runtime: WebRuntime, data: Any) -> GenerationConfig:
     if not isinstance(raw_config, Mapping):
         raise ApiError(400, "invalid_envelope",
                        "'config' must be a JSON object")
+    if any(not isinstance(key, str) for key in raw_config):
+        raise ApiError(400, "unknown_config_field", "config keys must be strings")
     unknown = sorted(set(raw_config) - EDITABLE_FIELDS)
     if unknown:
         raise ApiError(
@@ -350,7 +361,7 @@ def summarize_manifest_bytes(raw: bytes | None, unreadable: str | None = None) -
                 "verification": "not_performed"}
     from qwen_engine.manifest import ManifestFormatError, manifest_from_dict
     try:
-        manifest = manifest_from_dict(json.loads(raw.decode("utf-8")))
+        manifest = manifest_from_dict(_jsonsafe.strict_json_loads(raw.decode("utf-8")))
     except (ManifestFormatError, UnicodeDecodeError, ValueError, RecursionError):
         base["reason"] = MANIFEST_INVALID
         return base
@@ -368,16 +379,23 @@ def _manifest_core(summary: Mapping[str, Any]) -> dict[str, Any]:
     """Metadata-only manifest block shared by status and plan: never
     filenames, hashes or paths, and always verification:"not_performed"."""
     state: dict[str, Any] = {
-        "configured": bool(summary.get("configured", False)),
-        "valid": bool(summary.get("valid", False)),
+        "configured": summary.get("configured") is True,
+        "valid": False,
         "verification": "not_performed",
     }
+    schema, count = summary.get("schema_version"), summary.get("artifact_count")
+    state["valid"] = (state["configured"] and summary.get("valid") is True
+                      and type(schema) is int and schema == 1
+                      and type(count) is int and count > 0)
     if state["valid"]:
-        for key in ("schema_version", "artifact_count"):
-            if key in summary:
-                state[key] = summary[key]
+        state.update(schema_version=schema, artifact_count=count)
     else:
-        state["reason"] = summary.get("reason", MANIFEST_UNCONFIGURED)
+        reason = summary.get("reason")
+        reasons = (MANIFEST_UNCONFIGURED, MANIFEST_FILE_MISSING,
+                   MANIFEST_INVALID, MANIFEST_UNREADABLE)
+        state["reason"] = (reason if isinstance(reason, str) and reason in reasons
+                           else MANIFEST_INVALID if state["configured"]
+                           else MANIFEST_UNCONFIGURED)
     return state
 
 
@@ -392,10 +410,11 @@ def manifest_plan_state(summary: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _manifest_blocker(summary: Mapping[str, Any]) -> str | None:
-    if not summary.get("configured", False):
+    state = _manifest_core(summary)
+    if not state["configured"]:
         return "manifest_unconfigured"
-    if not summary.get("valid", False):
-        reason = summary.get("reason", MANIFEST_INVALID)
+    if not state["valid"]:
+        reason = state["reason"]
         return {"manifest_file_missing": MANIFEST_FILE_MISSING,
                 MANIFEST_INVALID: MANIFEST_INVALID,
                 MANIFEST_UNREADABLE: MANIFEST_UNREADABLE}.get(reason, MANIFEST_INVALID)

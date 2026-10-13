@@ -362,3 +362,59 @@ def test_calibration_honest_unknown_not_global_absence():
     assert "not verified for this server" in plan["calibration"]["detail"]
     assert plan["hardware"]["status"] == "unknown"
     assert "has not probed hardware" in plan["hardware"]["detail"]
+
+
+@pytest.mark.parametrize("replace", [
+    (b'"schema_version": 1', b'"schema_version": 99, "schema_version": 1'),
+    (b'"bytes": 12345', b'"bytes": 1, "bytes": 12345'),
+    (b'"role": "transformer"', b'"role": "wrong", "role": "transformer"'),
+])
+def test_manifest_metadata_refuses_duplicate_keys_like_loader(replace):
+    raw = _valid_manifest_bytes().replace(*replace)
+    summary = api.summarize_manifest_bytes(raw)
+    assert summary["valid"] is False
+    assert summary["reason"] == api.MANIFEST_INVALID
+    assert "manifest_invalid" in api.status_response(runtime(manifest_summary=summary)).payload["generation_blockers"]
+
+
+def test_runtime_metadata_is_an_owned_deep_snapshot():
+    summary = api.summarize_manifest_bytes(_valid_manifest_bytes())
+    rt = runtime(manifest_summary=summary)
+    before = api.status_response(rt).payload
+    summary["valid"] = False
+    summary["revisions"].append("1" * 40)
+    assert api.status_response(rt).payload == before
+    assert rt.manifest_summary["revisions"] == ("0" * 40,)
+    with pytest.raises(TypeError):
+        rt.manifest_summary["valid"] = False
+
+
+@pytest.mark.parametrize("summary", [[], {"bad": float("nan")}, {1: "bad"}])
+def test_runtime_invalid_summary_has_generic_typed_constructor_error(summary):
+    with pytest.raises(ValueError, match="strict JSON mapping"):
+        api.WebRuntime(manifest_summary=summary)
+
+
+@pytest.mark.parametrize("data", [
+    {"schema": ENVELOPE, "config": {}, 1: "bad", "extra": "bad"},
+    {"schema": ENVELOPE, "config": {1: "bad", "extra": "bad"}},
+])
+def test_programmatic_mixed_keys_are_typed_not_sorting_errors(data):
+    with pytest.raises(api.ApiError) as caught:
+        api.build_config(runtime(), data)
+    assert caught.value.status == 400
+
+
+@pytest.mark.parametrize("summary", [
+    {"configured": True, "valid": False, "reason": "/private/secret.json"},
+    {"configured": True, "valid": True, "schema_version": 1, "artifact_count": "/private/secret.json"},
+    {"configured": True, "valid": True, "schema_version": "/private/secret.json", "artifact_count": 1},
+    {"configured": True, "valid": True, "schema_version": True, "artifact_count": 1},
+])
+def test_manifest_public_projection_is_closed_and_blocker_agrees(summary):
+    rt = runtime(manifest_summary=summary)
+    for response in (api.status_response(rt), api.plan_response(rt, plan_bytes({"prompt": "x"}))):
+        assert "/private/" not in json.dumps(response.payload)
+        assert response.payload["manifest"]["valid"] is False
+        assert response.payload["manifest"]["reason"] == api.MANIFEST_INVALID
+        assert "manifest_invalid" in response.payload["generation_blockers"]

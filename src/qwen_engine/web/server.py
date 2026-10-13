@@ -51,6 +51,7 @@ import socket
 import stat as stat_module
 import sys
 import threading
+from pathlib import Path
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib import resources
@@ -72,6 +73,7 @@ DEFAULT_PORT = 8765
 MAX_BODY_BYTES = 64 * 1024
 #: Finite socket/read timeout applied before any header or body read.
 CONNECTION_TIMEOUT_SECONDS = 30
+WORKER_QUEUE_POLL_SECONDS = 1.0
 #: Concurrency cap: a small pool of PERSISTENT worker threads serves this
 #: single-user local development server. No thread is ever spawned per
 #: connection (thread churn exhausts pid-limited containers), and extra
@@ -115,7 +117,7 @@ _DEFENSIVE_HEADERS = (
 
 
 def _port_ok(text: str) -> bool:
-    return text.isdigit() and text.isascii() and (text == "0" or not text.startswith("0")) \
+    return 1 <= len(text) <= 5 and text.isdigit() and text.isascii() and (text == "0" or not text.startswith("0")) \
         and 0 <= int(text) <= 65535
 
 
@@ -261,7 +263,9 @@ _MANIFEST_LIMIT = 1 << 20  # <= 1 MiB, bounded read
 def read_manifest_limited(path: str) -> tuple[bytes | None, str | None]:
     """One bounded, hang-proof read of the manifest file at startup: regular
     FD only (no FIFO open-block, no symlink follow), hard 1 MiB cap. Returns
-    (bytes, None) or (None, typed reason code) — never raises."""
+    (bytes, None) or (None, typed reason code). Observed opened/published
+    size or identity changes refuse; this is a snapshot, not verification."""
+    path = Path(os.path.abspath(path))
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
                      | getattr(os, "O_NONBLOCK", 0))
@@ -274,6 +278,8 @@ def read_manifest_limited(path: str) -> tuple[bytes | None, str | None]:
             st = os.fstat(fd)
             if not stat_module.S_ISREG(st.st_mode):
                 return None, api.MANIFEST_UNREADABLE
+            if st.st_size > _MANIFEST_LIMIT:
+                return None, "manifest_too_large"
             # BOUNDED chunk loop to EOF (a single os.read may legitimately
             # return fewer bytes than requested); past the cap it is typed
             # too-large, never buffered further.
@@ -281,7 +287,7 @@ def read_manifest_limited(path: str) -> tuple[bytes | None, str | None]:
             total = 0
             while True:
                 try:
-                    chunk = os.read(fd, 1 << 16)
+                    chunk = os.read(fd, min(1 << 16, st.st_size + 1 - total))
                 except OSError:
                     return None, api.MANIFEST_UNREADABLE
                 if not chunk:
@@ -289,7 +295,15 @@ def read_manifest_limited(path: str) -> tuple[bytes | None, str | None]:
                 total += len(chunk)
                 if total > _MANIFEST_LIMIT:
                     return None, "manifest_too_large"
+                if total > st.st_size:
+                    return None, api.MANIFEST_UNREADABLE
                 chunks.append(chunk)
+            def signature(info):
+                return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                        info.st_mtime_ns, info.st_ctime_ns)
+            if (total != st.st_size or signature(st) != signature(os.fstat(fd))
+                    or signature(st) != signature(path.stat(follow_symlinks=False))):
+                return None, api.MANIFEST_UNREADABLE
         except OSError:
             return None, api.MANIFEST_UNREADABLE
         return b"".join(chunks), None
@@ -623,12 +637,13 @@ def stop_workers(conn_queue: "queue.Queue[Any]",
     with FINITE timeouts — never blocking forever. Returns the workers
     STILL ALIVE after their bounded join (the caller must keep references
     to them — no false claim that everything joined). A worker
-    mid-request is already bounded by the handler socket timeout; the
-    threads are daemons as the last-resort backstop."""
+    mid-request has an idle socket timeout, not a total request deadline;
+    slow trickle clients may outlive the joins. References to still-live
+    daemon threads are retained rather than claiming they all stopped."""
     for _ in workers:
         try:
             conn_queue.put(_WORKER_SHUTDOWN, timeout=put_timeout)
-        except Exception:  # full/broken queue: worker sees _stopping instead
+        except Exception:  # full/broken queue: idle workers poll _stopping
             break
     still_alive: list[threading.Thread] = []
     for t in workers:
@@ -711,7 +726,11 @@ class _Server(HTTPServer):
     def _worker(self) -> None:
         while True:
             try:
-                item = self._queue.get()
+                item = self._queue.get(timeout=WORKER_QUEUE_POLL_SECONDS)
+            except queue.Empty:
+                if self._stopping:
+                    return
+                continue
             except OSError:  # interpreter teardown
                 return
             if item is _WORKER_SHUTDOWN:   # graceful shutdown sentinel
