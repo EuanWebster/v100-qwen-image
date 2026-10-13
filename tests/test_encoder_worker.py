@@ -335,6 +335,25 @@ def test_request_id_cap_precedes_loading(inputs, monkeypatch):
         execute(inputs)
 
 
+@pytest.mark.parametrize("error", [RuntimeError("inference failed"), ValueError("tensor failed"),
+                                 OSError("checkpoint read failed"), KeyboardInterrupt()])
+def test_pipeline_failure_is_not_relabelled_as_destination_error(inputs, monkeypatch, error):
+    def failed(*a):
+        raise error
+    monkeypatch.setattr(ew, "_encode_request", failed)
+    with pytest.raises(type(error)) as caught:
+        execute(inputs)
+    assert caught.value is error
+    assert not inputs.response.exists()
+
+
+def test_invalid_response_parent_remains_typed_setup_failure(inputs, monkeypatch):
+    inputs.response = inputs.response.parent / "missing-parent/response.json"
+    monkeypatch.setattr(ew, "_encode_request", lambda *a: pytest.fail("encoded with invalid output"))
+    with pytest.raises(EncoderSetupError, match="invalid worker response destination"):
+        execute(inputs)
+
+
 @pytest.mark.parametrize("value", ["-1", "not-a-number"])
 def test_invalid_cli_headroom_precedes_guard(monkeypatch, value):
     monkeypatch.setattr(ew, "install_offline_guard", lambda: pytest.fail("guard installed"))

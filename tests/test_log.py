@@ -238,3 +238,50 @@ def test_human_sink_gets_readable_phase_lines(tmp_path):
 def test_log_import_pulls_in_no_heavy_modules():
     import qwen_engine.log  # noqa: F401
     assert not set(HEAVY_MODULES) & set(sys.modules)
+
+
+@pytest.mark.parametrize("point", ["start", "event", "end", "error"])
+@pytest.mark.parametrize("fault", [OSError("clock failed"), ValueError("clock failed"),
+                                  None, "not a clock", float("nan"), float("inf"), 10**1000])
+def test_timing_faults_are_nonfatal_and_do_not_mask_body_errors(point, fault):
+    sink, human = ListSink(), ListSink()
+    calls = 0
+    def clock():
+        nonlocal calls
+        calls += 1
+        if calls == (1 if point == "start" else 2):
+            if isinstance(fault, Exception):
+                raise fault
+            return fault
+        return 0.0
+    logger = PhaseLogger(sink=sink, human_sink=human, clock=clock, wall_clock=lambda: 1.0)
+    primary = RuntimeError("original pipeline failure")
+    def body():
+        with logger.phase("save"):
+            if point == "event":
+                logger.event("tick")
+            if point == "error":
+                raise primary
+    if point == "error":
+        with pytest.raises(RuntimeError) as caught:
+            body()
+        assert caught.value is primary
+    else:
+        body()
+    assert logger._stack == []
+    recs = sink.records()
+    bad = next(r for r in recs if r["event"] == (
+        "tick" if point == "event" else "phase_error" if point == "error" else "phase_end"))
+    assert bad["elapsed_ms"] is None
+    if point in ("start", "end"):
+        assert human.lines == ["[save] done (timing unavailable)"]
+
+
+def test_timing_interrupt_is_not_swallowed():
+    def clock():
+        raise KeyboardInterrupt()
+    logger = PhaseLogger(clock=clock)
+    with pytest.raises(KeyboardInterrupt):
+        with logger.phase("load"):
+            pytest.fail("body after interrupt")
+    assert logger._stack == []

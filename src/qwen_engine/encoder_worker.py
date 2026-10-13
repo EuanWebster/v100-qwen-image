@@ -15,7 +15,7 @@ import os
 import stat
 import sys
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from qwen_engine._jsonsafe import plain_json, reject_constant
@@ -315,13 +315,14 @@ def execute_worker(request_path, response_path, manifest_path, models_dir, *, he
     except EncoderRequestError as exc:
         raise ManifestFormatError(str(exc)) from exc
     manifest = manifest_from_dict(manifest_doc)
-    try:
-        with _parent(response_path) as (parent, name, directory):
-            _require_absent(name, directory)
-            payload = _encode_request(request, manifest, models_dir, headroom_bytes)
-            _publish_response(parent, name, directory, result_bytes(payload, rid))
-    except (OSError, ValueError, TypeError, RuntimeError) as exc:
-        raise EncoderSetupError(f"invalid worker response destination: {exc}") from exc
+    with ExitStack() as stack:
+        try:
+            parent, name, directory = stack.enter_context(_parent(response_path))
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            raise EncoderSetupError(f"invalid worker response destination: {exc}") from exc
+        _require_absent(name, directory)
+        payload = _encode_request(request, manifest, models_dir, headroom_bytes)
+        _publish_response(parent, name, directory, result_bytes(payload, rid))
 
 
 def _headroom_arg(value: str) -> int:

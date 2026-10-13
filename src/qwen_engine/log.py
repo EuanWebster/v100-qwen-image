@@ -9,6 +9,7 @@ replay) can make timing deterministic.
 from __future__ import annotations
 
 import json
+import math
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -69,7 +70,23 @@ class PhaseLogger:
     #: attributable. Default ``None``: single-run logs need no attribution;
     #: there are still **no default file writes** anywhere.
     run_id: str | None = None
-    _stack: list[tuple[str, float]] = field(default_factory=list, repr=False)
+    _stack: list[tuple[str, float | None]] = field(default_factory=list, repr=False)
+
+    def _clock_value(self) -> float | None:
+        try:
+            value = self.clock()
+            if type(value) not in (int, float) or not math.isfinite(value):
+                return None
+            return float(value)
+        except Exception:
+            return None  # timing is diagnostic, not a pipeline prerequisite
+
+    def _elapsed(self, start: float | None) -> float | None:
+        end = self._clock_value() if start is not None else None
+        if start is None or end is None:
+            return None
+        elapsed = (end - start) * 1000.0
+        return elapsed if math.isfinite(elapsed) else None
 
     # --- emitting ---------------------------------------------------------
 
@@ -84,7 +101,7 @@ class PhaseLogger:
         current = phase if phase is not None else (active[0] if active else DEFAULT_PHASE)
         elapsed_ms: float | None = None
         if active is not None and current == active[0]:
-            elapsed_ms = (self.clock() - active[1]) * 1000.0
+            elapsed_ms = self._elapsed(active[1])
         record: dict[str, Any] = {
             "schema_version": self.schema_version,
             "run_id": self.run_id,
@@ -112,9 +129,10 @@ class PhaseLogger:
         ``phase_end`` record or the ``human_sink`` line is emitted on an
         otherwise-successful body does **not** fail the phase — an image
         saved successfully must still exit 0, not report a log fault.  Only
-        the body's own exceptions propagate.
+        the body's own exceptions propagate. Ordinary clock failures likewise
+        do not abort work or mask a body error; unavailable timing is null.
         """
-        start = self.clock()
+        start = self._clock_value()
         self._stack.append((name, start))
         try:
             try:
@@ -127,8 +145,8 @@ class PhaseLogger:
             try:
                 yield self
             except BaseException as exc:
-                elapsed_ms = (self.clock() - start) * 1000.0
                 try:
+                    elapsed_ms = self._elapsed(start)
                     self._emit({"schema_version": self.schema_version,
                                 "run_id": self.run_id,
                                 "ts": self.wall_clock(), "phase": name,
@@ -138,7 +156,7 @@ class PhaseLogger:
                     pass  # never mask the primary exception with a log fault
                 raise
             else:
-                elapsed_ms = (self.clock() - start) * 1000.0
+                elapsed_ms = self._elapsed(start)
                 try:
                     self._emit({"schema_version": self.schema_version,
                                 "run_id": self.run_id,
@@ -150,7 +168,8 @@ class PhaseLogger:
                 if self.human_sink is not None:
                     try:
                         self.human_sink(
-                            f"[{name}] done in {elapsed_ms:.0f} ms")
+                            f"[{name}] done in {elapsed_ms:.0f} ms" if elapsed_ms is not None
+                            else f"[{name}] done (timing unavailable)")
                     except Exception:
                         pass  # likewise for the human-readable completion line
         finally:

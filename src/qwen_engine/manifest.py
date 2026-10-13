@@ -21,9 +21,12 @@ import os
 import re
 import stat as stat_module
 from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+from qwen_engine._jsonsafe import reject_constant
 
 #: Schema version of ``models/manifest.json`` (finalize values in task 2.1).
 MANIFEST_SCHEMA_VERSION = 1
@@ -44,6 +47,8 @@ STATE_UNREADABLE = "unreadable"
 STATE_PATH_ESCAPE = "path_escape"
 
 _HASH_CHUNK = 1 << 20
+MAX_MANIFEST_BYTES = 1 << 20
+_STAT_FIELDS = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +270,8 @@ class ArtifactHashMismatchError(ArtifactError):
 class ArtifactUnreadableError(ArtifactError):
     """Exists but cannot be read/hashed (permissions, I/O, not a regular file,
     changed mid-verification). Never blocks: FIFOs and directories are
-    identified from ``stat`` *before* any open."""
+    identified from ``stat`` before open and from a nonblocking opened FD,
+    so replacement races cannot turn verification into a blocking FIFO open."""
 
     problem = "artifact unreadable"
 
@@ -309,7 +315,7 @@ def _artifact_from_dict(index: int, data: Any, errors: list[str]) -> ModelArtifa
         bad("(entry)", f"must be an object, got {type(data).__name__}")
         return None
     art: dict[str, Any] = dict(data)
-    for key in sorted(set(art) - _ARTIFACT_KEYS):
+    for key in sorted(set(art) - _ARTIFACT_KEYS, key=repr):
         bad(key, "unknown artifact key")
     _check_artifact_fields(art, f"artifacts[{index}]", errors)
     if any(err.startswith(f"artifacts[{index}].") for err in errors):
@@ -323,7 +329,7 @@ def manifest_from_dict(data: Any) -> ModelManifest:
     errors: list[str] = []
     if not isinstance(data, Mapping):
         raise ManifestFormatError(f"manifest: must be a JSON object, got {type(data).__name__}")
-    for key in sorted(set(data) - _MANIFEST_KEYS):
+    for key in sorted(set(data) - _MANIFEST_KEYS, key=repr):
         errors.append(f"{key}: unknown manifest key")
     version = data.get("schema_version")
     if (not isinstance(version, int) or isinstance(version, bool)
@@ -359,8 +365,30 @@ def manifest_from_dict(data: Any) -> ModelManifest:
 def load_manifest(path: str | Path) -> ModelManifest:
     path = Path(path)
     try:
-        raw = path.read_bytes()
-    except (OSError, ValueError) as exc:  # ValueError: embedded NUL in path
+        # Intentional manifest symlinks are accepted after canonicalization;
+        # no-follow/nonblocking final open prevents a swapped link/FIFO read.
+        canonical = path.resolve(strict=True)
+        fd = os.open(canonical, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            before = os.fstat(fd)
+            if not stat_module.S_ISREG(before.st_mode) or before.st_size > MAX_MANIFEST_BYTES:
+                raise ValueError("manifest must be a bounded regular file (1 MiB cap)")
+            data = bytearray()
+            while True:
+                block = os.read(fd, min(65536, MAX_MANIFEST_BYTES + 1 - len(data)))
+                if not block:
+                    break
+                data.extend(block)
+                if len(data) > MAX_MANIFEST_BYTES:
+                    raise ValueError("manifest byte cap exceeded")
+            if (len(data) != before.st_size or _stat_signature(before) != _stat_signature(os.fstat(fd))
+                    or _stat_signature(before) != _stat_signature(canonical.stat(follow_symlinks=False))
+                    or path.resolve(strict=True) != canonical):
+                raise ValueError("manifest changed during read")
+            raw = bytes(data)
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, RuntimeError) as exc:
         raise ManifestFormatError(
             f"manifest file not readable: {path}: {exc.strerror or exc if isinstance(exc, OSError) else exc}"
         ) from exc
@@ -369,7 +397,7 @@ def load_manifest(path: str | Path) -> ModelManifest:
     except UnicodeDecodeError as exc:
         raise ManifestFormatError(f"manifest file is not valid UTF-8: {path}: {exc}") from exc
     try:
-        data = json.loads(text)
+        data = json.loads(text, object_pairs_hook=_unique_pairs, parse_constant=reject_constant)
     except (ValueError, RecursionError) as exc:
         # ValueError subsumes JSONDecodeError and covers the integer-string
         # digit limit; RecursionError covers deeply nested input, which the
@@ -387,21 +415,58 @@ class _FileChangedDuringHash(OSError):
     """Internal: the open file mutated between fstat and the end of hashing."""
 
 
+def _stat_signature(info: os.stat_result) -> tuple[int, ...]:
+    return tuple(getattr(info, field) for field in _STAT_FIELDS)
+
+
+def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+@contextmanager
+def _artifact_fd(root: Path, resolved: Path):
+    """Open a canonical in-root target through anchored no-follow directories."""
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    parent_fd, fd = root_fd, None
+    try:
+        parts = resolved.relative_to(root).parts
+        for part in parts[:-1]:
+            child_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                               dir_fd=parent_fd)
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            parent_fd = child_fd
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        yield root_fd, parent_fd, fd
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if parent_fd != root_fd:
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
 def _hash_and_check(fd: int, pre: os.stat_result) -> str:
     """Stream-hash an already-open descriptor; raise :class:`_FileChangedDuringHash`
-    if the file changed (size or mtime) while hashing."""
+    if bytes exceed the initial size or opened identity changes while hashing."""
     digest = hashlib.sha256()
     os.lseek(fd, 0, os.SEEK_SET)
-    while chunk := os.read(fd, _HASH_CHUNK):
+    count = 0
+    while chunk := os.read(fd, min(_HASH_CHUNK, pre.st_size + 1 - count)):
+        count += len(chunk)
+        if count > pre.st_size:
+            raise _FileChangedDuringHash("file grew during verification")
         digest.update(chunk)
     after = os.fstat(fd)
-    if after.st_size != pre.st_size:
+    if count != pre.st_size or _stat_signature(after) != _stat_signature(pre):
         raise _FileChangedDuringHash(
-            f"file changed during verification (size {pre.st_size} -> {after.st_size})"
+            "file changed during verification (size, mode, timestamps or identity)"
         )
-    if (getattr(after, "st_mtime_ns", None) is not None
-            and after.st_mtime_ns != pre.st_mtime_ns):
-        raise _FileChangedDuringHash("file modified during verification (mtime changed)")
     return digest.hexdigest()
 
 
@@ -420,7 +485,7 @@ def _verify_one(artifact: ModelArtifact, root: Path,
             ArtifactPathError(artifact, f"resolves to {resolved}, outside {root_resolved}"),
         )
     try:
-        st = resolved.stat()
+        st = resolved.stat(follow_symlinks=False)
     except FileNotFoundError:
         return ArtifactStatus(artifact, STATE_MISSING, ArtifactMissingError(artifact))
     except OSError as exc:  # permission on a path component, ELOOP, ...
@@ -441,43 +506,34 @@ def _verify_one(artifact: ModelArtifact, root: Path,
             ArtifactSizeMismatchError(artifact, artifact.bytes, st.st_size),
         )
     try:
-        fd = os.open(resolved, os.O_RDONLY)
+        with _artifact_fd(root_resolved, resolved) as (root_fd, parent_fd, fd):
+            pre = os.fstat(fd)
+            if not stat_module.S_ISREG(pre.st_mode):
+                raise OSError("not a regular file (swapped after stat)")
+            if pre.st_size != artifact.bytes:
+                return ArtifactStatus(artifact, STATE_SIZE_MISMATCH,
+                    ArtifactSizeMismatchError(artifact, artifact.bytes, pre.st_size))
+            if _stat_signature(pre) != _stat_signature(st):
+                raise OSError("artifact changed between stat and open")
+            try:
+                actual_sha = _hash_and_check(fd, pre)
+            except _FileChangedDuringHash:
+                return ArtifactStatus(artifact, STATE_SIZE_MISMATCH,
+                    ArtifactSizeMismatchError(artifact, artifact.bytes, os.fstat(fd).st_size,
+                                              detail="file changed during hashing"))
+            published = os.stat(resolved.name, dir_fd=parent_fd, follow_symlinks=False)
+            root_open, root_now = os.fstat(root_fd), root_resolved.stat(follow_symlinks=False)
+            now_resolved, fail = _resolve_or_fail(path)
+            if (now_resolved != resolved or _stat_signature(published) != _stat_signature(pre)
+                    or _stat_signature(path.stat()) != _stat_signature(pre)
+                    or (root_open.st_dev, root_open.st_ino) != (root_now.st_dev, root_now.st_ino)):
+                raise OSError("artifact path/root changed during verification")
     except FileNotFoundError:
         return ArtifactStatus(artifact, STATE_MISSING, ArtifactMissingError(artifact))
     except OSError as exc:
         return ArtifactStatus(artifact, STATE_UNREADABLE,
-                              ArtifactUnreadableError(artifact, _os_detail(exc)))
-    try:
-        try:
-            pre = os.fstat(fd)
-        except OSError as exc:
-            return ArtifactStatus(artifact, STATE_UNREADABLE,
-                                  ArtifactUnreadableError(artifact, _os_detail(exc)))
-        if not stat_module.S_ISREG(pre.st_mode):
-            return ArtifactStatus(
-                artifact, STATE_UNREADABLE,
-                ArtifactUnreadableError(artifact, "not a regular file (swapped after stat)"),
-            )
-        if pre.st_size != artifact.bytes:
-            return ArtifactStatus(
-                artifact, STATE_SIZE_MISMATCH,
-                ArtifactSizeMismatchError(artifact, artifact.bytes, pre.st_size),
-            )
-        try:
-            actual_sha = _hash_and_check(fd, pre)
-        except _FileChangedDuringHash as exc:
-            return ArtifactStatus(
-                artifact, STATE_SIZE_MISMATCH,
-                ArtifactSizeMismatchError(artifact, artifact.bytes,
-                                          os.fstat(fd).st_size,
-                                          detail="file changed during hashing"),
-            )
-        except OSError as exc:
-            return ArtifactStatus(artifact, STATE_UNREADABLE,
-                                  ArtifactUnreadableError(
-                                      artifact, str(exc) or _os_detail(exc)))
-    finally:
-        os.close(fd)
+                              ArtifactUnreadableError(artifact, _os_detail(exc) if exc.errno is not None
+                                                      else str(exc)))
     if actual_sha != artifact.sha256:
         return ArtifactStatus(
             artifact, STATE_HASH_MISMATCH,

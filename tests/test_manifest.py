@@ -18,6 +18,7 @@ import os
 import socket
 import stat as stat_module
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -601,3 +602,166 @@ def test_manifest_parse_safety_limits_are_typed(tmp_path, monkeypatch,
     with pytest.raises(mf.ManifestFormatError) as exc:
         mf.load_manifest(path)
     assert type(exc.value) is mf.ManifestFormatError
+
+
+@pytest.mark.parametrize("kind", ["fifo", "directory", "oversized"])
+def test_manifest_input_is_bounded_regular_and_never_blocks(tmp_path, kind):
+    path = tmp_path / "manifest.json"
+    if kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        path.write_bytes(b" " * (mf.MAX_MANIFEST_BYTES + 1))
+    with pytest.raises(mf.ManifestFormatError, match="bounded regular"):
+        mf.load_manifest(path)
+    assert mf.manifest_status(path, tmp_path)["status"] == "manifest_invalid"
+
+
+def test_manifest_exact_byte_cap_and_intentional_symlink(tmp_path, monkeypatch):
+    path = write_manifest(tmp_path, manifest_dict())
+    monkeypatch.setattr(mf, "MAX_MANIFEST_BYTES", path.stat().st_size)
+    assert mf.load_manifest(path).artifacts
+    link = tmp_path / "link.json"
+    link.symlink_to(path)
+    assert mf.load_manifest(link) == mf.load_manifest(path)
+    monkeypatch.setattr(mf, "MAX_MANIFEST_BYTES", path.stat().st_size - 1)
+    with pytest.raises(mf.ManifestFormatError):
+        mf.load_manifest(link)
+
+
+@pytest.mark.parametrize("raw", ['{"schema_version":99,"schema_version":1,"artifacts":[]}',
+                                 '{"schema_version":1,"note":NaN,"artifacts":[]}',
+                                 '{"schema_version":1,"note":Infinity,"artifacts":[]}'])
+def test_duplicate_or_nonfinite_manifest_json_refused(tmp_path, raw):
+    path = tmp_path / "manifest.json"
+    path.write_text(raw)
+    with pytest.raises(mf.ManifestFormatError, match="not valid JSON"):
+        mf.load_manifest(path)
+
+
+@pytest.mark.parametrize("place", ["manifest", "artifact"])
+def test_nonstring_mapping_keys_raise_typed_manifest_error(place):
+    data = manifest_dict()
+    target = data if place == "manifest" else data["artifacts"][0]
+    target[1], target[None] = "bad", "bad"
+    with pytest.raises(mf.ManifestFormatError, match="unknown.*key"):
+        mf.manifest_from_dict(data)
+
+
+@pytest.mark.parametrize("change", ["grow", "replace"])
+def test_manifest_changes_during_read_refused(tmp_path, monkeypatch, change):
+    path = write_manifest(tmp_path, manifest_dict())
+    original = os.read
+    changed = False
+    def read(fd, size):
+        nonlocal changed
+        raw = original(fd, size)
+        if raw and not changed:
+            changed = True
+            if change == "grow":
+                with path.open("ab") as fh:
+                    fh.write(b" ")
+            else:
+                other = tmp_path / "replacement.json"
+                other.write_bytes(path.read_bytes())
+                other.replace(path)
+        return raw
+    monkeypatch.setattr(mf.os, "read", read)
+    with pytest.raises(mf.ManifestFormatError, match="changed during read"):
+        mf.load_manifest(path)
+
+
+@pytest.mark.parametrize("change", ["fifo", "symlink", "regular"])
+def test_artifact_replacement_before_open_refused_without_blocking(tmp_path, monkeypatch, change):
+    manifest = mf.manifest_from_dict(manifest_dict())
+    target = materialize(tmp_path, manifest)
+    other = tmp_path / "other"
+    other.write_bytes(b"payload")
+    original = os.open
+    def opened(path, flags, *args, **kwargs):
+        if os.fspath(path) == target.name:
+            assert flags & os.O_NONBLOCK  # prevents hanging the regression on old code
+            target.unlink()
+            if change == "fifo":
+                os.mkfifo(target)
+            elif change == "symlink":
+                target.symlink_to(other)
+            else:
+                target.write_bytes(b"payload")
+        return original(path, flags, *args, **kwargs)
+    monkeypatch.setattr(mf.os, "open", opened)
+    before = len(list(Path("/proc/self/fd").iterdir()))
+    report = mf.resolve_manifest(manifest, tmp_path)
+    assert not report.ok and isinstance(report.errors[0], mf.ArtifactUnreadableError)
+    assert len(list(Path("/proc/self/fd").iterdir())) == before
+
+
+def test_parent_symlink_replacement_cannot_redirect_artifact_read(tmp_path, monkeypatch):
+    root, outside = tmp_path / "models", tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (outside / "model.safetensors").write_bytes(b"payload")
+    manifest = mf.manifest_from_dict(manifest_dict())
+    materialize(root, manifest)
+    original = os.open
+    def opened(path, flags, *args, **kwargs):
+        if path == "dit":
+            (root / "dit").rename(root / "old-dit")
+            (root / "dit").symlink_to(outside, target_is_directory=True)
+        return original(path, flags, *args, **kwargs)
+    monkeypatch.setattr(mf.os, "open", opened)
+    monkeypatch.setattr(mf.os, "read", lambda *a: pytest.fail("read redirected content"))
+    report = mf.resolve_manifest(manifest, root)
+    assert not report.ok and isinstance(report.errors[0], mf.ArtifactUnreadableError)
+
+
+@pytest.mark.parametrize("change", ["replace", "alias", "mtime-reset", "root"])
+def test_artifact_path_or_contents_changed_during_hash_not_accepted(tmp_path, monkeypatch, change):
+    root = tmp_path / "models"
+    root.mkdir()
+    manifest = mf.manifest_from_dict(manifest_dict())
+    target = materialize(root, manifest)
+    before = target.stat()
+    original = os.read
+    changed = False
+    def read(fd, size):
+        nonlocal changed
+        raw = original(fd, size)
+        if raw and not changed:
+            changed = True
+            if change == "replace":
+                other = root / "replacement"
+                other.write_bytes(b"payload")
+                other.replace(target)
+            elif change == "alias":
+                target.rename(root / "previous")
+                target.symlink_to(root / "previous")
+            elif change == "root":
+                root.rename(tmp_path / "moved")
+                root.mkdir()
+                materialize(root, manifest)
+            else:
+                target.write_bytes(b"changed")
+                os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return raw
+    monkeypatch.setattr(mf.os, "read", read)
+    report = mf.resolve_manifest(manifest, root)
+    assert changed and not report.ok and not report.resolved
+
+
+def test_growing_artifact_hash_reads_only_original_size_plus_one(tmp_path, monkeypatch):
+    manifest = mf.manifest_from_dict(manifest_dict())
+    target = materialize(tmp_path, manifest)
+    original = os.read
+    count = 0
+    def read(fd, size):
+        nonlocal count
+        with target.open("ab") as fh:
+            fh.write(b"x" * 1000)
+        raw = original(fd, size)
+        count += len(raw)
+        return raw
+    monkeypatch.setattr(mf.os, "read", read)
+    report = mf.resolve_manifest(manifest, tmp_path)
+    assert not report.ok and count == manifest.artifacts[0].bytes + 1

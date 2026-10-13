@@ -1,9 +1,10 @@
 """Pipeline adapter protocol + plan/dry-run types (plan R1, task 1.3).
 
-The engine core speaks only this protocol. The only module allowed to import
-torch / diffusers / transformers is ``qwen_engine.adapters.qwen21_diffusers``
-— **which does not exist yet**; stubbing it at M1 is a boundary violation the
-import test catches. Heavy imports stay deferred inside that future adapter.
+The generation core speaks only this protocol. Its future heavy generation
+module, ``qwen_engine.adapters.qwen21_diffusers``, does not exist yet; stubbing
+it at M1 is a boundary violation the import test catches. CPU encoder helpers
+and the separate throwaway worker may lazily import ML only after their own
+request/setup gates. Plain package/CLI/web imports remain ML-free.
 """
 from __future__ import annotations
 
