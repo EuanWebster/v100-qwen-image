@@ -1,5 +1,6 @@
 """Pure query/kernel spies; synthetic records do not prove a real V100."""
 import ctypes
+from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -195,3 +196,42 @@ def test_nvml_shutdown_fault_never_masks_primary_interrupt(nvml):
     with pytest.raises(KeyboardInterrupt):
         module._nvml_snapshot(UUID)
     assert nvml.calls[-1] == "nvmlShutdown"
+
+
+@pytest.mark.parametrize("case", ["ok", "device", "dtype", "shape", "value"])
+def test_kernel_requires_actual_device_dtype_shape_synchronized_value(case):
+    calls = []
+    @contextmanager
+    def inference():
+        calls.append("inference_enter")
+        try:
+            yield
+        finally:
+            calls.append("inference_exit")
+    output = SimpleNamespace(device=("cuda", 1), dtype="fp16", shape=(16, 16))
+    output.cpu = lambda: calls.append("copy_cpu") or output
+    if case in ("device", "dtype", "shape"):
+        setattr(output, case, {"device": ("cpu", 1), "dtype": "fp32", "shape": (16, 1)}[case])
+    class Inputs:
+        def __matmul__(self, other):
+            assert other is self
+            calls.append("matmul")
+            return output
+    def ones(shape, *, dtype, device):
+        assert shape == (16, 16) and dtype == "fp16" and device == ("cuda", 1)
+        calls.append("ones_cuda_fp16")
+        return Inputs()
+    def full(shape, value, *, dtype):
+        assert shape == (16, 16) and value == 16 and dtype == "fp16"
+        calls.append("reference_cpu_fp16")
+        return "expected"
+    torch = SimpleNamespace(device=lambda kind, index: (kind, index), float16="fp16", ones=ones, full=full,
+        inference_mode=inference, cuda=SimpleNamespace(synchronize=lambda index: calls.append(("synchronize", index))),
+        equal=lambda actual, expected: actual is output and expected == "expected" and case != "value")
+    if case == "ok":
+        module._kernel(torch, 1)
+    else:
+        with pytest.raises(module.HardwareProbeError, match="kernel_result_invalid"):
+            module._kernel(torch, 1)
+    assert calls[:4] == ["inference_enter", "ones_cuda_fp16", "matmul", ("synchronize", 1)]
+    assert calls[-1] == "inference_exit"

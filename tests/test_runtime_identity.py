@@ -2,6 +2,7 @@
 from dataclasses import replace
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +25,7 @@ def settings():
     values.update(global_fp32="none", cudnn_fp32="none", mkldnn_matmul_fp32="none",
                   mkldnn_conv_fp32="none", preferred_blas="BlasBackend.Cublas",
                   preferred_linalg="LinalgBackend.Default", cublas_workspace=None, cublaslt_workspace=None)
+    values.update(current_cuda_device=None, current_cuda_uuid=None)
     return values
 
 
@@ -45,7 +47,7 @@ def test_observe_canonical_immutable_no_raw_environment(fixture):
     assert value.sha256 == module.observe_generation_runtime().sha256
     assert set(value.to_dict()) == {"schema", "package_metadata_sha256", "worker_source_sha256",
                                    "host_execution_sha256", "torch_execution_sha256", "environment_sha256",
-                                   "cuda_context_initialized"}
+                                   "cuda_context_initialized", "cuda_binding_sha256"}
     assert value.cuda_context_initialized is False
     copied = value.to_dict()
     copied["host_execution_sha256"] = "f" * 64
@@ -203,6 +205,7 @@ def test_cuda_workspace_unknown_is_not_zero_or_gpu_evidence():
     with pytest.raises(module.RuntimeIdentityError):
         module._validate_torch(doc)
     doc["cublaslt_workspace"] = 0
+    doc["current_cuda_device"], doc["current_cuda_uuid"] = 0, "GPU-01234567-0123-0123-0123-012345678901"
     module._validate_torch(doc)
     doc["cublas_workspace"] = -1
     with pytest.raises(module.RuntimeIdentityError):
@@ -214,7 +217,104 @@ def test_context_flag_is_true_boolean_and_identity_drift(fixture):
     for value in (0, 1, None, "false"):
         with pytest.raises(module.RuntimeIdentityError):
             replace(identity, cuda_context_initialized=value)
-    assert replace(identity, cuda_context_initialized=True).sha256 != identity.sha256
+    assert replace(identity, cuda_context_initialized=True, cuda_binding_sha256="4" * 64).sha256 != identity.sha256
+
+
+def test_cuda_device_uuid_index_binding_is_exact(fixture, monkeypatch):
+    uuid = "GPU-01234567-0123-0123-0123-012345678901"
+    cpu = module.observe_generation_runtime()
+    assert not cpu.matches_cuda_device(uuid=uuid, logical_device_index=0)
+    def cuda():
+        doc = settings()
+        doc.update(cuda_initialized=True, current_cuda_device=1, current_cuda_uuid=uuid,
+                   cublas_workspace=0, cublaslt_workspace=0)
+        return doc
+    monkeypatch.setattr(module, "_torch_document", cuda)
+    identity = module.observe_generation_runtime()
+    assert identity.matches_cuda_device(uuid=uuid, logical_device_index=1)
+    assert not identity.matches_cuda_device(uuid=uuid, logical_device_index=0)
+    assert not identity.matches_cuda_device(uuid="GPU-ffffffff-ffff-ffff-ffff-ffffffffffff", logical_device_index=1)
+    for values in ({"cuda_context_initialized": False}, {"cuda_binding_sha256": None}):
+        with pytest.raises(module.RuntimeIdentityError):
+            replace(identity, **values)
+    for index in (True, -1, 128, "0"):
+        with pytest.raises(module.RuntimeIdentityError):
+            identity.matches_cuda_device(uuid=uuid, logical_device_index=index)
+    with pytest.raises(module.RuntimeIdentityError):
+        identity.matches_cuda_device(uuid="bad", logical_device_index=1)
+
+
+def torch_spy(*, initialized, index=1, uuid="GPU-01234567-0123-0123-0123-012345678901"):
+    """Private getter spy, never a sys.modules Torch stub/backend selector."""
+    calls = []
+    def getter(name, value):
+        def get(*args):
+            calls.append((name, args))
+            return value
+        return get
+    def cuda_only(name, value):
+        def get(*args):
+            if not initialized:
+                pytest.fail("CPU observation queried CUDA " + name)
+            calls.append((name, args))
+            return value
+        return get
+    matmul = SimpleNamespace(fp32_precision="none", allow_fp16_reduced_precision_reduction=False,
+        allow_bf16_reduced_precision_reduction=False, allow_fp16_accumulation=False,
+        allow_fp16_reduced_precision_reduction_split_k=False, allow_bf16_reduced_precision_reduction_split_k=False,
+        prefer_cublaslt_grouped_gemm=False)
+    cuda_backend = SimpleNamespace(matmul=matmul,
+        flash_sdp_enabled=getter("flash", False), mem_efficient_sdp_enabled=getter("efficient", False),
+        math_sdp_enabled=getter("math", False), cudnn_sdp_enabled=getter("cudnn_sdp", False),
+        fp16_bf16_reduction_math_sdp_allowed=getter("sdp_reduction", False),
+        preferred_blas_library=getter("blas", "BlasBackend.Cublas"),
+        preferred_linalg_library=getter("linalg", "LinalgBackend.Default"),
+        cublas_workspace_size=cuda_only("workspace", 4096),
+        cublaslt_workspace_size=cuda_only("lt_workspace", 8192))
+    cudnn = SimpleNamespace(conv=SimpleNamespace(fp32_precision="none"), fp32_precision="none",
+                            enabled=False, benchmark=False, deterministic=False)
+    mkldnn = SimpleNamespace(enabled=False, matmul=SimpleNamespace(fp32_precision="none"),
+                             conv=SimpleNamespace(fp32_precision="none"))
+    torch = SimpleNamespace(backends=SimpleNamespace(cuda=cuda_backend, cudnn=cudnn, mkldnn=mkldnn,
+        fp32_precision="none", cpu=SimpleNamespace(get_cpu_capability=getter("capability", "AVX2"))),
+        cuda=SimpleNamespace(is_initialized=lambda: initialized, current_device=cuda_only("current", index),
+            get_device_properties=cuda_only("properties", SimpleNamespace(uuid=uuid)),
+            get_allocator_backend=getter("allocator", "native")),
+        __config__=SimpleNamespace(show=lambda: "fixture compiled build"),
+        get_num_threads=lambda: 2, get_num_interop_threads=lambda: 2,
+        get_float32_matmul_precision=lambda: "highest", are_deterministic_algorithms_enabled=lambda: False,
+        is_deterministic_algorithms_warn_only_enabled=lambda: False)
+    return torch, calls
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+def test_getter_observation_skips_cpu_device_calls_and_binds_cuda_scope(initialized):
+    torch, calls = torch_spy(initialized=initialized)
+    doc = module._torch_execution(torch)
+    assert doc["cuda_initialized"] is initialized
+    if initialized:
+        assert doc["current_cuda_device"] == 1 and doc["current_cuda_uuid"].startswith("GPU-")
+        assert ("properties", (1,)) in calls
+        assert doc["cublas_workspace"] == 4096 and doc["cublaslt_workspace"] == 8192
+    else:
+        assert doc["current_cuda_device"] is doc["current_cuda_uuid"] is None
+        assert doc["cublas_workspace"] is doc["cublaslt_workspace"] is None
+        assert not {name for name, _ in calls} & {"current", "properties", "workspace", "lt_workspace"}
+
+
+@pytest.mark.parametrize("index", [True, -1, 128, None])
+def test_invalid_current_device_precedes_properties_and_workspace_query(index):
+    torch, calls = torch_spy(initialized=True, index=index)
+    with pytest.raises(module.RuntimeIdentityError):
+        module._torch_execution(torch)
+    assert not {name for name, _ in calls} & {"properties", "workspace", "lt_workspace"}
+
+
+def test_invalid_cuda_uuid_precedes_workspace_query():
+    torch, calls = torch_spy(initialized=True, uuid="invalid UUID")
+    with pytest.raises(module.RuntimeIdentityError):
+        module._torch_execution(torch)
+    assert not {name for name, _ in calls} & {"workspace", "lt_workspace"}
 
 
 @pytest.fixture

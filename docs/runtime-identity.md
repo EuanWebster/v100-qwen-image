@@ -24,7 +24,12 @@ environment values or boot identifier appear in the returned record.
 CUDA BLAS workspace-size getters touch the CUDA runtime, despite looking like
 read-only settings. They are **not called** before Torch's CUDA context is
 initialized. CPU snapshots explicitly carry `cuda_context_initialized=False`
-and unknown workspace sizes, not fabricated zero. A future gated CUDA caller
+and unknown workspace/device binding, not fabricated zero. Initialized CUDA
+snapshots include the current logical index and UUID in their settings digest
+and a separate hashed binding; `matches_cuda_device` requires both to match
+the intended device. Observe inside the intended CUDA device context and
+compare against the independently probed index/UUID, not an implicit index0.
+A future gated CUDA caller
 must collect the CUDA-side settings after independently accepted kernel/device
 bring-up and refuse CPU-only identity as complete GPU execution evidence.
 Initialized CUDA workspace observation is not accepted yet on real hardware.

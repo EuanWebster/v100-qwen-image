@@ -39,7 +39,8 @@ TORCH_KEYS = frozenset({"build_sha256", "cpu_capability", "threads", "interop_th
     "mkldnn", "cudnn", "cudnn_benchmark", "cudnn_deterministic", "allocator_backend",
     "global_fp32", "cudnn_fp32", "mkldnn_matmul_fp32", "mkldnn_conv_fp32", "fp16_accumulation",
     "fp16_split_k", "bf16_split_k", "prefer_grouped_gemm", "math_sdp_reduction",
-    "preferred_blas", "preferred_linalg", "cublas_workspace", "cublaslt_workspace", "cuda_initialized"})
+    "preferred_blas", "preferred_linalg", "cublas_workspace", "cublaslt_workspace", "cuda_initialized",
+    "current_cuda_device", "current_cuda_uuid"})
 
 
 class RuntimeIdentityError(EngineError):
@@ -139,8 +140,24 @@ def _torch_document():
     # Private import seam supports CPU unit spies only; no public backend,
     # interpreter, source-root, environment or revision override is exposed.
     import torch
+    return _torch_execution(torch)
+
+
+def _torch_execution(torch):
+    """Read only the supplied pinned Torch object; private CPU spy seam."""
+    from qwen_engine.hardware_probe import _uuid
     cuda, cudnn = torch.backends.cuda, torch.backends.cudnn
     initialized = torch.cuda.is_initialized()
+    if type(initialized) is not bool:
+        raise RuntimeIdentityError("invalid_cuda_initialization_identity")
+    index = torch.cuda.current_device() if initialized else None
+    if initialized and (type(index) is not int or not 0 <= index < 128):
+        raise RuntimeIdentityError("invalid_current_cuda_device_identity")
+    uuid = None
+    if initialized:
+        raw_uuid = str(torch.cuda.get_device_properties(index).uuid)
+        _device_binding(raw_uuid, index)
+        uuid = _uuid(raw_uuid)
     doc = dict(build_sha256=_digest({"build": torch.__config__.show()}),
         cpu_capability=torch.backends.cpu.get_cpu_capability(),
         threads=torch.get_num_threads(), interop_threads=torch.get_num_interop_threads(),
@@ -166,6 +183,7 @@ def _torch_document():
         # These seemingly read-only getters touch the CUDA runtime. Never
         # call them in a CPU observation; unknown must not become guessed 0.
         cuda_initialized=initialized,
+        current_cuda_device=index, current_cuda_uuid=uuid,
         cublas_workspace=cuda.cublas_workspace_size() if initialized else None,
         cublaslt_workspace=cuda.cublaslt_workspace_size() if initialized else None,
         allocator_backend=torch.cuda.get_allocator_backend())
@@ -179,6 +197,7 @@ def _validate_torch(doc):
                    "preferred_blas", "preferred_linalg"}
     integer_keys = {"threads", "interop_threads"}
     workspace_keys = {"cublas_workspace", "cublaslt_workspace"}
+    device_keys = {"current_cuda_device", "current_cuda_uuid"}
     if type(doc) is not dict or set(doc) != TORCH_KEYS or not _hex(doc["build_sha256"]):
         raise RuntimeIdentityError("incomplete_torch_execution_identity")
     for key in string_keys:
@@ -190,8 +209,28 @@ def _validate_torch(doc):
             or any((type(doc[k]) is not int or not 0 <= doc[k] <= 2**40) if doc["cuda_initialized"]
                    else doc[k] is not None for k in workspace_keys)):
         raise RuntimeIdentityError("invalid_torch_workspace_identity")
-    if any(type(doc[k]) is not bool for k in TORCH_KEYS - string_keys - integer_keys - workspace_keys - {"build_sha256"}):
+    if doc["cuda_initialized"]:
+        from qwen_engine.hardware_probe import _uuid
+        index, uuid = doc["current_cuda_device"], doc["current_cuda_uuid"]
+        _device_binding(uuid, index)
+        if _uuid(uuid) != uuid:
+            raise RuntimeIdentityError("invalid_current_cuda_device_identity")
+    elif any(doc[k] is not None for k in device_keys):
+        raise RuntimeIdentityError("uninitialized_cuda_cannot_claim_device_identity")
+    if any(type(doc[k]) is not bool for k in TORCH_KEYS - string_keys - integer_keys - workspace_keys - device_keys - {"build_sha256"}):
         raise RuntimeIdentityError("invalid_torch_execution_flag")
+
+
+def _device_binding(uuid, index):
+    from qwen_engine.hardware_probe import _uuid
+    try:
+        if type(index) is not int or not 0 <= index < 128:
+            raise RuntimeIdentityError("invalid_cuda_binding_index")
+        return _digest({"uuid": _uuid(uuid), "index": index})
+    except RuntimeIdentityError:
+        raise
+    except Exception:
+        raise RuntimeIdentityError("invalid_cuda_binding_identity") from None
 
 
 @dataclass(frozen=True)
@@ -202,13 +241,16 @@ class GenerationRuntimeIdentity:
     torch_execution_sha256: str
     environment_sha256: str
     cuda_context_initialized: bool
+    cuda_binding_sha256: str | None = None
     schema: str = RUNTIME_SCHEMA
 
     def __post_init__(self):
         if (type(self.schema) is not str or self.schema != RUNTIME_SCHEMA
                 or type(self.cuda_context_initialized) is not bool
                 or any(not _hex(getattr(self, f.name)) for f in fields(self)
-                       if f.name not in ("schema", "cuda_context_initialized"))):
+                       if f.name not in ("schema", "cuda_context_initialized", "cuda_binding_sha256"))
+                or (not _hex(self.cuda_binding_sha256) if self.cuda_context_initialized
+                    else self.cuda_binding_sha256 is not None)):
             raise RuntimeIdentityError("invalid_generation_runtime_identity")
 
     def to_dict(self):
@@ -217,6 +259,11 @@ class GenerationRuntimeIdentity:
     @property
     def sha256(self):
         return _digest(self.to_dict())
+
+    def matches_cuda_device(self, *, uuid: str, logical_device_index: int) -> bool:
+        """Match fresh observed binding; not proof of kernel execution or fit."""
+        binding = _device_binding(uuid, logical_device_index)
+        return self.cuda_context_initialized and self.cuda_binding_sha256 == binding
 
 
 def observe_generation_runtime() -> GenerationRuntimeIdentity:
@@ -237,7 +284,9 @@ def observe_generation_runtime() -> GenerationRuntimeIdentity:
                 or runtime_metadata_digest(observe_installed_packages()) != runtime_metadata_digest(packages)):
             raise RuntimeIdentityError("generation_runtime_changed_during_observation")
         return GenerationRuntimeIdentity(runtime_metadata_digest(packages), source, host,
-                                         _digest(settings), environment, settings["cuda_initialized"])
+            _digest(settings), environment, settings["cuda_initialized"],
+            _device_binding(settings["current_cuda_uuid"], settings["current_cuda_device"])
+            if settings["cuda_initialized"] else None)
     except RuntimeIdentityError:
         raise
     except Exception:

@@ -35,10 +35,11 @@ failures are preserved and worker exit is required for failed library cleanup.
 
 ## CPU acceptance, 2026-10-13
 
-56 guarded pure tests cover typed device/profile/kernel ordering, fixed NVML
+61 guarded pure tests cover typed device/profile/kernel ordering, fixed NVML
 library and ctypes ABI, whole-device counter coherence, UUID matching, all
 query/initialization/shutdown failures, missing symbols, fixed errors and
-interrupt preservation. Positive cases are **fabricated query/kernel spies**,
+interrupt preservation, plus FP16 kernel device/dtype/shape/synchronized-value
+checks. Positive cases are **fabricated query/kernel spies**,
 not V100 evidence. `tools/hardware_refusal_cpu_check.py` proves actual CUDA
 unavailability/refusal in this container under offline fixture-only guards;
 it forbids a kernel/NVML call and fails if CUDA becomes available.

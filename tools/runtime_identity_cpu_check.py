@@ -26,10 +26,13 @@ def checks():
         raise AssertionError("CPU fingerprint attempted CUDA initialization/workspace query")
     with patch.object(torch.cuda, "_lazy_init", forbidden), \
          patch.object(torch.backends.cuda, "cublas_workspace_size", forbidden), \
-         patch.object(torch.backends.cuda, "cublaslt_workspace_size", forbidden):
+         patch.object(torch.backends.cuda, "cublaslt_workspace_size", forbidden), \
+         patch.object(torch.cuda, "current_device", forbidden), \
+         patch.object(torch.cuda, "get_device_properties", forbidden):
         first = observe_generation_runtime()
         assert first == observe_generation_runtime() and first.cuda_context_initialized is False
         assert len(first.sha256) == 64 and torch.cuda.is_initialized() is False
+        assert first.cuda_binding_sha256 is None
         doc = _torch_document()
         assert doc["cublas_workspace"] is None and doc["cublaslt_workspace"] is None
         print("PASS real pinned metadata/source/host/CPU/settings/environment identity is stable and ML-lazy")
