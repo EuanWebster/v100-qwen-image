@@ -1,18 +1,17 @@
 /* Shared, bounded real-Chrome lifecycle helpers for the standalone browser
  * check scripts (chrome_browser_check.mjs, web_integration_check.mjs).
  *
- * NOT part of the guarded main suite; Node built-ins only, no dependencies.
+ * Real Chrome is separate from the guarded main suite. Node built-ins plus
+ * the existing Python interpreter run a dedicated Linux ownership wrapper.
  *
  * Contract (2026-10-12 root review):
- *   * the script must NEVER hang: the WebSocket open, EVERY CDP send and the
+ *   * protocol waits are bounded: the WebSocket open, EVERY CDP send and the
  *     whole check each carry a finite timeout;
  *   * an early child exit rejects startup instead of waiting on a DevTools
  *     port that will never be announced;
- *   * cleanup is scoped to OUR OWN spawned child only: Browser.close over the
- *     still-open WebSocket first, then waiting for the child to exit; the
- *     bounded fallback signals our spawned process GROUP with
- *     process.kill(-child.pid, sig) (child.spawned detached: true).
- *     child.kill(sig, true) does NOT signal a group and must not be used;
+ *   * cleanup signals only OUR dedicated ownership wrapper. It adopts and
+ *     reaps Chrome grandchildren; never KILL/unref this owner first. A
+ *     kernel-unreapable child keeps ownership pending, not false success;
  *   * Chrome runs with its own sandbox ENABLED by default — --no-sandbox is
  *     added only when the environment explicitly asks (QWEN_CHROME_NO_SANDBOX=1);
  *   * capacity preflight only REPORTS free cgroup pids slots — it does not
@@ -20,6 +19,7 @@
  */
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 export const DEFAULTS = {
   devtoolsAnnounceMs: 45000,
@@ -27,6 +27,7 @@ export const DEFAULTS = {
   sendMs: 30000,
   browserCloseMs: 8000,
   childExitMs: 10000,
+  ownerExitMs: 8000,
 };
 
 /** Read the cgroup v2 pids controller, if readable. Never throws. */
@@ -44,8 +45,8 @@ export function cgroupCapacity() {
 /**
  * Launch our own Chrome child and resolve its DevTools WebSocket URL.
  * Rejects on spawn error, on an early child exit (stderr tail attached), or
- * on the bounded announce timeout. The child is detached so cleanup can
- * signal the whole group; we only ever signal OUR OWN spawned pid group.
+ * on the bounded announce timeout. The detached child is a private ownership
+ * wrapper, not Chrome itself; signal only its PID to request scoped cleanup.
  */
 export function launchChrome({ chromePath, profileDir, extraArgs = [] }) {
   const args = [
@@ -67,7 +68,11 @@ export function launchChrome({ chromePath, profileDir, extraArgs = [] }) {
   ];
   // stdout is IGNORED (the child can never block writing it; we parse only
   // stderr), stderr is capped to a rolling 16 KiB tail (bounded memory).
-  const chrome = spawn(chromePath, args,
+  // A dedicated Linux subreaper owns/adopts/waits Chrome grandchildren.
+  // Never rely on the container's PID1 to reap orphaned browser descendants.
+  const owner = fileURLToPath(new URL('./process_lineage_owner.py', import.meta.url));
+  const python = process.env.QWEN_PYTHON || process.env.PYTHON || 'python3';
+  const chrome = spawn(python, ['-B', owner, '--', chromePath, ...args],
     { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
   const wsUrl = new Promise((res, rej) => {
     let settled = false;
@@ -184,11 +189,10 @@ async function boundedWait(promise, ms, timeoutValue) {
 
 /**
  * Cleanup, scoped to OUR OWN spawned child only (never a broad kill):
- *  1. Browser.close over the live WebSocket (Chrome reaps its own children);
- *  2. wait (bounded) for the child to exit;
- *  3. bounded fallback: signal our spawned process GROUP — process.kill(-pid)
- *     with the child spawned detached. child.kill(sig, true) does NOT do
- *     this and is deliberately not used.
+ *  1. Browser.close, then wait for our wrapper to reap the whole lineage;
+ *  2. bounded fallback: TERM only the wrapper PID; it owns descendant cleanup;
+ *  3. pending ownership returns false, retains refs/profile and forbids KILL
+ *     or explicit parent process.exit before the owner is finished.
  */
 export async function shutdownChrome(chrome, ws, cdp) {
   if (chrome && ws && ws.readyState === 1 && cdp && !cdp.dead) {
@@ -203,13 +207,17 @@ export async function shutdownChrome(chrome, ws, cdp) {
     if (chrome.exitCode !== null || chrome.signalCode !== null) res(true);
     else chrome.once('exit', () => res(true));
   });
-  try { chrome.unref(); } catch {}
   const gotExit = await boundedWait(exited, DEFAULTS.childExitMs, false);
   if (!gotExit && Number.isInteger(chrome.pid)) {
-    for (const sig of ['SIGTERM', 'SIGKILL']) {
-      try { process.kill(-chrome.pid, sig); } catch { /* already gone */ }
-      const gone = await boundedWait(exited, 3000, false);
-      if (gone) break;
+    // Signal ONLY the owner; it performs scoped TERM/KILL on its children
+    // and stays alive until they are reaped. Killing the owner/group would
+    // recreate the PID1 zombie leak this wrapper prevents.
+    try { process.kill(chrome.pid, 'SIGTERM'); } catch { /* already gone */ }
+    const gone = await boundedWait(exited, DEFAULTS.ownerExitMs, false);
+    if (!gone) {
+      chrome.cleanupPending = true;
+      return false; // retain owner refs, no SIGKILL/unref/false cleanup success
     }
   }
+  return true;
 }

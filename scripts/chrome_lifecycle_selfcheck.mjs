@@ -28,6 +28,7 @@ function assert(cond, msg) { if (!cond) throw new Error(msg); }
 DEFAULTS.sendMs = 100;
 DEFAULTS.browserCloseMs = 60;
 DEFAULTS.childExitMs = 60;
+DEFAULTS.ownerExitMs = 60;
 
 class FakeSocket {
   constructor() { this.listeners = {}; this.sent = []; this.throwOnSend = false; }
@@ -129,7 +130,7 @@ await check('synchronous send failure clears the pending entry', async () => {
   await p;
 });
 
-await check('shutdownChrome signals only its own spawned group, bounded', async () => {
+await check('shutdownChrome requests cleanup only from its dedicated owner PID', async () => {
   const calls = [];
   const originalKill = process.kill;
   process.kill = (pid, sig) => {
@@ -145,12 +146,25 @@ await check('shutdownChrome signals only its own spawned group, bounded', async 
   };
   try {
     await shutdownChrome(chrome, null, null);   // no ws: straight to signals
-    assert(calls.length >= 1, 'group signal expected');
-    assert(calls[0][0] === -424242, 'must signal the process GROUP (-pid)');
-    assert(!calls.some(([p]) => p === 424242), 'never the bare child pid');
+    assert(calls.length === 1, 'one owner cleanup request expected');
+    assert(calls[0][0] === 424242 && calls[0][1] === 'SIGTERM', 'must request TERM from the owner PID');
+    assert(!calls.some(([p, sig]) => p < 0 || sig === 'SIGKILL'), 'never kill owner/group before it reaps');
   } finally {
     process.kill = originalKill;
   }
+});
+
+await check('pending owner cleanup retains ownership instead of unref/KILL/success', async () => {
+  const calls = [];
+  const originalKill = process.kill;
+  process.kill = (pid, sig) => calls.push([pid, sig]);
+  const chrome = { pid: 424242, exitCode: null, signalCode: null,
+    once() {}, unref() { throw new Error('owner must remain referenced'); } };
+  try {
+    assert(await shutdownChrome(chrome, null, null) === false, 'must report pending cleanup');
+    assert(chrome.cleanupPending === true, 'ownership remains visible');
+    assert(calls.length === 1 && calls[0][0] === 424242 && calls[0][1] === 'SIGTERM', 'no owner KILL');
+  } finally { process.kill = originalKill; }
 });
 
 await check('early child exit / spawn error rejects startup (bounded)', async () => {

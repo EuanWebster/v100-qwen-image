@@ -32,14 +32,15 @@
  *      'undefined') and a parsePlan blank/Python-whitespace-only echoed
  *      prompt rejection against the real served plan echo.
  *      Cleanup lives at the OUTERMOST scope: however the run ends, the
- *      chrome lifecycle state (outer-scoped) is shut down (bounded) BEFORE
- *      our server child group is killed — an aborted leg can never orphan
- *      Chrome. Inside a capacity-limited sandbox it reports NOT RUN
+ *      chrome lifecycle state (outer-scoped) asks its dedicated subreaper to
+ *      finish before the server group is killed. Kernel-unreapable children
+ *      retain the owner/fixture tree, not false cleanup success.
+ *      Inside a capacity-limited sandbox it reports NOT RUN
  *      honestly (free cgroup slots reported, cause not claimed). NOT RUN
  *      checks are counted SEPARATELY — never inside passed/total.
  *
  * Cleanup only ever touches the processes THIS script spawned (server and,
- * when opted in, Chrome) via their process groups — never a broad kill.
+ * when opted in, Chrome) — server group and browser owner PID, never a broad kill.
  * Exit: 0 all EXECUTED checks passed; 1 a check failed or errored;
  * 2 environment problem (server could not start).
  */
@@ -130,8 +131,9 @@ async function cleanupChrome() {
   // finally, so even a watchdog abort mid-leg cannot orphan the browser.
   const st = chromeState;
   if (!st) return;
+  const cleaned = await shutdownChrome(st.chrome, st.ws, st.cdp);
+  if (cleaned === false) return false;
   chromeState = null;
-  await shutdownChrome(st.chrome, st.ws, st.cdp);
   try { rmSync(st.profileDir, { recursive: true, force: true, maxRetries: 5 }); } catch {}
 }
 
@@ -1000,11 +1002,24 @@ try {
   // OUTERMOST cleanup, in order: OUR Chrome (bounded, awaited — an aborted
   // chromeChecks can never leave it running), THEN the server group, THEN
   // the temp tree. Nothing here touches any other process.
-  try { await cleanupChrome(); } catch (e) { console.error('chrome cleanup note:', e.message); }
+  let chromeCleaned = true;
+  try {
+    if (await cleanupChrome() === false) {
+      chromeCleaned = false;
+      exitCode = 1;
+      forceFail('Chrome owner cleanup pending; retained owner and fixture tree', 'no owner KILL/false cleanup success');
+    }
+  } catch (e) {
+    chromeCleaned = false;
+    exitCode = 1;
+    forceFail('Chrome owner cleanup failed; retained fixture tree', e.message);
+  }
   console.log(results.join('\n'));
   console.log(`\n${passed}/${passed + failed} executed integration checks passed` +
               (notRun ? ` — ${notRun} NOT RUN (see above, not counted in the total)` : ''));
   await killGroup(child);
-  try { rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5 }); } catch {}
+  if (chromeCleaned) {
+    try { rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5 }); } catch {}
+  }
 }
-process.exit(exitCode);
+process.exitCode = exitCode; // never orphan an unfinished ownership wrapper

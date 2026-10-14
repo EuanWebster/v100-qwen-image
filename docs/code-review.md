@@ -189,3 +189,54 @@ timeout/reaping provides the current ordinary child lifecycle. Cache/filesystem
 snapshots are not guarantees against hostile simultaneous rewriting.
 The local HTTP socket timeout is an idle timeout, not a total slow-trickle
 request deadline; finite shutdown joins retain any still-live daemon refs.
+
+## 2026-10-13/14 unattended integration and recovery review
+
+Re-read the interrupted workspace and preserved the unrelated user-owned
+`sandbox.yaml`. Scoped implementation/review commits through`0e80749` add:
+
+- Config Path coercion correction; managed phase lifecycle/cleanup and
+  cancellation while preserving verified saves and primary failures.
+- Fixed offline generation worker/executor protocol, bounded pipes/results,
+  own-group stop/reaping, late coherent-save semantics, retained retryable
+  pipe/scratch ownership and replacement-peer refusal. No web activation.
+- Trusted supplied Qwen21 component bridge: full-identity/value/mask decoding,
+  explicit conditioning conversion, upstream sampler/VAE/normalization/PNG,
+  finite checks, real callback cancellation and no-clobber output. FP32 stays
+  CPU-witness-only. It loads no weights and grants no asset/resource proof.
+- Runtime identity including host/CPU/affinity, source/packages, actual
+  precision/thread/allocator/backend settings and bounded relevant env.
+  CPU leaves CUDA workspace/binding unknown; initialized CUDA settings bind
+  to exact logical-index/UUID. Actual CUDA success acceptance remains pending.
+- Explicit V100 diagnostic groundwork: pinned build/profile checks, tiny
+  synchronized FP16 kernel, UUID-matched typed NVML whole-device counters and
+  balanced library reference cleanup. Real native/GPU success remains pending.
+
+Read the new modules and their integration/failure boundaries. Review fixes
+include post-reap scratch/pipe retention, cleanup not masking committed worker
+results, explicit current-device binding and rejecting unreviewed FP32 GPU
+execution. Offline tiny FP16/FP32 component witnesses run each pinned ML
+interpreter; split sampler/VAE pixels exactly match the unsplit upstream path
+for the same tiny random components. Default-threshold tiling is actually
+entered at320px, not merely toggled. No actual base checkpoint body was loaded.
+Real processor, helper36, miniature-worker12, cross-child/cache8, metadata6,
+actual-memory-refusal3, CPU runtime4 and CUDA-absence2 checks pass each direction.
+
+Final process audit found an additional browser grandchild zombie leak despite
+passing CDP/direct-child checks. The resumed work implements a private Linux
+subreaper wrapper, owned-descendant waiting and no hard owner kill/parent exit.
+17Python regressions and10pure JS checks, real standalone61 and served105 each,
+with no new zombies in controlled snapshots. Existing zombies remain and were
+not globally killed/reparented. Details: [process-ownership.md](process-ownership.md).
+
+Current guarded full suites2435passed+2skipped each on3.11.15/3.13.5.
+All reusable environments/scripts/tests are persistent; ordinary disposable
+fixtures alone live in temporary directories. No cloud model, Qwen harness,
+subagent, driver/service/config mutation or fake generation activation.
+
+This is CPU integration/review acceptance, **not completed image generation**.
+The default local loader, resource/peak collectors/calibration and live web jobs
+remain pending. Actual V100 bring-up, native ABI/numerics/VRAM/PCIe/quality
+require real hardware; full CPU encoder fidelity also requires sufficient
+complete applicable RAM evidence (17.53GB weights exceed observed16GiB cap).
+Current blockers/sequence: [runtime-readiness.md](runtime-readiness.md).

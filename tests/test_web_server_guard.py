@@ -476,7 +476,7 @@ def test_web_import_is_ml_free_and_never_touches_weights():
 
 def test_chrome_lifecycle_protocol_selfcheck_pure():
     # Pure protocol checks for the shared Chrome helpers (no Chrome launch,
-    # no fake DOM): timeouts, pending cleanup, group-only signals, spawn
+    # no fake DOM): timeouts, pending cleanup, owner-only signals, spawn
     # errors, and the documented no---no-zygote source fact.
     import shutil
     import subprocess

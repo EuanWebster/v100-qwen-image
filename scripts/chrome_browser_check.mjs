@@ -8,13 +8,16 @@
  *
  *     CHROME_PATH=/path/to/chrome node scripts/chrome_browser_check.mjs
  *
- * Dependencies: none (Node built-ins + the global WebSocket; shared bounded
- * lifecycle in ./chrome_lifecycle.mjs). It launches its own Chrome child
+ * Dependencies: Node built-ins/global WebSocket and the existing Python
+ * interpreter for a private Linux lineage owner (shared lifecycle helper).
+ * It launches its own Chrome lineage
  * with a throwaway profile under the system temp dir and always cleans
- * that child up (Browser.close, then own-group signal — never a broad kill).
+ * that lineage up (Browser.close, then owner-PID TERM — never a broad kill).
  * Chrome's own sandbox stays enabled unless QWEN_CHROME_NO_SANDBOX=1 is set
  * explicitly. Every wait is bounded: DevTools announce, websocket open,
  * EACH CDP send and the whole check; an early child exit rejects startup.
+ * A kernel-unreapable child retains its owner/profile instead of falsely
+ * claiming cleanup or being orphaned by an explicit parent process.exit.
  * No screenshots are written or committed.
  *
  * Covers: seed edges/length/non-ASCII, snapshot keys, presets and manual
@@ -393,7 +396,12 @@ try {
   guard.cancel();
   console.log(results.join('\n'));
   console.log(`\n${results.length - failed}/${results.length} browser checks passed`);
-  await shutdownChrome(chrome, ws, cdp);
-  try { rmSync(profileDir, { recursive: true, force: true, maxRetries: 5 }); } catch {}
+  const cleaned = await shutdownChrome(chrome, ws, cdp);
+  if (cleaned === false) {
+    failed++;
+    console.error('browser cleanup pending: retained owner and profile; no false successful exit');
+  } else {
+    try { rmSync(profileDir, { recursive: true, force: true, maxRetries: 5 }); } catch {}
+  }
 }
-process.exit(failed === 0 ? 0 : 1);
+process.exitCode = failed === 0 ? 0 : 1; // retain any pending owner rather than orphaning it

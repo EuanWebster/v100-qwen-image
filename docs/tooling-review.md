@@ -78,3 +78,13 @@ test/diagnostic-contract correction, not suppression of browser failures.
 
 Final whole-suite/browser results and remaining scope are recorded in
 `code-review.md`; no service, ML lock, actual model or generation changes.
+
+## 2026-10-14 descendant-ownership correction
+
+The historical direct-child/group cleanup above did not reap every Chrome
+grandchild under this container's non-reaping PID1. The private process-lineage
+owner now adopts/waits those descendants. Node signals only the owner PID and
+retains pending ownership instead of hard-exiting or deleting live profiles.
+Actual fork-tree, real Chrome and no-new-zombie evidence:
+[process-ownership.md](process-ownership.md). Existing foreign zombies and
+shared tool/container configuration were not changed.
