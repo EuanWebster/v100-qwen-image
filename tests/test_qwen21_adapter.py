@@ -188,3 +188,47 @@ def test_cli_notice_names_the_attestation_when_used(tmp_path, capsys, monkeypatc
     err = capsys.readouterr().err
     assert "attesting that this process tree has no cgroup memory limit" in err
     assert captured == {"trust_unbounded_host": True}
+
+
+# -- transformer release before the VAE decode ------------------------------
+
+
+class _RecordingInner:
+    def __init__(self, order):
+        self.order = order
+
+    def denoise(self, config, conditioning):
+        self.order.append("denoise")
+        return ["latents"]
+
+    def decode(self, latents):
+        self.order.append("decode")
+        return "image"
+
+
+def test_denoise_releases_the_transformer_before_decode():
+    """Single-use loader: the transformer is dead weight during decode, and
+    releasing it is what lets the untiled (artifact-free) decode fit."""
+    from types import SimpleNamespace
+
+    adapter = cli._make_adapter()
+    order = []
+    adapter._inner = _RecordingInner(order)
+    transformer = SimpleNamespace()
+    adapter._pipeline = SimpleNamespace(transformer=transformer)
+
+    latents = adapter.denoise(GenerationConfig(), None)
+    assert adapter._pipeline.transformer is None
+    adapter.decode(latents)
+    assert order == ["denoise", "decode"]
+
+
+def test_release_is_idempotent_without_a_pipeline_or_transformer():
+    from types import SimpleNamespace
+
+    adapter = cli._make_adapter()
+    adapter._release_denoiser()  # no pipeline at all
+    adapter._pipeline = SimpleNamespace(transformer=None)
+    adapter._release_denoiser()  # already released
+    adapter._pipeline = SimpleNamespace()
+    adapter._release_denoiser()  # attribute absent

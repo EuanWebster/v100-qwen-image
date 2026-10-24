@@ -81,7 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run", action="store_true",
                    help="actually generate (verifies manifest assets first; no downloads)")
     p.add_argument("--tiled-decode", action="store_true",
-                   help="VAE tiling (decode-memory knob only, C6)")
+                   help="VAE tiling: lower decode memory, but measurably leaves "
+                        "faint streak artifacts in flat regions; the default "
+                        "untiled decode is used after the transformer is released")
     p.add_argument("--attest-unbounded-host", action="store_true",
                    help="operator attestation that this process tree has no cgroup "
                         "memory limit, so the CPU encoder gate uses the freshly read "

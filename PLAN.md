@@ -1428,3 +1428,21 @@ standing rule that executed plans stay honest.)*
   (resident 14,806MiB peak) and succeeds with `vae.enable_tiling()`; PNG saved.
   That is load/kernel/sampling/decode evidence only — not prompt fidelity, not
   an accepted image, and `--tiled-decode` is required on this 16GB profile.
+
+- 2026-10-24 **first real text-to-image images on the V100 + tiled-decode
+  quality fix**: `--attest-unbounded-host` resolved the last encoder blocker
+  (opt-in operator scope attestation; default stays refuse) and the real CLI
+  produced prompt-following images: 512²/4 steps and 1024²/40 steps, the
+  latter in 1m43s cold / 1m27s warm, denoise 42.1s, decode 0.85s, peak
+  device VRAM 15,439 MiB. Prompt fidelity confirmed by eye on "a red cube on
+  a white table, studio photo" at both sizes. A measured defect was found and
+  fixed: VAE **tiled** decode leaves faint vertical dashed streaks in flat
+  regions (max 52/255, mean 1.24 vs the same latents decoded untiled), so the
+  loader now releases the transformer after denoise (`pipeline.transformer =
+  None` **plus `gc.collect()`** — diffusers' per-module hook registry keeps
+  the module in a cycle; 13.89 GiB → 0.64 GiB measured) and decodes untiled by
+  default. `--tiled-decode` stays as an explicit memory-first knob and its
+  help now names the artifact. fp16 vs fp32 VAE decode differs by ≤1/255, so
+  precision is not the cause. Measurements and honest limits (exploratory,
+  not calibration; ~15.4/16 GiB is tight, one transient allocator retry;
+  2K still needs M5) are in docs/generation-measurements-2026-10-24.md.

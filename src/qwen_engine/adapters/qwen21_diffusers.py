@@ -29,6 +29,7 @@ Boundary rules:
 """
 from __future__ import annotations
 
+import gc
 import threading
 from pathlib import Path
 from typing import Any
@@ -286,7 +287,41 @@ class Qwen21DiffusersAdapter:
         return self._attached().encode(config)
 
     def denoise(self, config: GenerationConfig, conditioning):
-        return self._attached().denoise(config, conditioning)
+        latents = self._attached().denoise(config, conditioning)
+        self._release_denoiser()
+        return latents
+
+    def _release_denoiser(self) -> None:
+        """Drop the transformer's VRAM before the VAE decode (single-use loader).
+
+        The bridge never touches the transformer again after denoise (decode
+        uses the VAE, save uses the image), and this adapter is single-use, so
+        releasing the reference is safe. The freed blocks stay in this
+        process's own allocator cache and are reused by the decode allocation;
+        no global allocator flush is performed and nothing outside this process
+        is affected.
+
+        ``pipeline.transformer = None`` is not enough on its own: diffusers
+        attaches a per-module hook registry that refers back to the module, so
+        the transformer survives as an unreachable reference cycle (measured:
+        13.9 GiB still allocated after the assignment, 0.64 GiB after
+        ``gc.collect()`` breaks the cycle). The collector runs only after the
+        reference is dropped, so it cannot collect anything still in use.
+
+        Why it matters (measured on the V100): transformer + VAE resident is
+        ~14.8 GiB of 16 GiB, which leaves too little for an untiled 1024²
+        decode. Untiled decode at 1024² is also measurably *better* than the
+        tiled path: tiled decode leaves faint vertical dashed streaks in flat
+        regions (max channel difference 52/255, mean 1.24 against the resident
+        decode of the same latents), while the resident decode is clean.
+        ``--tiled-decode`` therefore stays available as an explicit
+        memory-first knob, not as the default.
+        """
+        pipeline = self._pipeline
+        if pipeline is None or getattr(pipeline, "transformer", None) is None:
+            return
+        pipeline.transformer = None
+        gc.collect()
 
     def decode(self, latents):
         return self._attached().decode(latents)
