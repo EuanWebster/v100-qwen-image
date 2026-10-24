@@ -90,8 +90,13 @@ async function check() {
   await evaluate(`document.getElementById('prompt').value='a red cube on a white table, studio photo, sharp focus, soft daylight';
     document.getElementById('steps').value='20'; document.getElementById('seed').value='${real ? '42' : '18446744073709551615'}';
     document.getElementById('create-form').requestSubmit();`);
+  await until(`['Generating', 'Queued'].some(text => document.getElementById('job-feedback').textContent.startsWith(text))`);
+  assert.equal(await evaluate(`document.getElementById('generate-btn').textContent`), 'Queue another image');
+  assert(await evaluate(`document.getElementById('preview-message').textContent === document.getElementById('job-feedback').textContent`));
+  console.log('PASS active generation is visible beside Generate and inside the empty preview');
   await until(`document.getElementById('job-status').textContent.startsWith('succeeded')`, real ? 240000 : 15000);
   await until(`document.getElementById('preview-image').naturalWidth > 0`);
+  assert(await evaluate(`!document.getElementById('view-result').hidden && document.getElementById('job-feedback').textContent.startsWith('Image ready')`));
   let ids = await jobIds();
   assert.equal(ids.length, 1);
   const id = ids[0];

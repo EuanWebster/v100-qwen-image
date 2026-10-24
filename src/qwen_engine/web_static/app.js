@@ -1136,6 +1136,8 @@
 
   function updateGenerate() {
     $('generate-btn').disabled = !apiConnected || !generationConnected || submittingJob;
+    var active = Object.keys(jobCache).some(function (id) { return !jobTerminal(jobCache[id]); });
+    $('generate-btn').textContent = submittingJob ? 'Submitting…' : active ? 'Queue another image' : 'Generate';
     setText('generate-reason', generationConnected
       ? (submittingJob ? 'Submitting…' : 'Jobs run one at a time. Model and resource checks run for each job.')
       : GENERATION_UNAVAILABLE_REASON);
@@ -1146,6 +1148,24 @@
     setText('job-status', job.state + (job.phase ? ' · ' + job.phase :
       job.state === 'running' ? ' · verifying model assets' : '') +
       (job.error_code ? ' · ' + job.error_code + ' (see server terminal)' : ''));
+    var descriptions = {
+      queued: 'Queued — waiting for the current generation to finish.',
+      running: 'Generating — ' + ({load: 'loading model weights', encode: 'encoding your prompt',
+        denoise: 'drawing the image', decode: 'decoding the image', save: 'saving the image'}[job.phase] || 'verifying model files') + '.',
+      cancelling: 'Cancellation requested — waiting for the engine to release resources.',
+      cancelled: 'Generation cancelled.',
+      succeeded: 'Image ready. Use View completed image below.',
+      failed: 'Generation failed — ' + job.error_code + '. See the server terminal for details.'
+    };
+    var feedback = descriptions[job.state];
+    if (job.elapsed_ms !== null) feedback += ' Elapsed: ' + (job.elapsed_ms / 1000).toFixed(0) + ' s.';
+    setText('job-feedback', feedback);
+    $('job-feedback').dataset.state = job.state;
+    $('view-result').hidden = job.state !== 'succeeded';
+    setText('preview-title', job.state === 'running' ? 'Generating your image…' :
+      job.state === 'queued' ? 'Generation queued' : job.state === 'failed' ? 'Generation failed' : 'No image yet');
+    setText('preview-message', feedback);
+    updateGenerate();
     setText('job-timings', Object.keys(job.phase_ms).map(function (phase) {
       return phase + ': ' + (job.phase_ms[phase] / 1000).toFixed(2) + ' s';
     }).join(' · '));
@@ -1210,6 +1230,8 @@
 
   function jobFailure(message) {
     setText('job-status', message);
+    setText('job-feedback', message);
+    $('job-feedback').dataset.state = 'error';
     // No automatic POST retry: a lost submit response may still own a real job.
   }
 
@@ -1245,6 +1267,9 @@
           $('preview-empty').hidden = false;
           ['cancel-job', 'action-download', 'action-open', 'action-again'].forEach(function (id) { $(id).disabled = true; });
           setText('job-status', 'No job selected.');
+          setText('job-feedback', 'Ready to submit a generation.');
+          $('job-feedback').removeAttribute('data-state');
+          $('view-result').hidden = true;
           setText('job-timings', '');
           ['stat-result', 'stat-steps', 'stat-elapsed'].forEach(function (id) { setText(id, '—'); });
         }
@@ -1276,6 +1301,8 @@
     }
     var envelope = config ? {schema: PLAN_REQUEST_SCHEMA, config: config} : buildEnvelope().envelope;
     submittingJob = true;
+    setText('job-feedback', 'Submitting your generation…');
+    $('job-feedback').dataset.state = 'submitting';
     updateGenerate();
     apiRequest(API_JOBS, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Qwen-UI': '1'},
       body: JSON.stringify(envelope)}, 'json').then(function (r) {
@@ -1346,6 +1373,9 @@
     });
     $('btn-plan').addEventListener('click', function () { runPlan(true); });
     $('btn-export').addEventListener('click', function () { exportConfig(); });
+    $('view-result').addEventListener('click', function () {
+      $('preview-frame').scrollIntoView({behavior: 'smooth', block: 'center'});
+    });
     $('cancel-job').addEventListener('click', function () {
       if (selectedJob) jobAction(selectedJob, 'cancel');
     });

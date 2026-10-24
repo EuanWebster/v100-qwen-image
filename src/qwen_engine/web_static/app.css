@@ -210,6 +210,12 @@ details.advanced > .help { margin-top: 10px; }
 
 .actions { margin-top: 16px; }
 .disabled-reason { margin: 8px 0 0; font-size: 12.5px; color: var(--text-muted); }
+.job-feedback { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+  font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+.job-feedback[data-state="running"], .job-feedback[data-state="queued"],
+.job-feedback[data-state="submitting"] { border-color: var(--accent); }
+.job-feedback[data-state="succeeded"] { border-color: #69b879; }
+.job-feedback[data-state="failed"], .job-feedback[data-state="error"] { border-color: #dd7777; }
 
 /* ---------- Preview ---------- */
 

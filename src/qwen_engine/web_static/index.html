@@ -155,6 +155,8 @@
             <button type="submit" id="generate-btn" class="btn-primary" disabled>
               Generate</button>
             <p class="disabled-reason" id="generate-reason" role="status"></p>
+            <p id="job-feedback" class="job-feedback" role="status" aria-live="polite">Ready to submit a generation.</p>
+            <button type="button" id="view-result" class="btn-secondary" hidden>View completed image</button>
             <button type="button" id="cancel-job" class="btn-secondary" disabled>Cancel selected job</button>
           </div>
 
@@ -177,8 +179,8 @@
       <section class="preview-column" aria-label="Preview">
         <div class="preview-frame" id="preview-frame" data-aspect="1 / 1">
           <div class="preview-empty" id="preview-empty">
-            <p class="preview-empty-title">No image yet</p>
-            <p>Submit a generation to the local engine. Completed images appear here.</p>
+            <p class="preview-empty-title" id="preview-title">No image yet</p>
+            <p id="preview-message">Submit a generation to the local engine. Completed images appear here.</p>
           </div>
           <img id="preview-image" hidden alt="">
         </div>

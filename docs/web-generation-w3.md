@@ -57,6 +57,25 @@ provable memory-scope evidence.
   server terminal. Lost POST responses are not retried automatically: inspect
   History before retrying because the job may already have been accepted.
 
+### Generation feedback (2026-10-24 follow-up)
+
+A user reported that Generate did nothing. Server evidence showed both requests
+were accepted and successfully saved (112.3 s and 85.9 s at 1344×768/40 steps).
+Generation itself worked; the old progress status below the preview was easy to
+miss, and the empty preview kept saying “No image yet”. The exact state of the
+user's remote browser was not independently inspected.
+
+The workspace now shows submission/job phase/elapsed/error/completion feedback
+immediately beside Generate, repeats it in an empty preview, labels the button
+“Queue another image” while work exists, and offers a nearby “View completed
+image” button. Real Chrome fixture checks cover this visible feedback during
+execution and after completion; the 37 static checks pass.
+
+The existing live server was deliberately left running to preserve its two
+in-memory History entries. It caches static assets at startup, so this feedback
+change takes effect on its next restart. The existing completed images remain
+available through the running app's History/image endpoints.
+
 ## Submission availability and memory
 
 `generation_available` means the server accepts generation submissions; it
