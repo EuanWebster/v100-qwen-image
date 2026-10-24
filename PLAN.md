@@ -1485,3 +1485,17 @@ standing rule that executed plans stay honest.)*
   the cleaner untiled default. Full record with commands and honest limits in
   docs/generation-measurements-2026-10-24.md. MLP chunking and tiling
   geometry have ML-free tests; guarded suite: 2490 passed, 2 skipped.
+
+- 2026-10-24 **fixed quality suite (`fixed-quality-v1`)**: added
+  `tools/quality_suite.py` — six fixed prompts/seeds covering object, text,
+  composition, counting, style and lighting, run through the real CLI with
+  per-case hashes, phase timings, sampled device/host peaks and a captioned
+  contact sheet. Measured 1024²/40 on the V100: six of six exited 0,
+  107–109 s wall each, denoise 42.8–43.0 s, decode 1.26–1.29 s, peaks
+  15,373–15,379 MiB, host MemAvailable ≥ 52.7 GiB. Review: object, text,
+  composition, counting and style pass; lighting is partial (strong backlight
+  and caustic, but the requested long shadows are not visible). The object
+  image is byte-identical to the pre-change run
+  (`sha256 8d274d4f…`), so phase-exclusive residency/chunking did not perturb
+  1024². Record: docs/quality-suite-2026-10-24.md; review status is agent
+  visual inspection with human sign-off pending.
