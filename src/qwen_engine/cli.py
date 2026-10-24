@@ -189,9 +189,9 @@ def _make_adapter() -> Any:
         if exc.name != "qwen_engine.adapters.qwen21_diffusers":
             raise
         raise EngineError(
-            "no pipeline adapter available: Qwen21DiffusersAdapter is not "
-            "implemented yet (M4+); heavy ML imports are reachable only "
-            "through it — this is the M1 boundary, not a fault to retry"
+            "no pipeline adapter module available: "
+            "qwen_engine.adapters.qwen21_diffusers is missing from this "
+            "installation (packaging error, not a missing dependency)"
         ) from exc
     return module.Qwen21DiffusersAdapter()
 

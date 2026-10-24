@@ -1,0 +1,131 @@
+"""ML-free boundaries and review-scope refusals for the default loader.
+
+No torch/diffusers/transformers import, no model weights, no GPU and no
+network occur in this module: the loader's heavy imports live inside
+``load`` after its policy and manifest gates.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from dataclasses import replace
+
+import pytest
+
+from qwen_engine import cli
+from qwen_engine.config import ConfigError, GenerationConfig
+from qwen_engine.errors import EngineError
+from qwen_engine.manifest import ManifestError
+
+HEAVY = ("torch", "diffusers", "transformers")
+
+
+def _config(tmp_path, **overrides):
+    values = dict(
+        prompt="a red cube",
+        output_dir=str(tmp_path / "out"),
+        cache_dir=str(tmp_path / "cache"),
+        manifest_path=str(tmp_path / "missing-manifest.json"),
+        models_dir=str(tmp_path / "models"),
+    )
+    values.update(overrides)
+    return GenerationConfig(**values)
+
+
+def test_module_import_stays_ml_free_in_a_fresh_interpreter():
+    code = (
+        "import sys\n"
+        "import qwen_engine.adapters.qwen21_diffusers as mod\n"
+        "heavy = sorted(set(sys.modules) & {'torch', 'diffusers', 'transformers'})\n"
+        "assert not heavy, heavy\n"
+        "assert mod.Qwen21DiffusersAdapter.__module__ == "
+        "'qwen_engine.adapters.qwen21_diffusers'\n"
+        "print('ok')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-B", "-c", code],
+        capture_output=True, text=True, env=dict(os.environ))
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "ok"
+
+
+def test_factory_returns_the_default_loader_without_heavy_imports():
+    adapter = cli._make_adapter()
+    assert type(adapter).__module__ == "qwen_engine.adapters.qwen21_diffusers"
+    assert not set(HEAVY) & set(sys.modules)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("quant", "q8"),
+    ("quant", "q4"),
+    ("offload", "streamed"),
+    ("offload", "offload"),
+    ("attention_backend", "eager"),
+    ("attention_backend", "efficient"),
+])
+def test_unreviewed_execution_policy_refuses_before_manifest_or_ml(
+        tmp_path, field, value):
+    adapter = cli._make_adapter()
+    with pytest.raises(ConfigError) as caught:
+        adapter.load(_config(tmp_path, **{field: value}), {})
+    assert field in caught.value.fields
+    assert not set(HEAVY) & set(sys.modules)
+
+
+@pytest.mark.parametrize("missing", [
+    "output_dir", "cache_dir", "manifest_path", "models_dir",
+])
+def test_missing_runtime_paths_refuse_before_manifest_or_ml(tmp_path, missing):
+    adapter = cli._make_adapter()
+    values = {missing: None}
+    with pytest.raises(ConfigError) as caught:
+        adapter.load(_config(tmp_path, **values), {})
+    assert missing in caught.value.fields
+    assert not set(HEAVY) & set(sys.modules)
+
+
+def test_missing_manifest_refuses_before_any_ml_import(tmp_path):
+    adapter = cli._make_adapter()
+    with pytest.raises(ManifestError):
+        adapter.load(_config(tmp_path), {})
+    assert not set(HEAVY) & set(sys.modules)
+
+
+def test_phase_calls_before_load_are_refused():
+    adapter = cli._make_adapter()
+    with pytest.raises(EngineError):
+        adapter.encode(GenerationConfig())
+    with pytest.raises(EngineError):
+        adapter.denoise(GenerationConfig(), None)
+    with pytest.raises(EngineError):
+        adapter.decode(None)
+    with pytest.raises(EngineError):
+        adapter.save(None, GenerationConfig())
+
+
+def test_cancel_event_binding_and_idempotent_close():
+    import threading
+
+    adapter = cli._make_adapter()
+    with pytest.raises(ConfigError):
+        adapter.set_cancel_event("not-an-event")
+    adapter.set_cancel_event(threading.Event())
+    adapter.set_cancel_event(None)  # re-binding before load is allowed
+    adapter.close()
+    adapter.close()  # idempotent after partial/never load
+
+
+def test_second_load_is_refused_after_close():
+    adapter = cli._make_adapter()
+    adapter.close()
+    with pytest.raises(EngineError):
+        adapter.load(GenerationConfig(), {})
+
+
+def test_config_replacement_keeps_policy_refusal_reachable(tmp_path):
+    """replace() on a valid config still yields the reviewed-profile errors."""
+    config = _config(tmp_path, quant="q8")
+    adapter = cli._make_adapter()
+    with pytest.raises(ConfigError):
+        adapter.load(replace(config, offload="streamed"), {})

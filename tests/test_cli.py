@@ -311,9 +311,9 @@ def test_cpu_surface_imports_no_heavy_modules():
     assert not set(HEAVY) & set(sys.modules)
 
 
-def test_make_adapter_names_the_absent_adapter_module(monkeypatch):
-    """The known M1 boundary: ModuleNotFoundError whose .name is exactly the
-    adapter module becomes a clear EngineError."""
+def test_make_adapter_names_a_missing_adapter_module(monkeypatch):
+    """A ModuleNotFoundError whose .name is exactly the adapter module becomes
+    a clear packaging EngineError (the module now ships with the package)."""
     import importlib
 
     def fake_import(name):
@@ -322,7 +322,7 @@ def test_make_adapter_names_the_absent_adapter_module(monkeypatch):
     monkeypatch.setattr(importlib, "import_module", fake_import)
     with pytest.raises(EngineError) as exc:
         cli._make_adapter()
-    assert "not implemented" in str(exc.value)
+    assert "missing from this installation" in str(exc.value)
 
 
 def test_make_adapter_internal_dependency_error_keeps_identity(monkeypatch):
@@ -621,20 +621,24 @@ def test_cli_module_entry_point_declared():
 # --- second senior-review pass: ordering + overflow at the CLI ---------------
 
 
-def test_verified_assets_no_output_dir_real_absent_adapter_exits_2(
-        tmp_path, capsys):
-    """THE real M1 CLI path, no monkeypatched adapter anywhere.
+def test_verified_assets_no_output_dir_never_creates_adapter_exits_2(
+        tmp_path, capsys, monkeypatch):
+    """THE real CLI ordering path.
 
-    The Qwen21DiffusersAdapter module is genuinely absent; an actual run
-    whose assets verify but whose output is unconfigured must be a CONFIG
-    error (exit 2), not the adapter-absent boundary (exit 1): the config
-    check runs after asset verification (missing assets keep exit 4) and
-    BEFORE any adapter creation/import."""
+    The loader adapter now exists; an actual run whose assets verify but whose
+    output is unconfigured must still be a CONFIG error (exit 2) and must not
+    create the adapter: the config check runs after asset verification (missing
+    assets keep exit 4) and BEFORE any adapter creation/load."""
     import importlib.util
 
     assert importlib.util.find_spec(
-        "qwen_engine.adapters.qwen21_diffusers") is None, \
-        "this test is only meaningful with the real adapter genuinely absent"
+        "qwen_engine.adapters.qwen21_diffusers") is not None, \
+        "the packaged loader module must be importable"
+
+    def exploding_make_adapter():
+        raise AssertionError("adapter was created before the output_dir check")
+
+    monkeypatch.setattr(cli, "_make_adapter", exploding_make_adapter)
 
     mpath = write_manifest(tmp_path)
     (tmp_path / "models" / "dit").mkdir(parents=True, exist_ok=True)

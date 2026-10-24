@@ -1404,3 +1404,27 @@ standing rule that executed plans stay honest.)*
   metadata boundary, with the production worker unchanged. Found by the fresh
   environment run, not a product regression. Real-model fidelity, encoder
   RAM/fit, VRAM calibration and quality acceptance remain pending.
+
+- 2026-10-24 **default loader implemented + real V100 component proof (step 2
+  of testing against the installed card)**: `adapters/qwen21_diffusers.py`
+  (`Qwen21DiffusersAdapter`) is now the adapter behind `cli._make_adapter()`.
+  Import stays ML-free; `load()` refuses any non-`fp16`/non-`resident`/eager-
+  or-efficient-attention policy and any missing `manifest_path`/`models_dir`/
+  `output_dir`/`cache_dir` *before* a manifest read or ML import, re-resolves
+  the local bundle (never trusts a caller path list), checks the pinned runtime
+  (CUDA 12.6, sm_70, V100-16GB band), loads processor/transformer/VAE/scheduler
+  locally one component at a time (move to GPU, then read the next, to bound
+  host peak), and delegates the five phases to `SuppliedQwen21Adapter`. Asset
+  comparison resolves the CLI's lexical paths against the bundle's canonical
+  absolutes. Tests: `tests/test_qwen21_adapter.py` (ML-free boundary, policy
+  and lifecycle refusals) plus updated `test_cli.py` ordering/factory tests.
+  Guarded suite: **2452 passed + 2 skipped**.
+  Real run on the card (`--run`, 512x512, 4 steps): 24 assets verified, bundle
+  resolved, runtime identity bound, transformer+VAE resident FP16, then the
+  documented deliberate refusal at the encoder's host-memory gate (exit 3,
+  `cgroup memory constraint state unknown` -> `refuse`); GPU returned to 0MiB.
+  Component-level proof with synthetic conditioning (`/tmp/opencode/qwen_component_smoke.py`):
+  denoise 4 steps ~1.0s, VAE decode OOMs **without** tiling at 512x512
+  (resident 14,806MiB peak) and succeeds with `vae.enable_tiling()`; PNG saved.
+  That is load/kernel/sampling/decode evidence only — not prompt fidelity, not
+  an accepted image, and `--tiled-decode` is required on this 16GB profile.

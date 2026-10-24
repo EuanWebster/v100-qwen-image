@@ -1,8 +1,9 @@
 """Pipeline adapter protocol + plan/dry-run types (plan R1, task 1.3).
 
-The generation core speaks only this protocol. Its future heavy generation
-module, ``qwen_engine.adapters.qwen21_diffusers``, does not exist yet; stubbing
-it at M1 is a boundary violation the import test catches. CPU encoder helpers
+The generation core speaks only this protocol. The heavy generation module,
+``qwen_engine.adapters.qwen21_diffusers``, keeps every torch/diffusers/
+transformers import inside its lazy ``load`` path; importing the module itself
+must stay ML-free (the import test catches boundary drift). CPU encoder helpers
 and the separate throwaway worker may lazily import ML only after their own
 request/setup gates. Plain package/CLI/web imports remain ML-free.
 """

@@ -1,0 +1,296 @@
+"""Default local loader + Qwen-Image-2.1 diffusers adapter (M4 groundwork).
+
+Boundary rules:
+
+* Importing this module stays **ML-free**. ``torch``, ``diffusers`` and
+  ``transformers`` are imported only inside :meth:`Qwen21DiffusersAdapter.load`,
+  i.e. only on an actual run.
+* Every weight comes from the verified local reference bundle
+  (``manifest`` + ``models_dir`` -> :func:`resolve_local_bundle`), never from a
+  repo id, an ambient Hugging Face cache or the network. The CLI has already
+  resolved the same bundle once; the adapter re-resolves so it never trusts a
+  caller-supplied path list, and pays the documented re-hash cost.
+* Only the reviewed resident profile is implemented: unquantized FP16 on one
+  V100, native SDPA, transformer + VAE resident, no text encoder in-process
+  (the Qwen3-VL encoder runs in the subprocess worker), no hooks/offload.
+  Q8/Q4 and streaming are M5 work and are refused here rather than silently
+  ignored.
+* The adapter **loads and attaches**; it grants no memory fit, no calibration
+  and no image-quality acceptance. The measured memory policy (M5.3) remains a
+  separate gate, and the CPU encoder's own conservative host-memory preflight
+  still refuses until complete trusted budget evidence exists.
+* Nothing here writes outside the configured cache/output directories, changes
+  a driver, touches ROCm, or flushes a global allocator on behalf of other
+  processes.
+"""
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+from typing import Any
+
+from qwen_engine.adapters.supplied_qwen21 import SuppliedQwen21Adapter
+from qwen_engine.config import (
+    AttentionBackend,
+    ConfigError,
+    FieldError,
+    GenerationConfig,
+    OffloadMode,
+    Quant,
+)
+from qwen_engine.encoder import EmbeddingCache
+from qwen_engine.encoder_client import ProductionEncoder
+from qwen_engine.errors import EngineError, HardwareAbsentError
+from qwen_engine.local_bundle import LocalReferenceBundle, resolve_local_bundle
+from qwen_engine.manifest import load_manifest
+from qwen_engine.runtime_identity import observe_generation_runtime
+
+#: The only encoder dtype this loader asks the CPU worker for. The checkpoint is
+#: BF16, so this expands no weights; fp16/fp32 are alternatives only after a
+#: measured decision (C5).
+ENCODER_DTYPE = "bf16"
+
+#: Explicit, non-defaulted host headroom passed to the encoder worker's
+#: conservative preflight. It is a *prerequisite* input, not a measured peak.
+ENCODER_HEADROOM_BYTES = 4 * 1024**3
+
+#: Bounded encoder worker lifetime; a full 17.5 GB CPU load is slow.
+ENCODER_TIMEOUT_S = 3600.0
+
+#: The reviewed execution device is the first CUDA logical device. The
+#: hardware gate below still verifies its identity before anything is loaded.
+LOGICAL_DEVICE_INDEX = 0
+
+
+def _libraries():
+    """Import the heavy stack *and* validate the pinned runtime first.
+
+    Package policy runs before every ML import, exactly like the supplied
+    component bridge; a drifted environment refuses here rather than loading
+    mismatched classes.
+    """
+    from qwen_engine.encoder_identity import (
+        observe_installed_packages,
+        validate_installed_packages,
+    )
+
+    validate_installed_packages(observe_installed_packages())
+    import torch
+    from diffusers import (
+        AutoencoderKLQwenImage21,
+        FlowMatchEulerDiscreteScheduler,
+        QwenImage21Pipeline,
+        QwenImage21Transformer2DModel,
+    )
+    from transformers import Qwen3VLProcessor
+
+    return (
+        torch,
+        QwenImage21Pipeline,
+        QwenImage21Transformer2DModel,
+        AutoencoderKLQwenImage21,
+        FlowMatchEulerDiscreteScheduler,
+        Qwen3VLProcessor,
+    )
+
+
+def _require_v100(torch) -> Any:
+    """Refuse anything but the reviewed Volta profile before a weight is read.
+
+    Device *enumeration* is not execution proof, but a wrong CUDA build, a
+    non-Volta device or an absent sm_70 kernel set cannot run this stack, and
+    must surface as the hardware exit code (5) rather than a load traceback.
+    """
+    if getattr(torch.version, "cuda", None) != "12.6" or not torch.cuda.is_available():
+        raise HardwareAbsentError(
+            "reviewed CUDA 12.6 PyTorch build and a visible V100 are required; "
+            "install the pinned cu126 wheel and check the device"
+        )
+    if not 0 <= LOGICAL_DEVICE_INDEX < torch.cuda.device_count():
+        raise HardwareAbsentError("the reviewed logical CUDA device is not visible")
+    properties = torch.cuda.get_device_properties(LOGICAL_DEVICE_INDEX)
+    if (
+        (properties.major, properties.minor) != (7, 0)
+        or "V100" not in properties.name
+        or not 15 * 1024**3 <= properties.total_memory <= 16 * 1024**3
+    ):
+        raise HardwareAbsentError(
+            "a Tesla V100 16GB-class device is required; "
+            f"found {properties.name!r} (compute {properties.major}.{properties.minor})"
+        )
+    if "sm_70" not in torch.cuda.get_arch_list():
+        raise HardwareAbsentError(
+            "the installed torch build has no sm_70 kernels; the pinned cu126 "
+            "wheel is required for Volta"
+        )
+    return properties
+
+
+def _validate_policy(config: GenerationConfig) -> None:
+    """Review-scope refusals, before any manifest read or ML import."""
+    if not isinstance(config, GenerationConfig):
+        raise ConfigError(FieldError("config", "a GenerationConfig is required"))
+    errors: list[FieldError] = []
+    if config.quant is not Quant.FP16:
+        errors.append(FieldError(
+            "quant", "the resident loader currently supports fp16 only; "
+                     "q8/q4 belong to the M5 quality ladder"))
+    if config.offload is not OffloadMode.RESIDENT:
+        errors.append(FieldError(
+            "offload", "the resident loader supports offload=resident only; "
+                       "streamed/offload modes are M5"))
+    if config.attention_backend not in (AttentionBackend.AUTO, AttentionBackend.SDPA):
+        errors.append(FieldError(
+            "attention_backend", "this loader supports auto/sdpa only; "
+                                  "other backends are benchmark work"))
+    for name in ("manifest_path", "models_dir"):
+        if getattr(config, name) is None:
+            errors.append(FieldError(name, "an actual run requires this path"))
+    if config.output_dir is None:
+        errors.append(FieldError("output_dir", "an actual run requires an output directory"))
+    if config.cache_dir is None:
+        errors.append(FieldError(
+            "cache_dir", "the encoder cache/scratch requires an explicit cache_dir"))
+    if errors:
+        raise ConfigError(errors)
+
+
+class Qwen21DiffusersAdapter:
+    """One-shot local loader over the reviewed supplied-component bridge.
+
+    ``load`` resolves and verifies the local bundle, checks the pinned runtime
+    and the V100 profile, builds the pinned pipeline classes locally (processor,
+    transformer, VAE, scheduler; no text encoder), places them as resident FP16
+    components, then delegates the five phases to
+    :class:`~qwen_engine.adapters.supplied_qwen21.SuppliedQwen21Adapter`.
+    """
+
+    def __init__(self) -> None:
+        self._event: threading.Event | None = None
+        self._inner: SuppliedQwen21Adapter | None = None
+        self._pipeline: Any = None
+        self._bundle: LocalReferenceBundle | None = None
+        self._state = "new"
+
+    def set_cancel_event(self, event: threading.Event | None) -> None:
+        if self._state != "new" or (event is not None and not isinstance(event, threading.Event)):
+            raise ConfigError("bind a threading.Event or None before load")
+        self._event = event
+
+    def load(self, config: GenerationConfig, assets) -> None:
+        if self._state != "new" or self._inner is not None:
+            raise EngineError("the loader adapter is single-use and already attached")
+        _validate_policy(config)
+        manifest = load_manifest(config.manifest_path)
+        bundle = resolve_local_bundle(manifest, config.models_dir)
+        bundle_assets = bundle.to_assets()
+        # The CLI resolver reports paths in the caller's lexical form (e.g. a
+        # relative --models-dir); the bundle publishes canonical absolutes.
+        # Compare resolved identities, then attach the canonical set.
+        supplied_assets = {
+            role: tuple(Path(path).resolve() for path in paths)
+            for role, paths in dict(assets).items()
+        }
+        if supplied_assets != bundle_assets:
+            raise ConfigError(FieldError(
+                "assets", "verified asset paths disagree with the pinned local bundle"))
+
+        # CPU-side identity before the CUDA context exists; the post-context
+        # observation below must bind to this exact device UUID/index.
+        observe_generation_runtime()
+
+        (
+            torch,
+            pipeline_cls,
+            transformer_cls,
+            vae_cls,
+            scheduler_cls,
+            processor_cls,
+        ) = _libraries()
+        properties = _require_v100(torch)
+        device = torch.device("cuda", LOGICAL_DEVICE_INDEX)
+
+        try:
+            # Load and place one component at a time: the CPU copy of each is
+            # released before the next component's weights are read, so host
+            # peak stays near one model rather than the whole stack.
+            transformer = transformer_cls.from_pretrained(
+                bundle.component_dirs["dit"], torch_dtype=torch.float16,
+                local_files_only=True)
+            transformer.to(device=device, dtype=torch.float16).eval()
+            vae = vae_cls.from_pretrained(
+                bundle.component_dirs["vae"], torch_dtype=torch.float16,
+                local_files_only=True)
+            vae.to(device=device, dtype=torch.float16).eval()
+            scheduler = scheduler_cls.from_pretrained(
+                bundle.component_dirs["scheduler"], local_files_only=True)
+            processor = processor_cls.from_pretrained(
+                bundle.component_dirs["processor"], local_files_only=True)
+        except Exception as exc:
+            raise EngineError(
+                f"local component load refused: {type(exc).__name__}: {exc}") from exc
+
+        pipeline = pipeline_cls(
+            scheduler=scheduler, vae=vae, text_encoder=None,
+            processor=processor, transformer=transformer)
+
+        runtime = observe_generation_runtime()
+        if not runtime.matches_cuda_device(
+                uuid=str(properties.uuid), logical_device_index=LOGICAL_DEVICE_INDEX):
+            raise EngineError(
+                "generation runtime identity is not bound to the reviewed CUDA device")
+
+        cache_root = Path(config.cache_dir)
+        scratch = cache_root / "encoder-scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        encoder = ProductionEncoder(
+            manifest_path=config.manifest_path,
+            models_dir=config.models_dir,
+            scratch_dir=scratch,
+            headroom_bytes=ENCODER_HEADROOM_BYTES,
+            timeout_s=ENCODER_TIMEOUT_S,
+            cache=EmbeddingCache(cache_root / "embeds"),
+        )
+
+        inner = SuppliedQwen21Adapter(
+            pipeline=pipeline,
+            encoder=encoder,
+            manifest=manifest,
+            bundle=bundle,
+            encoder_dtype=ENCODER_DTYPE,
+            execution_dtype="fp16",
+            use_kv_cache=True,
+        )
+        inner.set_cancel_event(self._event)
+        inner.load(config, bundle_assets)
+        self._pipeline = pipeline
+        self._bundle = bundle
+        self._inner = inner
+        self._state = "loaded"
+
+    def _attached(self) -> SuppliedQwen21Adapter:
+        if self._inner is None:
+            raise EngineError("loader adapter is not attached; call load() first")
+        return self._inner
+
+    def encode(self, config: GenerationConfig):
+        return self._attached().encode(config)
+
+    def denoise(self, config: GenerationConfig, conditioning):
+        return self._attached().denoise(config, conditioning)
+
+    def decode(self, latents):
+        return self._attached().decode(latents)
+
+    def save(self, image, config: GenerationConfig):
+        return self._attached().save(image, config)
+
+    def close(self) -> None:
+        """Drop owned references; never delete outputs, flush allocators or
+        touch another process's devices. Idempotent after partial load."""
+        inner, self._inner = self._inner, None
+        self._pipeline = None
+        self._bundle = None
+        self._state = "closed"
+        if inner is not None:
+            inner.close()
