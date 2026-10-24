@@ -1,0 +1,89 @@
+"""Reviewed Q8_0 GGUF transformer attachment; heavy imports stay inside calls.
+
+The current pinned Diffusers implementation dequantizes each linear weight for
+FP16 computation. No native INT8 matrix kernel, Triton, remote kernel download,
+or hardware FP8 support is required by this path.
+"""
+from __future__ import annotations
+
+import os
+import hashlib
+import json
+
+from qwen_engine.errors import EngineError
+
+
+def artifact_set_identity(base_identity: str, artifact_identity: str) -> str:
+    """Bind base companions and the exact quantized transformer into evidence."""
+    return hashlib.sha256(json.dumps({"schema": "qwen_engine.q8_bundle.v1",
+                                     "base": base_identity, "q8": artifact_identity},
+                                    sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def validate_q8_environment():
+    """Refuse optional remote-kernel mode before any ML module can import it."""
+    if os.environ.get("DIFFUSERS_GGUF_CUDA_KERNELS", "false").lower() in ("1", "true", "yes"):
+        raise EngineError("Q8 profile requires DIFFUSERS_GGUF_CUDA_KERNELS=false")
+
+
+def _restore_bf16_auxiliaries(model, torch, gguf_utils, bf16_type):
+    for name, parameter in list(model.named_parameters()):
+        if isinstance(parameter, gguf_utils.GGUFParameter) and parameter.quant_type == bf16_type:
+            owner_name, _, parameter_name = name.rpartition(".")
+            value = gguf_utils.dequantize_gguf_tensor(parameter).to(torch.float16)
+            model.get_submodule(owner_name)._parameters[parameter_name] = torch.nn.Parameter(value, requires_grad=False)
+
+
+def load_q8_transformer(transformer_cls, bundle, artifact, torch, device):
+    # The optional kernel mode can execute code downloaded from the Hub. Keep
+    # this profile on the pinned local pure-Torch fallback, refusing ambient
+    # settings instead of mutating them or silently choosing another backend.
+    validate_q8_environment()
+    import gguf
+    from diffusers import GGUFQuantizationConfig
+    from diffusers.quantizers.gguf import utils as gguf_utils
+
+    if gguf_utils.ops is not None:
+        raise EngineError("Q8 profile refuses previously initialized remote GGUF kernels")
+    reader = gguf.GGUFReader(str(artifact.path))
+    allowed = {gguf.GGMLQuantizationType.Q8_0, gguf.GGMLQuantizationType.F16,
+               gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.BF16}
+    types = {tensor.tensor_type for tensor in reader.tensors}
+    if gguf.GGMLQuantizationType.Q8_0 not in types or not types <= allowed:
+        raise EngineError("Q8 profile requires Q8_0 tensors with only unquantized auxiliary tensors")
+    del reader
+    model = transformer_cls.from_single_file(
+        str(artifact.path), config=str(bundle.root), subfolder="transformer",
+        quantization_config=GGUFQuantizationConfig(compute_dtype=torch.float16),
+        torch_dtype=torch.float16, local_files_only=True,
+    )
+    # The upstream GGUF loader keeps BF16 auxiliaries as packed byte
+    # GGUFParameters even in non-linear modules (notably text_norm). Those
+    # modules do not dequantize in forward. Normalize only these unquantized
+    # auxiliaries on CPU before placement; actual Q8 weights remain packed.
+    _restore_bf16_auxiliaries(model, torch, gguf_utils, gguf.GGMLQuantizationType.BF16)
+    model.to(device=device).eval()
+    return model
+
+
+def validate_q8_parameters(model, device, dtype):
+    """Recognize only the pinned GGUF parameter class and reviewed Q8 type."""
+    import gguf
+    import torch
+    from diffusers.quantizers.gguf.utils import GGUFLinear, GGUFParameter
+
+    count = 0
+    for name, parameter in model.named_parameters():
+        if parameter.is_meta or parameter.device != device:
+            raise EngineError("Q8 transformer contains misplaced parameters")
+        if isinstance(parameter, GGUFParameter):
+            owner = model.get_submodule(name.rpartition(".")[0])
+            if (parameter.quant_type != gguf.GGMLQuantizationType.Q8_0
+                    or parameter.dtype != torch.uint8 or not isinstance(owner, GGUFLinear)):
+                raise EngineError("Q8 transformer contains an unreviewed quantized parameter")
+            count += parameter.quant_type == gguf.GGMLQuantizationType.Q8_0
+        elif parameter.dtype != dtype:
+            raise EngineError("Q8 transformer auxiliary parameters disagree with FP16 execution")
+    if count == 0:
+        raise EngineError("Q8 transformer has no quantized parameters")
+    return count

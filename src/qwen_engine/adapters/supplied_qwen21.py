@@ -104,9 +104,11 @@ class SuppliedQwen21Adapter:
         self._check("new")
         if not isinstance(config, GenerationConfig):
             raise ConfigError("GenerationConfig is required")
-        if (config.quant != Quant.FP16 or config.offload != OffloadMode.RESIDENT
+        if config.quant is Quant.Q8 and config.q8_manifest_path is None:
+            raise ConfigError("Q8 attachment requires the explicit sidecar identity")
+        if (config.quant not in (Quant.FP16, Quant.Q8) or config.offload != OffloadMode.RESIDENT
                 or config.attention_backend not in (AttentionBackend.AUTO, AttentionBackend.SDPA)):
-            raise ConfigError("supplied resident adapter supports only unquantized native SDPA")
+            raise ConfigError("supplied resident adapter supports FP16 or reviewed Q8_0 with native SDPA")
         if assets != self._bundle.to_assets():
             raise ConfigError("attached assets disagree with the supplied bundle")
         torch, image, classes = _libraries()
@@ -125,7 +127,10 @@ class SuppliedQwen21Adapter:
         for model in (pipe.transformer, pipe.vae):
             if any(getattr(module, "_hf_hook", None) is not None for module in model.modules()):
                 raise EngineError("resident components must not have dispatch/offload hooks")
-            if any(p.is_meta or p.device != device or p.dtype != dtype for p in model.parameters()):
+            if model is pipe.transformer and config.quant is Quant.Q8:
+                from qwen_engine.adapters.q8_loader import validate_q8_parameters
+                validate_q8_parameters(model, device, dtype)
+            elif any(p.is_meta or p.device != device or p.dtype != dtype for p in model.parameters()):
                 raise EngineError("supplied model placement/dtype disagrees with execution policy")
             if model.training:
                 raise EngineError("supplied components must already be in evaluation mode")

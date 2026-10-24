@@ -888,6 +888,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "(read once at startup, <=1 MiB, never verified here)")
     p.add_argument("--models-dir", default=None,
                    help="model storage root (metadata context only for W2)")
+    p.add_argument("--q8-manifest", default=None,
+                   help="server-owned Q8 GGUF sidecar manifest; never selectable by browser paths")
     p.add_argument("--enable-generation", action="store_true",
                    help="enable real serial engine jobs (requires manifest, models, output and cache paths)")
     p.add_argument("--attest-unbounded-host", action="store_true",
@@ -932,6 +934,7 @@ def main(argv: list[str] | None = None) -> int:
         "benchmarks_dir": None if args.benchmarks_dir is None else os.path.realpath(args.benchmarks_dir),
         "models_dir": None if args.models_dir is None else os.path.realpath(args.models_dir),
         "manifest_path": None if args.manifest is None else os.path.realpath(args.manifest),
+        "q8_manifest_path": None if args.q8_manifest is None else os.path.realpath(args.q8_manifest),
     }
     status = _startup_config_or_exit(paths)
     if status:

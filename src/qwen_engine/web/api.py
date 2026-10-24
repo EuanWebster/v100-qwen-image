@@ -53,7 +53,7 @@ EDITABLE_FIELDS = frozenset({
 
 #: Server-controlled runtime path fields (never editable from the browser).
 RUNTIME_PATH_FIELDS = ("output_dir", "cache_dir", "log_dir",
-                       "benchmarks_dir", "models_dir", "manifest_path")
+                       "benchmarks_dir", "models_dir", "manifest_path", "q8_manifest_path")
 
 #: Seed wire grammar: ASCII decimal digits only, at most 20 characters
 #: (the full uint64 range stays an exact string; range is validated later
@@ -117,6 +117,7 @@ class WebRuntime:
     benchmarks_dir: str | None = None
     models_dir: str | None = None
     manifest_path: str | None = None
+    q8_manifest_path: str | None = None
     manifest_summary: Mapping[str, Any] = field(default_factory=dict)
     generation_enabled: bool = False
 

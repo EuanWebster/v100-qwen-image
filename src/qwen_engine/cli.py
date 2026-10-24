@@ -59,6 +59,7 @@ _OVERRIDES = {
     "benchmarks_dir": "benchmarks_dir",
     "models_dir": "models_dir",
     "manifest": "manifest_path",
+    "q8_manifest": "q8_manifest_path",
 }
 MAX_CONFIG_BYTES = 1 << 20
 
@@ -119,6 +120,8 @@ def build_parser() -> argparse.ArgumentParser:
                              f"override config field {flag!r} (default: unset -> no writes)"))
     p.add_argument("--manifest", type=Path, default=None,
                    help="model manifest path override (default: unset -> run refuses)")
+    p.add_argument("--q8-manifest", type=Path, default=None,
+                   help="explicit verified Q8 GGUF sidecar manifest (required with --quant q8)")
     return p
 
 

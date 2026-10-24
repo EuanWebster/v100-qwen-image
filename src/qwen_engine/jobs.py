@@ -120,7 +120,7 @@ def _request(config):
     doc = json.loads(raw)
     # Copy immutable values and bind relative explicitly configured paths now,
     # preserving lexical '..'/symlink semantics (not abspath normalization).
-    for name in ("models_dir", "manifest_path", "cache_dir", "log_dir", "benchmarks_dir"):
+    for name in ("models_dir", "manifest_path", "q8_manifest_path", "cache_dir", "log_dir", "benchmarks_dir"):
         if doc[name] is not None and not Path(doc[name]).is_absolute():
             doc[name] = str(Path.cwd() / doc[name])
     config = GenerationConfig.from_dict(doc)

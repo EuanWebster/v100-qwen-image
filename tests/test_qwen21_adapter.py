@@ -57,7 +57,6 @@ def test_factory_returns_the_default_loader_without_heavy_imports():
 
 
 @pytest.mark.parametrize("field,value", [
-    ("quant", "q8"),
     ("quant", "q4"),
     ("offload", "streamed"),
     ("offload", "offload"),
@@ -89,6 +88,20 @@ def test_missing_manifest_refuses_before_any_ml_import(tmp_path):
     adapter = cli._make_adapter()
     with pytest.raises(ManifestError):
         adapter.load(_config(tmp_path), {})
+    assert not set(HEAVY) & set(sys.modules)
+
+
+def test_q8_requires_explicit_sidecar_before_assets_or_ml(tmp_path):
+    with pytest.raises(ConfigError) as caught:
+        cli._make_adapter().load(_config(tmp_path, quant="q8"), {})
+    assert "q8_manifest_path" in caught.value.fields
+    assert not set(HEAVY) & set(sys.modules)
+
+
+def test_q8_remote_kernel_mode_refuses_before_ml_import(tmp_path, monkeypatch):
+    monkeypatch.setenv("DIFFUSERS_GGUF_CUDA_KERNELS", "true")
+    with pytest.raises(EngineError, match="CUDA_KERNELS=false"):
+        cli._make_adapter().load(_config(tmp_path, quant="q8", q8_manifest_path=str(tmp_path / "q8.json")), {})
     assert not set(HEAVY) & set(sys.modules)
 
 

@@ -1,5 +1,12 @@
 # Handoff: V100 Qwen-Image project
 
+> **Latest checkpoint: STOPPED at user request, 2026-10-24.** Read
+> [the Q8 checkpoint](docs/q8-checkpoint-2026-10-24.md). Experimental Q8 passed a
+> real V100 smoke; guarded CPU suite2644passed/2skipped. Full-recipe quality/2K
+> benchmarks and production preflight integration remain. The app is restored.
+> Pause until **2026-10-25 01:50 GMT/UTC** unless Euan explicitly resumes sooner.
+> The scheduled desktop reminder does not automatically resume Codex.
+
 > **Current state, evening 2026-10-24:** The hand-rolled CLI now produces real
 > Qwen-Image-2.1 images on the V100: 1024²/40 steps in roughly 107–109 seconds,
 > and experimental 2048²/20 steps in 3m39s. Exact memory observations are

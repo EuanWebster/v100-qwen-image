@@ -159,7 +159,7 @@ def test_form_snapshot_uses_exact_config_enums_and_keys():
         f"snapshot keys outside GenerationConfig fields: {keys - config_fields}"
     assert keys - {"kind"} == config_fields - {
         "output_dir", "cache_dir", "log_dir", "benchmarks_dir",
-        "models_dir", "manifest_path",
+        "models_dir", "manifest_path", "q8_manifest_path",
     }, "snapshot must carry every non-path GenerationConfig field, no aliases"
 
     # Selects expose EXACTLY the config.py enum values — no invented options,

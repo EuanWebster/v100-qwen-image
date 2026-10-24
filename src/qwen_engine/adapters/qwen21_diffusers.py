@@ -194,10 +194,14 @@ def _validate_policy(config: GenerationConfig) -> None:
     if not isinstance(config, GenerationConfig):
         raise ConfigError(FieldError("config", "a GenerationConfig is required"))
     errors: list[FieldError] = []
-    if config.quant is not Quant.FP16:
+    if config.quant not in (Quant.FP16, Quant.Q8):
         errors.append(FieldError(
-            "quant", "the resident loader currently supports fp16 only; "
-                     "q8/q4 belong to the M5 quality ladder"))
+            "quant", "the resident loader supports fp16 or reviewed Q8_0; q4 is not implemented"))
+    if config.quant is Quant.Q8 and config.q8_manifest_path is None:
+        errors.append(FieldError("q8_manifest_path", "Q8 requires an explicit --q8-manifest sidecar"))
+    if config.quant is Quant.Q8:
+        from qwen_engine.adapters.q8_loader import validate_q8_environment
+        validate_q8_environment()
     if config.offload is not OffloadMode.RESIDENT:
         errors.append(FieldError(
             "offload", "the resident loader supports offload=resident only; "
@@ -264,6 +268,10 @@ class Qwen21DiffusersAdapter:
         _validate_policy(config)
         manifest = load_manifest(config.manifest_path)
         bundle = resolve_local_bundle(manifest, config.models_dir)
+        q8_artifact = None
+        if config.quant is Quant.Q8:
+            from qwen_engine.q8_artifact import resolve_q8_artifact
+            q8_artifact = resolve_q8_artifact(config.q8_manifest_path)
         bundle_assets = bundle.to_assets()
         # The CLI resolver reports paths in the caller's lexical form (e.g. a
         # relative --models-dir); the bundle publishes canonical absolutes.
@@ -295,10 +303,14 @@ class Qwen21DiffusersAdapter:
             # Load and place one component at a time: the CPU copy of each is
             # released before the next component's weights are read, so host
             # peak stays near one model rather than the whole stack.
-            transformer = transformer_cls.from_pretrained(
-                bundle.component_dirs["dit"], torch_dtype=torch.float16,
-                local_files_only=True)
-            transformer.to(device=device, dtype=torch.float16).eval()
+            if q8_artifact is None:
+                transformer = transformer_cls.from_pretrained(
+                    bundle.component_dirs["dit"], torch_dtype=torch.float16,
+                    local_files_only=True)
+                transformer.to(device=device, dtype=torch.float16).eval()
+            else:
+                from qwen_engine.adapters.q8_loader import load_q8_transformer
+                transformer = load_q8_transformer(transformer_cls, bundle, q8_artifact, torch, device)
             vae = vae_cls.from_pretrained(
                 bundle.component_dirs["vae"], torch_dtype=torch.float16,
                 local_files_only=True)

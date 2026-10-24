@@ -494,6 +494,13 @@ class CalibrationCollector:
                 "calibration observation needs exactly one pinned model revision")
         self._revision = revisions[0]
         self._artifact_set_sha256 = reference_bundle_fingerprints(manifest).bundle
+        if config.quant.value == "q8":
+            from qwen_engine.q8_artifact import resolve_q8_artifact
+            from qwen_engine.adapters.q8_loader import artifact_set_identity
+            if config.q8_manifest_path is None:
+                raise CalibrationError("Q8 calibration requires an explicit sidecar manifest")
+            q8 = resolve_q8_artifact(config.q8_manifest_path)
+            self._artifact_set_sha256 = artifact_set_identity(self._artifact_set_sha256, q8.identity_sha256)
         self._interval_s = interval_s
         self._adapter: Any = None
         self._facts: dict[str, Any] | None = None

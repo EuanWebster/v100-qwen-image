@@ -42,7 +42,7 @@ DEFAULT_STEPS = 40
 _DIR_FIELDS = ("output_dir", "cache_dir", "log_dir", "benchmarks_dir",
                "models_dir")
 #: Fields that must name an existing *file* when they exist on disk.
-_FILE_FIELDS = ("manifest_path",)
+_FILE_FIELDS = ("manifest_path", "q8_manifest_path")
 
 
 class Quant(StrEnum):
@@ -152,6 +152,7 @@ class GenerationConfig:
     benchmarks_dir: str | None = None
     models_dir: str | None = None
     manifest_path: str | None = None
+    q8_manifest_path: str | None = None
 
     _ENUM_FIELDS: ClassVar[dict[str, type[StrEnum]]] = {
         "quant": Quant,

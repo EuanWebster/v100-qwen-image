@@ -2,8 +2,8 @@
 
 This module wires three EXISTING layers together for a production adapter:
 
-* ``bench.load_calibration`` — bounded (<=16 MiB) strict JSON read of a
-  calibration log,
+* ``bench.CalibrationLog`` — strict parsing of one bounded (<=16 MiB) byte
+  snapshot of a calibration log,
 * ``calibration.calibration_evidence`` — the exactness bridge that refuses
   legacy/incomplete observations instead of partially trusting them,
 * ``memory.assess_memory`` — the exact-match conservative arithmetic, used
@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Callable
 
 from qwen_engine import bench
-from qwen_engine.bench import MAX_BENCH_FILE_BYTES, load_calibration
+from qwen_engine.bench import MAX_BENCH_FILE_BYTES
 from qwen_engine.calibration import calibration_evidence
 from qwen_engine.errors import MemoryGuardError
 from qwen_engine.memory import (
@@ -146,8 +146,8 @@ def load_evidence(path: str | Path) -> tuple[CalibrationEvidence, ...]:
             f"above the {MAX_EVIDENCE_RECORDS}-record facade ceiling; refusing "
             "rather than silently dropping evidence")
     try:
-        # Exactness bridge: raises CalibrationError (a MemoryGuardError via
-        # EngineError) naming every missing field on incomplete records.
+        # Exactness bridge failures are normalized to the memory-refusal
+        # family below, without partially trusting incomplete records.
         return tuple(calibration_evidence(o) for o in log.observations)
     except MemoryGuardError:
         raise

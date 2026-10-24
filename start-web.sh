@@ -14,6 +14,7 @@ qwen_args=(
   --host "${QWEN_TAILSCALE_HOST:-100.98.64.62}"
   --port "${QWEN_WEB_PORT:-8765}"
   --manifest models/manifest.json --models-dir models/assets
+  --q8-manifest models/q8_manifest.json
   --output-dir output/web --cache-dir cache
 )
 # This launcher targets the direct host environment used for CLI validation.
