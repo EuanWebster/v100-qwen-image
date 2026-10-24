@@ -97,7 +97,10 @@
   var PRESETS = {
     square:    { width: 1024, height: 1024 },
     landscape: { width: 1344, height: 768 },
-    portrait:  { width: 768,  height: 1344 }
+    portrait:  { width: 768,  height: 1344 },
+    square2k:    { width: 2048, height: 2048 },
+    landscape2k: { width: 2688, height: 1536 },
+    portrait2k:  { width: 1536, height: 2688 }
   };
 
   var VIEWS = { create: 'view-create', history: 'view-history', settings: 'view-settings' };
@@ -1026,6 +1029,8 @@
     if (!preset) return;
     $('width').value = String(preset.width);
     $('height').value = String(preset.height);
+    // Larger presets need tiled decode; 1K presets restore clean untiled decode.
+    $('vae-tiling').checked = (preset.width / 16) * (preset.height / 16) > 4096;
     syncPresetButtons();
     setPreviewAspect(preset.width, preset.height);
     renderValidation(validateForm().errors);

@@ -90,6 +90,20 @@ percentage. A saved and verified image sets Complete. Cancellation/failure do
 not display completion, and unavailable status marks progress unavailable.
 The existing two-second polling updates the bar automatically.
 
+### 2K aspect presets
+
+The aspect selector offers square 2048×2048, landscape 2688×1536 and portrait
+1536×2688, doubling each dimension of the corresponding 1K preset. Selecting
+2K automatically enables tiled VAE decode; selecting a 1K preset restores the
+cleaner untiled decode. Presets update the preview ratio, pressed state and
+plan staleness without changing the prompt, seed or step count.
+
+Real Chrome checks cover all three dimension/tiling selections and switching
+back to 1K, plus existing job/progress/reload/cancel/mobile-layout flows. This
+is a UI convenience, not additional memory-fit evidence: the earlier measured
+2K generation was square; the new landscape/portrait shapes were not separately
+GPU-benchmarked in this change.
+
 Backward-compatible page handling keeps the bar indeterminate for a server
 without step telemetry. Both backend and cached static files require a server
 restart to activate the feature. Existing image files are preserved on restart;

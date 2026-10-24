@@ -84,6 +84,19 @@ async function check() {
   await send('Page.navigate', {url: origin + '/'});
   await until(`document.getElementById('generate-btn') && !document.getElementById('generate-btn').disabled`);
   console.log('PASS generation-enabled status recognized');
+  for (const [preset, width, height] of [['square2k',2048,2048], ['landscape2k',2688,1536], ['portrait2k',1536,2688]]) {
+    const result = await evaluate(`(() => {
+      document.querySelector('[data-preset="${preset}"]').click();
+      return {config:QwenStudio.formSnapshot(),pressed:document.querySelector('[data-preset="${preset}"]').getAttribute('aria-pressed')};
+    })()`);
+    assert.equal(result.config.width,width);
+    assert.equal(result.config.height,height);
+    assert.equal(result.config.vae_tiled_decode,true);
+    assert.equal(result.pressed,'true');
+  }
+  await evaluate(`document.querySelector('[data-preset="square"]').click()`);
+  assert.equal(await evaluate(`document.getElementById('vae-tiling').checked`),false);
+  console.log('PASS three 2K presets set dimensions/tiling; switching to 1K restores untiled decode');
   const bad = await evaluate(`fetch('/api/v1/jobs', {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>r.status)`);
   assert.equal(bad, 403);
   console.log('PASS job write requires exact UI header');
