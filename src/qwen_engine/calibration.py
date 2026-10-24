@@ -228,10 +228,15 @@ class _NvmlDevice:
             self._call("nvmlDeviceGetMemoryInfo", self._handle,
                        ctypes.byref(memory))
             self.total_bytes = int(memory.total)
-            if (self.total_bytes != expected_total_bytes
-                    or not 15 * GiB <= self.total_bytes <= 17 * GiB):
+            # CUDA reports *usable* memory (the driver reserves a few hundred
+            # MiB), so exact equality with NVML's raw total is wrong. The UUID
+            # binds the device; the totals must still agree within a bound.
+            if (not 15 * GiB <= self.total_bytes <= 17 * GiB
+                    or not 0 < expected_total_bytes <= self.total_bytes
+                    or self.total_bytes - expected_total_bytes > GiB):
                 raise CalibrationError(
-                    "NVML total does not match the CUDA device's total memory")
+                    "NVML total is inconsistent with the CUDA device's total "
+                    "memory")
         except BaseException:
             self.close()
             raise
@@ -342,7 +347,8 @@ class _Sampler:
 
     RSS values are *current* readings sampled on an interval, not kernel
     high-water marks; a shorter spike than the interval can be missed. The
-    interval is recorded with the observation so the limit is explicit.
+    collector's configured interval (50 ms by default) states the coverage
+    limit; it is not a claim of continuous observation.
     """
 
     def __init__(self, nvml: _NvmlDevice, interval_s: float):
@@ -439,6 +445,19 @@ ARCHITECTURE = "sm_70"
 CUDA_BUILD = "12.6"
 
 
+def _require_reviewed_device(properties: Any) -> None:
+    """Refuse every device except the reviewed V100 16GB / sm_70 profile."""
+    major = getattr(properties, "major", None)
+    minor = getattr(properties, "minor", None)
+    total = getattr(properties, "total_memory", None)
+    if ((major, minor) != (7, 0)
+            or "V100" not in str(getattr(properties, "name", ""))
+            or type(total) is not int
+            or not 15 * GiB <= total <= 16 * GiB):
+        raise CalibrationError(
+            "measurement requires the reviewed Tesla V100 16GB profile")
+
+
 class CalibrationCollector:
     """Opt-in, in-process measured-memory collector.
 
@@ -509,11 +528,7 @@ class CalibrationCollector:
         if not torch.cuda.is_available():
             raise CalibrationError("CUDA is unavailable; nothing to measure")
         properties = torch.cuda.get_device_properties(LOGICAL_DEVICE_INDEX)
-        if ((type(properties.major), type(properties.minor)) != (7, 0)
-                or "V100" not in str(properties.name)
-                or not 15 * GiB <= int(properties.total_memory) <= 16 * GiB):
-            raise CalibrationError(
-                "measurement requires the reviewed Tesla V100 16GB profile")
+        _require_reviewed_device(properties)
         if str(torch.version.cuda) != CUDA_BUILD:
             raise CalibrationError(
                 f"measurement requires the reviewed CUDA {CUDA_BUILD} build")

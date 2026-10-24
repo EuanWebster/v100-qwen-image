@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -195,6 +196,27 @@ def _config(**overrides):
     )
     values.update(overrides)
     return GenerationConfig(**values)
+
+
+def test_reviewed_device_gate_compares_values_not_types():
+    # Regression: comparing type(major)/type(minor) refuses every real GPU.
+    good = SimpleNamespace(major=7, minor=0, name="Tesla V100-SXM2-16GB",
+                           total_memory=16945512448)
+    cal._require_reviewed_device(good)
+    for bad in (
+        SimpleNamespace(major=8, minor=0, name=good.name,
+                        total_memory=good.total_memory),
+        SimpleNamespace(major=7, minor=5, name=good.name,
+                        total_memory=good.total_memory),
+        SimpleNamespace(major=7, minor=0, name="Tesla T4",
+                        total_memory=good.total_memory),
+        SimpleNamespace(major=7, minor=0, name=good.name,
+                        total_memory=8 * GiB),
+        SimpleNamespace(major=7, minor=0, name=good.name,
+                        total_memory=17 * GiB),
+    ):
+        with pytest.raises(cal.CalibrationError, match="reviewed Tesla V100"):
+            cal._require_reviewed_device(bad)
 
 
 def _facts(**overrides):
