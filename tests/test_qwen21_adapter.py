@@ -232,3 +232,177 @@ def test_release_is_idempotent_without_a_pipeline_or_transformer():
     adapter._release_denoiser()  # already released
     adapter._pipeline = SimpleNamespace()
     adapter._release_denoiser()  # attribute absent
+
+
+# -- phase-exclusive residency (VAE off the card during denoise) ------------
+
+
+class _FakeVae:
+    def __init__(self, name):
+        self.name = name
+        self.tiling = False
+
+    def to(self, **kwargs):
+        self.moved = kwargs
+        return self
+
+    def eval(self):
+        return self
+
+    def enable_tiling(self, **kwargs):
+        self.tiling = True
+        self.tiling_args = kwargs
+
+
+class _FakeVaeClass:
+    def __init__(self, order):
+        self.order = order
+        self.calls = []
+
+    def from_pretrained(self, path, **kwargs):
+        self.order.append("reload-vae")
+        self.calls.append((path, kwargs))
+        return _FakeVae(path)
+
+
+class _VaeInner:
+    def __init__(self, order, pipeline):
+        self.order = order
+        self.pipeline = pipeline
+
+    def denoise(self, config, conditioning):
+        self.order.append(("denoise", self.pipeline.vae))
+        return ["latents"]
+
+    def decode(self, latents):
+        self.order.append(("decode", self.pipeline.vae))
+        return "image"
+
+
+def test_denoise_takes_the_vae_off_the_card_and_decode_restores_it():
+    from types import SimpleNamespace
+
+    order = []
+    adapter = cli._make_adapter()
+    pipeline = SimpleNamespace(transformer=SimpleNamespace(), vae=_FakeVae("resident"))
+    adapter._pipeline = pipeline
+    adapter._inner = _VaeInner(order, pipeline)
+    adapter._vae_cls = _FakeVaeClass(order)
+    adapter._vae_dir = "/models/vae"
+    adapter._torch = SimpleNamespace(float16="fp16", float32="fp32",
+                                     device=lambda *a: ("cuda", a[1]))
+    adapter._tiled_decode = True
+
+    latents = adapter.denoise(GenerationConfig(), None)
+    assert order[0] == ("denoise", None)        # VAE already gone
+    assert pipeline.transformer is None         # transformer gone afterwards
+    adapter.decode(latents)
+    assert order[1] == "reload-vae"
+    assert isinstance(order[2][1], _FakeVae)    # decoded with the restored VAE
+    assert order[2][1].tiling is True
+    assert order[2][1].tiling_args == {
+        "tile_sample_min_height": 1024, "tile_sample_min_width": 1024,
+        "tile_sample_stride_height": 768, "tile_sample_stride_width": 768}
+    path, kwargs = adapter._vae_cls.calls[0]
+    assert path == "/models/vae"
+    # Tiled decode restores the VAE in fp32: the fp16 tiled path is
+    # non-finite at 2048², and the transformer is gone by decode time.
+    assert kwargs == {"torch_dtype": "fp32", "local_files_only": True}
+    assert order[2][1].moved == {"device": ("cuda", 0), "dtype": "fp32"}
+
+
+def test_untiled_decode_restores_the_vae_in_fp16():
+    from types import SimpleNamespace
+
+    order = []
+    adapter = cli._make_adapter()
+    pipeline = SimpleNamespace(vae=None)
+    adapter._pipeline = pipeline
+    adapter._vae_cls = _FakeVaeClass(order)
+    adapter._vae_dir = "/models/vae"
+    adapter._torch = SimpleNamespace(float16="fp16", float32="fp32",
+                                     device=lambda *a: ("cuda", a[1]))
+    adapter._tiled_decode = False
+    adapter._restore_vae()
+    path, kwargs = adapter._vae_cls.calls[0]
+    assert path == "/models/vae"
+    assert kwargs == {"torch_dtype": "fp16", "local_files_only": True}
+    assert pipeline.vae.moved == {"device": ("cuda", 0), "dtype": "fp16"}
+    assert pipeline.vae.tiling is False
+
+
+def test_vae_release_is_idempotent_and_restore_is_skipped_when_present():
+    from types import SimpleNamespace
+
+    adapter = cli._make_adapter()
+    pipeline = SimpleNamespace(vae=_FakeVae("resident"))
+    adapter._pipeline = pipeline
+    adapter._vae_cls = None       # no loader available: restore must no-op
+    adapter._release_vae()
+    assert pipeline.vae is None
+    adapter._release_vae()        # already released
+    adapter._restore_vae()        # nothing to restore with
+    assert pipeline.vae is None
+
+
+# -- high-token MLP chunking (exact, token-wise) ----------------------------
+
+
+class _Rows:
+    """Minimal ML-free stand-in for a (1, tokens, width) tensor."""
+
+    def __init__(self, rows):
+        self.rows = list(rows)
+
+    @property
+    def shape(self):
+        return (1, len(self.rows), 64)
+
+    def __getitem__(self, item):
+        batch, rest = item
+        assert batch == slice(None)
+        return _Rows(self.rows[rest])
+
+
+class _RecordingMlp:
+    def __init__(self):
+        self.calls = []
+
+    def forward(self, hidden):
+        self.calls.append(len(hidden.rows))
+        return _Rows([row + 1 for row in hidden.rows])
+
+
+def _chunking_fixture():
+    from types import SimpleNamespace
+    from qwen_engine.adapters import qwen21_diffusers as qd
+
+    first, second = _RecordingMlp(), _RecordingMlp()
+    transformer = SimpleNamespace(transformer_blocks=[
+        SimpleNamespace(img_mlp=first), SimpleNamespace(img_mlp=second)])
+    fake_torch = SimpleNamespace(
+        cat=lambda parts, dim: _Rows(row for part in parts for row in part.rows))
+    return qd, transformer, fake_torch, first, second
+
+
+def test_high_token_denoise_chunks_the_swiglu_mlp_exactly():
+    qd, transformer, fake_torch, first, second = _chunking_fixture()
+    assert qd._apply_mlp_chunking(fake_torch, transformer, 2048) == 2
+    out = first.forward(_Rows(range(5000)))
+    assert first.calls == [2048, 2048, 904]
+    assert out.rows == [row + 1 for row in range(5000)]
+    assert second.calls == []          # wrapped, but not called by this test
+    first.forward(_Rows([1, 2]))       # short sequence: one unchunked call
+    assert first.calls[-1] == 2
+
+
+def test_mlp_chunking_is_idempotent_and_refuses_an_unknown_layout():
+    qd, transformer, fake_torch, first, _ = _chunking_fixture()
+    assert qd._apply_mlp_chunking(fake_torch, transformer, 2048) == 2
+    assert qd._apply_mlp_chunking(fake_torch, transformer, 512) == 0
+    first.forward(_Rows(range(3000)))
+    assert first.calls == [2048, 952]   # original chunk retained, never doubled
+    from types import SimpleNamespace
+    with pytest.raises(EngineError, match="chunk"):
+        qd._apply_mlp_chunking(fake_torch, SimpleNamespace(transformer_blocks=[
+            SimpleNamespace()]), 2048)

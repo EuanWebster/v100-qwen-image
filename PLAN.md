@@ -1465,3 +1465,23 @@ standing rule that executed plans stay honest.)*
   embedding cache (cold encode, 1m05s) is byte-identical too — the disk
   embedding cache returns the conditioning it stored without perturbing
   sampling.
+
+- 2026-10-24 **2048² works on the 16 GB V100 (experimental)**: the first 2K
+  attempt OOM'd during denoise (15,983 MiB device peak) on a 386 MiB SwiGLU
+  intermediate, not on weights. Three targeted changes, all exact/measured:
+  (1) phase-exclusive residency — release the VAE before denoise
+  (13.89→13.25 GiB), not just the transformer before decode; (2) above 4096
+  latent tokens, evaluate each block's token-wise image MLP in 2048-token
+  chunks (all 32 blocks wrapped; 2K denoise peak 14.79 GiB allocated /
+  15,835 MiB device) — 1024² is exactly 4096 tokens and stays unchanged;
+  (3) tiled decode with 1024 px tiles / 768 px stride and an fp32 VAE.
+  The library default tiling (256/192) left a visible dashed grid at 1:1 and
+  the fp16 tiled path was **non-finite** at 2048²; with the new geometry the
+  tile boundary is below the image's own row/column noise (0.026 vs median
+  0.223 at 767→768), and fp16 vs fp32 differs by ≤2/255. 2K/20 is sharp and
+  prompt-faithful in 3m39s (denoise 149.5s ≈7.5s/step, decode 7.6s); 2K/8
+  was visibly under-converged, so 20 steps is the documented minimum.
+  `--tiled-decode` is required at 2K and its help now says so; 1024² keeps
+  the cleaner untiled default. Full record with commands and honest limits in
+  docs/generation-measurements-2026-10-24.md. MLP chunking and tiling
+  geometry have ML-free tests; guarded suite: 2490 passed, 2 skipped.

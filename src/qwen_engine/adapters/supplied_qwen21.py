@@ -213,14 +213,18 @@ class SuppliedQwen21Adapter:
         self._finite(latents, (1, config.latent_tokens, 64), self._dtype)
         with torch.inference_mode():
             unpacked = pipe._unpack_latents(latents, config.height, config.width, pipe.vae_scale_factor)
-            mean = torch.tensor(pipe.vae.config.latents_mean, device=self._device, dtype=self._dtype).view(1, 64, 1, 1, 1)
-            std = torch.tensor(pipe.vae.config.latents_std, device=self._device, dtype=self._dtype).view(1, 64, 1, 1, 1)
+            # Validate against the VAE's own dtype: memory-first tiled decode
+            # runs the VAE in fp32 (the fp16 tiled path is non-finite at 2K),
+            # while the execution tensors stay fp16.
+            vae_dtype = pipe.vae.dtype
+            mean = torch.tensor(pipe.vae.config.latents_mean, device=self._device, dtype=vae_dtype).view(1, 64, 1, 1, 1)
+            std = torch.tensor(pipe.vae.config.latents_std, device=self._device, dtype=vae_dtype).view(1, 64, 1, 1, 1)
             if not bool(torch.isfinite(mean).all() and torch.isfinite(std).all() and (std > 0).all()):
                 raise EngineError("invalid VAE latent normalization")
-            normalized = unpacked.to(pipe.vae.dtype) * std + mean
-            self._finite(normalized, tuple(unpacked.shape), self._dtype)
+            normalized = unpacked.to(vae_dtype) * std + mean
+            self._finite(normalized, tuple(unpacked.shape), vae_dtype)
             decoded = pipe.vae.decode(normalized, return_dict=False)[0][:, :, 0]
-            self._finite(decoded, (1, 4, config.height, config.width), self._dtype)
+            self._finite(decoded, (1, 4, config.height, config.width), vae_dtype)
             images = pipe.image_processor.postprocess(decoded, output_type="pil")
         self._check("denoised")
         if len(images) != 1 or not isinstance(images[0], self._image.Image) or images[0].size != (config.width, config.height):

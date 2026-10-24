@@ -81,9 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run", action="store_true",
                    help="actually generate (verifies manifest assets first; no downloads)")
     p.add_argument("--tiled-decode", action="store_true",
-                   help="VAE tiling: lower decode memory, but measurably leaves "
-                        "faint streak artifacts in flat regions; the default "
-                        "untiled decode is used after the transformer is released")
+                   help="VAE tiling: required at 2048x2048, where an untiled "
+                        "decode does not fit; uses fp32 1024 px tiles with a "
+                        "768 px stride. At 1024x1024 the default untiled decode "
+                        "is cleaner (the transformer is released first)")
     p.add_argument("--attest-unbounded-host", action="store_true",
                    help="operator attestation that this process tree has no cgroup "
                         "memory limit, so the CPU encoder gate uses the freshly read "

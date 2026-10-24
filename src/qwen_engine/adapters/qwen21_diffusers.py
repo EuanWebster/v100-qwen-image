@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import gc
 import threading
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,63 @@ ENCODER_TIMEOUT_S = 3600.0
 #: The reviewed execution device is the first CUDA logical device. The
 #: hardware gate below still verifies its identity before anything is loaded.
 LOGICAL_DEVICE_INDEX = 0
+
+#: Latent-token count above which the transformer's SwiGLU MLP is evaluated in
+#: token chunks (1024² is exactly 4096, so 1024² and below stay unchunked).
+#: At 2048² the joint sequence is 16,384 tokens and one SwiGLU intermediate is
+#: ~386 MiB; two of them are live at once, which is what pushed the measured
+#: 2K attempt over the 16 GiB card. Chunking is exact — the MLP is token-wise —
+#: so it changes peak memory and kernel count, never the result.
+MLP_CHUNK_ABOVE_TOKENS = 4096
+
+#: Token chunk used above that threshold. 2048 tokens keeps each intermediate
+#: near 48 MiB and measured 2K denoise inside the card with headroom.
+MLP_CHUNK_TOKENS = 2048
+
+#: Tiled-decode geometry. The library default (256 px tiles, 192 px stride)
+#: leaves a visible grid of dashed seams on a 2048² image; 1024 px tiles with
+#: a 768 px stride leave one boundary per axis and measured clean at 1:1.
+TILED_DECODE_TILE = 1024
+TILED_DECODE_STRIDE = 768
+
+
+def _chunked_mlp_forward(inner_forward, torch, chunk: int, hidden_states):
+    """Evaluate a token-wise MLP in fixed token chunks (exact, not an approximation)."""
+    tokens = hidden_states.shape[1]
+    if tokens <= chunk:
+        return inner_forward(hidden_states)
+    parts = [inner_forward(hidden_states[:, start:start + chunk])
+             for start in range(0, tokens, chunk)]
+    return torch.cat(parts, dim=1)
+
+
+def _apply_mlp_chunking(torch, transformer, chunk: int) -> int:
+    """Bound the SwiGLU intermediates for high token counts.
+
+    Only the per-block image MLP is touched: it is token-wise, so slicing the
+    sequence dimension is mathematically identical to one pass. Text tokens do
+    not pass through it. Returns the number of wrapped blocks for the caller's
+    evidence; a model without the expected blocks refuses rather than silently
+    running unchunked.
+    """
+    blocks = getattr(transformer, "transformer_blocks", None)
+    if not blocks:
+        raise EngineError("transformer layout has no blocks to chunk")
+    wrapped = already = 0
+    for block in blocks:
+        mlp = getattr(block, "img_mlp", None)
+        if mlp is None:
+            continue
+        if getattr(mlp, "_token_chunk", None) is not None:
+            already += 1
+            continue
+        mlp._token_chunk = chunk
+        mlp.forward = partial(_chunked_mlp_forward, mlp.forward, torch, chunk)
+        wrapped += 1
+    if wrapped + already != len(blocks):
+        raise EngineError(
+            f"MLP chunking wrapped {wrapped} of {len(blocks)} transformer blocks")
+    return wrapped
 
 
 def _libraries():
@@ -178,6 +236,12 @@ class Qwen21DiffusersAdapter:
         self._inner: SuppliedQwen21Adapter | None = None
         self._pipeline: Any = None
         self._bundle: LocalReferenceBundle | None = None
+        self._torch: Any = None
+        self._vae_cls: Any = None
+        self._vae_dir: Path | None = None
+        self._tiled_decode = False
+        self._mlp_chunk_tokens = 0
+        self._mlp_chunked_blocks = 0
         self._trust_unbounded_host = trust_unbounded_host
         self._state = "new"
 
@@ -273,8 +337,16 @@ class Qwen21DiffusersAdapter:
         )
         inner.set_cancel_event(self._event)
         inner.load(config, bundle_assets)
+        if config.latent_tokens > MLP_CHUNK_ABOVE_TOKENS:
+            self._mlp_chunked_blocks = _apply_mlp_chunking(
+                torch, pipeline.transformer, MLP_CHUNK_TOKENS)
+            self._mlp_chunk_tokens = MLP_CHUNK_TOKENS
         self._pipeline = pipeline
         self._bundle = bundle
+        self._torch = torch
+        self._vae_cls = vae_cls
+        self._vae_dir = bundle.component_dirs["vae"]
+        self._tiled_decode = config.vae_tiled_decode
         self._inner = inner
         self._state = "loaded"
 
@@ -287,9 +359,58 @@ class Qwen21DiffusersAdapter:
         return self._attached().encode(config)
 
     def denoise(self, config: GenerationConfig, conditioning):
+        self._release_vae()
         latents = self._attached().denoise(config, conditioning)
         self._release_denoiser()
         return latents
+
+    def decode(self, latents):
+        self._restore_vae()
+        return self._attached().decode(latents)
+
+    def _release_vae(self) -> None:
+        """Take the VAE off the card while the transformer denoises.
+
+        Phase-exclusive residency: denoise needs only the transformer, decode
+        needs only the VAE, so the two never have to be resident together.
+        Dropping the object (rather than moving it to CPU) also keeps
+        ``_execution_device`` unambiguous — a CPU-placed VAE would otherwise be
+        the first module the pipeline inspects. The VAE is reloaded from the
+        same verified local directory before decode.
+        """
+        pipeline = self._pipeline
+        if pipeline is None or getattr(pipeline, "vae", None) is None:
+            return
+        pipeline.vae = None
+        gc.collect()
+
+    def _restore_vae(self) -> None:
+        pipeline = self._pipeline
+        if pipeline is None or self._vae_cls is None or self._vae_dir is None:
+            return
+        if getattr(pipeline, "vae", None) is not None:
+            return
+        torch = self._torch
+        # Tiled decode runs the VAE in fp32: at 2048² the fp16 tiled path with
+        # the library's default 256 px tiles produced non-finite output
+        # (measured; the same latents decode finite in fp32), and the
+        # transformer is already released, so the wider activations fit
+        # (13.4 GiB peak with 1024 px tiles). Untiled decode stays fp16 — it
+        # fits the 1024² envelope, and fp16/fp32 differ by at most 1/255 there
+        # (2/255 with 2K tiling), so precision is not buying visible quality.
+        dtype = torch.float32 if self._tiled_decode else torch.float16
+        vae = self._vae_cls.from_pretrained(
+            self._vae_dir, torch_dtype=dtype, local_files_only=True)
+        vae.to(device=torch.device("cuda", LOGICAL_DEVICE_INDEX),
+               dtype=dtype).eval()
+        if self._tiled_decode:
+            vae.enable_tiling(
+                tile_sample_min_height=TILED_DECODE_TILE,
+                tile_sample_min_width=TILED_DECODE_TILE,
+                tile_sample_stride_height=TILED_DECODE_STRIDE,
+                tile_sample_stride_width=TILED_DECODE_STRIDE,
+            )
+        pipeline.vae = vae
 
     def _release_denoiser(self) -> None:
         """Drop the transformer's VRAM before the VAE decode (single-use loader).
@@ -322,9 +443,6 @@ class Qwen21DiffusersAdapter:
             return
         pipeline.transformer = None
         gc.collect()
-
-    def decode(self, latents):
-        return self._attached().decode(latents)
 
     def save(self, image, config: GenerationConfig):
         return self._attached().save(image, config)
