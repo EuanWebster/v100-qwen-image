@@ -1499,3 +1499,26 @@ standing rule that executed plans stay honest.)*
   (`sha256 8d274d4f…`), so phase-exclusive residency/chunking did not perturb
   1024². Record: docs/quality-suite-2026-10-24.md; review status is agent
   visual inspection with human sign-off pending.
+
+- 2026-10-24 **measured-memory calibration collector**: added the opt-in
+  `--calibration-record PATH` collector (commit `227b0a7`). It samples
+  device-wide NVML used memory by CUDA UUID every 50 ms and the owned
+  process tree's RSS, records Torch allocated/reserved peaks per phase, and
+  appends one exact `calibration_observation.v1` record per phase only after
+  device/runtime/artifact identity, measured conditioning facts, dtypes, KV
+  and embedding-cache decisions are all present. `denoise` is the whole-loop
+  peak and stays distinct from a step-indexed `denoise-step`; a legacy record
+  remains loadable but is refused by name. Real measured records (fresh
+  cache): 1024²/40 denoise device peak 15.247 GiB, owned-tree encode peak
+  16.317 GiB, 1m47s, image byte-identical to the pre-collector anchor
+  (`8d274d4f…`); 2048²/20 denoise 15.698 GiB (16,074 MiB), tree encode
+  16.344 GiB, 3m39s, only 0.30 GiB raw-device headroom. A fresh
+  `assess_memory` query consumed both records (15.247 / 15.698 GiB required,
+  4 GiB host headroom); a 1 GiB GPU headroom refuses both, and step-count or
+  runtime-digest drift refuses with `exact_calibration_missing`. Running it
+  for real exposed and fixed: the profile gate compared `type(major)` instead
+  of the value and refused every GPU; NVML raw total (16.00 GiB) vs CUDA
+  usable total (15.77 GiB) cannot be equality-checked; setup is now atomic
+  and adapter facts bind before sampling. Record:
+  docs/calibration-collector-2026-10-24.md; policy text updated in
+  docs/memory-policy.md. Guarded suite: 2532 passed, 2 skipped.

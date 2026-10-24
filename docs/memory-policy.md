@@ -1,10 +1,12 @@
 # Pure generation memory-policy groundwork
 
 `qwen_engine.memory` adds typed immutable exact-match evidence and refusal
-arithmetic. It does **not** probe hardware, collect/persist calibration,
-load components, change the existing encoder guard, wire the CLI/adapter,
-or prove fit. No expert override, interpolation or automatic quality/mode
-change. Real autodiscovery still cannot prove complete cgroup scope and
+arithmetic. The policy module itself does **not** probe hardware, load
+components, change the existing encoder guard, or prove fit; the separate
+opt-in collector (`qwen_engine.calibration`, enabled with
+`--calibration-record`) measures and persists records, and every record still
+has to pass these exact-match and age gates. No expert override,
+interpolation or automatic quality/mode change. Real autodiscovery still cannot prove complete cgroup scope and
 refuses all real encoder loads in this deployment unless the operator
 attestation below is used.
 
@@ -50,8 +52,11 @@ A warm embedding-cache observation cannot authorize a cold encoder miss;
 the actual validated branch must match, otherwise use conservative cold
 evidence or refuse. The current-process runtime fingerprint now has a CPU
 witness ([runtime-identity.md](runtime-identity.md)), including explicit
-uninitialized-CUDA/unknown-workspace state. Actual CUDA identity acceptance,
-resource/peak collectors and default-loader integration remain unimplemented.
+uninitialized-CUDA/unknown-workspace state. The opt-in collector now binds
+the CUDA/NVML device identity, samples device-wide and owned-tree peaks and
+reads the default loader's measured conditioning facts
+([calibration-collector-2026-10-24.md](calibration-collector-2026-10-24.md));
+job/web integration remains separate.
 
 Device identity includes UUID, architecture, driver and CUDA build. The
 resource provider must independently verify actual CUDA kernel execution
@@ -76,10 +81,12 @@ runtime/device and footprint evidence and are rejected as input.
 
 GPU footprint must include **device-wide used-memory peaks** (context and
 non-Torch allocations), not merely Torch allocator reserved/allocated peaks.
-Host footprint must include the **owned process tree**, not just parent
+host footprint must include the **owned process tree**, not just parent
 RSS while an encoder child runs. Summed child RSS may conservatively double
-count shared pages. A future collector must actually measure these interval
-peaks with adequate coverage; a one-off counter is not a peak measurement.
+count shared pages. The opt-in collector measures these interval peaks per
+phase (50 ms NVML by device UUID; owned-tree RSS); coverage is
+interval-limited — a spike shorter than the interval can be missed — so the
+record is exact evidence, not a guarantee of continuous observation.
 Missing measurements remain unknown. Reserved/allocated/tree consistency
 is validated; current main-process RSS cannot be zero.
 
@@ -95,11 +102,13 @@ fragmentation freedom, numerical quality or resource reservation against
 other services. Caller code must still enforce all hardware/assets/fidelity
 gates. Unknown/unmeasured fields never enable a pass.
 
-113 guarded pure tests cover every descriptor/device/cache drift, unresolved
+114 guarded policy tests cover every descriptor/device/cache drift, unresolved
 backend/dtypes/steps, staleness/future/clock faults, conditioning unknowns,
 incomplete/old records, parent-only/Torch-only peaks, finite/zero/unknown
 cgroup constraints, exact2K refusal, bounds, worst-case/headroom arithmetic
-and typed invalid inputs. Positive arithmetic cases use **fabricated trusted
-fixtures**, not measured hardware/model data. No calibration persistence or
-existing benchmark schema changed. Collector, probe, reviewed adapter and
-CLI/job integration remain separate milestones.
+and typed invalid inputs. Positive arithmetic cases here use **fabricated
+trusted fixtures**; the measured evidence lives in
+[calibration-collector-2026-10-24.md](calibration-collector-2026-10-24.md).
+The collector, exactness bridge and default-loader/CLI integration have
+landed with 39 calibration tests; job/web integration remains a separate
+milestone. Legacy bench records stay loadable but ineligible.
