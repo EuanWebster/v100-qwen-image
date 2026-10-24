@@ -56,7 +56,7 @@ def test_narrow_verification_publishes_only_encoder_components(tiny, passing_mem
     assert result.encoder_artifact_set_sha256 == reference_bundle_fingerprints(manifest).encoder
     weight_bytes = sum(a.bytes for a in manifest.artifacts if a.identity.endswith(".safetensors") and a.role == "text_encoder")
     assert result.checkpoint_bytes == weight_bytes
-    assert passing_memory == [(weight_bytes, dict(checkpoint_dtype="bf16", target_dtype="fp16", headroom_bytes=42))]
+    assert passing_memory == [(weight_bytes, dict(checkpoint_dtype="bf16", target_dtype="fp16", headroom_bytes=42, attested_unbounded_host=False))]
     assert result.memory_report.decision == "proceed"
     with pytest.raises(TypeError):
         result.assets["vae"] = ()
@@ -301,3 +301,23 @@ def test_interrupt_closes_all_verifier_descriptors(tiny, passing_memory, monkeyp
     with pytest.raises(KeyboardInterrupt):
         ea.verify_encoder_assets(manifest, root, target_dtype="fp16", headroom_bytes=0)
     assert len(list(Path("/proc/self/fd").iterdir())) == before
+
+
+@pytest.mark.parametrize("attested", [True, False])
+def test_asset_verification_forwards_the_operator_attestation(tiny, monkeypatch, attested):
+    """The second memory gate is the same decision: the boolean attestation
+    is forwarded verbatim and no caller-supplied snapshot can enter here."""
+    manifest, root = tiny
+    seen = {}
+
+    def report(checkpoint_bytes, **kwargs):
+        seen.update(kwargs)
+        raise MemoryPreflightError("stop here")
+
+    monkeypatch.setattr(ea, "require_encoder_memory_fit", report)
+    with pytest.raises(MemoryPreflightError):
+        ea.verify_encoder_assets(manifest, root, target_dtype="fp16",
+                                 headroom_bytes=0,
+                                 attested_unbounded_host=attested)
+    assert seen["attested_unbounded_host"] is attested
+    assert "snapshot" not in seen

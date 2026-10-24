@@ -89,11 +89,14 @@ class ProductionEncoder:
     def __init__(self, *, manifest_path, models_dir, headroom_bytes: int,
                  timeout_s: float, scratch_dir, python: str | None = None,
                  cache: EmbeddingCache | None = None, projection_timeout_s: float = 10.0,
-                 cancel_grace_s: float = 5.0, logger: PhaseLogger | None = None):
+                 cancel_grace_s: float = 5.0, logger: PhaseLogger | None = None,
+                 attested_unbounded_host: bool = False):
         if type(headroom_bytes) is not int or headroom_bytes < 0:
             raise EncoderSetupError("headroom_bytes must be an explicit nonnegative integer")
         if cache is not None and not isinstance(cache, EmbeddingCache):
             raise EncoderSetupError("cache must be an EmbeddingCache or None")
+        if not isinstance(attested_unbounded_host, bool):
+            raise EncoderSetupError("attested_unbounded_host must be an explicit boolean")
         chosen = sys.executable if python is None else python
         if not isinstance(chosen, str) or not chosen.strip() or "\0" in chosen:
             raise EncoderSetupError("python must be a nonblank interpreter path/name")
@@ -115,8 +118,11 @@ class ProductionEncoder:
             headroom_argument = str(headroom_bytes)
         except ValueError as exc:
             raise EncoderSetupError("headroom_bytes is not representable as a CLI argument") from exc
-        self._loader = EncoderWorker(command=[*command, "--models-dir", str(self.models_dir),
-                                              "--headroom-bytes", headroom_argument],
+        loading_flags = ["--models-dir", str(self.models_dir),
+                         "--headroom-bytes", headroom_argument]
+        if attested_unbounded_host:
+            loading_flags.append("--attest-unbounded-host")
+        self._loader = EncoderWorker(command=[*command, *loading_flags],
                                      timeout_s=timeout_s, **common)
 
     def encode(self, config: GenerationConfig, *, encoder_dtype: str,

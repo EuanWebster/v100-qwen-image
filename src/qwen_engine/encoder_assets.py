@@ -176,11 +176,15 @@ def _verify_one(artifact: ModelArtifact, component_fd: int) -> tuple[int, ...]:
 
 
 def verify_encoder_assets(manifest: ModelManifest, models_dir: str | Path, *,
-                          target_dtype: str, headroom_bytes: int) -> VerifiedEncoderAssets:
+                          target_dtype: str, headroom_bytes: int,
+                          attested_unbounded_host: bool = False) -> VerifiedEncoderAssets:
     """Validate full profile, memory prerequisite, then freshly verify 16 files.
 
     Headroom is required, never part of encoding identity. There is no public
-    memory-snapshot/provider/trusted-root bypass: actual discovery must proceed.
+    memory-snapshot/provider/trusted-root bypass: actual discovery must proceed,
+    and the only alternative is the explicit boolean operator attestation
+    (``attested_unbounded_host``), which carries no numbers and still applies
+    a freshly read host availability.
     The narrow file set is checked before hashing and checked again afterwards.
     Other component files may be missing/partial; they are never inspected.
     """
@@ -191,7 +195,9 @@ def verify_encoder_assets(manifest: ModelManifest, models_dir: str | Path, *,
         raise EncoderAssetError("target encoder dtype must be fp16/bf16/fp32")
     artifacts = tuple(a for a in manifest.artifacts if a.role in ENCODER_ROLES)
     memory_report = require_encoder_memory_fit(_checkpoint_bytes(artifacts),
-        checkpoint_dtype=CHECKPOINT_DTYPE, target_dtype=target_dtype, headroom_bytes=headroom_bytes)
+        checkpoint_dtype=CHECKPOINT_DTYPE, target_dtype=target_dtype,
+        headroom_bytes=headroom_bytes,
+        attested_unbounded_host=attested_unbounded_host)
     # NO root canonicalization, directory access, asset read or ML import above this line.
     try:
         root = _canonical_root(models_dir)

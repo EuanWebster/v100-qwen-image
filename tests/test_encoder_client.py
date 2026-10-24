@@ -304,3 +304,27 @@ def test_same_key_concurrent_clients_still_load_only_once(client, monkeypatch):
         if second.ident is not None:
             second.join(5)
     assert not errors and len(loads) == 1 and len(results) == 2 and results[0] == results[1]
+
+
+# -- operator host-scope attestation ----------------------------------------
+
+
+def test_attestation_flag_is_forwarded_only_to_the_loading_worker(tmp_path):
+    args = dict(manifest_path="manifest.json", models_dir="models", scratch_dir=tmp_path,
+                headroom_bytes=0, timeout_s=20, python="selected/python")
+    plain = ec.ProductionEncoder(**args)
+    attested = ec.ProductionEncoder(attested_unbounded_host=True, **args)
+    assert "--attest-unbounded-host" not in plain._loader.command
+    assert "--attest-unbounded-host" not in plain._projector.command
+    assert attested._loader.command[-1] == "--attest-unbounded-host"
+    assert "--attest-unbounded-host" not in attested._projector.command
+    assert attested.models_dir == plain.models_dir
+
+
+@pytest.mark.parametrize("value", ["yes", 1, 0, None])
+def test_attestation_must_be_an_explicit_boolean(tmp_path, value):
+    with pytest.raises(EncoderSetupError, match="explicit boolean"):
+        ec.ProductionEncoder(manifest_path="manifest.json", models_dir="models",
+                             scratch_dir=tmp_path, headroom_bytes=0,
+                             timeout_s=20, python="selected/python",
+                             attested_unbounded_host=value)

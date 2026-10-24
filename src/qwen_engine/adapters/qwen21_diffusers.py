@@ -18,7 +18,11 @@ Boundary rules:
 * The adapter **loads and attaches**; it grants no memory fit, no calibration
   and no image-quality acceptance. The measured memory policy (M5.3) remains a
   separate gate, and the CPU encoder's own conservative host-memory preflight
-  still refuses until complete trusted budget evidence exists.
+  still refuses until complete trusted budget evidence exists. The single
+  opt-in exception is the constructor's ``trust_unbounded_host`` — the
+  operator's own attestation that this process tree has no cgroup memory
+  limit; it is off by default and the gate still applies a fresh
+  ``MemAvailable`` read, so it can never supply a number.
 * Nothing here writes outside the configured cache/output directories, changes
   a driver, touches ROCm, or flushes a global allocator on behalf of other
   processes.
@@ -165,11 +169,15 @@ class Qwen21DiffusersAdapter:
     :class:`~qwen_engine.adapters.supplied_qwen21.SuppliedQwen21Adapter`.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, trust_unbounded_host: bool = False) -> None:
+        if not isinstance(trust_unbounded_host, bool):
+            raise ConfigError(
+                "trust_unbounded_host must be an explicit boolean operator attestation")
         self._event: threading.Event | None = None
         self._inner: SuppliedQwen21Adapter | None = None
         self._pipeline: Any = None
         self._bundle: LocalReferenceBundle | None = None
+        self._trust_unbounded_host = trust_unbounded_host
         self._state = "new"
 
     def set_cancel_event(self, event: threading.Event | None) -> None:
@@ -250,6 +258,7 @@ class Qwen21DiffusersAdapter:
             headroom_bytes=ENCODER_HEADROOM_BYTES,
             timeout_s=ENCODER_TIMEOUT_S,
             cache=EmbeddingCache(cache_root / "embeds"),
+            attested_unbounded_host=self._trust_unbounded_host,
         )
 
         inner = SuppliedQwen21Adapter(

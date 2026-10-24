@@ -129,3 +129,62 @@ def test_config_replacement_keeps_policy_refusal_reachable(tmp_path):
     adapter = cli._make_adapter()
     with pytest.raises(ConfigError):
         adapter.load(replace(config, offload="streamed"), {})
+
+
+# -- operator host-scope attestation (off by default) -----------------------
+
+
+def test_loader_defaults_to_no_host_scope_attestation():
+    adapter = cli._make_adapter()
+    assert adapter._trust_unbounded_host is False
+
+
+def test_loader_accepts_the_explicit_operator_attestation():
+    adapter = cli._make_adapter(trust_unbounded_host=True)
+    assert adapter._trust_unbounded_host is True
+
+
+@pytest.mark.parametrize("value", ["yes", 1, 0, None])
+def test_loader_refuses_a_non_boolean_attestation(value):
+    with pytest.raises(ConfigError, match="explicit boolean"):
+        cli._make_adapter(trust_unbounded_host=value)
+
+
+def test_cli_exposes_the_attestation_flag_by_default_off():
+    parser = cli.build_parser()
+    assert parser.parse_args([]).attest_unbounded_host is False
+    assert parser.parse_args(["--attest-unbounded-host"]).attest_unbounded_host is True
+
+
+def test_cli_notice_names_the_attestation_when_used(tmp_path, capsys, monkeypatch):
+    """The run transcript must show the attestation before generation; the
+    adapter factory is stubbed so no model is touched."""
+    import json
+
+    mpath = tmp_path / "manifest.json"
+    mpath.write_text(json.dumps({"schema": "qwen_engine.manifest.v1",
+                                 "artifacts": []}))
+    (tmp_path / "models").mkdir()
+    captured = {}
+
+    class FakeAdapter:
+        def set_cancel_event(self, event):
+            pass
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        raise EngineError("stop after the notice")
+
+    monkeypatch.setattr(cli, "_make_adapter", factory)
+    monkeypatch.setattr(cli, "_verify_assets", lambda config: type(
+        "R", (), {"resolved": {}})())
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(json.dumps({
+        "prompt": "a red cube", "manifest_path": str(mpath),
+        "models_dir": str(tmp_path / "models"),
+        "output_dir": str(tmp_path / "out")}))
+    assert cli.main(["--config", str(cfg), "--run",
+                     "--attest-unbounded-host"]) == 1
+    err = capsys.readouterr().err
+    assert "attesting that this process tree has no cgroup memory limit" in err
+    assert captured == {"trust_unbounded_host": True}

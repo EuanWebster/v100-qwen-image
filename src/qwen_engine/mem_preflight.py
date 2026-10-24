@@ -49,6 +49,16 @@ Scope gate (fail closed, documented honestly):
   state is **trusted caller evidence** for pure budget arithmetic (and is
   how tests exercise pass decisions); nothing here invents a
   root-is-complete default or a production bypass.
+* The single production escape from the scope gate is the **opt-in
+  operator attestation** (``attested_unbounded_host``, CLI
+  ``--attest-unbounded-host``). It declares — as trusted operator evidence,
+  never as a measurement — that the encoder process tree is free of cgroup
+  memory limits, then applies a ``MemAvailable`` value **read at the gate**
+  so no caller can supply a number. It is off by default, is mutually
+  exclusive with an injected snapshot, and the decision still refuses when
+  the freshly read host availability is below the requirement. A hidden cap
+  would not be detected: the attestation is exactly as trustworthy as the
+  operator who made it, and run evidence records that it was used.
 
 Budget rule: the **tighter applicable budget** — with finite caps the
 cgroup availability always bounds the decision even when host RAM looks
@@ -120,6 +130,17 @@ _TRUSTED_UNLIMITED_REASON = (
     "this path; real discovery stays unknown/refuse under the visible-"
     "root completeness gate, so whole-host/root absence of constraints "
     "is not proven here either way)")
+
+#: Note recorded for the **opt-in operator attestation** path. The operator
+#: (not a caller-supplied number) states that the process tree has no cgroup
+#: memory limit; the availability number is still read fresh by this module.
+#: Public so run evidence, docs and tests quote exactly one wording.
+ATTESTED_UNBOUNDED_REASON = (
+    "operator attestation: the encoder process tree is declared free of "
+    "cgroup memory limits (--attest-unbounded-host); the applicable budget "
+    "is the host MemAvailable read at this gate, NOT an independently "
+    "discovered cgroup state — this is trusted operator evidence, not a "
+    "measurement, and a hidden cap would not be detected")
 
 #: Scope gate: a completed visible walk still cannot prove the visible
 #: root is the TRUE hierarchy root (a namespace '/' can be a non-root
@@ -244,10 +265,12 @@ class MemorySnapshot:
                     f"substituted away by the host number")
             return min(self.host_available_bytes, cgroup_available), \
                 tuple(reasons)
-        # Trusted caller-supplied UNLIMITED evidence (injected snapshot —
-        # real autodiscovery never reaches this branch): only the host
-        # number can decide, with the honest trusted-evidence note.
-        if _TRUSTED_UNLIMITED_REASON not in reasons:
+        # Trusted caller-supplied UNLIMITED evidence (injected snapshot or the
+        # operator attestation — real autodiscovery never reaches this
+        # branch): only the host number can decide, with the honest
+        # trusted-evidence note.
+        if (_TRUSTED_UNLIMITED_REASON not in reasons
+                and ATTESTED_UNBOUNDED_REASON not in reasons):
             reasons.append(_TRUSTED_UNLIMITED_REASON)
         return self.host_available_bytes, tuple(reasons)
 
@@ -586,23 +609,59 @@ class MemoryPreflightReport:
                 "conservative_precondition": self.conservative_precondition}
 
 
+def attested_unbounded_snapshot(meminfo_path: str | Path = "/proc/meminfo"
+                                ) -> MemorySnapshot:
+    """The operator-attested UNLIMITED snapshot, with a **fresh** host read.
+
+    Only the cgroup *scope* is attested ("this process tree is not confined
+    by a cgroup memory limit"); the availability number is read here, so an
+    attestation can never smuggle in a fabricated budget. An unreadable or
+    unparseable ``MemAvailable`` stays unknown and still refuses.
+    """
+    available, notes = read_host_available(meminfo_path)
+    return MemorySnapshot(
+        host_available_bytes=available,
+        cgroup_state=CGROUP_UNLIMITED,
+        notes=(ATTESTED_UNBOUNDED_REASON,) + tuple(notes),
+    )
+
+
 def encoder_memory_preflight(checkpoint_bytes: int, *,
                              checkpoint_dtype: str, target_dtype: str,
                              headroom_bytes: int,
                              snapshot: MemorySnapshot | None = None,
+                             attested_unbounded_host: bool = False,
                              meminfo_path: str | Path = "/proc/meminfo",
                              proc_cgroup_path: str | Path = "/proc/self/cgroup",
                              cgroup_fs_root: str | Path = "/sys/fs/cgroup",
                              ) -> MemoryPreflightReport:
     """Evaluate the preflight. Tests inject ``snapshot`` or the paths; the
     real call reads only the documented proc/cgroup files. Never reads a
-    model file, never imports an ML package, never loads anything."""
+    model file, never imports an ML package, never loads anything.
+
+    ``attested_unbounded_host`` is the **opt-in operator attestation** that
+    the cgroup scope gate cannot prove: it declares the process tree free of
+    cgroup memory limits and then applies the freshly read ``MemAvailable``.
+    It is off by default, is mutually exclusive with an injected ``snapshot``
+    and never supplies a number itself."""
+    if not isinstance(attested_unbounded_host, bool):
+        raise MemoryPreflightError(
+            "attested_unbounded_host must be an explicit boolean")
+    if attested_unbounded_host and snapshot is not None:
+        raise MemoryPreflightError(
+            "an attested unbounded host and an injected snapshot are "
+            "mutually exclusive: both claim the cgroup scope")
     weights, required = encoder_memory_required(
         checkpoint_bytes=checkpoint_bytes, checkpoint_dtype=checkpoint_dtype,
         target_dtype=target_dtype, headroom_bytes=headroom_bytes)
-    snap = snapshot if snapshot is not None else read_memory_snapshot(
-        meminfo_path=meminfo_path, proc_cgroup_path=proc_cgroup_path,
-        cgroup_fs_root=cgroup_fs_root)
+    if snapshot is not None:
+        snap = snapshot
+    elif attested_unbounded_host:
+        snap = attested_unbounded_snapshot(meminfo_path=meminfo_path)
+    else:
+        snap = read_memory_snapshot(
+            meminfo_path=meminfo_path, proc_cgroup_path=proc_cgroup_path,
+            cgroup_fs_root=cgroup_fs_root)
     if not isinstance(snap, MemorySnapshot):
         raise MemoryPreflightError("snapshot must be a MemorySnapshot or None")
     budget, reasons = snap.budget()

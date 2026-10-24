@@ -5,7 +5,32 @@ arithmetic. It does **not** probe hardware, collect/persist calibration,
 load components, change the existing encoder guard, wire the CLI/adapter,
 or prove fit. No expert override, interpolation or automatic quality/mode
 change. Real autodiscovery still cannot prove complete cgroup scope and
-refuses all real encoder loads in this deployment.
+refuses all real encoder loads in this deployment unless the operator
+attestation below is used.
+
+## The opt-in operator host-scope attestation
+
+`--attest-unbounded-host` (CLI) / `attested_unbounded_host=True` (worker and
+encoder client) / `trust_unbounded_host=True` (loader adapter constructor) is
+the single deliberate escape from the scope gate. It is an **operator
+statement about scope**, never a measurement and never a number:
+
+- The boolean declares that the encoder process tree is not confined by a
+  cgroup memory limit. It cannot be derived from the environment, config
+  convenience or a caller-supplied snapshot.
+- The availability figure is read *inside* the gate from `/proc/meminfo`
+  (`MemAvailable`) at decision time, so an attestation cannot smuggle in a
+  fabricated budget; an unreadable value still refuses.
+- It is off by default and mutually exclusive with an injected
+  `MemorySnapshot`. The preflight report carries
+  `ATTESTED_UNBOUNDED_REASON`, the CLI writes a `host_scope_attested` event
+  and prints a notice, and the worker's two memory gates both receive it.
+- A hidden cap would not be detected. The attestation is exactly as
+  trustworthy as the operator making it; it is appropriate for a
+  single-user workstation where the operator knows the machine, not for a
+  shared or containerized deployment. Nothing else in this document is
+  relaxed by it: headroom, GPU evidence, calibration and quality acceptance
+  remain separate gates.
 
 ## Identity and completeness
 

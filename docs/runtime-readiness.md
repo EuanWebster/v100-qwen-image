@@ -44,6 +44,16 @@ integration is claimed.
    be relabelled quantized or given an invented memory pass. Merely installing
    the V100, rewriting orchestration in C++, or changing fp16/bf16 storage
    does not remove this raw-weight lower bound. FP32 CPU expansion is larger.
+
+   **2026-10-24 host update**: on this workstation the encoder child runs
+   outside any container (cgroup namespace is the initial one, ~122GiB RAM,
+   ~72GiB available at test time), so the raw-weight lower bound is no longer
+   the constraint — only the *unprovable* visible-root scope is. The opt-in
+   `--attest-unbounded-host` flag records the operator's own attestation that
+   the process tree has no cgroup memory limit and then applies a freshly read
+   `MemAvailable`; the default is still refuse, the attestation supplies no
+   number, a tight host still refuses, and the run log records its use.
+   Design and limits: [memory-policy.md](memory-policy.md).
 3. **Assets complete, model fidelity pending**: the explicitly approved base
    fetch continuation now verifies all24files (33,131,601,593B); settled
    closed-tree preflight passes29entries with no partials. Full DiT/VAE META

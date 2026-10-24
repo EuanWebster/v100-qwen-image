@@ -82,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="actually generate (verifies manifest assets first; no downloads)")
     p.add_argument("--tiled-decode", action="store_true",
                    help="VAE tiling (decode-memory knob only, C6)")
+    p.add_argument("--attest-unbounded-host", action="store_true",
+                   help="operator attestation that this process tree has no cgroup "
+                        "memory limit, so the CPU encoder gate uses the freshly read "
+                        "host MemAvailable alone (default: the gate refuses when the "
+                        "cgroup scope cannot be proven)")
     # Field overrides (take precedence over --config):
     p.add_argument("--prompt")
     p.add_argument("--negative", default=None)
@@ -171,15 +176,16 @@ def _verify_assets(config: GenerationConfig):
     return report
 
 
-def _make_adapter() -> Any:
-    """Instantiate the real adapter. Absent at M1 — importing a heavy
-    adapter is the *only* path to torch/diffusers/transformers.
+def _make_adapter(*, trust_unbounded_host: bool = False) -> Any:
+    """Instantiate the real adapter; the only path to torch/diffusers/transformers.
 
-    Only the *absence of the adapter module itself* is the known M1
-    boundary; a :class:`ModuleNotFoundError` for anything else (e.g. torch
-    missing *inside* a future adapter) keeps its own identity — an
-    unimplemented milestone must never masquerade as a missing dependency,
-    and vice versa.
+    Only the *absence of the adapter module itself* is a packaging error; a
+    :class:`ModuleNotFoundError` for anything else (e.g. torch missing *inside*
+    the adapter) keeps its own identity — a packaging fault must never
+    masquerade as a missing dependency, and vice versa.
+
+    ``trust_unbounded_host`` is forwarded verbatim as the operator's own
+    cgroup-scope attestation; it changes no other gate.
     """
     import importlib
 
@@ -193,16 +199,18 @@ def _make_adapter() -> Any:
             "qwen_engine.adapters.qwen21_diffusers is missing from this "
             "installation (packaging error, not a missing dependency)"
         ) from exc
-    return module.Qwen21DiffusersAdapter()
+    return module.Qwen21DiffusersAdapter(trust_unbounded_host=trust_unbounded_host)
 
 
 def _run_generate(config: GenerationConfig, logger: PhaseLogger,
-                  assets: Any = None, adapter: Any = None) -> int:
-    # Refuse an unconfigured output BEFORE the adapter exists at all: the
-    # absent M4 adapter is an exit-1 boundary and must not mask the
-    # config-error-2 for a run with nowhere to save.
+                  assets: Any = None, adapter: Any = None,
+                  trust_unbounded_host: bool = False) -> int:
+    # Refuse an unconfigured output BEFORE the adapter exists at all: an
+    # adapter import/load failure is an exit-1 boundary and must not mask
+    # the config-error-2 for a run with nowhere to save.
     require_run_config(config)
-    adapter = adapter if adapter is not None else _make_adapter()
+    adapter = adapter if adapter is not None else _make_adapter(
+        trust_unbounded_host=trust_unbounded_host)
     result = generate(config, adapter, assets or {}, logger)
     print(json.dumps(result.to_dict(), sort_keys=True))
     return int(ExitCode.OK)
@@ -242,7 +250,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         # config error (2), checked BEFORE the adapter is created/imported
         # — the absent M4 adapter must not turn it into exit 1.
         report = _verify_assets(config)  # -> ManifestError -> exit 4
-        return _run_generate(config, logger, assets=report.resolved)
+        if args.attest_unbounded_host:
+            print(
+                "notice: --attest-unbounded-host: attesting that this process "
+                "tree has no cgroup memory limit; the encoder gate will apply "
+                "only a freshly read host MemAvailable (recorded in run evidence)",
+                file=sys.stderr)
+            _safe_log(logger, "host_scope_attested",
+                      attestation="unbounded-host", source="operator")
+        return _run_generate(config, logger, assets=report.resolved,
+                             trust_unbounded_host=args.attest_unbounded_host)
     except ConfigError as exc:
         for err in exc.errors:
             print(f"config error: {err}", file=sys.stderr)

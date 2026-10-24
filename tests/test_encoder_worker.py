@@ -276,7 +276,7 @@ def test_destination_race_is_no_clobber_and_temp_is_cleaned(tmp_path, monkeypatc
 @pytest.mark.parametrize("failure", [OSError("disk full"), KeyboardInterrupt()])
 def test_write_failure_closes_fd_and_removes_only_own_temp(tmp_path, monkeypatch, failure):
     target = tmp_path / "response"
-    def failed(*args):
+    def failed(*args, **kwargs):
         raise failure
     monkeypatch.setattr(ew.os, "write", failed)
     before = len(list(Path("/proc/self/fd").iterdir()))
@@ -340,7 +340,7 @@ def test_request_id_cap_precedes_loading(inputs, monkeypatch):
 @pytest.mark.parametrize("error", [RuntimeError("inference failed"), ValueError("tensor failed"),
                                  OSError("checkpoint read failed"), KeyboardInterrupt()])
 def test_pipeline_failure_is_not_relabelled_as_destination_error(inputs, monkeypatch, error):
-    def failed(*a):
+    def failed(*a, **k):
         raise error
     monkeypatch.setattr(ew, "_encode_request", failed)
     with pytest.raises(type(error)) as caught:
@@ -453,3 +453,59 @@ print('PRODUCT GUARD PASS')
     result = subprocess.run([sys.executable, "-B", "-c", code], env=env, cwd=tmp_path,
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0 and "PRODUCT GUARD PASS" in result.stdout, result.stderr
+
+
+# -- operator host-scope attestation plumbing --------------------------------
+
+
+def test_attestation_flag_reaches_the_loading_worker(monkeypatch):
+    seen = {}
+
+    def capture(*args, **kwargs):
+        seen["args"] = args
+        seen.update(kwargs)
+
+    monkeypatch.setattr(ew, "execute_worker", capture)
+    assert ew.main(["--request", "r", "--response", "s", "--manifest", "m",
+                    "--models-dir", "d", "--headroom-bytes", "0",
+                    "--attest-unbounded-host"]) == 0
+    assert seen["attested_unbounded_host"] is True
+
+
+def test_attestation_is_off_by_default(monkeypatch):
+    seen = {}
+
+    def capture(*args, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(ew, "execute_worker", capture)
+    assert ew.main(["--request", "r", "--response", "s", "--manifest", "m",
+                    "--models-dir", "d", "--headroom-bytes", "0"]) == 0
+    assert seen["attested_unbounded_host"] is False
+
+
+def test_projection_refuses_the_attestation_flag(monkeypatch):
+    monkeypatch.setattr(ew, "execute_projection",
+                        lambda *a: pytest.fail("projection ran"))
+    with pytest.raises(SystemExit) as caught:
+        ew.main(["--request", "r", "--response", "s", "--manifest", "m",
+                 "--project-identity", "--attest-unbounded-host"])
+    assert caught.value.code == 2
+
+
+@pytest.mark.parametrize("attested", [True, False])
+def test_encode_request_forwards_the_attestation_to_the_preflight(inputs, monkeypatch, attested):
+    calls = {}
+
+    def refuse(checkpoint, **kwargs):
+        calls.update(kwargs)
+        raise MemoryPreflightError("stop here")
+
+    monkeypatch.setattr(ew, "require_encoder_memory_fit", refuse)
+    monkeypatch.setattr(ew, "verify_encoder_assets",
+                        lambda *a, **k: pytest.fail("assets verified after refusal"))
+    with pytest.raises(MemoryPreflightError):
+        ew._encode_request(inputs.req, inputs.manifest, inputs.root,
+                           0, attested_unbounded_host=attested)
+    assert calls["attested_unbounded_host"] is attested
+

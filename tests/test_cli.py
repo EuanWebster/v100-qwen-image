@@ -214,7 +214,7 @@ def test_cli_run_exits_zero_when_sink_fails_only_on_complete(
     mpath = write_manifest(tmp_path)
     (tmp_path / "models" / "dit" / "model.bin").parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / "models" / "dit" / "model.bin").write_bytes(b"payload")
-    monkeypatch.setattr(cli, "_make_adapter", lambda: adapter)
+    monkeypatch.setattr(cli, "_make_adapter", lambda **k: adapter)
     cfg = config_file(tmp_path, output_dir=str(tmp_path / "output"),
                       manifest_path=str(mpath), models_dir=str(tmp_path / "models"))
     assert run_cli(tmp_path, ["--config", cfg, "--run"]) == 0
@@ -547,7 +547,7 @@ def test_success_path_returns_zero_and_passes_verified_assets(tmp_path, capsys, 
     mpath = write_manifest(tmp_path)
     (tmp_path / "models" / "dit" / "model.bin").parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / "models" / "dit" / "model.bin").write_bytes(b"payload")
-    monkeypatch.setattr(cli, "_make_adapter", lambda: adapter)
+    monkeypatch.setattr(cli, "_make_adapter", lambda **k: adapter)
     cfg = config_file(tmp_path, output_dir=str(tmp_path / "output"),
                       manifest_path=str(mpath), models_dir=str(tmp_path / "models"))
     assert run_cli(tmp_path, ["--config", cfg, "--run"]) == 0
@@ -565,7 +565,7 @@ def test_actual_run_without_output_dir_exits_2_without_loading(tmp_path, capsys,
     mpath = write_manifest(tmp_path)
     (tmp_path / "models" / "dit" / "model.bin").parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / "models" / "dit" / "model.bin").write_bytes(b"payload")
-    monkeypatch.setattr(cli, "_make_adapter", lambda: adapter)
+    monkeypatch.setattr(cli, "_make_adapter", lambda **k: adapter)
     cfg = config_file(tmp_path, manifest_path=str(mpath),
                       models_dir=str(tmp_path / "models"))
     cfg = json.loads(Path(cfg).read_text())

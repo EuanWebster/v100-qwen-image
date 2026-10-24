@@ -829,3 +829,95 @@ def test_import_pulls_in_no_heavy_modules():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True,
                          text=True)
     assert out.returncode == 0 and out.stdout.strip() == "ok", out.stderr
+
+
+# -- the opt-in operator attestation ----------------------------------------
+
+
+def test_attested_unbounded_host_proceeds_on_fresh_host_read(tmp_path):
+    """The attestation declares the cgroup SCOPE only; the budget comes from
+    a fresh MemAvailable read under the supplied meminfo path."""
+    env = make_env(tmp_path, host_kb=64 * 1024 * 1024, cgroup_path="/child")
+    put_level(env, "/child", mem_max="max")     # real read would be unknown
+    report = encoder_memory_preflight(
+        GIB, checkpoint_dtype="bf16", target_dtype="fp32",
+        headroom_bytes=GIB, attested_unbounded_host=True, **env)
+    assert report.decision == "proceed"
+    assert report.budget_bytes == 64 * GIB
+    assert report.cgroup_state == CGROUP_UNLIMITED
+    reasons = " ".join(report.reasons)
+    assert "operator attestation" in reasons
+    assert "--attest-unbounded-host" in reasons
+    assert "trusted operator evidence" in reasons
+    # The injected-snapshot wording must not claim a different evidence class.
+    assert "explicitly injected trusted snapshot" not in reasons
+
+
+def test_attested_unbounded_host_still_refuses_when_host_is_tight(tmp_path):
+    env = make_env(tmp_path, host_kb=1024 * 1024, cgroup_path="/child")
+    put_level(env, "/child", mem_max="max")
+    report = encoder_memory_preflight(
+        GIB, checkpoint_dtype="bf16", target_dtype="fp32",
+        headroom_bytes=GIB, attested_unbounded_host=True, **env)
+    assert report.decision == "refuse"
+    assert "exceeds the applicable budget" in " ".join(report.reasons)
+
+
+def test_attested_unbounded_host_refuses_unknown_memavailable(tmp_path):
+    env = make_env(tmp_path, raw_meminfo="MemTotal: 1 kB\n", cgroup_path="/child")
+    put_level(env, "/child", mem_max="max")
+    report = encoder_memory_preflight(
+        GIB, checkpoint_dtype="bf16", target_dtype="fp32",
+        headroom_bytes=GIB, attested_unbounded_host=True, **env)
+    assert report.decision == "refuse"
+    assert report.host_available_bytes is None
+    assert "host MemAvailable is unknown" in " ".join(report.reasons)
+
+
+def test_attested_unbounded_host_does_not_read_cgroup_state(tmp_path):
+    """The attestation replaces discovery entirely: even a finite cap that a
+    real read would see cannot enter the arithmetic, and a missing cgroup
+    root does not matter. This is exactly the documented trust boundary."""
+    env = make_env(tmp_path, host_kb=64 * 1024 * 1024, cgroup_path="/child")
+    put_level(env, "/child", mem_max=GIB, mem_current=GIB)  # zero budget if read
+    report = encoder_memory_preflight(
+        GIB, checkpoint_dtype="bf16", target_dtype="fp32",
+        headroom_bytes=GIB, attested_unbounded_host=True, **env)
+    assert report.decision == "proceed"
+    assert report.cgroup_limit_bytes is None
+    assert report.cgroup_current_bytes is None
+    assert report.cgroup_available_bytes is None
+
+
+def test_attestation_and_snapshot_are_mutually_exclusive():
+    snap = MemorySnapshot(host_available_bytes=64 * GIB,
+                          cgroup_state=CGROUP_UNLIMITED)
+    with pytest.raises(MemoryPreflightError, match="mutually exclusive"):
+        encoder_memory_preflight(1, checkpoint_dtype="bf16",
+                                 target_dtype="fp32", headroom_bytes=0,
+                                 snapshot=snap, attested_unbounded_host=True)
+
+
+@pytest.mark.parametrize("value", ["yes", 1, 0, None])
+def test_attestation_must_be_an_explicit_boolean(value):
+    with pytest.raises(MemoryPreflightError, match="explicit boolean"):
+        encoder_memory_preflight(1, checkpoint_dtype="bf16",
+                                 target_dtype="fp32", headroom_bytes=0,
+                                 attested_unbounded_host=value)
+
+
+def test_attestation_is_off_by_default_on_the_real_read_path(tmp_path):
+    env = make_env(tmp_path, host_kb=64 * 1024 * 1024, cgroup_path="/child")
+    put_level(env, "/child", mem_max="max")
+    report = preflight(env, checkpoint_bytes=GIB, checkpoint_dtype="bf16",
+                       target_dtype="fp32", headroom_bytes=GIB)
+    assert report.decision == "refuse"
+    assert report.cgroup_state == CGROUP_UNKNOWN
+
+
+def test_docstring_names_the_attestation_as_the_single_escape():
+    import qwen_engine.mem_preflight as mod
+    doc = mod.__doc__
+    assert "--attest-unbounded-host" in doc
+    assert "operator attestation" in doc
+    assert "never as a measurement" in doc

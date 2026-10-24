@@ -225,16 +225,20 @@ def _load_local_components(assets: VerifiedEncoderAssets, dtype: str):
     return model, processor
 
 
-def _encode_request(request, manifest, models_dir, headroom_bytes):
+def _encode_request(request, manifest, models_dir, headroom_bytes, *,
+                    attested_unbounded_host=False):
     validate_production_request(request)
     validate_local_reference_layout(manifest)
     checkpoint = sum(a.bytes for a in manifest.artifacts
                      if a.role == "text_encoder" and a.identity.endswith(".safetensors"))
     require_encoder_memory_fit(checkpoint, checkpoint_dtype=CHECKPOINT_DTYPE,
-                              target_dtype=request.dtype, headroom_bytes=headroom_bytes)
+                              target_dtype=request.dtype, headroom_bytes=headroom_bytes,
+                              attested_unbounded_host=attested_unbounded_host)
     validate_worker_request_identity(request, manifest)
     # Rechecks actual memory immediately before fresh asset verification.
-    assets = verify_encoder_assets(manifest, models_dir, target_dtype=request.dtype, headroom_bytes=headroom_bytes)
+    assets = verify_encoder_assets(manifest, models_dir, target_dtype=request.dtype,
+                                   headroom_bytes=headroom_bytes,
+                                   attested_unbounded_host=attested_unbounded_host)
     if assets.encoder_artifact_set_sha256 != request.implementation_identity.encoder_artifact_set_sha256:
         raise EncoderRequestError("verified encoder artifacts disagree with request identity")
     validate_shard_index(assets)
@@ -331,14 +335,16 @@ def _response_destination(response_path):
         yield parent, name, directory
 
 
-def execute_worker(request_path, response_path, manifest_path, models_dir, *, headroom_bytes: int):
+def execute_worker(request_path, response_path, manifest_path, models_dir, *,
+                   headroom_bytes: int, attested_unbounded_host: bool = False):
     """Run only in a fresh child: offline guard lifetime is process-wide."""
     install_offline_guard()
     request, rid = _read_request(request_path)
     validate_production_request(request)
     manifest = _read_manifest(manifest_path)
     with _response_destination(response_path) as (parent, name, directory):
-        payload = _encode_request(request, manifest, models_dir, headroom_bytes)
+        payload = _encode_request(request, manifest, models_dir, headroom_bytes,
+                                  attested_unbounded_host=attested_unbounded_host)
         _publish_response(parent, name, directory, result_bytes(payload, rid))
 
 
@@ -377,10 +383,16 @@ def main(argv=None) -> int:
                         help="metadata-only seed projection; no ML/model-root access or loading")
     parser.add_argument("--models-dir")
     parser.add_argument("--headroom-bytes", type=_headroom_arg)
+    parser.add_argument("--attest-unbounded-host", action="store_true",
+                        help="operator attestation that this process tree has no cgroup "
+                             "memory limit; the gate still applies a freshly read "
+                             "MemAvailable (off by default; never supplies a number)")
     args = parser.parse_args(argv)
     if args.project_identity:
-        if args.models_dir is not None or args.headroom_bytes is not None:
-            parser.error("--project-identity refuses loading flags --models-dir/--headroom-bytes")
+        if (args.models_dir is not None or args.headroom_bytes is not None
+                or args.attest_unbounded_host):
+            parser.error("--project-identity refuses loading flags "
+                         "--models-dir/--headroom-bytes/--attest-unbounded-host")
     elif args.models_dir is None or args.headroom_bytes is None:
         parser.error("loading requires --models-dir and --headroom-bytes")
     try:
@@ -388,7 +400,8 @@ def main(argv=None) -> int:
             execute_projection(args.request, args.response, args.manifest)
         else:
             execute_worker(args.request, args.response, args.manifest, args.models_dir,
-                           headroom_bytes=args.headroom_bytes)
+                           headroom_bytes=args.headroom_bytes,
+                           attested_unbounded_host=args.attest_unbounded_host)
         return 0
     except MemoryPreflightError as exc:
         return _report_failure(3, exc)
