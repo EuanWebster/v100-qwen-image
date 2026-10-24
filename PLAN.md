@@ -1452,3 +1452,11 @@ standing rule that executed plans stay honest.)*
   transient allocator retry, but looks **worse** than scale 1.0 at equal
   steps (saturated/plastic vs natural shading), so the default scale 1.0 is
   the recommended quality path. Recorded in the same doc.
+  Known stale surface, deliberately not changed here: the W2 web status
+  endpoint and static page still say `adapter_not_implemented` / "generation
+  is not implemented". The web process genuinely does not import or load the
+  adapter, so it still cannot generate, but the *reason* text is now wrong.
+  Fixing it spans api `_gates`/`_blockers`, the closed gate/blocker validator
+  in `web_static/app.js` (it rejects any payload with a different gate set, so
+  a server-only edit breaks the page), the handler guard/copy and both web
+  test files. Recorded in docs/web-interface.md.

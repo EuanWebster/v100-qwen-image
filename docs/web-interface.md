@@ -42,6 +42,18 @@ queue/automatic-download/cloud features are out of scope by directive.
   Runnable as `qwen-web` or `python -m qwen_engine.web`; `--help` prints
   without binding, reading or importing ML. Generation is not implemented
   anywhere (W3).
+
+  **Stale gate (2026-10-24)**: the CLI now has a working adapter and produces
+  real images, but this web status surface still reports
+  `adapter_not_implemented` and the static page still disables Generate with
+  "not implemented" copy. That is deliberate in one narrow sense — the web
+  process does not import or load the adapter, so it still cannot generate —
+  but the *reason* text is now wrong. Fixing it is a coordinated change across
+  `web/api.py` (`_gates`/`_blockers`), the closed gate/blocker validator in
+  `web_static/app.js` (which rejects any payload whose four gate codes are not
+  exactly the current set, so a server-only change breaks the page), the
+  handler guard and copy at `app.js:1099+`, and both web test files. Not done
+  as part of the V100 generation work.
 * `tests/test_web_static.py` — guarded text/structure checks (no browser, no
   network, ML-free; asserts originality-relevant invariants: no external
   origins, no `innerHTML`, BigInt seed handling with a ≤ 20-digit bounded
