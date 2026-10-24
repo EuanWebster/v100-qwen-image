@@ -67,6 +67,25 @@ A 2K run would exceed this envelope with the resident profile; it needs the
 M5 memory work (streamed/offloaded components or a smaller decode footprint)
 before it can be attempted.
 
+## Text rendering and guidance
+
+* Prompt-following and text rendering check (1024², 40 steps, seed 7,
+  `true_cfg_scale` 1.0): "a hand-painted wooden sign reading "OPEN" leaning
+  against a driftwood post on a misty beach at dawn" produced a legible
+  "OPEN" sign with plausible weathering. Text was not garbled, mirrored or
+  misspelled.
+* True CFG costs roughly a doubled transformer batch. Measured peaks:
+  15,889 MiB at 512²/20 steps (negative prompt, scale 4.0) and a transient
+  allocator retry at 1024²/20 steps, which still completed.
+* **Higher guidance looked worse at equal steps.** The same prompt and seed
+  at 512²/20: scale 4.0 with a negative prompt gave saturated, plastic-looking
+  red with blown highlights; scale 1.0 gave natural shading and a plausible
+  material. The 1024²/40-step scale-1.0 image was the best of the set. So the
+  default (`1.0`, guidance inactive without a negative prompt) is the
+  recommended quality path on this profile; raising the scale is a user choice
+  for a specific negative constraint, not a quality upgrade.
+
+
 ## Reproduction
 
 ```

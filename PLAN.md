@@ -1446,3 +1446,9 @@ standing rule that executed plans stay honest.)*
   precision is not the cause. Measurements and honest limits (exploratory,
   not calibration; ~15.4/16 GiB is tight, one transient allocator retry;
   2K still needs M5) are in docs/generation-measurements-2026-10-24.md.
+  Follow-up probes the same day: text rendering is correct (a legible
+  hand-painted "OPEN" beach sign at 1024²/40/seed7); true CFG (negative
+  prompt, scale 4.0) fits at 512² (15,889 MiB peak) and at 1024² with one
+  transient allocator retry, but looks **worse** than scale 1.0 at equal
+  steps (saturated/plastic vs natural shading), so the default scale 1.0 is
+  the recommended quality path. Recorded in the same doc.
