@@ -1,11 +1,15 @@
 # Handoff: V100 Qwen-Image project
 
-> **Current-state pointer (added 2026-10-12 — the text below is the historical
-> **Oct-7 snapshot and is preserved unchanged).** This snapshot's "Implementation
-> has not started" applied to that date only: the engine milestones and the web
-> W1/W2 work have since landed. For the CURRENT state run `memctl brief
-> v100-qwen-image` and read the latest handoff (`docs/handoffs/` — most recent
-> file) before acting; do not resume from the historical text alone.
+> **Current state, updated 2026-10-24:** The V100 is installed, its NVIDIA driver
+> and basic CUDA computation are verified, and an independent NVIDIA ComfyUI is
+> running at <http://127.0.0.1:8189> with an actual SDXL generation validated.
+> Read [the current handoff](docs/handoffs/2026-10-24-v100-comfyui-nvidia.md)
+> and run `memctl brief v100-qwen-image` before continuing.
+>
+> The text below is the historical Oct-7 snapshot. Its "Implementation has not
+> started" and hardware-absence statements apply to that date only. Engine and
+> web work has since landed; the hand-rolled Qwen pipeline still has separate
+> GPU/model acceptance and memory-budget work remaining.
 
 Updated 2026-10-07 by Codex. Euan is ending the host session and will reopen
 Codex inside this project's sandbox. Review and requirements interview are
