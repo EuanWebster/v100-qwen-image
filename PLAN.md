@@ -1384,3 +1384,23 @@ standing rule that executed plans stay honest.)*
   unproven cgroup scope. Real adapter/process executor/calibration, full
   model fidelity and V100/numerics/quality acceptance remain pending;
   Generate stays disabled and user-owned sandbox.yaml remains untouched.
+
+- 2026-10-24 **host test environment rebuilt + CPU baseline (step 1 of testing
+  against the installed card)**: the NVIDIA ComfyUI service was stopped by user
+  approval (GPU back to 0MiB used); the project `.venv` was recreated on the
+  host with uv (CPython 3.13.14) from `requirements.lock` (64 packages:
+  torch2.14.1+cu126, torchvision0.29.1+cu126, diffusers0.41.0.dev0,
+  transformers5.17.0 at git856157a2, sm_70 in `get_arch_list()`), pytest9.1.1,
+  and an editable install of this package. Guarded R7 suite: **2435 passed +
+  2 skipped** (no torch/diffusers/transformers imported by tests, writes only
+  in temp). Real CUDA execution from the locked environment on the V100:
+  cc(7,0), FP16 512x512 matmul max abs deviation 0.050 vs an FP32 CPU
+  reference, FP32 elementwise exact, 22MiB reserved; no model load and no
+  generation. The default loader is still absent (`--run` exits 1 by design).
+  One test correction: `test_actual_fresh_child_package_refusal_happens_before_cache`
+  had assumed the ambient child interpreter lacked torchvision (true on
+  2026-10-13, false now that the reviewed lock installs it); it now uses a
+  deterministic wrapper interpreter that hides only the vision wheel at the
+  metadata boundary, with the production worker unchanged. Found by the fresh
+  environment run, not a product regression. Real-model fidelity, encoder
+  RAM/fit, VRAM calibration and quality acceptance remain pending.

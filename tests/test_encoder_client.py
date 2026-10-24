@@ -218,9 +218,59 @@ def test_completed_identity_cannot_exceed_worker_request_cap(client, monkeypatch
         client.encode(GenerationConfig(), encoder_dtype="fp16")
 
 
-def test_actual_fresh_child_package_refusal_happens_before_cache(client, monkeypatch):
+# Real-child interpreter whose metadata view omits the reviewed vision wheel.
+# The reviewed lock does install torchvision, so the absent-wheel scenario this
+# test exists for must be simulated at the same metadata boundary the worker
+# validates. Production code is untouched: the child still runs its own fresh
+# package policy before any cache or model access.
+NO_VISION_CHILD = """#!{python}
+import runpy
+import sys
+from importlib import metadata
+
+HIDDEN = "torchvision"
+_original_distribution = metadata.distribution
+_original_distributions = metadata.distributions
+
+
+def _hidden(name):
+    return isinstance(name, str) and name.lower().replace("_", "-") == HIDDEN
+
+
+def distribution(name=None, *args, **kwargs):
+    if _hidden(name):
+        raise metadata.PackageNotFoundError(name)
+    return _original_distribution(name, *args, **kwargs)
+
+
+def distributions(*args, **kwargs):
+    for dist in _original_distributions(*args, **kwargs):
+        if not _hidden(dist.metadata.get("Name")):
+            yield dist
+
+
+metadata.distribution = distribution
+metadata.distributions = distributions
+
+arguments = sys.argv[1:]
+if arguments[:3] != ["-B", "-m", "qwen_engine.encoder_worker"]:
+    raise SystemExit("unexpected child invocation")
+sys.argv = ["qwen_engine.encoder_worker", *arguments[3:]]
+runpy.run_module("qwen_engine.encoder_worker", run_name="__main__")
+"""
+
+
+def test_actual_fresh_child_package_refusal_happens_before_cache(tmp_path):
+    wrapper = tmp_path / "child-without-reviewed-vision"
+    wrapper.write_text(NO_VISION_CHILD.format(python=sys.executable), encoding="ascii")
+    wrapper.chmod(0o755)
+    client = ec.ProductionEncoder(
+        manifest_path=ROOT / "models/manifest.json",
+        models_dir=tmp_path / "never-accessed-models",
+        scratch_dir=tmp_path, timeout_s=20, headroom_bytes=0,
+        python=str(wrapper), cache=EmbeddingCache(tmp_path / "cache"))
     for name in ("lock_for", "get", "put"):
-        monkeypatch.setattr(client.cache, name, lambda *a: pytest.fail("cache after actual refusal"))
+        setattr(client.cache, name, lambda *a: pytest.fail("cache after actual refusal"))
     with pytest.raises(EncoderWorkerError) as caught:
         client.encode(GenerationConfig(), encoder_dtype="fp16")
     assert caught.value.exit_code == 1 and "torchvision: expected" in caught.value.stderr
