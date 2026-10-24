@@ -213,7 +213,9 @@ def _validate_policy(config: GenerationConfig) -> None:
         errors.append(FieldError("output_dir", "an actual run requires an output directory"))
     if config.cache_dir is None:
         errors.append(FieldError(
-            "cache_dir", "the encoder cache/scratch requires an explicit cache_dir"))
+            "cache_dir", "the encoder cache/scratch requires an explicit cache_dir; "
+                         "add --cache-dir cache (created automatically) "
+                         "or set cache_dir in the JSON config"))
     if errors:
         raise ConfigError(errors)
 

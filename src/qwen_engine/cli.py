@@ -113,7 +113,10 @@ def build_parser() -> argparse.ArgumentParser:
     for flag in ("output_dir", "cache_dir", "log_dir", "benchmarks_dir",
                  "models_dir"):
         p.add_argument(f"--{flag.replace('_', '-')}", dest=flag, default=None,
-                       help=f"override config field {flag!r} (default: unset -> no writes)")
+                       help=("encoder cache/scratch directory, required for --run "
+                             "(e.g. cache; created automatically)"
+                             if flag == "cache_dir" else
+                             f"override config field {flag!r} (default: unset -> no writes)"))
     p.add_argument("--manifest", type=Path, default=None,
                    help="model manifest path override (default: unset -> run refuses)")
     return p
