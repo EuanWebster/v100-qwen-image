@@ -101,6 +101,16 @@ mobile sizes. CPU tests cover propagation from an injected adapter and refusal
 of backward, out-of-range or mismatched step observations. No new full-model
 GPU run was needed for this telemetry-only change.
 
+Activated after the user agreed to restart: all four jobs were terminal before
+stopping the old server. Their public job details and image filenames were saved
+to `output/web/history-before-progress-restart-2026-10-24.json`; all PNG files
+remain in their original job directories. The new server is running on localhost,
+LAN and Tailscale port8765 with the progress bar and earlier feedback fix active.
+Refresh the page to load them. Session History restarted empty, as documented.
+Guarded CPU suite: **2568 passed, 2 skipped** (22.62 s); actual Chrome fixture
+observed partial sampler progress, completion, reload and cancellation. Live
+updated assets and generation status verified through all three listener IPs.
+
 ## Submission availability and memory
 
 `generation_available` means the server accepts generation submissions; it
