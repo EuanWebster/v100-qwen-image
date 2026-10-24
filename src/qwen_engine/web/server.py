@@ -1,11 +1,10 @@
-"""Local web server: loopback-only transport with opt-in serial engine jobs.
+"""Explicit-address web server with opt-in serial engine jobs.
 
 Safety posture (reviewed W2 contract):
 
-* Binds the **literal** ``127.0.0.1`` only. ``--host`` is refused BEFORE any
-  bind for anything else — including ``::1`` (an IPv6 loopback bind needs its
-  own reviewed, actually-tested milestone) and any non-loopback address.
-  ``localhost`` is never resolved to decide the bind address.
+* Defaults to literal ``127.0.0.1``. Repeated ``--host`` allows explicit
+  IPv4 LAN/Tailscale listeners sharing one job queue. Wildcard, DNS and
+  public-address binds are refused; each listener validates its own Host.
 * Default port 8765 (the dsh harness port 3081 is unrelated and must never
   be used); ``--port 0`` picks an ephemeral port and the actual canonical
   origin is printed after bind.
@@ -44,9 +43,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import ipaddress
 import os
 import re
 import signal
+import selectors
 import queue
 import socket
 import stat as stat_module
@@ -63,13 +64,15 @@ from qwen_engine.web import api
 from qwen_engine.web.api import ApiError, ApiResponse, WebRuntime
 
 DEFAULT_HOST = "127.0.0.1"
-#: Only the literal loopback (W2 policy; ::1 refused until an actual
-#: IPv6-tested bind milestone is reviewed). Never "localhost" — no DNS.
+#: Default bind; additional explicit private IPv4 addresses are opt-in.
 ALLOWED_BIND_HOSTS = (DEFAULT_HOST,)
 #: Accepted Host header names at the bound port: the bound literal plus the
 #: usual browser alias for loopback. Everything else (including a rebound
 #: attacker hostname) is refused.
 ALLOWED_HOST_NAMES = ("127.0.0.1", "localhost")
+_PRIVATE_BIND_NETWORKS = tuple(ipaddress.ip_network(value) for value in
+                               ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
+                                "192.168.0.0/16", "100.64.0.0/10"))
 DEFAULT_PORT = 8765
 MAX_BODY_BYTES = 64 * 1024
 #: Finite socket/read timeout applied before any header or body read.
@@ -124,10 +127,22 @@ def _port_ok(text: str) -> bool:
         and 0 <= int(text) <= 65535
 
 
+def valid_bind_host(host: str) -> bool:
+    """Explicit IPv4 loopback, RFC1918 LAN or Tailscale/CGNAT addresses only.
+
+    No wildcard or DNS resolution: the OS must own each requested address.
+    """
+    try:
+        address = ipaddress.IPv4Address(host)
+    except ipaddress.AddressValueError:
+        return False
+    return any(address in network for network in _PRIVATE_BIND_NETWORKS)
+
+
 def validate_host(values: list[str], bound_ip: str,
                   port: int) -> tuple[str | None, str | None]:
-    """(expected_origin, error): exactly one Host header naming the bound
-    loopback literal (or localhost) at the actual port; everything else —
+    """(expected_origin, error): exactly one Host header naming this listener
+    literal (or localhost on 127.0.0.1) at the actual port; everything else —
     duplicates, userinfo, whitespace, non-ASCII, missing/foreign port, foreign
     name — is a typed error string."""
     if len(values) != 1:
@@ -151,8 +166,11 @@ def validate_host(values: list[str], bound_ip: str,
         return None, "Host port must not have leading zeros"
     if int(port_part) != port:
         return None, "Host port must match the bound port"
-    if name.lower() not in ALLOWED_HOST_NAMES:
-        return None, "Host name must be the bound loopback address (or localhost)"
+    names = {bound_ip}
+    if bound_ip == DEFAULT_HOST:
+        names.add("localhost")
+    if name.lower() not in names:
+        return None, "Host name must match this listener address (or localhost on loopback)"
     return f"http://{name.lower()}:{port}", None
 
 
@@ -690,10 +708,12 @@ def stop_workers(conn_queue: "queue.Queue[Any]",
 
 
 class _Server(HTTPServer):
-    """Loopback server with a BOUNDED POOL of persistent worker threads —
+    """Explicit-address server with a BOUNDED POOL of persistent worker threads —
     no per-connection thread creation, finite handler idle timeout via
     _Handler.timeout, typed 503 when saturated."""
-    allow_reuse_address = False
+    # Allow a clean restart while old connections remain in TIME_WAIT.
+    # This is SO_REUSEADDR, not SO_REUSEPORT: no shared live listeners.
+    allow_reuse_address = True
 
     web_runtime: WebRuntime
     assets: dict[str, bytes]
@@ -701,12 +721,14 @@ class _Server(HTTPServer):
     bound_port: int
 
     def __init__(self, addr_info, handler) -> None:
-        super().__init__(addr_info, handler)
         self._queue: "queue.Queue[Any]" = queue.Queue(
             maxsize=MAX_QUEUED_CONNECTIONS)
         self._workers: list[threading.Thread] = []
         self._pool_ready = False
         self._stopping = False
+        # TCPServer calls our server_close() if bind fails inside its init.
+        # The worker state must exist before entering that constructor.
+        super().__init__(addr_info, handler)
 
     def _ensure_pool(self) -> None:
         # Lazily started on the first connection: startup itself then costs
@@ -850,14 +872,14 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Qwen Image Studio local web server: serves the workspace, "
             "status/plan/config-export API and opt-in serial generation jobs. Planning "
-            "is available by default. Loopback "
-            "only. Omitted path options mean 'unconfigured': the server "
+            "is available by default. Explicit IPv4 loopback/LAN/Tailscale binds. "
+            "Omitted path options mean 'unconfigured': the server "
             "then writes nothing anywhere."
         ),
     )
-    p.add_argument("--host", default=DEFAULT_HOST,
-                   help="bind address: only the literal 127.0.0.1 is "
-                        "accepted in W2 (refused before bind otherwise)")
+    p.add_argument("--host", action="append", default=None,
+                   help="explicit IPv4 loopback, LAN or Tailscale address; repeat "
+                        "to share one job queue across listeners (default: 127.0.0.1)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT,
                    help=f"TCP port (default {DEFAULT_PORT}; 0 picks an "
                         "ephemeral port and prints the actual origin)")
@@ -889,14 +911,11 @@ def _startup_config_or_exit(paths: dict[str, str | None]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.host not in ALLOWED_BIND_HOSTS:
-        hint = ""
-        if args.host == "::1":
-            hint = (" (IPv6 loopback needs its own reviewed, actually-tested "
-                    "bind milestone — W2 refuses it)")
-        print(f"error: refusing to bind {args.host!r}: W2 binds the literal "
-              f"127.0.0.1 only{hint}; non-loopback exposure needs a reviewed "
-              "bind/auth policy milestone", file=sys.stderr)
+    hosts = list(dict.fromkeys(args.host or [DEFAULT_HOST]))
+    if len(hosts) > 8 or any(not valid_bind_host(host) for host in hosts):
+        print("error: refusing to bind: use at most eight explicit IPv4 loopback, "
+              "RFC1918 LAN or Tailscale addresses; wildcards, DNS names, public "
+              "addresses and IPv6 are unsupported", file=sys.stderr)
         return 2
     if not 0 <= args.port <= 65535:
         print("error: --port must be in [0, 65535]", file=sys.stderr)
@@ -937,16 +956,23 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 1
 
+    listeners = []
+    port = args.port
     try:
-        httpd = _Server((args.host, args.port), _Handler)
+        for host in hosts:
+            httpd = _Server((host, port), _Handler)
+            listeners.append(httpd)
+            port = int(httpd.server_address[1])
+            httpd.web_runtime = runtime
+            httpd.assets = assets
+            httpd.bound_ip = host
+            httpd.bound_port = port
     except OSError as exc:
-        print(f"error: cannot bind http://{args.host}:{args.port}: "
+        for listener in listeners:
+            listener.server_close()
+        print(f"error: cannot bind http://{host}:{port}: "
               f"{exc.strerror or exc}", file=sys.stderr)
         return 1
-    httpd.web_runtime = runtime
-    httpd.assets = assets
-    httpd.bound_ip = args.host
-    httpd.bound_port = int(httpd.server_address[1])
     httpd.generation = None
     if args.enable_generation:
         from qwen_engine.web.generation import WebGeneration
@@ -954,19 +980,20 @@ def main(argv: list[str] | None = None) -> int:
             Path(runtime.output_dir).mkdir(parents=True, exist_ok=True)
             httpd.generation = WebGeneration(runtime, trust_unbounded_host=args.attest_unbounded_host)
         except (OSError, ValueError, RuntimeError):
-            httpd.server_close()
+            for listener in listeners:
+                listener.server_close()
             print("error: generation output storage or worker could not be initialized", file=sys.stderr)
             return 1
         if args.attest_unbounded_host:
             print("notice: operator attests no cgroup RAM limit for generation; "
                   "the encoder still checks fresh host MemAvailable", file=sys.stderr)
 
-    origin = f"http://{args.host}:{httpd.bound_port}"
-    print(f"qwen-web listening on {origin}")
+    for listener in listeners:
+        listener.generation = httpd.generation
+        print(f"qwen-web listening on http://{listener.bound_ip}:{port}")
     mode = "generation enabled (serial jobs)" if httpd.generation else "planning only (no generation)"
-    print(f"qwen-web: {mode}; loopback-only local "
-          "server. Container loopback is NOT the host's or a Tailscale "
-          "peer's loopback — remote access is a later reviewed milestone.")
+    print(f"qwen-web: {mode}; explicit address binds with per-listener "
+          "Host and same-origin request checks.")
     sys.stdout.flush()
     def terminate(signum, frame):
         raise KeyboardInterrupt
@@ -974,11 +1001,20 @@ def main(argv: list[str] | None = None) -> int:
     old_term = signal.signal(signal.SIGTERM, terminate)
     stopped = True
     try:
-        httpd.serve_forever()
+        if len(listeners) == 1:
+            httpd.serve_forever()
+        else:
+            with selectors.DefaultSelector() as selector:
+                for listener in listeners:
+                    selector.register(listener, selectors.EVENT_READ)
+                while True:
+                    for key, _ in selector.select(timeout=.5):
+                        key.fileobj._handle_request_noblock()
     except KeyboardInterrupt:
         pass
     finally:
-        httpd.server_close()
+        for listener in listeners:
+            listener.server_close()
         if httpd.generation is not None:
             stopped = httpd.generation.close()
         signal.signal(signal.SIGTERM, old_term)

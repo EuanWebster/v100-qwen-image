@@ -6,6 +6,10 @@ manifest verification and adapter/encoder checks. ComfyUI is not involved.
 
 ## Run
 
+For this host with LAN and Tailscale access, use the executable
+`./start-web.sh`. Addresses and overrides: [LAN/Tailscale startup](lan-tailscale.md).
+The manual command below retains the default localhost-only bind.
+
 From the repository with its ML virtual environment active:
 
 ```bash
@@ -70,7 +74,7 @@ Adapter/encoder checks and real execution failures remain authoritative.
 
 ## HTTP contract
 
-All existing loopback, exact Host/Origin, same-origin fetch, body/timeout limits,
+The default loopback bind, exact Host/Origin, same-origin fetch, body/timeout limits,
 `X-Qwen-UI: 1`, JSON-only writes, defensive headers and static allowlists remain.
 No arbitrary filesystem route is added.
 

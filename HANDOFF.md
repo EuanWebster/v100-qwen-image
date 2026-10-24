@@ -6,6 +6,9 @@
 > recorded; exact calibration preflight is not wired into generation. W3 now
 > supports real web generation, Preview, session History, cancellation and
 > measured timings. A real browser-driven 1024²/20-step run took 86.7 seconds.
+> Executable `./start-web.sh` now binds localhost, LAN192.168.68.103 and
+> Tailscale100.98.64.62 on8765 with one shared queue; see
+> [LAN/Tailscale startup](docs/lan-tailscale.md).
 > NVIDIA ComfyUI remains installed but stopped for engine testing.
 > Read [W3 instructions](docs/web-generation-w3.md),
 > [the W3 handoff](docs/handoffs/2026-10-24-w3-generation.md)

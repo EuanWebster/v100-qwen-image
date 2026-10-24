@@ -279,7 +279,8 @@
         loads no external fonts, scripts or analytics; its only requests
         are same-origin calls to the local server. Plain static hosting
         serves these files but enforces nothing by itself — locality is
-        enforced by the qwen-web server binding loopback only.</dd></div>
+        controlled by the qwen-web server's explicit bind addresses. Remote
+        access uses the LAN or Tailscale address selected by the operator.</dd></div>
       <div><dt>Drafts</dt><dd>Nothing is saved by the browser automatically.
         An opt-in draft store for validated form values may come later.</dd></div>
     </dl>
