@@ -9,6 +9,11 @@
 > Executable `./start-web.sh` now binds localhost, LAN192.168.68.103 and
 > Tailscale100.98.64.62 on8765 with one shared queue; see
 > [LAN/Tailscale startup](docs/lan-tailscale.md).
+> **Roadmap expanded 2026-10-24:** editing with one/up to ten references,
+> native transparent output, official eight-step Turbo, all seven upstream
+> aspect ratios and optional reviewed prompt rewriting are now planned in
+> PLAN M6.2/M8/W4. Q8 + calibrated memory preflight remain next GPU work.
+> See [the upstream/local-Qwen review](docs/upstream-feature-roadmap-2026-10-24.md).
 > NVIDIA ComfyUI remains installed but stopped for engine testing.
 > Read [W3 instructions](docs/web-generation-w3.md),
 > [the W3 handoff](docs/handoffs/2026-10-24-w3-generation.md)

@@ -3,8 +3,15 @@
 Hand-rolled Qwen-Image-2.1 generation pipeline for a Tesla V100 16GB, structured like
 the LTX-2.5 ROCm build (engine / front-end split, subprocess encoder, VRAM calibration).
 
-Status: **current executable plan, revised 2026-10-07; senior-review fix pass on
-`f6325d0`.** This revision supersedes the original draft (committed as `df59ce7`) and
+Status: **roadmap extended 2026-10-24 at Euan's request** with single/multi-reference
+editing, native transparent generation, official 8-step Turbo, all upstream aspect
+presets and optional prompt rewriting (M6.2/M8/W4). These are **planned**, not newly
+implemented by this revision. Q8 + measured memory preflight remain the next GPU
+work. Upstream evidence and two local Qwen planning reviews:
+[feature review](docs/upstream-feature-roadmap-2026-10-24.md).
+
+The original executable plan was revised 2026-10-07, with senior-review fixes on
+`f6325d0`. It superseded the original draft (committed as `df59ce7`) and
 incorporates every correction and confirmed requirement in `HANDOFF.md` (committed as
 `08bde4b`) — all of those corrections remain in force. The supersession ledger in
 *Corrections applied* below records what changed and why; the senior-review ledger
@@ -17,30 +24,33 @@ benchmark schemas, and fresh-environment test requirements.
 
 ## Goal
 
-Generate high-quality images with Qwen-Image-2.1 at 1024×1024 on a single 16GB Volta
-card (2K as an experimental opt-in whose feasibility is **not yet demonstrated**), with a
+Generate and edit high-quality images with Qwen-Image-2.1 on a single 16GB Volta
+card, preserving 1024×1024 as the default. Square 2K has been demonstrated;
+other shapes and new workflows need their own V100 measurements. Use a
 local **web workspace** as the primary front-end (2026-10-12 pivot — replaces the
 deferred desktop GUI; the headless CLI stays; design in `docs/web-interface.md`)
-and a conservative memory policy that refuses anything it cannot
-clear from calibration (R4/M5.3 — no uncalibrated guarantees, per C8).
+and integrate the conservative calibrated memory policy (R4/M5.3). The policy
+consumer and collector exist, but generation preflight is **not yet wired**;
+current submission availability must not be presented as a memory-fit guarantee.
 Maximum image quality takes priority; speed is improved where possible, with no
 user-specified hard generation-time limit.
 
 ---
 
-## Confirmed requirements (spec — from Euan, confirmed 2026-10-07 in the review)
+## Confirmed requirements (2026-10-07 baseline; scope expanded 2026-10-24)
 
 1. A single Tesla V100 16GB is a **firm requirement** at this time.
 2. **Maximum image quality takes priority.** Improve speed where possible; there is no
    hard generation-time limit.
-3. **Text-to-image first.** Editing and RGBA workflows are not required for the first
-   usable version.
+3. **Text-to-image first**, now delivered. Euan's 2026-10-24 request adds single- and
+   multi-reference image editing and transparent generation as subsequent milestones.
 4. All discussed categories may be needed — photographic portraits, landscapes,
    illustrations, product images, text-heavy designs. Evaluate on a **balanced genre
    set**, never optimized for one genre.
 5. **Preserve existing services.** Do not assume the AMD GPUs or the machine's full RAM
    are available to this project.
-6. 1024×1024 default; 2K is an **experimental opt-in**, feasibility unproven.
+6. 1024×1024 default; 2K remains an **experimental opt-in**. Square FP16 2K/20
+   steps has run successfully; this does not establish every shape/mode fits.
 7. Hardware bring-up (driver install + container GPU passthrough) is in scope, done by
    the project at the software layer; physical installation, cooling and power are
    Euan's.
@@ -50,8 +60,20 @@ user-specified hard generation-time limit.
    streaming offload, subprocess encoder, embedding cache, VRAM guard, CLI. Not
    hand-rolled: the DiT forward / attention mask (upstream implements them; hand-rolling
    buys zero quality and adds a large bug surface).
+9. Add image editing with one reference and an ordered collection of references;
+   target the upstream maximum of ten, with the usable V100 envelope measured.
+10. Add native transparent/RGBA generation with alpha preserved in previews and PNGs.
+11. Add the official **8-step Turbo** option while keeping base quality mode available.
+12. Expose every upstream recommended aspect ratio and its canonical dimensions.
+13. Add optional **prompt rewriting**, with the original retained and a visible
+    review/apply step for the rewrite and any suggested aspect change.
 
-## Environment snapshot
+## Historical environment snapshot (2026-10-07)
+
+This table is historical. The V100 is now installed and the host CLI/web app
+generates images; use `memctl brief v100-qwen-image`, `HANDOFF.md`, and the dated
+generation measurements for current state. GPU-absence gates below describe the
+original bring-up sequence, not a present blocker.
 
 Read-only checks **inside this sandbox on 2026-10-07** (replaces the stale 2026-10-06
 host table; host observations do not prove container state):
@@ -145,7 +167,7 @@ CPU tests never touch a heavy ML import:
 | `qwen_engine/manifest.py` | **Versioned model-manifest schema + `resolve_model_path`** — pinned repo/revision/artifact/sha256/size contract, existence/size verification, **no-download policy** (R3; schema in M2.1). | stdlib |
 | `qwen_engine/local_bundle.py` | **Local reference-bundle contract (M2.2a)** — trusted factory `resolve_local_bundle` runs `resolve_manifest` itself (explicit full-rehash cost) before projecting into role-grouped adapter `assets` plus explicit component dirs under an explicit model root; lower-level `project_resolution_report` **trusts its caller's report** (never authenticated evidence). Enforces the committed 24-file full-reference layout table and the profile's **exact pinned repo/revision**, plus a coherence-checked success claim (`errors`/per-status `error`/`resolved` mapping); publishes **absolute, CWD-stable paths**; closed-tree `preflight_closed_tree` refuses any entry beyond the allowlist before a future `from_pretrained`; construction-time scalar invariants + defensive freezing; version-tagged artifact-set fingerprints (encoder digest = **asset component only** of the future worker cache key). No downloads, no ML imports. | manifest types, stdlib |
 | `qwen_engine/adapters/base.py` | **Pipeline adapter protocol** the engine core calls (`load`, `encode`, `denoise`, `decode`, `save`) plus dry-run status types. Deliberately **no `plan` method** — dry-run planning is adapter-independent (`core.plan()` builds the document itself). The core runs end-to-end against a fake adapter in tests. | config/manifest/memory/log types |
-| `qwen_engine/adapters/qwen21_diffusers.py` | The eventual `Qwen21DiffusersAdapter` — the **only** module that imports torch / diffusers / transformers, and those imports are deferred *inside* the adapter (lazy), executed only on an actual run. Does not exist yet; stubbing it at M1 is a boundary violation the import test catches. | torch, diffusers, transformers |
+| `qwen_engine/adapters/qwen21_diffusers.py` | Working `Qwen21DiffusersAdapter`: verified local FP16 resident loading, phase-exclusive model residency, large-image MLP chunking, tiled decode and actual step-progress forwarding over `supplied_qwen21.py`. ML imports are deferred to runtime adapter/encoder paths. Editing, official Turbo and Q8 need the planned extensions; they are not current supported loader modes. | torch, diffusers, transformers (lazy) |
 | `qwen_engine/log.py` | Structured **phase/event logging**: JSONL events `{ts, phase, event, elapsed_ms, counters…}` to a configurable sink, plus human-readable phase lines. Shared by engine, CLI and bench. | stdlib |
 | `qwen_engine/memory.py` | **Memory-policy** descriptor + verdict logic (R4; detail in M5.3): "does this config fit *right now*?" from calibrated observations, current free memory, and headroom; conservative on unknown; stale calibration invalidated (C8). (Supersedes the draft's standalone `vramfit.py` naming.) | config/manifest/log types |
 | `qwen_engine/encoder.py` | Encoder **subprocess worker + embedding cache** (port `run_subprocess_logged`; key **v3** — v2 plus the optional immutable `EncoderImplementationIdentity` (M2.2b foundation): encoder artifact-set digest (**asset component only**, never the whole key), worker protocol/implementation + prompt-extraction revisions, exact diffusers/transformer commits, torch build/version, safetensors/torchvision versions; generic fake requests may carry none, a production worker must require one; atomic writes, quarantine, timeout/cancel, bounded worker responses, fake-worker tests — R5; detail in M1.4/M2.2b). | stdlib |
@@ -352,6 +374,10 @@ unexpected (logged with context, traceback only into the log sink).
   resident **Q8** and other higher-quality quants compared against it (numerical
   comparison on equivalent execution paths + human eval on the genre set). Q4 only as a
   capacity fallback with the quality delta documented (C3).
+  Q8 is the next GPU feature: first prove a V100-compatible weight-only loading /
+  dequantization path in an isolated review environment, pin verified artifacts,
+  then compare fixed prompts/seeds at 1K and 2K for quality, time and peak memory.
+  Keep the working FP16 path available; Q8 is not implemented or a speed guarantee.
 - **5.2** Streaming block offload mode where it preserves quality or is needed for
   capacity; cost it against the measured link (M3.4). Equivalence test: streamed vs
   resident at fixed seed, max abs diff within fp16 tolerance — this is an *equivalent
@@ -388,10 +414,22 @@ unexpected (logged with context, traceback only into the log sink).
   knob only (C6). No pre-asserted GB ceiling; the guard from 5.3 decides per-run from
   calibrated data — and while 2K calibration is still missing, each 2K experiment runs
   explicitly under `--expert-override` (logged), per R4.
-- **6.2** Optional accelerator study — `Viggle/Qwen-Image-2.1-viggle-turbo` v0.3 (6
-  steps, prescribed sigmas/scheduler; LoRA unmerged or FP32-merged pre-quantization per
-  its card) — evaluated against the base recipe by human eval on the genre set; ships
-  only as an opt-in preset if quality holds (C4/C7).
+- **6.2 — Official 8-step Turbo (planned, added 2026-10-24).** Integrate
+  [Qwen/Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo)
+  as a distinct, verified model/recipe identity with
+  its saved eight-step sampling schedule and CFG=1. Reducing base-model steps
+  to eight does not implement this mode. Review pipeline-configured schedule
+  support against our pinned Diffusers code in isolation before changing locks;
+  pin the new checkpoint/config hashes and record the effective sigmas/steps.
+  Architecture similarity does not prove weight identity or permit reuse of
+  base calibration. Prove FP16 numerical finiteness on V100 and benchmark full
+  wall time, quality and memory at 1K before 2K and edit/RGBA combinations.
+  Preserve base/40 as the quality default; evaluate Turbo by human genre review,
+  with a regression reference per recipe, not cross-recipe pixel equality.
+  Eight steps do not establish a lower peak-memory requirement or a fixed
+  wall-time speedup. UI, progress totals and job records must reflect the actual
+  schedule. The previously listed Viggle six-step LoRA remains separate optional
+  research, lower priority than this official mode (C4/C7 still apply).
 
 ### M7 — Bench, calibrate, document
 
@@ -401,7 +439,112 @@ unexpected (logged with context, traceback only into the log sink).
 - **7.2** `README.md` (what fits at what cost, commands) + `docs/bringup.md` (V100
   driver/CDI/PCIe trail for the next Volta box).
 
-### W — Web workspace milestones (2026-10-12 pivot: the web UI is the primary interface; CLI + engine unchanged)
+### M8 — Remaining upstream capabilities (planned, requested 2026-10-24)
+
+Source: [official README at reviewed revision](https://github.com/QwenLM/Qwen-Image-2.1/blob/ab96caa944157ca28a4f36b695c3047549f48f98/README.md).
+See [the feature review](docs/upstream-feature-roadmap-2026-10-24.md) for evidence,
+current-code findings and local Qwen review provenance. Upstream support is a
+capability target, **not proof of fit or quality on this 16GB V100**.
+
+**Shared delivery gates:** preserve FP16/base T2I and existing services. Extend
+versioned config, manifest/runtime identity, CLI, web job snapshots, metadata,
+progress/cancellation and calibration descriptors for each new mode. First wire
+M5.3 and measure the new descriptors: reference count/order, processed image
+sizes and conditioning lengths, recipe/schedule, alpha/decode mode and quant.
+Use fresh GPU/host budgets with measured headroom; invent no fixed memory or
+latency thresholds. Model downloads remain an explicit operator action.
+
+- **8.1 — All recommended aspect presets.** Add the complete table below to the
+  shared preset source and both front-ends. These are rounded upstream pixel
+  sizes associated with nominal ratio labels. Replace/correct the current
+  2688×1536 / 1536×2688 convenience presets when labeling canonical 16:9/9:16;
+  retain user custom dimensions and saved jobs unchanged. Preserve 1K choices;
+  smaller counterparts must satisfy the 32-pixel alignment rule, so do not
+  blindly halve every upstream size. Reuse this mapping for rewrite suggestions.
+
+  | Ratio | Canonical upstream 2K dimensions |
+  |---|---|
+  | 1:1 | 2048×2048 |
+  | 4:3 | 2400×1792 |
+  | 3:4 | 1792×2400 |
+  | 3:2 | 2528×1696 |
+  | 2:3 | 1696×2528 |
+  | 16:9 | 2752×1536 |
+  | 9:16 | 1536×2752 |
+
+  Acceptance: exact dimensions/pressed states/preview ratio/tiling and plan
+  staleness agree in CLI/web. Record V100 peak memory, timing and image review
+  per shape before treating it as calibrated; missing evidence stays explicit.
+  Existing square-only 2K proof does not clear the other six shapes.
+
+- **8.2 — Native transparent generation (RGBA).** Add an explicit transparent
+  output choice and visible effective-prompt handling using the upstream RGBA
+  guidance. Keep the user's original prompt and record any applied wrapper;
+  do not simulate transparency by painting a checkerboard into RGB pixels.
+  Our decoder already validates four channels and the saver accepts RGB/RGBA;
+  audit the postprocessor and expose/verify native alpha end to end rather than
+  introducing another model by default. Preserve alpha through decode, tiling,
+  saved PNGs, downloads and thumbnails; use checkerboard only as UI background.
+  Acceptance: meaningful partially/fully transparent pixels, visual inspection
+  over light/dark backgrounds (fine edges/translucency), no opaque-only false
+  pass, correct dimensions and an unchanged opaque T2I baseline. Calibrate alpha
+  output at 1K then 2K; check tile boundaries in alpha as well as color.
+
+- **8.3 — Single-reference image editing.** Extend the CPU encoder worker's
+  production request/response and pinned vision preprocessing to condition on
+  an image; current production validation explicitly rejects images and the
+  bridge calls T2I with `image=None`. Implement image-aware embeddings/masks,
+  reference VAE latents and the reviewed upstream attention/prefix-cache path;
+  deleting the rejection alone is insufficient. Use server-owned immutable
+  upload handles/CLI local input snapshots, bounded compressed and decoded image
+  sizes and recorded orientation/color/alpha preprocessing. Browser inputs may
+  not choose server paths or make the server fetch arbitrary URLs.
+  Acceptance: a real 1K V100 instruction-driven edit with preserved requested
+  content, finite tensors and correct output; changed input bytes cause a cache
+  miss; fresh/cached execution agrees for the same complete input identity;
+  cancel/failure cleans owned work without deleting source images or saved output.
+  Then measure 2K and opaque/transparent input/output combinations separately.
+
+- **8.4 — Multiple reference images.** Extend the single-reference path to an
+  ordered list, targeting upstream's maximum of ten. Show numbered thumbnails,
+  add/remove/reorder controls and unambiguous prompt references to that order.
+  Include processed image content, ordered identities, preprocessing and vision
+  implementation revisions in conditioning-cache keys; full job metadata also
+  records seed/schedule/output settings without needlessly making embedding
+  keys depend on sampler-only settings. Validate counts, per-image resolution,
+  total conditioning tokens and memory together. Measure 2, 4, then higher
+  counts through 10 where feasible; expose the measured V100 limits clearly.
+  Acceptance: meaningful multi-subject composition/identity preservation,
+  reordering and replacing inputs invalidate conditioning correctly, request
+  ownership remains immutable, and unsupported combinations refuse before load.
+  Ten upstream inputs are a target, not a promise that ten full-size images fit.
+
+- **8.5 — Optional prompt rewriting for generation and editing.** Evaluate the
+  official [PE-T2I](https://huggingface.co/Qwen/Qwen-Image-2.1-PE-T2I) and
+  [PE-I2I](https://huggingface.co/Qwen/Qwen-Image-2.1-PE-I2I) models
+  (Qwen3.5-VL 9B) and their `prompt_rewrite/` code as separate pinned assets and
+  an independently measured runtime, not the existing base encoder. Keep this
+  local and optional. Measure CPU and V100-compatible quantized/serial options;
+  release rewriter residency before image generation and preserve other services.
+  Do not assume current vLLM or BF16 examples work on Volta, or that the planning
+  model on port8079 is equivalent to the official PE checkpoints.
+  UX: explicit Rewrite action → show original/proposal → Edit/Apply/Keep original.
+  Validate bounded structured output (`rewritten_prompt`, `wh_ratio`, and editing
+  `ratio_follow`); ratio suggestions and reference selection must be valid and
+  explicitly accepted before dimensions change. Retain original/effective text,
+  provider/model revision, applied suggestions and reference order in job records.
+  Acceptance: preserve subject/count/text/edit intent and language handling;
+  no silent changes, stale responses, malformed-output application or hidden
+  external fallback. Cancellation/timeout keeps the original draft intact.
+
+**Suggested sequence:** Q8 feasibility + M5.3 integration; complete aspect catalog
+and RGBA audit; official Turbo; single-reference then multiple-reference editing;
+rewriter feasibility can proceed independently, with editing rewriting following
+reference support. Base quality mode remains usable throughout. Persistent job
+history is a recommended companion task before repeated deployment restarts;
+it is not claimed implemented by this feature-plan update.
+
+### W — Web workspace milestones (2026-10-12 pivot: web primary, shared engine + CLI retained)
 
 Visual/UX reference only (inspected, not vendored): FlashML-org/FreeVideo `web/`
 studio layout — header + left controls / right stable preview, progressive
@@ -492,6 +635,16 @@ disclosure, stat cards, creations history. Engine stays ComfyUI-free.
 
 ---
 
+- **W4 (planned, 2026-10-24)** — expose M6.2/M8 through the existing job engine:
+  base/Turbo recipe choice, full ratio catalog, transparent-output toggle,
+  single/ordered-multiple reference upload/review, and explicit prompt rewrite
+  preview/apply. Keep model/memory readiness truthful; route uploads through
+  bounded server-owned staging and job snapshots, never browser runtime paths.
+  Persist enough effective prompt/reference/recipe/output identity to reproduce
+  a result. Verify alpha preview/download, stale rewrite handling, progress with
+  actual recipe steps, cancellation and desktop/mobile accessibility in real
+  Chrome. This is planned UI work, not a newly enabled capability.
+
 ## Tests / validation
 
 - Full: `cd /work && .venv/bin/pytest -q`; every numbered task ships a test.
@@ -539,9 +692,12 @@ disclosure, stat cards, creations history. Engine stays ComfyUI-free.
 **Open questions (none block M0/M1):**
 1. Which resident quant survives the quality ladder (5.1) — measurement + Euan's eye,
    not folklore.
-2. Whether Viggle turbo quality holds as an opt-in preset (6.2).
-3. In-sandbox model storage path/mount (2.1).
-4. ~~GUI front-end — deliberately out (YAGNI; CLI per spec).~~ **Resolved
+2. Whether official eight-step Turbo quality holds on V100 (6.2), and later
+   whether the separate third-party six-step LoRA merits another mode.
+3. What reference-count/input-resolution envelope fits for editing (8.3/8.4),
+   and where to run the separate 9B rewriters without displacing existing services.
+4. In-sandbox model storage path/mount (2.1).
+5. ~~GUI front-end — deliberately out (YAGNI; CLI per spec).~~ **Resolved
    2026-10-12:** pivot to a local web workspace as the primary interface
    (W milestones above; `docs/web-interface.md`). CLI and engine kept.
 
