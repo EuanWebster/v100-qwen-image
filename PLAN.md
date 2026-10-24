@@ -1460,3 +1460,8 @@ standing rule that executed plans stay honest.)*
   in `web_static/app.js` (it rejects any payload with a different gate set, so
   a server-only edit breaks the page), the handler guard/copy and both web
   test files. Recorded in docs/web-interface.md.
+  Reproducibility checks (512²/20/seed42): two consecutive runs are
+  byte-identical (sha256 69726d86…), and a third run with a freshly emptied
+  embedding cache (cold encode, 1m05s) is byte-identical too — the disk
+  embedding cache returns the conditioning it stored without perturbing
+  sampling.

@@ -67,6 +67,19 @@ A 2K run would exceed this envelope with the resident profile; it needs the
 M5 memory work (streamed/offloaded components or a smaller decode footprint)
 before it can be attempted.
 
+## Reproducibility and cache correctness
+
+At 512²/20 steps, seed 42, identical prompt:
+
+* Two consecutive runs produced **byte-identical PNGs**
+  (`sha256 69726d86…`), and
+* a third run with a **fresh embedding cache** (cold encoder, 1 m 05 s wall)
+  produced the same `sha256`, so the disk embedding cache returns the same
+  conditioning it stored and does not perturb sampling.
+
+This is determinism for one prompt/seed/config on this build; it is not a
+claim about other resolutions, CFG settings or hardware.
+
 ## Text rendering and guidance
 
 * Prompt-following and text rendering check (1024², 40 steps, seed 7,
