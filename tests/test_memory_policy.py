@@ -167,7 +167,7 @@ def test_clock_fault_refuses_without_masking_or_fake_time(evidence, monkeypatch)
     assert not result.allowed and "current_time_unknown" in result.reasons
 
 
-@pytest.mark.parametrize("field,value", [("phase", []), ("phase", "denoise"), ("schema", "wrong"),
+@pytest.mark.parametrize("field,value", [("phase", []), ("phase", "sampling"), ("schema", "wrong"),
     ("width", True), ("width", 100), ("height", 8192), ("steps", 0), ("steps", 1001),
     ("backend", "auto"), ("backend", []), ("quant_format", ""), ("residency", "auto"),
     ("cfg_active", 1), ("vae_tiled_decode", 1), ("encoder_dtype", "auto"),
@@ -263,3 +263,14 @@ def test_wrong_profile_refuses_even_when_calibration_matches(evidence):
 def test_device_identity_labels_bounded_and_typed(evidence, field, value):
     with pytest.raises(m.MemoryPolicyError, match="device identity"):
         replace(evidence[1].device, **{field: value})
+
+
+def test_whole_loop_denoise_phase_is_distinct_from_an_indexed_step(evidence):
+    """A whole-loop peak is conservative evidence; it never matches a step."""
+    descriptor, resources, sample = evidence
+    whole = replace(descriptor, phase="denoise")
+    assert whole.step_index is None
+    result = assess((whole, resources, replace(sample, descriptor=whole)))
+    assert result.allowed and result.matching_samples == 1
+    with pytest.raises(m.MemoryPolicyError, match="step index"):
+        replace(descriptor, phase="denoise", step_index=0)

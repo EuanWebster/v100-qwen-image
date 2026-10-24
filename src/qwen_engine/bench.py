@@ -25,6 +25,15 @@ Schemas
   matching observations still have to be matched on the conditioning
   fields (phase/tokens/resolution/residency/CFG/VAE/prompt length) by the
   consumer at M5.3; equivalence is *not* implied here.
+
+The v1 observation was later extended with **optional exactness fields**
+(step count, CFG/negative length, dtypes, KV policy, step index, cache hit,
+artifact-set and generation-runtime digests, device identity, device-wide
+GPU peak and owned-process-tree host peak). They are optional so records
+written before the collector existed still load — and remain **ineligible**
+for the memory policy, because a missing field is unknown, never guessed.
+Only a record carrying every exactness field can be bridged to
+``qwen_engine.memory`` (see ``qwen_engine.calibration``).
 """
 from __future__ import annotations
 
@@ -644,7 +653,27 @@ _OBS_KEYS = {"schema", "observed_at", "phase", "model_revision", "backend",
              "quant", "residency", "vae_tiled_decode", "cfg_duplicated",
              "tokens", "resolution", "peak_gpu_allocated_bytes",
              "peak_gpu_reserved_bytes", "peak_host_rss_bytes",
-             "prompt_tokens"}
+             "prompt_tokens",
+             # Exactness extension (optional; absent = legacy/ineligible).
+             "steps", "negative_prompt_tokens", "cfg_active", "encoder_dtype",
+             "execution_dtype", "use_kv_cache", "step_index",
+             "embedding_cache_hit", "artifact_set_sha256",
+             "runtime_identity_sha256", "device_uuid", "device_architecture",
+             "driver_version", "cuda_build", "peak_gpu_used_bytes",
+             "peak_host_tree_bytes"}
+
+#: The exactness fields. Every one is required before the memory policy may
+#: trust a record, except ``negative_prompt_tokens`` (None exactly when CFG
+#: is inactive) and ``step_index`` (None exactly outside ``denoise-step``);
+#: :func:`qwen_engine.calibration.missing_exact_fields` applies those rules.
+EXACT_OBSERVATION_FIELDS = (
+    "steps", "prompt_tokens", "negative_prompt_tokens", "cfg_active",
+    "encoder_dtype", "execution_dtype", "use_kv_cache", "step_index",
+    "embedding_cache_hit", "artifact_set_sha256", "runtime_identity_sha256",
+    "device_uuid", "device_architecture", "driver_version", "cuda_build",
+    "peak_gpu_reserved_bytes", "peak_gpu_used_bytes", "peak_host_rss_bytes",
+    "peak_host_tree_bytes",
+)
 
 
 @dataclass(frozen=True)
@@ -677,6 +706,28 @@ class CalibrationObservation:
     #: invented length. Kept so future calibration conditioning (M5.3) does
     #: not have to re-derive prompt length from the prompt itself.
     prompt_tokens: int | None = None
+    # -- exactness extension (all optional; null = not recorded) ------------
+    # A record with any of these unknown is legacy evidence: loadable, but
+    # refused by the memory-policy bridge rather than partially trusted.
+    steps: int | None = None
+    negative_prompt_tokens: int | None = None
+    cfg_active: bool | None = None
+    encoder_dtype: str | None = None
+    execution_dtype: str | None = None
+    use_kv_cache: bool | None = None
+    step_index: int | None = None
+    embedding_cache_hit: bool | None = None
+    artifact_set_sha256: str | None = None
+    runtime_identity_sha256: str | None = None
+    device_uuid: str | None = None
+    device_architecture: str | None = None
+    driver_version: str | None = None
+    cuda_build: str | None = None
+    #: Device-wide used peak (NVML/CUDA), including context and non-Torch
+    #: allocations. ``peak_gpu_reserved_bytes`` alone is not a GPU footprint.
+    peak_gpu_used_bytes: int | None = None
+    #: Peak summed RSS of the owned process tree (job + encoder child).
+    peak_host_tree_bytes: int | None = None
     schema: str = OBSERVATION_SCHEMA
 
     def __post_init__(self) -> None:
@@ -706,6 +757,22 @@ class CalibrationObservation:
             "peak_gpu_reserved_bytes": self.peak_gpu_reserved_bytes,
             "peak_host_rss_bytes": self.peak_host_rss_bytes,
             "prompt_tokens": self.prompt_tokens,
+            "steps": self.steps,
+            "negative_prompt_tokens": self.negative_prompt_tokens,
+            "cfg_active": self.cfg_active,
+            "encoder_dtype": self.encoder_dtype,
+            "execution_dtype": self.execution_dtype,
+            "use_kv_cache": self.use_kv_cache,
+            "step_index": self.step_index,
+            "embedding_cache_hit": self.embedding_cache_hit,
+            "artifact_set_sha256": self.artifact_set_sha256,
+            "runtime_identity_sha256": self.runtime_identity_sha256,
+            "device_uuid": self.device_uuid,
+            "device_architecture": self.device_architecture,
+            "driver_version": self.driver_version,
+            "cuda_build": self.cuda_build,
+            "peak_gpu_used_bytes": self.peak_gpu_used_bytes,
+            "peak_host_tree_bytes": self.peak_host_tree_bytes,
         }
 
     @classmethod
@@ -740,6 +807,22 @@ class CalibrationObservation:
                    peak_gpu_reserved_bytes=data.get("peak_gpu_reserved_bytes"),
                    peak_host_rss_bytes=data.get("peak_host_rss_bytes"),
                    prompt_tokens=data.get("prompt_tokens"),
+                   steps=data.get("steps"),
+                   negative_prompt_tokens=data.get("negative_prompt_tokens"),
+                   cfg_active=data.get("cfg_active"),
+                   encoder_dtype=data.get("encoder_dtype"),
+                   execution_dtype=data.get("execution_dtype"),
+                   use_kv_cache=data.get("use_kv_cache"),
+                   step_index=data.get("step_index"),
+                   embedding_cache_hit=data.get("embedding_cache_hit"),
+                   artifact_set_sha256=data.get("artifact_set_sha256"),
+                   runtime_identity_sha256=data.get("runtime_identity_sha256"),
+                   device_uuid=data.get("device_uuid"),
+                   device_architecture=data.get("device_architecture"),
+                   driver_version=data.get("driver_version"),
+                   cuda_build=data.get("cuda_build"),
+                   peak_gpu_used_bytes=data.get("peak_gpu_used_bytes"),
+                   peak_host_tree_bytes=data.get("peak_host_tree_bytes"),
                    schema=data.get("schema"))
 
 
@@ -778,8 +861,70 @@ def validate_observation_fields(obs: CalibrationObservation) -> list[str]:
                        for v in res)):
         _bad(errors, "resolution", f"must be two positive ints, got {res!r}")
     for name in ("peak_gpu_allocated_bytes", "peak_gpu_reserved_bytes",
-                 "peak_host_rss_bytes"):
+                 "peak_host_rss_bytes", "peak_gpu_used_bytes",
+                 "peak_host_tree_bytes"):
         _check_optional_bytes(getattr(obs, name), name, errors)
+    # -- exactness extension ------------------------------------------------
+    if obs.steps is not None and (
+            isinstance(obs.steps, bool) or not isinstance(obs.steps, int)
+            or obs.steps < 1):
+        _bad(errors, "steps", f"must be a positive integer or null, got {obs.steps!r}")
+    if obs.negative_prompt_tokens is not None and (
+            isinstance(obs.negative_prompt_tokens, bool)
+            or not isinstance(obs.negative_prompt_tokens, int)
+            or obs.negative_prompt_tokens < 1):
+        _bad(errors, "negative_prompt_tokens",
+             f"must be a positive integer or null, got {obs.negative_prompt_tokens!r}")
+    for name in ("cfg_active", "use_kv_cache", "embedding_cache_hit"):
+        value = getattr(obs, name)
+        if value is not None and not isinstance(value, bool):
+            _bad(errors, name, f"must be a boolean or null, got {value!r}")
+    if obs.cfg_active is False and obs.negative_prompt_tokens is not None:
+        _bad(errors, "negative_prompt_tokens",
+             "inactive CFG must not carry a negative encoding length")
+    if obs.step_index is not None and (
+            isinstance(obs.step_index, bool) or not isinstance(obs.step_index, int)
+            or obs.step_index < 0):
+        _bad(errors, "step_index",
+             f"must be a non-negative integer or null, got {obs.step_index!r}")
+    elif obs.phase == "denoise-step" and obs.step_index is None:
+        _bad(errors, "step_index", "required for phase 'denoise-step'")
+    elif obs.phase != "denoise-step" and obs.step_index is not None:
+        _bad(errors, "step_index", "applies only to phase 'denoise-step'")
+    for name in ("encoder_dtype", "execution_dtype"):
+        value = getattr(obs, name)
+        if value is not None and (
+                not isinstance(value, str) or not value.strip()
+                or not value.isascii() or len(value) > 64):
+            _bad(errors, name, f"must be a short ASCII label or null, got {value!r}")
+    for name in ("artifact_set_sha256", "runtime_identity_sha256"):
+        value = getattr(obs, name)
+        if value is not None and (
+                not isinstance(value, str) or not _SHA256_RE.fullmatch(value)):
+            _bad(errors, name, f"must be 64 lowercase hex chars or null, got {value!r}")
+    for name in ("device_uuid", "device_architecture", "driver_version",
+                 "cuda_build"):
+        value = getattr(obs, name)
+        if value is not None and (
+                not isinstance(value, str) or not value.strip()
+                or not value.isascii() or len(value) > 128):
+            _bad(errors, name, f"must be a short ASCII label or null, got {value!r}")
+    # Footprint ordering: a phase peak is a nested set of measurements.
+    if (obs.peak_gpu_allocated_bytes is not None
+            and obs.peak_gpu_reserved_bytes is not None
+            and obs.peak_gpu_allocated_bytes > obs.peak_gpu_reserved_bytes):
+        _bad(errors, "peak_gpu_allocated_bytes",
+             "cannot exceed peak_gpu_reserved_bytes")
+    if (obs.peak_gpu_reserved_bytes is not None
+            and obs.peak_gpu_used_bytes is not None
+            and obs.peak_gpu_reserved_bytes > obs.peak_gpu_used_bytes):
+        _bad(errors, "peak_gpu_reserved_bytes",
+             "cannot exceed device-wide peak_gpu_used_bytes")
+    if (obs.peak_host_rss_bytes is not None
+            and obs.peak_host_tree_bytes is not None
+            and obs.peak_host_rss_bytes > obs.peak_host_tree_bytes):
+        _bad(errors, "peak_host_rss_bytes",
+             "cannot exceed the owned-process-tree peak")
     return errors
 
 

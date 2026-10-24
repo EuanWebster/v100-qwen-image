@@ -90,6 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "memory limit, so the CPU encoder gate uses the freshly read "
                         "host MemAvailable alone (default: the gate refuses when the "
                         "cgroup scope cannot be proven)")
+    p.add_argument("--calibration-record", type=Path, default=None, metavar="PATH",
+                   help="opt-in measured-memory collector: sample device-wide NVML "
+                        "and owned-process-tree peaks per phase and append exact "
+                        "calibration observations to PATH (requires --run). A "
+                        "mid-run measurement failure keeps the generated image but "
+                        "exits 1 without writing a record")
     # Field overrides (take precedence over --config):
     p.add_argument("--prompt")
     p.add_argument("--negative", default=None)
@@ -207,15 +213,41 @@ def _make_adapter(*, trust_unbounded_host: bool = False) -> Any:
 
 def _run_generate(config: GenerationConfig, logger: PhaseLogger,
                   assets: Any = None, adapter: Any = None,
-                  trust_unbounded_host: bool = False) -> int:
+                  trust_unbounded_host: bool = False,
+                  calibration_record: Path | None = None) -> int:
     # Refuse an unconfigured output BEFORE the adapter exists at all: an
     # adapter import/load failure is an exit-1 boundary and must not mask
     # the config-error-2 for a run with nowhere to save.
     require_run_config(config)
     adapter = adapter if adapter is not None else _make_adapter(
         trust_unbounded_host=trust_unbounded_host)
-    result = generate(config, adapter, assets or {}, logger)
+    collector = None
+    if calibration_record is not None:
+        # Measurement setup happens before the load phase so its samples
+        # cover the whole run. A setup failure refuses the run: an explicit
+        # measurement request is never silently ignored.
+        from qwen_engine.calibration import CalibrationCollector
+
+        collector = CalibrationCollector(config, record_path=calibration_record)
+        # Bind before sampling: an adapter that cannot report measured facts
+        # refuses the run before any device state is touched.
+        collector.bind(adapter)
+        collector.start()
+    try:
+        result = generate(
+            config, adapter, assets or {}, logger,
+            phase_callback=collector.on_phase if collector is not None else None)
+    except BaseException:
+        if collector is not None:
+            collector.abort()
+        raise
+    # The verified save is already published: a measurement failure below
+    # must keep the image and fail only the record (exit 1 via EngineError).
     print(json.dumps(result.to_dict(), sort_keys=True))
+    if collector is not None:
+        observations = collector.finish()
+        _safe_log(logger, "calibration_record", path=str(collector.path),
+                  observations=len(observations))
     return int(ExitCode.OK)
 
 
@@ -234,6 +266,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)  # usage errors: argparse prints + exit 2
     if args.run and args.dry_run:
         print("error: --run and --dry-run are mutually exclusive", file=sys.stderr)
+        parser.print_usage(sys.stderr)
+        return int(ExitCode.CONFIG)
+    if args.calibration_record is not None and not args.run:
+        print("error: --calibration-record requires --run", file=sys.stderr)
         parser.print_usage(sys.stderr)
         return int(ExitCode.CONFIG)
     logger = PhaseLogger()
@@ -262,7 +298,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _safe_log(logger, "host_scope_attested",
                       attestation="unbounded-host", source="operator")
         return _run_generate(config, logger, assets=report.resolved,
-                             trust_unbounded_host=args.attest_unbounded_host)
+                             trust_unbounded_host=args.attest_unbounded_host,
+                             calibration_record=args.calibration_record)
     except ConfigError as exc:
         for err in exc.errors:
             print(f"config error: {err}", file=sys.stderr)

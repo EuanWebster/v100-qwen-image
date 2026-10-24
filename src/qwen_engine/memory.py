@@ -20,7 +20,10 @@ from qwen_engine.mem_preflight import MemorySnapshot
 
 POLICY_SCHEMA = "qwen_engine.memory_policy.v1"
 MAX_OBSERVATIONS = 4096
-_PHASES = frozenset({"load", "encode", "denoise-step", "decode", "save"})
+#: ``denoise`` is the peak of the whole sampling loop (a conservative
+#: superset of every individual step); ``denoise-step`` is one exact step and
+#: requires ``step_index``. The two are distinct keys and never match.
+_PHASES = frozenset({"load", "encode", "denoise", "denoise-step", "decode", "save"})
 
 
 class MemoryPolicyError(MemoryGuardError):

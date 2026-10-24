@@ -103,6 +103,10 @@ class ProductionEncoder:
         chosen = os.path.abspath(chosen) if os.sep in chosen else shutil.which(chosen)
         if chosen is None:
             raise EncoderSetupError("selected Python interpreter was not found")
+        #: Last cache decision of this encoder instance (None until encoded).
+        #: Only an observation aid for the measured-memory collector; it never
+        #: changes cache behaviour or the returned payload.
+        self.last_cache_hit: bool | None = None
         self.manifest_path = _absolute_path(manifest_path, "manifest_path")
         self.models_dir = _absolute_path(models_dir, "models_dir")
         scratch_dir = _absolute_path(scratch_dir, "scratch_dir")
@@ -137,15 +141,20 @@ class ProductionEncoder:
         request = _completed_request(projected, seed, rid, manifest)
         self._loader._event("production_encoder_identity", cache_key=cache_key(request),
                             request_id=rid, python=self._projector.python)
+        self.last_cache_hit = None
         if self.cache is None:
+            # No cache configured behaves as a miss: the child encoder runs.
+            self.last_cache_hit = False
             return ProductionEncoding(request, self._loader.run(request, request_id=rid, cancel_event=cancel_event))
         key = cache_key(request)
         with self.cache.lock_for(key):
             payload = self.cache.get(key)
             if payload is not None:
                 self._loader._event("encoder_cache_hit", cache_key=key)
+                self.last_cache_hit = True
                 return ProductionEncoding(request, payload)
             self._loader._event("encoder_cache_miss", cache_key=key)
             result = ProductionEncoding(request, self._loader.run(request, request_id=rid, cancel_event=cancel_event))
             self.cache.put(key, result.payload)
+            self.last_cache_hit = False
             return result

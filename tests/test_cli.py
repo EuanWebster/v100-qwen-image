@@ -486,6 +486,17 @@ def test_run_and_dry_run_are_mutually_exclusive(tmp_path, capsys):
     assert "mutually exclusive" in err and "Traceback" not in err
 
 
+def test_calibration_record_requires_run(tmp_path, capsys):
+    target = tmp_path / "calibration.json"
+    assert run_cli(tmp_path, ["--calibration-record", target]) == 2
+    err = capsys.readouterr().err
+    assert "requires --run" in err and "Traceback" not in err
+    assert not target.exists()
+    # Dry-run cannot smuggle in a measurement request either.
+    assert run_cli(tmp_path, ["--dry-run", "--calibration-record", target]) == 2
+    assert not target.exists()
+
+
 def test_invalid_utf8_config_file_exits_2(tmp_path, capsys):
     bad = tmp_path / "config.json"
     bad.write_bytes(b'{"prompt": "caf\xe9 invalid \xff"}')

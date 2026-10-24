@@ -237,3 +237,35 @@ def test_png_writer_caps_extent_and_refuses_fileno(monkeypatch):
             stream.write(b"x")
         with pytest.raises(OSError):
             stream.fileno()
+
+
+def test_calibration_facts_measure_the_processed_conditioning(setup):
+    supplied = setup.make()
+    supplied._state = "encoded"  # private fixture state, no production payload
+    supplied._config = setup.config
+    supplied._conditioning = SimpleNamespace(
+        positive=SimpleNamespace(embeds=SimpleNamespace(shape=(1, 25, 16))),
+        negative=None)
+    setup.provider.last_cache_hit = True
+    assert supplied.calibration_facts() == {
+        "prompt_tokens": 25,
+        "negative_prompt_tokens": None,
+        "cfg_active": False,
+        "encoder_dtype": "fp16",
+        "execution_dtype": "fp16",
+        "use_kv_cache": True,
+        "embedding_cache_hit": True,
+    }
+    active = replace(setup.config, negative_prompt="blurry", true_cfg_scale=2.0)
+    supplied._config = active
+    supplied._conditioning = SimpleNamespace(
+        positive=SimpleNamespace(embeds=SimpleNamespace(shape=(1, 25, 16))),
+        negative=SimpleNamespace(embeds=SimpleNamespace(shape=(1, 12, 16))))
+    facts = supplied.calibration_facts()
+    assert facts["cfg_active"] is True
+    assert facts["negative_prompt_tokens"] == 12
+    # An encoder that never reported a cache decision stays unknown (None),
+    # so the collector refuses rather than inventing a miss.
+    del setup.provider.last_cache_hit
+    assert supplied.calibration_facts()["embedding_cache_hit"] is None
+    supplied.close()

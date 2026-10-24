@@ -358,6 +358,10 @@ class Qwen21DiffusersAdapter:
     def encode(self, config: GenerationConfig):
         return self._attached().encode(config)
 
+    def calibration_facts(self):
+        """Delegate the exact conditioning facts to the attached adapter."""
+        return self._attached().calibration_facts()
+
     def denoise(self, config: GenerationConfig, conditioning):
         self._release_vae()
         latents = self._attached().denoise(config, conditioning)

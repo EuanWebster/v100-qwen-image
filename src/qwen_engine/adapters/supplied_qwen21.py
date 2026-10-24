@@ -157,6 +157,31 @@ class SuppliedQwen21Adapter:
         self._state = "encoded"
         return branches
 
+    def calibration_facts(self):
+        """Exact run facts the measured-memory collector must record.
+
+        Read only after encoding: the token lengths come from the validated
+        conditioning tensors that were actually processed (padded sequence
+        length, i.e. the memory-relevant count), and ``cfg_active`` is the
+        config's true-CFG predicate. ``embedding_cache_hit`` is the encoder's
+        own last decision; ``None`` (unmeasured) makes the collector refuse.
+        """
+        self._check("encoded")
+        branches = self._conditioning
+        if branches is None:
+            raise EngineError("no conditioning is attached")
+        negative = branches.negative
+        return {
+            "prompt_tokens": int(branches.positive.embeds.shape[1]),
+            "negative_prompt_tokens": (
+                int(negative.embeds.shape[1]) if negative is not None else None),
+            "cfg_active": bool(self._config.cfg_active),
+            "encoder_dtype": self.encoder_dtype,
+            "execution_dtype": self.execution_dtype,
+            "use_kv_cache": bool(self.use_kv_cache),
+            "embedding_cache_hit": getattr(self._encoder, "last_cache_hit", None),
+        }
+
     def _finite(self, tensor, shape, dtype):
         torch = self._torch
         if (not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != shape
