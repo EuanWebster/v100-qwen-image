@@ -21,6 +21,11 @@ def png():
 def execute(context):
     for phase in ('load', 'encode', 'denoise', 'decode', 'save'):
         context.report_phase(phase)
+        if phase == 'denoise':
+            for step in range(context.config.steps):
+                context.check_cancelled()
+                httpd.generation.report_steps(context.job_id, step + 1, context.config.steps)
+                context._cancel.wait(.20)
         context._cancel.wait(.35)
         context.check_cancelled()
     path = Path(context.config.output_dir) / 'fixture.png'

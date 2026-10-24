@@ -216,6 +216,9 @@ details.advanced > .help { margin-top: 10px; }
 .job-feedback[data-state="submitting"] { border-color: var(--accent); }
 .job-feedback[data-state="succeeded"] { border-color: #69b879; }
 .job-feedback[data-state="failed"], .job-feedback[data-state="error"] { border-color: #dd7777; }
+#job-progress-panel { margin: 12px 0; }
+#job-progress-label { display: block; font-size: 13px; line-height: 1.5; }
+#job-progress { display: block; width: 100%; height: 18px; accent-color: var(--accent); }
 
 /* ---------- Preview ---------- */
 

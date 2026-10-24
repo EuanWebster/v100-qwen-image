@@ -46,6 +46,9 @@ class WebGeneration:
         assets = _verify_assets(context.config)
         context.check_cancelled()
         adapter = _make_adapter(trust_unbounded_host=self.trust_unbounded_host)
+        progress_binder = getattr(adapter, "set_progress_callback", None)
+        if progress_binder is not None:
+            progress_binder(lambda completed, total: self.report_steps(context.job_id, completed, total))
 
         def sink(line):
             record = json.loads(line)
@@ -59,7 +62,9 @@ class WebGeneration:
     def _run(self, context):
         started = time.monotonic()
         with self._lock:
-            self._metrics[context.job_id] = {"started": started, "elapsed_ms": None, "phase_ms": {}}
+            self._metrics[context.job_id] = {"started": started, "elapsed_ms": None,
+                                             "phase_ms": {}, "completed_steps": 0,
+                                             "total_steps": context.config.steps}
         try:
             return self._executor(context)
         except (JobCancelled, GenerationCancelled):
@@ -72,16 +77,28 @@ class WebGeneration:
             with self._lock:
                 self._metrics[context.job_id]["elapsed_ms"] = (time.monotonic() - started) * 1000
 
+    def report_steps(self, job_id, completed, total):
+        """Actual completed sampler steps; never a wall-clock estimate."""
+        with self._lock:
+            metric = self._metrics[job_id]
+            if (type(completed) is not int or type(total) is not int
+                    or total != metric["total_steps"]
+                    or not metric["completed_steps"] <= completed <= total):
+                raise ValueError("invalid sampler progress")
+            metric["completed_steps"] = completed
+
     def public_job(self, record):
         with self._lock:
             metric = self._metrics.get(record.job_id)
             elapsed = None
             phases = {}
+            completed = 0
             if metric:
                 elapsed = metric["elapsed_ms"]
                 if elapsed is None:
                     elapsed = (time.monotonic() - metric["started"]) * 1000
                 phases = dict(metric["phase_ms"])
+                completed = metric["completed_steps"]
         return {
             "schema": JOB_SCHEMA, "job_id": record.job_id,
             "state": record.state.value, "phase": record.phase,
@@ -89,6 +106,7 @@ class WebGeneration:
             "config": editable_config_dict(record.config),
             "elapsed_ms": elapsed, "phase_ms": phases,
             "error_code": record.error_code,
+            "progress": {"completed_steps": completed, "total_steps": record.config.steps},
             "image_url": (f"/api/v1/jobs/{record.job_id}/image" if record.artifact else None),
         }
 

@@ -55,12 +55,16 @@ def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, 
     events = []
 
     class Adapter:
+        def set_progress_callback(self, callback): self.progress = callback
         def set_cancel_event(self, event):
             assert isinstance(event, threading.Event)
         def load(self, config, assets):
             events.append(('load', assets))
         def encode(self, config): return 'conditioning'
-        def denoise(self, config, conditioning): return 'latents'
+        def denoise(self, config, conditioning):
+            self.progress(1, config.steps)
+            self.progress(config.steps, config.steps)
+            return 'latents'
         def decode(self, latents): return PNG
         def save(self, image, config):
             path = Path(config.output_dir) / 'real-core.png'
@@ -90,6 +94,7 @@ def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, 
         assert all(value >= 0 for value in doc['phase_ms'].values())
         assert doc['elapsed_ms'] >= sum(doc['phase_ms'].values())
         assert doc['config']['seed'] == '18446744073709551615'
+        assert doc['progress'] == {'completed_steps': 40, 'total_steps': 40}
         assert str(Path(runtime.output_dir).parent) not in json.dumps(doc)
         assert service.image(record.job_id) == PNG
     finally:
@@ -198,6 +203,26 @@ def test_shutdown_cancels_live_and_queued_jobs_and_releases_executor(runtime):
     assert service.controller.get(first).state == JobState.CANCELLED
     assert service.controller.get(second).state == JobState.CANCELLED
     with pytest.raises(api.ApiError): service.submit(envelope())
+
+
+def test_partial_sampler_progress_is_visible_and_must_be_monotonic(runtime):
+    ready, release = threading.Event(), threading.Event()
+    def execute(context):
+        service.report_steps(context.job_id, 2, context.config.steps)
+        ready.set()
+        assert release.wait(5)
+        return save(context)
+    service = WebGeneration(runtime, executor=execute)
+    try:
+        job_id = service.submit(envelope()).payload['job_id']
+        assert ready.wait(5)
+        assert service.job_response(job_id).payload['progress'] == {'completed_steps': 2, 'total_steps': 40}
+        for completed, total in [(1, 40), (41, 40), (True, 40), (3, 41)]:
+            with pytest.raises(ValueError): service.report_steps(job_id, completed, total)
+        assert service.job_response(job_id).payload['progress']['completed_steps'] == 2
+    finally:
+        release.set()
+        assert service.close()
 
 
 def test_incomplete_generation_runtime_refuses_before_socket_or_writes(monkeypatch):

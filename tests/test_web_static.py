@@ -450,7 +450,7 @@ def test_w2_failure_paths_preserve_the_draft():
     js = _read("app.js")
     # only applyPreset (2 writes) and the Random button (1 write) may write
     # an input value — no server response ever populates the form.
-    assert js.count(".value = ") == 3, "server data must never write form fields"
+    assert js.count(".value = ") - js.count("progress.value = ") == 3, "server data must never write form fields"
     assert "draft was preserved" in js or "draft stays" in js or \
            "Nothing was sent or changed" in js
 

@@ -76,6 +76,31 @@ in-memory History entries. It caches static assets at startup, so this feedback
 change takes effect on its next restart. The existing completed images remain
 available through the running app's History/image endpoints.
 
+### Progress bar
+
+The front-page progress bar uses actual sampler step-end observations, reported
+by the supplied Qwen adapter through the default loader to each web job. Job
+snapshots carry `progress.completed_steps` and `progress.total_steps` alongside
+phase and elapsed time. Step counts must be integer, bounded and monotonic.
+
+Loading, model verification, CPU prompt encoding, queue wait and final decode/save
+use an indeterminate bar plus the actual phase. During denoising it displays
+“step X of Y” and the percentage **of drawing**, not an invented overall job
+percentage. A saved and verified image sets Complete. Cancellation/failure do
+not display completion, and unavailable status marks progress unavailable.
+The existing two-second polling updates the bar automatically.
+
+Backward-compatible page handling keeps the bar indeterminate for a server
+without step telemetry. Both backend and cached static files require a server
+restart to activate the feature. Existing image files are preserved on restart;
+the current in-memory History list is not persistent.
+
+Real Chrome fixture checks observe a partially filled bar during denoising and
+a full completed bar, along with queue/cancel/reload/image flows at desktop and
+mobile sizes. CPU tests cover propagation from an injected adapter and refusal
+of backward, out-of-range or mismatched step observations. No new full-model
+GPU run was needed for this telemetry-only change.
+
 ## Submission availability and memory
 
 `generation_available` means the server accepts generation submissions; it

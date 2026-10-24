@@ -156,6 +156,10 @@
               Generate</button>
             <p class="disabled-reason" id="generate-reason" role="status"></p>
             <p id="job-feedback" class="job-feedback" role="status" aria-live="polite">Ready to submit a generation.</p>
+            <div id="job-progress-panel" hidden>
+              <label for="job-progress" id="job-progress-label">Waiting for generation</label>
+              <progress id="job-progress" max="1" aria-labelledby="job-progress-label"></progress>
+            </div>
             <button type="button" id="view-result" class="btn-secondary" hidden>View completed image</button>
             <button type="button" id="cancel-job" class="btn-secondary" disabled>Cancel selected job</button>
           </div>

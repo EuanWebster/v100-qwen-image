@@ -94,9 +94,15 @@ async function check() {
   assert.equal(await evaluate(`document.getElementById('generate-btn').textContent`), 'Queue another image');
   assert(await evaluate(`document.getElementById('preview-message').textContent === document.getElementById('job-feedback').textContent`));
   console.log('PASS active generation is visible beside Generate and inside the empty preview');
+  await until(`document.getElementById('job-progress').hasAttribute('value') && document.getElementById('job-progress').value > 0 && document.getElementById('job-progress').value < 20`, real ? 180000 : 15000);
+  assert(await evaluate(`document.getElementById('job-progress-label').textContent.includes('% of drawing')`));
+  console.log('PASS progress bar shows observed sampler steps during denoising');
+  const progressShot = await send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: true});
+  writeFileSync(join(artifactDir, 'progress-active.png'), Buffer.from(progressShot.data, 'base64'));
   await until(`document.getElementById('job-status').textContent.startsWith('succeeded')`, real ? 240000 : 15000);
   await until(`document.getElementById('preview-image').naturalWidth > 0`);
   assert(await evaluate(`!document.getElementById('view-result').hidden && document.getElementById('job-feedback').textContent.startsWith('Image ready')`));
+  assert(await evaluate(`document.getElementById('job-progress').value === document.getElementById('job-progress').max`));
   let ids = await jobIds();
   assert.equal(ids.length, 1);
   const id = ids[0];

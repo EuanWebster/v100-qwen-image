@@ -246,6 +246,12 @@ class Qwen21DiffusersAdapter:
         self._mlp_chunked_blocks = 0
         self._trust_unbounded_host = trust_unbounded_host
         self._state = "new"
+        self._progress_callback = None
+
+    def set_progress_callback(self, callback) -> None:
+        if self._state != "new" or (callback is not None and not callable(callback)):
+            raise ConfigError("bind a callable progress callback or None before load")
+        self._progress_callback = callback
 
     def set_cancel_event(self, event: threading.Event | None) -> None:
         if self._state != "new" or (event is not None and not isinstance(event, threading.Event)):
@@ -338,6 +344,7 @@ class Qwen21DiffusersAdapter:
             use_kv_cache=True,
         )
         inner.set_cancel_event(self._event)
+        inner.set_progress_callback(self._progress_callback)
         inner.load(config, bundle_assets)
         if config.latent_tokens > MLP_CHUNK_ABOVE_TOKENS:
             self._mlp_chunked_blocks = _apply_mlp_chunking(
@@ -460,5 +467,6 @@ class Qwen21DiffusersAdapter:
         self._pipeline = None
         self._bundle = None
         self._state = "closed"
+        self._progress_callback = None
         if inner is not None:
             inner.close()

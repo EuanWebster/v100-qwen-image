@@ -80,6 +80,12 @@ class SuppliedQwen21Adapter:
         self._encoding_request = None
         self._conditioning = None
         self.actual_seed = None
+        self._progress_callback = None
+
+    def set_progress_callback(self, callback):
+        if self._state != "new" or (callback is not None and not callable(callback)):
+            raise ConfigError("bind a callable progress callback or None before attachment")
+        self._progress_callback = callback
 
     def _check(self, state, config=None):
         if self._state != state:
@@ -220,6 +226,8 @@ class SuppliedQwen21Adapter:
         def callback(pipe, index, timestep, tensors):
             self._check("encoded", config)
             self._finite(tensors["latents"], (1, config.latent_tokens, 64), self._dtype)
+            if self._progress_callback is not None:
+                self._progress_callback(index + 1, config.steps)
             return {}
 
         with torch.inference_mode():
@@ -278,5 +286,6 @@ class SuppliedQwen21Adapter:
         self._pipeline = self._encoder = self._manifest = self._bundle = None
         self._torch = self._image = self._device = self._dtype = self._config = None
         self._encoding_request = self._event = None
+        self._progress_callback = None
         self._conditioning = None
         self._state = "closed"

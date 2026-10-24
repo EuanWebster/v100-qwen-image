@@ -1131,6 +1131,11 @@
     })) return null;
     if ([null, 'execution_failed', 'worker_stopped', 'invalid_cancellation_acknowledgment'].indexOf(job.error_code) === -1) return null;
     if (job.image_url !== (job.state === 'succeeded' ? jobUrl(job.job_id) + '/image' : null)) return null;
+    // Older servers have no step observations; keep their bar indeterminate.
+    if (job.progress !== undefined && (!job.progress ||
+        !Number.isInteger(job.progress.completed_steps) ||
+        job.progress.total_steps !== c.steps || job.progress.completed_steps < 0 ||
+        job.progress.completed_steps > c.steps)) return null;
     return job;
   }
 
@@ -1161,6 +1166,22 @@
     if (job.elapsed_ms !== null) feedback += ' Elapsed: ' + (job.elapsed_ms / 1000).toFixed(0) + ' s.';
     setText('job-feedback', feedback);
     $('job-feedback').dataset.state = job.state;
+    $('job-progress-panel').hidden = false;
+    var progress = $('job-progress');
+    progress.max = job.config.steps;
+    if (job.state === 'succeeded') {
+      progress.value = job.config.steps;
+      setText('job-progress-label', 'Complete — image saved');
+    } else if (job.phase === 'denoise' && job.progress && !jobTerminal(job)) {
+      progress.value = job.progress.completed_steps;
+      setText('job-progress-label', 'Drawing: step ' + job.progress.completed_steps + ' of ' +
+        job.progress.total_steps + ' (' + Math.floor(100 * job.progress.completed_steps / job.progress.total_steps) + '% of drawing)');
+    } else {
+      progress.removeAttribute('value');
+      progress.hidden = jobTerminal(job);
+      setText('job-progress-label', descriptions[job.state]);
+    }
+    if (!jobTerminal(job) || job.state === 'succeeded') progress.hidden = false;
     $('view-result').hidden = job.state !== 'succeeded';
     setText('preview-title', job.state === 'running' ? 'Generating your image…' :
       job.state === 'queued' ? 'Generation queued' : job.state === 'failed' ? 'Generation failed' : 'No image yet');
@@ -1232,6 +1253,8 @@
     setText('job-status', message);
     setText('job-feedback', message);
     $('job-feedback').dataset.state = 'error';
+    $('job-progress').removeAttribute('value');
+    setText('job-progress-label', 'Progress unavailable. ' + message);
     // No automatic POST retry: a lost submit response may still own a real job.
   }
 
@@ -1270,6 +1293,7 @@
           setText('job-feedback', 'Ready to submit a generation.');
           $('job-feedback').removeAttribute('data-state');
           $('view-result').hidden = true;
+          $('job-progress-panel').hidden = true;
           setText('job-timings', '');
           ['stat-result', 'stat-steps', 'stat-elapsed'].forEach(function (id) { setText(id, '—'); });
         }
@@ -1303,6 +1327,10 @@
     submittingJob = true;
     setText('job-feedback', 'Submitting your generation…');
     $('job-feedback').dataset.state = 'submitting';
+    $('job-progress-panel').hidden = false;
+    $('job-progress').hidden = false;
+    $('job-progress').removeAttribute('value');
+    setText('job-progress-label', 'Submitting generation…');
     updateGenerate();
     apiRequest(API_JOBS, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Qwen-UI': '1'},
       body: JSON.stringify(envelope)}, 'json').then(function (r) {
