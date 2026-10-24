@@ -3,9 +3,12 @@
 > **Current state, evening 2026-10-24:** The hand-rolled CLI now produces real
 > Qwen-Image-2.1 images on the V100: 1024²/40 steps in roughly 107–109 seconds,
 > and experimental 2048²/20 steps in 3m39s. Exact memory observations are
-> recorded, but generation preflight and web generation are not yet wired to
-> them. NVIDIA ComfyUI remains installed but was stopped for the later tests.
-> Read [the current catch-up](docs/handoffs/2026-10-24-evening-catch-up.md)
+> recorded; exact calibration preflight is not wired into generation. W3 now
+> supports real web generation, Preview, session History, cancellation and
+> measured timings. A real browser-driven 1024²/20-step run took 86.7 seconds.
+> NVIDIA ComfyUI remains installed but stopped for engine testing.
+> Read [W3 instructions](docs/web-generation-w3.md),
+> [the W3 handoff](docs/handoffs/2026-10-24-w3-generation.md)
 > and run `memctl brief v100-qwen-image` before continuing.
 >
 > The text below is the historical Oct-7 snapshot. Its "Implementation has not

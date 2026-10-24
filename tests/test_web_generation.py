@@ -1,0 +1,238 @@
+"""W3 lifecycle/API boundaries without sockets, weights or ML imports."""
+from __future__ import annotations
+
+import base64
+import json
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from qwen_engine import cli
+from qwen_engine.core import GenerationResult
+from qwen_engine.jobs import JobState
+from qwen_engine.web import api, server
+from qwen_engine.web.generation import WebGeneration
+
+PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j2ioAAAAASUVORK5CYII=')
+
+
+def envelope(**values):
+    return json.dumps({'schema': api.WEB_PLAN_REQUEST_SCHEMA,
+                       'config': {'prompt': 'red cube', 'seed': '18446744073709551615', **values}}).encode()
+
+
+@pytest.fixture
+def runtime(tmp_path):
+    root = tmp_path / 'images'
+    root.mkdir()
+    return api.WebRuntime(output_dir=str(root), cache_dir=str(tmp_path / 'cache'),
+                          models_dir=str(tmp_path / 'models'), manifest_path=str(tmp_path / 'manifest.json'),
+                          manifest_summary={'configured': True, 'valid': True, 'schema_version': 1,
+                                            'artifact_count': 24, 'verification': 'not_performed'},
+                          generation_enabled=True)
+
+
+def save(context):
+    for phase in ('load', 'encode', 'denoise', 'decode', 'save'):
+        context.report_phase(phase)
+    path = Path(context.config.output_dir) / 'result.png'
+    path.write_bytes(PNG)
+    return GenerationResult(str(path))
+
+
+def test_enabled_status_means_submission_only_not_verified_memory(runtime):
+    status = api.status_response(runtime).payload
+    assert status['generation_available'] is True
+    assert status['generation_blockers'] == []
+    assert status['gates']['calibration']['state'] == 'unknown'
+    assert status['gates']['hardware']['state'] == 'unknown'
+    assert status['manifest']['verification'] == 'not_performed'
+
+
+def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, monkeypatch):
+    events = []
+
+    class Adapter:
+        def set_cancel_event(self, event):
+            assert isinstance(event, threading.Event)
+        def load(self, config, assets):
+            events.append(('load', assets))
+        def encode(self, config): return 'conditioning'
+        def denoise(self, config, conditioning): return 'latents'
+        def decode(self, latents): return PNG
+        def save(self, image, config):
+            path = Path(config.output_dir) / 'real-core.png'
+            path.write_bytes(image)
+            return path
+        def close(self): events.append('closed')
+
+    def verify(config):
+        events.append('verified')
+        return SimpleNamespace(resolved={'weights': ()})
+
+    def factory(*, trust_unbounded_host):
+        assert trust_unbounded_host is True
+        events.append('factory')
+        return Adapter()
+
+    monkeypatch.setattr(cli, '_verify_assets', verify)
+    monkeypatch.setattr(cli, '_make_adapter', factory)
+    service = WebGeneration(runtime, trust_unbounded_host=True)
+    try:
+        submitted = service.submit(envelope()).payload
+        record = service.controller.wait(submitted['job_id'])
+        doc = service.job_response(record.job_id).payload
+        assert record.state == JobState.SUCCEEDED
+        assert events == ['verified', 'factory', ('load', {'weights': ()}), 'closed']
+        assert set(doc['phase_ms']) == {'load', 'encode', 'denoise', 'decode', 'save'}
+        assert all(value >= 0 for value in doc['phase_ms'].values())
+        assert doc['elapsed_ms'] >= sum(doc['phase_ms'].values())
+        assert doc['config']['seed'] == '18446744073709551615'
+        assert str(Path(runtime.output_dir).parent) not in json.dumps(doc)
+        assert service.image(record.job_id) == PNG
+    finally:
+        assert service.close()
+
+
+def test_assets_failure_never_creates_adapter_and_error_is_private(runtime, monkeypatch):
+    def fail(config): raise RuntimeError('/private/model/path secret detail')
+    monkeypatch.setattr(cli, '_verify_assets', fail)
+    monkeypatch.setattr(cli, '_make_adapter', lambda **kw: pytest.fail('adapter loaded'))
+    service = WebGeneration(runtime)
+    try:
+        job_id = service.submit(envelope()).payload['job_id']
+        service.controller.wait(job_id)
+        doc = service.job_response(job_id).payload
+        assert doc['state'] == 'failed' and doc['error_code'] == 'execution_failed'
+        assert '/private' not in json.dumps(doc) and 'secret detail' not in json.dumps(doc)
+        assert doc['image_url'] is None
+    finally:
+        assert service.close()
+
+
+def test_queued_and_running_cancel_keep_the_worker_serial(runtime):
+    started, release = threading.Event(), threading.Event()
+    active = []
+    def blocking(context):
+        active.append(context.job_id)
+        context.report_phase('load')
+        started.set()
+        assert release.wait(5)
+        context.check_cancelled()
+        return save(context)
+    service = WebGeneration(runtime, executor=blocking)
+    try:
+        first = service.submit(envelope()).payload['job_id']
+        assert started.wait(5)
+        second = service.submit(envelope()).payload['job_id']
+        assert service.job_response(second, action='cancel').payload['state'] == 'cancelled'
+        assert service.job_response(first, action='cancel').payload['state'] == 'cancelling'
+        assert active == [first]
+        release.set()
+        assert service.controller.wait(first).state == JobState.CANCELLED
+        assert service.job_response(first).payload['image_url'] is None
+    finally:
+        release.set()
+        assert service.close()
+
+
+@pytest.mark.parametrize('change', ['content', 'symlink', 'directory'])
+def test_image_refuses_changed_artifacts(runtime, tmp_path, change):
+    service = WebGeneration(runtime, executor=save)
+    try:
+        job_id = service.submit(envelope()).payload['job_id']
+        record = service.controller.wait(job_id)
+        path = Path(record.config.output_dir) / record.artifact.filename
+        if change == 'content':
+            path.write_bytes(b'x' * len(PNG))
+        elif change == 'symlink':
+            outside = tmp_path / 'outside.png'
+            outside.write_bytes(PNG)
+            path.unlink()
+            path.symlink_to(outside)
+        else:
+            directory = path.parent
+            directory.rename(directory.with_name(directory.name + '-moved'))
+            directory.mkdir()
+            path.write_bytes(PNG)
+        with pytest.raises(api.ApiError) as caught:
+            service.image(job_id)
+        assert caught.value.code == 'image_unavailable'
+    finally:
+        assert service.close()
+
+
+def test_forget_preserves_files_and_list_is_bounded_ids_only(runtime):
+    service = WebGeneration(runtime, executor=save)
+    try:
+        job_id = service.submit(envelope(seed=None)).payload['job_id']
+        record = service.controller.wait(job_id)
+        assert isinstance(record.config.seed, int)
+        assert service.list_response().payload['jobs'] == [job_id]
+        path = Path(record.config.output_dir) / record.artifact.filename
+        service.job_response(job_id, action='forget')
+        assert path.read_bytes() == PNG
+        assert service.list_response().payload['jobs'] == []
+        with pytest.raises(api.ApiError): service.image(job_id)
+    finally:
+        assert service.close()
+
+
+def test_shutdown_cancels_live_and_queued_jobs_and_releases_executor(runtime):
+    started, released = threading.Event(), threading.Event()
+    def execute(context):
+        started.set()
+        try:
+            assert context._cancel.wait(5)
+            context.check_cancelled()
+        finally:
+            released.set()
+    service = WebGeneration(runtime, executor=execute)
+    first = service.submit(envelope()).payload['job_id']
+    assert started.wait(5)
+    second = service.submit(envelope()).payload['job_id']
+    assert service.close()
+    assert released.is_set()
+    assert service.controller.get(first).state == JobState.CANCELLED
+    assert service.controller.get(second).state == JobState.CANCELLED
+    with pytest.raises(api.ApiError): service.submit(envelope())
+
+
+def test_incomplete_generation_runtime_refuses_before_socket_or_writes(monkeypatch):
+    def fail(*args): pytest.fail('server bound before runtime validation')
+    monkeypatch.setattr(server, '_Server', fail)
+    assert server.main(['--enable-generation']) == 2
+
+
+@pytest.mark.parametrize('values,code', [
+    ({'output_dir': '/tmp/injected'}, 'unknown_config_field'),
+    ({'seed': 42}, 'invalid_seed'),
+    ({'quant': 'q4'}, 'unsupported_generation_config'),
+    ({'width': 2048, 'height': 2048}, 'tiled_decode_required'),
+])
+def test_bad_submissions_create_no_job_or_output(runtime, values, code):
+    service = WebGeneration(runtime, executor=save)
+    try:
+        with pytest.raises(api.ApiError) as caught:
+            service.submit(envelope(**values))
+        assert caught.value.code == code
+        assert not service.controller.snapshots()
+        assert not list(Path(runtime.output_dir).iterdir())
+    finally:
+        assert service.close()
+
+
+@pytest.mark.parametrize('method,suffix,kind', [
+    ('GET', '', 'job'), ('GET', '/image', 'image'),
+    ('POST', '/cancel', 'cancel'), ('POST', '/forget', 'forget'),
+])
+def test_exact_job_routes_and_method_policy(method, suffix, kind):
+    job_id = 'a' * 32
+    assert server.resolve_route(method, '/api/v1/jobs/' + job_id + suffix) == (kind, job_id)
+    with pytest.raises(api.ApiError) as caught:
+        server.resolve_route('DELETE', '/api/v1/jobs/' + job_id + suffix)
+    assert caught.value.status == 405
+    with pytest.raises(api.ApiError):
+        server.resolve_route(method, '/api/v1/jobs/' + job_id + suffix + '?path=/etc/passwd')

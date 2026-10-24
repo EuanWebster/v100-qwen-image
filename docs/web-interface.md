@@ -1,11 +1,15 @@
 # Web interface design — local Qwen Image Studio (W milestones)
 
+> **Current, 2026-10-24:** W3 generation is implemented. See
+> [W3 run instructions, contracts and validation](web-generation-w3.md).
+> The W1/W2 record below is historical: its disabled-generation statements,
+> three-endpoint limit and `adapter_not_implemented` gate are superseded.
+
 Dated 2026-10-12 (user pivot: the **web UI is the primary interface**, replacing
 the planned/deferred desktop GUI; the engine and CLI are kept unchanged).
 This document is the narrow design record for W1 **and the now-implemented
 W2** (review-pending until root's final acceptance); PLAN.md §W carries the
-milestone list. Statements below are CURRENT unless explicitly labelled
-historical.
+milestone list. This preserves the historical W1/W2 design and review evidence.
 
 ## What FreeVideo is — and is not
 

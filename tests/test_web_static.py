@@ -116,7 +116,7 @@ def test_seed_row_is_a_full_row_with_short_helper_and_accessible_range():
     assert re.search(r"\.seed-row input\s*{[^}]*min-width:\s*0", css)
 
 
-def test_generate_is_always_disabled_with_only_same_origin_api_calls():
+def test_generation_is_status_gated_with_only_same_origin_api_calls():
     # W2 truth: the page may talk ONLY to the three same-origin relative
     # endpoints (/api/v1/status, /api/v1/plan, /api/v1/config/export).
     # Generate stays unconditionally disabled (generation is W3); the
@@ -135,14 +135,13 @@ def test_generate_is_always_disabled_with_only_same_origin_api_calls():
         m = re.search(rf"var {const} = '([^']+)'", js)
         assert m, f"{const} missing"
         assert m.group(1) == route
-    assert re.search(r"generate\.disabled\s*=\s*true;\s*//\s*unconditional", js)
-    assert "disabled = false" not in js, "nothing may enable Generate"
+    assert "!apiConnected || !generationConnected || submittingJob" in js
     html = _read("index.html")
     m = re.search(r'id="generate-btn"[^>]*', html)
     assert m and "disabled" in m.group(0), "Generate must start disabled"
     # disabled visual state is NOT the gate: handlers refuse unconditionally
-    assert "function refuseSubmit" in js
-    assert js.count("refuseSubmit()") >= 2, "submit AND keydown must refuse"
+    assert "function submitGeneration" in js
+    assert js.count("submitGeneration()") >= 2, "submit AND keydown must use the gate"
     assert "Nothing was submitted" in js
 
 
@@ -306,12 +305,13 @@ def test_w2_status_is_strictly_validated_never_trusted_by_shape():
     body = m.group(1)
     assert "s.schema !== STATUS_SCHEMA" in body
     assert "s.planning_available !== true" in body          # strict boolean
-    assert "s.generation_available !== false" in body       # literal false ONLY
+    assert "typeof s.generation_available !== 'boolean'" in body
+    assert "s.generation_available !== (s.generation_blockers.length === 0)" in body
     # EXACT blocker set (four required + manifest reason when applicable),
     # never "any bounded subset" — a malformed server cannot hide blockers.
     assert "blockersExact(s.generation_blockers, manifest.blocker)" in body
     assert "parseManifestCore(s.manifest)" in body
-    assert "GATE_STATES" in js and "not_implemented" in js
+    assert "GATE_STATES" in js and "adapter_available" in js
     # a schema-rejected status is a typed state, distinct from a disconnect
     assert "Status rejected" in js and "Not connected" in js
     # every fetch is bounded by an AbortController timeout; no polling
@@ -610,8 +610,7 @@ def test_w2_parse_plan_bounds_aligned_with_server_contract():
     assert m, "KNOWN_BLOCKER_CODES missing"
     from qwen_engine.web import api
     codes = set(re.findall(r"'([a-z_]+)'", m.group(1)))
-    assert {"adapter_not_implemented", "hardware_not_probed",
-            "assets_unverified", "calibration_unknown"} <= codes
+    assert {"generation_disabled", "runtime_unconfigured"} <= codes
     # the same exact-set contract must gate status blockers too
     m = re.search(r"function parseStatus\(s\)\s*\{([\s\S]*?)\n  \}", js)
     assert "blockersExact(s.generation_blockers, manifest.blocker)" in m.group(1)
@@ -700,11 +699,11 @@ def test_manifest_core_and_blocker_contract_shared_and_exact():
     assert "m.artifact_count < 1" in body
     # exact required set mirrors the REAL server gates
     from qwen_engine.web import api
-    m2 = re.search(r"var REQUIRED_BLOCKER_CODES = \[([\s\S]*?)\];", js)
-    assert m2, "REQUIRED_BLOCKER_CODES missing"
+    m2 = re.search(r"var KNOWN_BLOCKER_CODES = \[([\s\S]*?)\];", js)
+    assert m2, "KNOWN_BLOCKER_CODES missing"
     codes = set(re.findall(r"'([a-z_]+)'", m2.group(1)))
-    assert codes == {g["code"] for g in api._gates().values()}, \
-        "required blockers must equal the server's gate codes exactly"
+    assert codes == {"generation_disabled", "runtime_unconfigured", "manifest_unconfigured",
+                     "manifest_file_missing", "manifest_invalid", "manifest_unreadable"}
     m3 = re.search(r"var MANIFEST_REASON_CODES = \[([\s\S]*?)\];", js)
     assert m3
     reason_codes = set(re.findall(r"'([a-z_]+)'", m3.group(1)))

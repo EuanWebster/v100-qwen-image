@@ -338,10 +338,10 @@ async function httpChecks() {
   check('status schema + honest booleans',
         st && st.schema === 'qwen_engine.web_status.v1' &&
         st.planning_available === true && st.generation_available === false &&
-        st.gates.adapter.code === 'adapter_not_implemented' &&
+        st.gates.adapter.code === 'adapter_available' &&
         st.gates.hardware.state === 'unknown' &&
-        st.generation_blockers.includes('assets_unverified') &&
-        st.generation_blockers.includes('calibration_unknown'),
+        st.generation_blockers.includes('generation_disabled') &&
+        st.generation_blockers.includes('runtime_unconfigured'),
         st && st.generation_blockers.join(','));
   const stBody = JSON.stringify(st);
   check('status leaks no manifest filename', !stBody.includes('tiny-placeholder') && !stBody.includes('safetensors'));

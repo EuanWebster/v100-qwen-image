@@ -1,0 +1,163 @@
+#!/usr/bin/env node
+/* Real Chrome W3 check. Default: explicit CPU fixture; --real: actual local
+ * FP16 engine, V100 and model bundle. Owns only its temporary server/browser.
+ * Artifacts remain under the printed /tmp directory for inspection.
+ */
+import assert from 'node:assert/strict';
+import {spawn} from 'node:child_process';
+import {mkdirSync, mkdtempSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {dirname, join, resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {launchChrome, openCdpSocket, makeCdp, shutdownChrome} from './chrome_lifecycle.mjs';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const python = process.env.QWEN_PYTHON || join(root, '.venv/bin/python');
+const real = process.argv.includes('--real');
+const artifactDir = mkdtempSync(join(tmpdir(), 'qwen-w3-'));
+const output = join(artifactDir, 'output');
+mkdirSync(output);
+console.log(`Mode: ${real ? 'REAL V100 / Qwen weights' : 'CPU fixture (synthetic test images)'}`);
+console.log(`Artifacts: ${artifactDir}`);
+const args = real ? ['-m', 'qwen_engine.web', '--port', '0', '--enable-generation',
+  '--attest-unbounded-host', '--manifest', join(root, 'models/manifest.json'),
+  '--models-dir', join(root, 'models/assets'), '--output-dir', output, '--cache-dir', join(root, 'cache')]
+  : [join(root, 'tests/fixtures/web_generation_server.py'), output];
+const server = spawn(python, args, {cwd: root, stdio: ['ignore', 'pipe', 'pipe']});
+let log = '', chrome, ws, cdp;
+let failed = false;
+let aborted = false;
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+let fatal;
+const deadline = new Promise((_, reject) => { fatal = setTimeout(() => reject(new Error('whole W3 check timed out')), real ? 360000 : 90000); });
+async function check() {
+  const origin = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('server start timed out')), 10000);
+    server.stdout.on('data', chunk => {
+      log = (log + chunk).slice(-65536);
+      const match = /listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(log);
+      if (match) { clearTimeout(timer); resolve(match[1]); }
+    });
+    server.on('error', reject);
+    server.on('exit', code => { clearTimeout(timer); reject(new Error(`server exited ${code}: ${log}`)); });
+  });
+  server.stderr.on('data', chunk => { log = (log + chunk).slice(-65536); });
+  console.log(origin);
+  const launched = launchChrome({chromePath: process.env.CHROME_PATH || '/opt/google/chrome/chrome',
+    profileDir: join(artifactDir, 'chrome'), extraArgs: ['--headless=new']});
+  chrome = launched.chrome;
+  const wsUrl = await launched.wsUrl;
+  if (aborted) throw new Error('check aborted');
+  const socket = openCdpSocket(wsUrl);
+  ws = socket.ws;
+  await socket.ready;
+  cdp = makeCdp(ws);
+  const {targetId} = await cdp.send('Target.createTarget', {url: 'about:blank'});
+  const {sessionId} = await cdp.send('Target.attachToTarget', {targetId, flatten: true});
+  const send = (method, params = {}) => cdp.send(method, params, sessionId);
+  await send('Runtime.enable');
+  await send('Page.enable');
+  const exceptions = [];
+  cdp.onEvent = event => { if (event.method === 'Runtime.exceptionThrown') exceptions.push(event.params); };
+  async function evaluate(expression) {
+    if (aborted) throw new Error('check aborted');
+    const result = await send('Runtime.evaluate', {expression, awaitPromise: true, returnByValue: true});
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || 'page exception');
+    return result.result.value;
+  }
+  async function until(expression, timeout = 15000) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (aborted) throw new Error('check aborted');
+      try { if (await evaluate(expression)) return; } catch { /* navigation not ready */ }
+      await delay(200);
+    }
+    throw new Error(`timed out: ${expression}\n${log}`);
+  }
+  async function api(path, config) {
+    return evaluate(`fetch(${JSON.stringify(path)}, ${config === undefined ? '{}' : JSON.stringify({
+      method: 'POST', headers: {'Content-Type': 'application/json', 'X-Qwen-UI': '1'}, body: JSON.stringify(config)
+    })}).then(async r => ({status:r.status, body:await r.json()}))`);
+  }
+  const jobIds = async () => (await api('/api/v1/jobs')).body.jobs;
+  await send('Emulation.setDeviceMetricsOverride', {width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false});
+  await send('Page.navigate', {url: origin + '/'});
+  await until(`document.getElementById('generate-btn') && !document.getElementById('generate-btn').disabled`);
+  console.log('PASS generation-enabled status recognized');
+  const bad = await evaluate(`fetch('/api/v1/jobs', {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>r.status)`);
+  assert.equal(bad, 403);
+  console.log('PASS job write requires exact UI header');
+  await evaluate(`document.getElementById('prompt').value='a red cube on a white table, studio photo, sharp focus, soft daylight';
+    document.getElementById('steps').value='20'; document.getElementById('seed').value='${real ? '42' : '18446744073709551615'}';
+    document.getElementById('create-form').requestSubmit();`);
+  await until(`document.getElementById('job-status').textContent.startsWith('succeeded')`, real ? 240000 : 15000);
+  await until(`document.getElementById('preview-image').naturalWidth > 0`);
+  let ids = await jobIds();
+  assert.equal(ids.length, 1);
+  const id = ids[0];
+  let job = (await api('/api/v1/jobs/' + id)).body;
+  assert.equal(job.config.seed, real ? '42' : '18446744073709551615');
+  assert.equal(job.state, 'succeeded');
+  assert(job.elapsed_ms > 0);
+  if (real) assert.deepEqual(Object.keys(job.phase_ms).sort(), ['decode', 'denoise', 'encode', 'load', 'save']);
+  assert(await evaluate(`document.querySelectorAll('.history-card').length === 1 && !document.getElementById('action-download').disabled`));
+  console.log(`PASS real UI submit → successful job → loaded Preview + History (${(job.elapsed_ms/1000).toFixed(1)} s)`);
+  writeFileSync(join(artifactDir, 'job.json'), JSON.stringify(job, null, 2));
+  const image = await fetch(origin + job.image_url);
+  assert.equal(image.headers.get('content-type'), 'image/png');
+  assert.equal(image.headers.get('x-content-type-options'), 'nosniff');
+  const imageBytes = Buffer.from(await image.arrayBuffer());
+  assert.equal(imageBytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+  writeFileSync(join(artifactDir, 'result.png'), imageBytes);
+  await send('Page.reload');
+  await until(`document.getElementById('preview-image').naturalWidth > 0 && document.querySelectorAll('.history-card').length === 1`);
+  console.log('PASS reload recovers server history and completed image');
+  const snapshot = await evaluate(`JSON.stringify(QwenStudio.formSnapshot())`);
+  const malformed = await evaluate(`(() => { var j=${JSON.stringify(job)}; j.image_url='https://example.invalid/x'; return QwenStudio.parseJob(j); })()`);
+  assert.equal(malformed, null);
+  assert.equal(await evaluate(`JSON.stringify(QwenStudio.formSnapshot())`), snapshot);
+  for (const width of [1440, 375, 320]) {
+    await send('Emulation.setDeviceMetricsOverride', {width, height: 1000, deviceScaleFactor: 1, mobile: width < 500});
+    await delay(150);
+    assert(await evaluate('document.documentElement.scrollWidth <= window.innerWidth + 1'));
+    const shot = await send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: true});
+    writeFileSync(join(artifactDir, `studio-${width}.png`), Buffer.from(shot.data, 'base64'));
+  }
+  console.log('PASS desktop/mobile layouts at 1440/375/320 px');
+  if (!real) {
+    await evaluate(`document.getElementById('prompt').value='cancel me'; document.getElementById('create-form').requestSubmit()`);
+    await until(`['queued','running'].some(s => document.getElementById('job-status').textContent.startsWith(s))`);
+    await evaluate(`document.getElementById('cancel-job').click()`);
+    await until(`document.getElementById('job-status').textContent.startsWith('cancelled')`);
+    console.log('PASS UI cancellation acknowledged without invented result');
+    ids = await jobIds();
+    await api('/api/v1/jobs/' + ids[1] + '/forget', {});
+    assert.equal((await api('/api/v1/jobs')).body.jobs.length, 1);
+    console.log('PASS terminal entry can be forgotten');
+  }
+  assert.equal(exceptions.length, 0, JSON.stringify(exceptions));
+  console.log('PASS no uncaught browser exceptions');
+}
+
+try { await Promise.race([check(), deadline]); }
+catch (error) { aborted = true; failed = true; console.error(error.stack); }
+finally {
+  clearTimeout(fatal);
+  writeFileSync(join(artifactDir, 'server.log'), log);
+  if (chrome) {
+    const result = await shutdownChrome(chrome, ws, cdp);
+    if (!result) { failed = true; console.error('Chrome cleanup pending'); }
+  }
+  server.kill('SIGTERM');
+  let stopTimer;
+  const ended = await Promise.race([
+    new Promise(resolve => {
+      if (server.exitCode !== null || server.signalCode !== null) resolve(true);
+      else server.once('exit', () => resolve(true));
+    }), new Promise(resolve => { stopTimer = setTimeout(() => resolve(false), 60000); }),
+  ]);
+  clearTimeout(stopTimer);
+  if (!ended) { failed = true; console.error('Owned test server did not stop after SIGTERM'); }
+  if (server.exitCode !== 0) { failed = true; console.error('Test server exited abnormally', server.exitCode, server.signalCode); }
+}
+process.exitCode = failed ? 1 : 0;

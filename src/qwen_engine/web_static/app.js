@@ -1,13 +1,10 @@
-/* Qwen Image Studio — W2 front-end (local same-origin status/plan API).
+/* Qwen Image Studio — W3 front-end (local same-origin engine jobs).
  *
  * Honest by construction:
- *   * The ONLY network calls are same-origin relative fetches to
- *     /api/v1/status, /api/v1/plan and /api/v1/config/export. Opened over
+ *   * Network calls use the local status/plan/config/export and job API. Opened over
  *     file:// (or without the qwen-web server) every fetch fails and the UI
  *     says so: "Not connected" — failures are never swallowed as success.
- *   * Generate remains ALWAYS disabled: generation is W3 and not
- *     implemented anywhere. The submit handlers refuse unconditionally;
- *     the disabled button is a visual state, not the gate.
+ *   * Generation requires explicit server enablement and per-job engine checks.
  *   * The server is authoritative for GenerationConfig validation. The
  *     lightweight form checks here exist only to give accessible inline
  *     feedback; they never replace the server's verdict.
@@ -41,15 +38,14 @@
   var SEED_MAX_DIGITS = SEED_MAX.toString().length; // 20
 
   var GENERATION_UNAVAILABLE_REASON =
-    'Generate is disabled: no generation adapter or job API is implemented ' +
-    'yet (that is W3). Planning and configuration validation are available ' +
-    'from the local server when this page is served by qwen-web.';
+    'Connect to a qwen-web server started with --enable-generation to generate images.';
 
   /* ---- Same-origin API contract (relative paths only: never a host,
    *      never an absolute URL, never a CDN) ---- */
   var API_STATUS = '/api/v1/status';
   var API_PLAN = '/api/v1/plan';
   var API_EXPORT = '/api/v1/config/export';
+  var API_JOBS = '/api/v1/jobs';
   var PLAN_REQUEST_SCHEMA = 'qwen_engine.web_plan_request.v1';
   var STATUS_SCHEMA = 'qwen_engine.web_status.v1';
   var PLAN_SCHEMA = 'qwen_engine.web_plan.v1';
@@ -60,7 +56,7 @@
   // stable code (qwen_engine.web/api.py). An arbitrary bounded string is a
   // schema rejection, never a trusted state.
   var GATE_STATES = {
-    adapter:     { states: ['not_implemented'], code: 'adapter_not_implemented' },
+    adapter:     { states: ['available'],       code: 'adapter_available' },
     hardware:    { states: ['unknown'],         code: 'hardware_not_probed' },
     assets:      { states: ['not_verified'],    code: 'assets_unverified' },
     calibration: { states: ['unknown'],         code: 'calibration_unknown' }
@@ -68,20 +64,12 @@
 
   // CLOSED blocker-code list — exactly what the real server can emit.
   var KNOWN_BLOCKER_CODES = [
-    'adapter_not_implemented', 'hardware_not_probed', 'assets_unverified',
-    'calibration_unknown', 'manifest_unconfigured', 'manifest_file_missing',
+    'generation_disabled', 'runtime_unconfigured', 'manifest_unconfigured', 'manifest_file_missing',
     'manifest_invalid', 'manifest_unreadable'
   ];
 
-  // The FOUR gate codes are ALWAYS blockers; the manifest contributes its
-  // closed reason code ONLY when configured=false or valid=false (exact
-  // server contract, api._blockers). A document carrying any other mix —
-  // even a recognizable-looking subset — is refused, so a malformed server
-  // can never hide a required blocker behind a plausible shape.
-  var REQUIRED_BLOCKER_CODES = [
-    'adapter_not_implemented', 'hardware_not_probed', 'assets_unverified',
-    'calibration_unknown'
-  ];
+  // Manifest failures always block submission. Hardware/assets/calibration
+  // evidence stays separate: enabling submission is not a memory-fit claim.
   var MANIFEST_REASON_CODES = [
     'manifest_unconfigured', 'manifest_file_missing', 'manifest_invalid',
     'manifest_unreadable'
@@ -323,6 +311,13 @@
   // never buffered. No unbounded bodies are ever read.
   var MAX_RESPONSE_BYTES = 262144;
   var apiConnected = false;      // a RECOGNIZED status document was seen
+  var generationConnected = false;
+  var submittingJob = false;
+  var jobCache = Object.create(null);
+  var selectedJob = null;
+  var refreshingJobs = false;
+  var jobTimer = null;
+  var jobSeq = 0;
   // EVERY status completion branch is guarded by this sequence: a newer
   // check (success OR failure) always wins over an older late arrival —
   // an old success must not re-enable planning after a newer disconnect,
@@ -440,16 +435,17 @@
   }
 
   // Plan/Export are only offered once a RECOGNIZED status has been seen;
-  // any disconnect or schema rejection takes them away again. Generate is
-  // NEVER touched here — it is and stays disabled (generation is W3).
+  // any disconnect or schema rejection takes them and generation away again.
   function setApiAvailable(available) {
     apiConnected = available;
     $('btn-plan').disabled = !available;
     $('btn-export').disabled = !available;
+    if (!available) generationConnected = false;
+    updateGenerate();
   }
 
   // The status document is NOT trusted by shape alone: schema tag, strict
-  // literal booleans (generation_available must be the literal false), the
+  // literal booleans (generation_available must match the blockers), the
   // exact known gates with their CLOSED states AND codes, blocker codes
   // from the closed list only, and the exact manifest verification — ALL
   // must match, or the whole document is rejected. A JSON null parses to
@@ -459,7 +455,7 @@
     if (!s || typeof s !== 'object') return null;   // null-safe by design
     if (s.schema !== STATUS_SCHEMA) return null;
     if (s.planning_available !== true) return null;
-    if (s.generation_available !== false) return null;  // literal false only
+    if (typeof s.generation_available !== 'boolean') return null;
     if (!s.gates || typeof s.gates !== 'object') return null;
     var gates = Object.keys(GATE_STATES);
     if (Object.keys(s.gates).length !== gates.length) return null;  // exact
@@ -470,11 +466,12 @@
           gate.code !== spec.code ||
           spec.states.indexOf(gate.state) === -1) return null;
     }
-    // EXACT blocker set (four required + manifest reason when applicable).
+    // Closed blockers and mandatory manifest reason, when applicable.
     var manifest = parseManifestCore(s.manifest);
     if (!manifest) return null;   // status ALWAYS carries the manifest block
     if (!blockersExact(s.generation_blockers, manifest.blocker)) return null;
-    return { recognized: true, planning: true, generation: false };
+    if (s.generation_available !== (s.generation_blockers.length === 0)) return null;
+    return { recognized: true, planning: true, generation: s.generation_available };
   }
 
   function statusUnrecognizedText(reason) {
@@ -511,21 +508,16 @@
     return { configured: m.configured, valid: m.valid, blocker: blocker };
   }
 
-  // The EXACT blocker set: the four REQUIRED gate codes plus the manifest
-  // blocker (when one applies), each exactly once. Missing, duplicated or
-  // extra codes all reject — a malformed server can never hide a required
-  // blocker behind an otherwise recognizable document.
+  // Only known static blockers, no duplicates, and exactly the manifest
+  // failure indicated by the metadata. Submission availability must agree.
   function blockersExact(list, manifestBlocker) {
     if (!Array.isArray(list)) return false;
-    var expected = REQUIRED_BLOCKER_CODES.slice();
-    if (manifestBlocker) expected.push(manifestBlocker);
-    if (list.length !== expected.length) return false;
-    for (var i = 0; i < expected.length; i++) {
-      if (list.indexOf(expected[i]) === -1) return false;
-    }
+    if (list.length > 3 || new Set(list).size !== list.length) return false;
     for (var j = 0; j < list.length; j++) {
-      if (expected.indexOf(list[j]) === -1) return false;
+      if (KNOWN_BLOCKER_CODES.indexOf(list[j]) === -1) return false;
+      if (MANIFEST_REASON_CODES.indexOf(list[j]) !== -1 && list[j] !== manifestBlocker) return false;
     }
+    if (manifestBlocker && list.indexOf(manifestBlocker) === -1) return false;
     return true;
   }
 
@@ -587,17 +579,21 @@
           return null;
         }
         setApiAvailable(true);
-        renderChip('Connected — planning only', 'Connected — planning only');
+        generationConnected = status.generation;
+        updateGenerate();
+        renderChip(status.generation ? 'Connected — engine jobs' : 'Connected — planning only',
+                   status.generation ? 'Connected — engine jobs' : 'Connected — planning only');
         setText('settings-backend',
-          'Connected to the local qwen-web server (planning only). ' +
-          'Generation is not implemented; every gate below explains why.');
+          'Connected to the local qwen-web server. Generation ' +
+          (status.generation ? 'submission is enabled.' : 'is disabled or unconfigured.'));
         setText('settings-gates',
-          'adapter: not implemented · hardware: not probed (unknown) · ' +
+          'adapter: available · hardware: checked during each job · ' +
           'assets: not verified · calibration: not verified for this ' +
           'server (unknown)');
         setText('settings-generation',
-          'Planning is available against the configured manifest. ' +
-          'Generation is NOT implemented — Generate stays disabled.');
+          'FP16 resident generation uses the same engine as the CLI. ' +
+          'Submission availability does not establish memory fitness.');
+        if (status.generation) refreshJobs();
         return status;
       });
   }
@@ -831,7 +827,7 @@
   // closed list only.
   function parsePlan(raw) {
     if (!raw || typeof raw !== 'object' || raw.schema !== PLAN_SCHEMA) return null;
-    if (raw.planning_available !== true || raw.generation_available !== false) return null;
+    if (raw.planning_available !== true || typeof raw.generation_available !== 'boolean') return null;
     if (typeof raw.cfg_active !== 'boolean') return null;
     if (!Number.isInteger(raw.latent_tokens) || raw.latent_tokens < 0) return null;
     var c = raw.config;
@@ -885,8 +881,9 @@
         m.fit !== 'not_evaluated') return null;
     if (!raw.hardware || raw.hardware.status !== 'unknown') return null;
     if (!raw.calibration || raw.calibration.status !== 'unknown') return null;
-    // EXACT blocker set (four required + manifest reason when applicable).
+    // Closed static blockers; submission availability must agree.
     if (!blockersExact(raw.generation_blockers, manifest.blocker)) return null;
+    if (raw.generation_available !== (raw.generation_blockers.length === 0)) return null;
     return raw;
   }
 
@@ -1095,17 +1092,230 @@
     renderView(name);   // no focus on load
   }
 
-  /* ---------------- Submission (generation refuses) ----------------
-   * Generation is not implemented (W3). The handlers enforce that directly:
-   * they never pretend a submission happened, regardless of how they were
-   * reached. The disabled button is a visual state, not the gate.
-   */
+  /* ---------------- Real engine jobs ---------------- */
 
-  function refuseSubmit() {
-    setText('generate-reason',
-      'Nothing was submitted: generation is not implemented in this build. ' +
-      'No generation adapter or job API exists, so there is no submit path. ' +
-      'Use Plan to validate this configuration with the local server.');
+  var JOB_STATES = ['queued', 'running', 'cancelling', 'cancelled', 'succeeded', 'failed'];
+  var JOB_PHASES = ['load', 'encode', 'denoise', 'decode', 'save'];
+
+  function jobTerminal(job) {
+    return ['cancelled', 'succeeded', 'failed'].indexOf(job.state) !== -1;
+  }
+
+  function jobUrl(id) { return API_JOBS + '/' + id; }
+
+  function parseJob(job) {
+    if (!job || job.schema !== 'qwen_engine.web_job.v1' ||
+        typeof job.job_id !== 'string' || !/^[0-9a-f]{32}$/.test(job.job_id) ||
+        JOB_STATES.indexOf(job.state) === -1 ||
+        !(job.phase === null || JOB_PHASES.indexOf(job.phase) !== -1) ||
+        typeof job.cancel_requested !== 'boolean') return null;
+    var c = job.config;
+    if (!c || Object.keys(c).length !== 11 || typeof c.prompt !== 'string' ||
+        !pyStrip(c.prompt) || c.prompt.length > MAX_CONFIG_STRING_CHARS ||
+        typeof c.negative_prompt !== 'string' || c.negative_prompt.length > MAX_CONFIG_STRING_CHARS ||
+        typeof c.seed !== 'string' || !/^\d{1,20}$/.test(c.seed) ||
+        BigInt(c.seed) > SEED_MAX || !Number.isInteger(c.steps) || c.steps < 1 || c.steps > 1000 ||
+        typeof c.true_cfg_scale !== 'number' || !isFinite(c.true_cfg_scale) || c.true_cfg_scale < 1 ||
+        typeof c.vae_tiled_decode !== 'boolean' ||
+        PLAN_ENUMS.quant.indexOf(c.quant) === -1 || PLAN_ENUMS.offload.indexOf(c.offload) === -1 ||
+        PLAN_ENUMS.attention_backend.indexOf(c.attention_backend) === -1) return null;
+    if (['width', 'height'].some(function (key) {
+      return !Number.isInteger(c[key]) || c[key] < 64 || c[key] > 4096 || c[key] % 32 !== 0;
+    })) return null;
+    if (!(job.elapsed_ms === null || (typeof job.elapsed_ms === 'number' &&
+          isFinite(job.elapsed_ms) && job.elapsed_ms >= 0))) return null;
+    if (!job.phase_ms || typeof job.phase_ms !== 'object' || Array.isArray(job.phase_ms)) return null;
+    if (Object.keys(job.phase_ms).some(function (phase) {
+      var value = job.phase_ms[phase];
+      return JOB_PHASES.indexOf(phase) === -1 || typeof value !== 'number' || !isFinite(value) || value < 0;
+    })) return null;
+    if ([null, 'execution_failed', 'worker_stopped', 'invalid_cancellation_acknowledgment'].indexOf(job.error_code) === -1) return null;
+    if (job.image_url !== (job.state === 'succeeded' ? jobUrl(job.job_id) + '/image' : null)) return null;
+    return job;
+  }
+
+  function updateGenerate() {
+    $('generate-btn').disabled = !apiConnected || !generationConnected || submittingJob;
+    setText('generate-reason', generationConnected
+      ? (submittingJob ? 'Submitting…' : 'Jobs run one at a time. Model and resource checks run for each job.')
+      : GENERATION_UNAVAILABLE_REASON);
+  }
+
+  function renderSelectedJob(job) {
+    selectedJob = job.job_id;
+    setText('job-status', job.state + (job.phase ? ' · ' + job.phase :
+      job.state === 'running' ? ' · verifying model assets' : '') +
+      (job.error_code ? ' · ' + job.error_code + ' (see server terminal)' : ''));
+    setText('job-timings', Object.keys(job.phase_ms).map(function (phase) {
+      return phase + ': ' + (job.phase_ms[phase] / 1000).toFixed(2) + ' s';
+    }).join(' · '));
+    setText('stat-elapsed', job.elapsed_ms === null ? '—' : (job.elapsed_ms / 1000).toFixed(1) + ' s');
+    setText('stat-steps', job.state === 'succeeded' ? String(job.config.steps) : '—');
+    setText('stat-result', job.state);
+    $('cancel-job').disabled = jobTerminal(job) || job.cancel_requested;
+    var complete = job.state === 'succeeded';
+    ['action-download', 'action-open', 'action-again'].forEach(function (id) {
+      $(id).disabled = !complete;
+      $(id).title = complete ? '' : 'No completed result selected';
+    });
+    var image = $('preview-image');
+    if (complete) {
+      if (image.getAttribute('src') !== job.image_url) image.src = job.image_url;
+      image.alt = job.config.prompt;
+      setPreviewAspect(job.config.width, job.config.height);
+    } else {
+      image.removeAttribute('src');
+    }
+    image.hidden = !complete;
+    $('preview-empty').hidden = complete;
+  }
+
+  function renderHistory(ids) {
+    var grid = $('history-grid');
+    grid.replaceChildren();
+    $('history-empty').hidden = ids.length > 0;
+    ids.slice().reverse().forEach(function (id) {
+      var job = jobCache[id];
+      if (!job) return;
+      var card = document.createElement('article');
+      card.className = 'history-card';
+      if (job.state === 'succeeded') {
+        var image = document.createElement('img');
+        image.src = job.image_url;
+        image.alt = job.config.prompt;
+        image.loading = 'lazy';
+        card.appendChild(image);
+      }
+      var label = document.createElement('p');
+      label.textContent = job.state + ' · seed ' + job.config.seed + ' · ' + job.config.prompt.slice(0, 160);
+      card.appendChild(label);
+      var view = document.createElement('button');
+      view.type = 'button';
+      view.className = 'btn-secondary';
+      view.textContent = 'View job';
+      view.addEventListener('click', function () { renderSelectedJob(jobCache[id]); location.hash = '#create'; });
+      card.appendChild(view);
+      if (jobTerminal(job)) {
+        var forget = document.createElement('button');
+        forget.type = 'button';
+        forget.className = 'btn-secondary';
+        forget.textContent = 'Forget entry';
+        forget.title = 'Remove session metadata; image files stay on disk';
+        forget.addEventListener('click', function () { jobAction(id, 'forget'); });
+        card.appendChild(forget);
+      }
+      grid.appendChild(card);
+    });
+  }
+
+  function jobFailure(message) {
+    setText('job-status', message);
+    // No automatic POST retry: a lost submit response may still own a real job.
+  }
+
+  function refreshJobs() {
+    if (refreshingJobs || !generationConnected) return Promise.resolve(false);
+    if (jobTimer) clearTimeout(jobTimer);
+    refreshingJobs = true;
+    var seq = jobSeq;
+    return apiRequest(API_JOBS, {headers: {'Accept': 'application/json'}}, 'json').then(function (r) {
+      var list = r.json;
+      if (!r.res || !r.res.ok || r.bodyError || !list || list.schema !== 'qwen_engine.web_jobs.v1' ||
+          !Array.isArray(list.jobs) || list.jobs.length > 32 || new Set(list.jobs).size !== list.jobs.length ||
+          list.jobs.some(function (id) { return typeof id !== 'string' || !/^[0-9a-f]{32}$/.test(id); })) {
+        throw new Error('jobs unavailable');
+      }
+      return Promise.all(list.jobs.map(function (id) {
+        if (jobCache[id] && jobTerminal(jobCache[id])) return jobCache[id];
+        return apiRequest(jobUrl(id), {headers: {'Accept': 'application/json'}}, 'json').then(function (answer) {
+          var job = answer.res && answer.res.ok && !answer.bodyError && parseJob(answer.json);
+          if (!job || job.job_id !== id) throw new Error('job rejected');
+          jobCache[id] = job;
+          return job;
+        });
+      })).then(function () {
+        if (seq !== jobSeq) return true;
+        Object.keys(jobCache).forEach(function (id) { if (list.jobs.indexOf(id) === -1) delete jobCache[id]; });
+        renderHistory(list.jobs);
+        if (!selectedJob || !jobCache[selectedJob]) selectedJob = list.jobs[list.jobs.length - 1] || null;
+        if (selectedJob) renderSelectedJob(jobCache[selectedJob]);
+        else {
+          $('preview-image').hidden = true;
+          $('preview-image').removeAttribute('src');
+          $('preview-empty').hidden = false;
+          ['cancel-job', 'action-download', 'action-open', 'action-again'].forEach(function (id) { $(id).disabled = true; });
+          setText('job-status', 'No job selected.');
+          setText('job-timings', '');
+          ['stat-result', 'stat-steps', 'stat-elapsed'].forEach(function (id) { setText(id, '—'); });
+        }
+        return true;
+      });
+    }).catch(function () {
+      setApiAvailable(false);
+      jobFailure('Job refresh failed; work may still be running. Use Check configuration to reconnect.');
+      return false;
+    }).then(function (ok) {
+      refreshingJobs = false;
+      // Poll serially after completion of this request; never overlap requests.
+      if (generationConnected) jobTimer = setTimeout(refreshJobs, 2000);
+      return ok;
+    });
+  }
+
+  function submitGeneration(config) {
+    if (submittingJob) return;
+    if (!config) {
+      var validation = validateForm();
+      promptTouched = true;
+      renderValidation(validation.errors);
+      if (Object.keys(validation.errors).length) return;
+    }
+    if (!generationConnected || !apiConnected) {
+      jobFailure('Nothing was submitted: connect to a generation-enabled server first.');
+      return;
+    }
+    var envelope = config ? {schema: PLAN_REQUEST_SCHEMA, config: config} : buildEnvelope().envelope;
+    submittingJob = true;
+    updateGenerate();
+    apiRequest(API_JOBS, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Qwen-UI': '1'},
+      body: JSON.stringify(envelope)}, 'json').then(function (r) {
+      var job = r.res && r.res.ok && !r.bodyError && parseJob(r.json);
+      if (!job) {
+        if (r.res && !r.res.ok && r.json && r.json.schema === ERROR_SCHEMA) {
+          renderApiError(r.res, r.json);
+          jobFailure('Submission refused. See the configuration message.');
+        } else {
+          jobFailure('Submission response was lost or rejected. Check History before retrying; the job may have been accepted.');
+        }
+        return;
+      }
+      jobCache[job.job_id] = job;
+      jobSeq++;
+      renderSelectedJob(job);
+    }).catch(function () {
+      jobFailure('Submission could not be confirmed. Check History before retrying.');
+    }).then(function () {
+      submittingJob = false;
+      updateGenerate();
+      refreshJobs();
+    });
+  }
+
+  function jobAction(id, action) {
+    apiRequest(jobUrl(id) + '/' + action,
+      {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Qwen-UI': '1'}, body: '{}'},
+      'json').then(function (r) {
+      if (!r.res || !r.res.ok || r.bodyError) {
+        jobFailure('Job action could not be confirmed. Refresh before retrying.');
+      } else if (action === 'cancel') {
+        var job = parseJob(r.json);
+        if (job) { jobCache[id] = job; renderSelectedJob(job); }
+      } else if (r.json && r.json.schema === 'qwen_engine.web_jobs.v1' && r.json.forgotten === id) {
+        delete jobCache[id];
+        jobSeq++;
+      }
+      refreshJobs();
+    });
   }
 
   /* ---------------- Wiring ---------------- */
@@ -1115,7 +1325,7 @@
       ev.preventDefault();
       promptTouched = true;
       renderValidation(validateForm().errors);
-      refuseSubmit();
+      submitGeneration();
     });
 
     $('create-form').addEventListener('keydown', function (ev) {
@@ -1123,7 +1333,7 @@
         ev.preventDefault();
         promptTouched = true;
         renderValidation(validateForm().errors);
-        refuseSubmit();
+        submitGeneration();
       }
     });
 
@@ -1136,6 +1346,28 @@
     });
     $('btn-plan').addEventListener('click', function () { runPlan(true); });
     $('btn-export').addEventListener('click', function () { exportConfig(); });
+    $('cancel-job').addEventListener('click', function () {
+      if (selectedJob) jobAction(selectedJob, 'cancel');
+    });
+    $('action-download').addEventListener('click', function () {
+      var job = jobCache[selectedJob];
+      if (!job || job.state !== 'succeeded') return;
+      var link = document.createElement('a');
+      link.href = job.image_url;
+      link.download = 'qwen-' + job.job_id + '.png';
+      link.click();
+    });
+    $('action-open').addEventListener('click', function () {
+      var job = jobCache[selectedJob];
+      if (job && job.state === 'succeeded') window.open(job.image_url, '_blank', 'noopener');
+    });
+    $('action-again').addEventListener('click', function () {
+      var job = jobCache[selectedJob];
+      if (job && job.state === 'succeeded') submitGeneration(job.config);
+    });
+    $('preview-image').addEventListener('error', function () {
+      jobFailure('The saved image could not be loaded; it may have moved or changed.');
+    });
 
     var presetButtons = document.querySelectorAll('.preset-btn');
     for (var i = 0; i < presetButtons.length; i++) {
@@ -1177,12 +1409,11 @@
     renderValidation(validateForm().errors);
 
     var generate = $('generate-btn');
-    generate.disabled = true;   // unconditional in W2: generation is W3
+    generate.disabled = true;   // enabled only by recognized server status
     setText('generate-reason', GENERATION_UNAVAILABLE_REASON);
     setText('settings-generation',
       'Planning and authoritative config validation come from the local ' +
-      'qwen-web server; generation needs a pipeline adapter and job API that ' +
-      'do not exist yet (W3).');
+      'qwen-web server; generation requires --enable-generation and configured runtime paths.');
 
     checkStatus();   // same-origin only; failures render honestly
   }
@@ -1201,13 +1432,14 @@
   // that shortens the whole-operation timeout so a stalled response BODY
   // can be observed quickly — production code never calls it.
   window.QwenStudio = {
-    version: 'w2-api',
+    version: 'w3-jobs',
     formSnapshot: formSnapshot,
     buildEnvelope: buildEnvelope,
     validateForm: validateForm,
     parseSeed: parseSeed,
     parseStatus: parseStatus,
     parsePlan: parsePlan,
+    parseJob: parseJob,
     randomSeedString: randomSeedString,
     checkStatus: checkStatus,
     setFetchTimeoutForChecks: function (ms) {

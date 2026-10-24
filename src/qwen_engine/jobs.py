@@ -216,6 +216,48 @@ class JobController:
         with self._condition:
             return tuple(self._records.values())
 
+    def read_artifact(self, job_id: str) -> bytes:
+        """Read only a recorded, successful artifact through owned directory FDs.
+
+        Recheck the saved digest on the actual bytes returned: replacing a file
+        after job completion must never turn the image endpoint into file access.
+        """
+        with self._condition:
+            record = self._record(job_id)
+            artifact = record.artifact
+            if record.state != JobState.SUCCEEDED or artifact is None:
+                raise JobError("job has no completed artifact")
+            self._check_root()
+            directory_fd = os.open(job_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                   dir_fd=self._root_fd)
+            try:
+                info = os.fstat(directory_fd)
+                if (info.st_dev, info.st_ino) != self._directories[job_id]:
+                    raise JobError("job directory replaced")
+                fd = os.open(artifact.filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=directory_fd)
+                try:
+                    info = os.fstat(fd)
+                    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                            or info.st_size != artifact.bytes):
+                        raise JobError("artifact changed")
+                    parts, count = [], 0
+                    while count <= artifact.bytes:
+                        block = os.read(fd, min(65536, artifact.bytes + 1 - count))
+                        if not block:
+                            break
+                        parts.append(block)
+                        count += len(block)
+                    data = b"".join(parts)
+                    if count != artifact.bytes or hashlib.sha256(data).hexdigest() != artifact.sha256:
+                        raise JobError("artifact changed")
+                    self._check_root()
+                    return data
+                finally:
+                    os.close(fd)
+            finally:
+                os.close(directory_fd)
+
     def cancel(self, job_id: str) -> JobSnapshot:
         with self._condition:
             record = self._record(job_id)

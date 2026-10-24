@@ -1,4 +1,4 @@
-"""W2 local web server: loopback-only stdlib transport for the web API.
+"""Local web server: loopback-only transport with opt-in serial engine jobs.
 
 Safety posture (reviewed W2 contract):
 
@@ -46,6 +46,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import queue
 import socket
 import stat as stat_module
@@ -95,6 +96,8 @@ STATIC_ROUTES = {
 STATUS_ROUTE = "/api/v1/status"
 PLAN_ROUTE = "/api/v1/plan"
 EXPORT_ROUTE = "/api/v1/config/export"
+JOBS_ROUTE = "/api/v1/jobs"
+_JOB_ROUTE = re.compile(r"/api/v1/jobs/([0-9a-f]{32})(?:/(image|cancel|forget))?\Z")
 
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; "
        "connect-src 'self'; img-src 'self'; base-uri 'none'; "
@@ -239,11 +242,26 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "static", target
         if target == STATUS_ROUTE:
             return "status", target
+        if target == JOBS_ROUTE:
+            return "jobs", target
     elif method == "POST":
         if target == PLAN_ROUTE:
             return "plan", target
         if target == EXPORT_ROUTE:
             return "export", target
+        if target == JOBS_ROUTE:
+            return "submit", target
+    match = _JOB_ROUTE.fullmatch(target)
+    if match:
+        action = match[2] or "job"
+        allow = "POST" if action in ("cancel", "forget") else "GET"
+        if method == allow:
+            return action, match[1]
+        raise ApiError(405, "method_not_allowed", "this route does not accept that method",
+                       headers=(("Allow", allow),))
+    if target == JOBS_ROUTE:
+        raise ApiError(405, "method_not_allowed", "this route does not accept that method",
+                       headers=(("Allow", "GET, POST"),))
     known = set(STATIC_ROUTES) | {STATUS_ROUTE, PLAN_ROUTE, EXPORT_ROUTE}
     if target in known:
         allow = "POST" if target in (PLAN_ROUTE, EXPORT_ROUTE) else "GET"
@@ -254,7 +272,7 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Startup helpers (one-shot; the request path never touches the filesystem)
+# Startup helpers (one-shot metadata reads; jobs verify weights separately)
 # ---------------------------------------------------------------------------
 
 _MANIFEST_LIMIT = 1 << 20  # <= 1 MiB, bounded read
@@ -549,6 +567,14 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, self.server.assets[asset], ctype)
             elif kind == "status":
                 self._send_api(api.status_response(self.server.web_runtime))
+            elif kind in ("jobs", "job", "image"):
+                jobs = getattr(self.server, "generation", None)
+                if jobs is None:
+                    raise ApiError(503, "generation_disabled", "generation is disabled on this server")
+                if kind == "image":
+                    self._send(200, jobs.image(arg), "image/png")
+                else:
+                    self._send_api(jobs.list_response() if kind == "jobs" else jobs.job_response(arg))
             else:
                 length = int(headers["content-length"][0])
                 body = self.rfile.read(length)
@@ -557,8 +583,18 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 if kind == "plan":
                     self._send_api(api.plan_response(self.server.web_runtime, body))
-                else:
+                elif kind == "export":
                     self._send_api(api.export_response(self.server.web_runtime, body))
+                else:
+                    jobs = getattr(self.server, "generation", None)
+                    if jobs is None:
+                        raise ApiError(503, "generation_disabled", "generation is disabled on this server")
+                    if kind == "submit":
+                        self._send_api(jobs.submit(body))
+                    else:
+                        if api.parse_request_json(body) != {}:
+                            raise ApiError(400, "invalid_envelope", "job actions require an empty JSON object")
+                        self._send_api(jobs.job_response(arg, action=kind))
         except ApiError as exc:
             self._send_api(ApiResponse(status=exc.status, payload=exc.to_payload(),
                                        headers=exc.headers))
@@ -812,9 +848,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="qwen-web",
         description=(
-            "Qwen Image Studio local web server (W2): serves the static "
-            "workspace plus the versioned status/plan/config-export API. "
-            "Planning only — generation is NOT implemented here. Loopback "
+            "Qwen Image Studio local web server: serves the workspace, "
+            "status/plan/config-export API and opt-in serial generation jobs. Planning "
+            "is available by default. Loopback "
             "only. Omitted path options mean 'unconfigured': the server "
             "then writes nothing anywhere."
         ),
@@ -830,6 +866,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "(read once at startup, <=1 MiB, never verified here)")
     p.add_argument("--models-dir", default=None,
                    help="model storage root (metadata context only for W2)")
+    p.add_argument("--enable-generation", action="store_true",
+                   help="enable real serial engine jobs (requires manifest, models, output and cache paths)")
+    p.add_argument("--attest-unbounded-host", action="store_true",
+                   help="operator attestation of no cgroup RAM cap; encoder uses fresh host MemAvailable")
     for flag in ("output-dir", "cache-dir", "log-dir", "benchmarks-dir"):
         p.add_argument(f"--{flag}", default=None,
                        help=f"server runtime path {flag!r} (never settable "
@@ -884,7 +924,12 @@ def main(argv: list[str] | None = None) -> int:
         raw, unreadable = read_manifest_limited(paths["manifest_path"])
         summary = api.summarize_manifest_bytes(raw, unreadable)
 
-    runtime = WebRuntime(**paths, manifest_summary=summary)
+    runtime = WebRuntime(**paths, manifest_summary=summary,
+                         generation_enabled=args.enable_generation)
+    if args.enable_generation and api._blockers(runtime):
+        print("error: generation requires valid manifest metadata and explicit "
+              "--manifest, --models-dir, --output-dir and --cache-dir", file=sys.stderr)
+        return 2
     try:
         assets = load_static_assets()
     except OSError as exc:
@@ -902,20 +947,44 @@ def main(argv: list[str] | None = None) -> int:
     httpd.assets = assets
     httpd.bound_ip = args.host
     httpd.bound_port = int(httpd.server_address[1])
+    httpd.generation = None
+    if args.enable_generation:
+        from qwen_engine.web.generation import WebGeneration
+        try:
+            Path(runtime.output_dir).mkdir(parents=True, exist_ok=True)
+            httpd.generation = WebGeneration(runtime, trust_unbounded_host=args.attest_unbounded_host)
+        except (OSError, ValueError, RuntimeError):
+            httpd.server_close()
+            print("error: generation output storage or worker could not be initialized", file=sys.stderr)
+            return 1
+        if args.attest_unbounded_host:
+            print("notice: operator attests no cgroup RAM limit for generation; "
+                  "the encoder still checks fresh host MemAvailable", file=sys.stderr)
 
     origin = f"http://{args.host}:{httpd.bound_port}"
     print(f"qwen-web listening on {origin}")
-    print("qwen-web: planning only (no generation); loopback-only local "
+    mode = "generation enabled (serial jobs)" if httpd.generation else "planning only (no generation)"
+    print(f"qwen-web: {mode}; loopback-only local "
           "server. Container loopback is NOT the host's or a Tailscale "
           "peer's loopback — remote access is a later reviewed milestone.")
     sys.stdout.flush()
+    def terminate(signum, frame):
+        raise KeyboardInterrupt
+
+    old_term = signal.signal(signal.SIGTERM, terminate)
+    stopped = True
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         httpd.server_close()
-    return 0
+        if httpd.generation is not None:
+            stopped = httpd.generation.close()
+        signal.signal(signal.SIGTERM, old_term)
+    if not stopped:
+        print("error: generation worker did not finish shutdown within 60 seconds", file=sys.stderr)
+    return 0 if stopped else 1
 
 
 if __name__ == "__main__":  # pragma: no cover

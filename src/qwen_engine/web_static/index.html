@@ -155,6 +155,7 @@
             <button type="submit" id="generate-btn" class="btn-primary" disabled>
               Generate</button>
             <p class="disabled-reason" id="generate-reason" role="status"></p>
+            <button type="button" id="cancel-job" class="btn-secondary" disabled>Cancel selected job</button>
           </div>
 
           <div class="actions api-actions" role="group"
@@ -177,11 +178,12 @@
         <div class="preview-frame" id="preview-frame" data-aspect="1 / 1">
           <div class="preview-empty" id="preview-empty">
             <p class="preview-empty-title">No image yet</p>
-            <p>Generation is not available in this build — no generation
-              adapter or job API is implemented, so nothing can appear here
-              yet.</p>
+            <p>Submit a generation to the local engine. Completed images appear here.</p>
           </div>
+          <img id="preview-image" hidden alt="">
         </div>
+        <p id="job-status" role="status" aria-live="polite">No job selected.</p>
+        <p id="job-timings" class="plan-note"></p>
 
         <div class="result-actions" aria-label="Result actions">
           <button type="button" class="btn-secondary" id="action-download"
@@ -204,11 +206,11 @@
           </div>
           <div class="stat-card">
             <p class="stat-label">Steps taken</p>
-            <p class="stat-value">—<span class="visually-hidden">(unknown)</span></p>
+            <p class="stat-value" id="stat-steps">—<span class="visually-hidden">(unknown)</span></p>
           </div>
           <div class="stat-card">
             <p class="stat-label">Elapsed</p>
-            <p class="stat-value">—<span class="visually-hidden">(unknown)</span></p>
+            <p class="stat-value" id="stat-elapsed">—<span class="visually-hidden">(unknown)</span></p>
           </div>
         </div>
 
@@ -227,7 +229,7 @@
             <div><dt>Hardware</dt><dd id="plan-hardware">—</dd></div>
             <div><dt>Calibration</dt><dd id="plan-calibration">—</dd></div>
           </dl>
-          <p class="stat-label">Generation blockers (why nothing runs yet)</p>
+          <p class="stat-label">Submission blockers (resource checks run inside each job)</p>
           <ul class="plan-blockers" id="plan-blockers" aria-live="polite"></ul>
         </section>
       </section>
@@ -240,8 +242,8 @@
     <h2 id="history-heading" tabindex="-1">History</h2>
     <p class="history-empty" id="history-empty">
       No saved generations yet. Completed images from this machine will appear
-      here as thumbnails. Nothing has been generated in this session, so this
-      list is honestly empty — no placeholders are shown.
+      here as thumbnails. History lasts until the server restarts; image files
+      stay on disk when entries are forgotten.
     </p>
     <div class="history-grid" id="history-grid" aria-live="polite"></div>
     <p><a class="back-link" href="#create">← Back to Create</a></p>
@@ -255,15 +257,15 @@
         only to the local qwen-web server on the same origin, when it is
         running. Opened over file:// or without that server it is
         disconnected: planning and authoritative validation are unavailable.
-        The server offers planning only — never generation.</dd></div>
+        Real generation requires explicit server enablement.</dd></div>
       <div><dt>Generation gates</dt><dd id="settings-gates">Unknown until the
         server answers: adapter, hardware, assets and calibration gates are
-        reported by /api/v1/status and are all explicitly unsatisfied in
-        this build.</dd></div>
+        reported by /api/v1/status. Asset and hardware checks run per job;
+        exact calibration preflight is not wired into generation.</dd></div>
       <div><dt>Generation</dt><dd id="settings-generation">Planning and
         authoritative config validation come from the local server;
-        generation needs a pipeline adapter and job API that do not exist
-        yet — Generate is disabled and the handlers refuse outright.</dd></div>
+        generation uses the engine through a serial job queue when enabled
+        by the server operator.</dd></div>
       <div><dt>Runtime paths &amp; model files</dt><dd>Runtime paths
         (output, cache, log, benchmarks, models, manifest) belong to the
         server's own configuration and can never be set from this page;

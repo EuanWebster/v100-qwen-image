@@ -118,8 +118,11 @@ class WebRuntime:
     models_dir: str | None = None
     manifest_path: str | None = None
     manifest_summary: Mapping[str, Any] = field(default_factory=dict)
+    generation_enabled: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.generation_enabled) is not bool:
+            raise ValueError("generation_enabled must be a bool")
         errors: list[str] = []
         summary = _jsonsafe.freeze_json(self.manifest_summary, "manifest_summary", errors)
         if errors or not isinstance(summary, Mapping):
@@ -421,20 +424,21 @@ def _manifest_blocker(summary: Mapping[str, Any]) -> str | None:
     return None
 
 
-#: The honest W2 gates: every one is explicitly NOT satisfied.
+#: Capabilities/evidence, separate from static submission blockers.
 def _gates() -> dict[str, dict[str, str]]:
     return {
         "adapter": {
-            "state": "not_implemented",
-            "code": "adapter_not_implemented",
-            "reason": "no pipeline adapter is implemented (M4+); generation "
-                      "would fail before touching a model",
+            "state": "available",
+            "code": "adapter_available",
+            "reason": "the FP16 resident Qwen adapter is implemented; actual "
+                      "load and resource checks run inside each job",
         },
         "hardware": {
             "state": "unknown",
             "code": "hardware_not_probed",
-            "reason": "no hardware probe has run for this server; the GPU is "
-                      "unknown here — not claimed present, absent or verified",
+            "reason": "status/plan do not probe hardware; each actual job "
+                      "validates its device, so submission availability is "
+                      "not hardware verification",
         },
         "assets": {
             "state": "not_verified",
@@ -455,7 +459,15 @@ def _gates() -> dict[str, dict[str, str]]:
 
 
 def _blockers(runtime: WebRuntime) -> list[str]:
-    codes = [gate["code"] for gate in _gates().values()]
+    """Static submission blockers, never a claim of measured memory fitness.
+
+    Hardware/assets are checked by the actual engine job, just as in the CLI.
+    Exact calibration preflight remains a separate, unimplemented integration.
+    """
+    codes = [] if runtime.generation_enabled else ["generation_disabled"]
+    if any(getattr(runtime, name) is None for name in
+           ("output_dir", "cache_dir", "models_dir", "manifest_path")):
+        codes.append("runtime_unconfigured")
     blocker = _manifest_blocker(runtime.manifest_summary)
     if blocker:
         codes.append(blocker)
@@ -483,7 +495,7 @@ def status_response(runtime: WebRuntime) -> ApiResponse:
     payload = {
         "schema": WEB_STATUS_SCHEMA,
         "planning_available": True,
-        "generation_available": False,
+        "generation_available": not _blockers(runtime),
         "gates": _gates(),
         "manifest": _manifest_core(summary),
         "generation_blockers": _blockers(runtime),
@@ -507,7 +519,7 @@ def plan_response(runtime: WebRuntime, raw_body: bytes) -> ApiResponse:
     payload = {
         "schema": WEB_PLAN_SCHEMA,
         "planning_available": True,
-        "generation_available": False,
+        "generation_available": not _blockers(runtime),
         "config": editable_config_dict(config),
         "cfg_active": core_doc["cfg_active"],
         "latent_tokens": core_doc["latent_tokens"],

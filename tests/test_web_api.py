@@ -53,11 +53,11 @@ def test_status_schema_booleans_and_explicit_gates():
     assert s["planning_available"] is True
     assert s["generation_available"] is False
     codes = {g["code"] for g in s["gates"].values()}
-    assert codes == {"adapter_not_implemented", "hardware_not_probed",
+    assert codes == {"adapter_available", "hardware_not_probed",
                      "assets_unverified", "calibration_unknown"}
-    assert s["gates"]["adapter"]["state"] == "not_implemented"
+    assert s["gates"]["adapter"]["state"] == "available"
     assert s["gates"]["hardware"]["state"] == "unknown"   # NOT absent/verified
-    assert set(s["generation_blockers"]) >= codes
+    assert set(s["generation_blockers"]) == {"generation_disabled", "runtime_unconfigured", "manifest_unconfigured"}
     # metadata-only manifest state, never verification
     assert s["manifest"]["verification"] == "not_performed"
 
@@ -90,7 +90,7 @@ def test_plan_happy_path_projection_and_seed_string():
     assert payload["manifest"]["fit"] == "not_evaluated"
     assert payload["hardware"]["status"] == "unknown"
     assert payload["calibration"]["status"] == "unknown"
-    assert "adapter_not_implemented" in payload["generation_blockers"]
+    assert "generation_disabled" in payload["generation_blockers"]
 
 
 def test_plan_token_math_and_cfg():

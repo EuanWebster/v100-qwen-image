@@ -152,7 +152,7 @@ CPU tests never touch a heavy ML import:
 | `qwen_engine/mem_preflight.py` | **Host-memory preflight for the forthcoming CPU encoder child (M2.2b)**: conservative stdlib check, before any ML import/weight read/loader call, that checkpoint bytes + explicit dtype expansion (integer ceiling division) + explicit runtime headroom fit the **tighter** of host `MemAvailable` (validated `kB` unit; conversion-limit-exceeding digits are unknown) and this process's cgroup v2 state. A real read walks **every visible ancestor** but is fail-closed **unknown**: a missing `memory.max` at any level proves nothing about the controller, and the visible root's completeness is unproven (a namespace `/` can hide a tighter ancestor), so real autodiscovery refuses regardless of root file contents — the tightest visible `limit - current` travels only as an **advisory visible availability** (an UPPER bound on true availability a hidden ancestor can only tighten) with truthful per-level source notes. An explicitly injected finite/unlimited `MemorySnapshot` is **trusted caller evidence** for pure budget arithmetic (finite cap never substituted away by host RAM; unknown host always refuses; absent finite current is never zero; zero cap is a zero budget). Passing is a conservative prerequisite, **not measured model-fit evidence**; the default deployment may legitimately refuse all real loads until trusted complete host-budget evidence exists. Scoped to Linux cgroup v2 — not the M5.3 `memory.py` policy and not a general resource framework. | stdlib |
 | `qwen_engine/bench.py` | **Versioned benchmark/result schemas** (R6; detail in M1.5): phase timings, peak host RSS, peak CUDA memory when available, environment and model identifiers; feeds `calibration.json`. | stdlib |
 | `qwen_engine/cli.py` | The engine's CLI front-end (kept after the 2026-10-12 web pivot; the desktop-GUI idea is superseded by the web workspace — see the W milestones): argparse → validate config → plan via `core.plan()` (adapter-independent) → `generate`; implements the **exit-code contract** (M1 acceptance criteria). `cli_gen.py` at the repo root stays as a thin entry-point shim. | the above only |
-| `qwen_engine/web_static/` | **Original static web workspace** (W milestones; design in `docs/web-interface.md`): self-contained HTML/CSS/JS — no framework, no CDN, no external fonts. Since W2 the page makes **only same-origin, relative API calls** (`/api/v1/status`, `/api/v1/plan`, `/api/v1/config/export`) to the local `qwen-web` server — no other network code exists. The earlier "no network requests at all" statement is HISTORICAL W1 evidence (W1 shipped without a server; the speculative capability probe was removed in the 2026-10-12 review). Opened over `file://` or without a server the page shows honest disconnected states. Generate is unconditionally disabled — no generation adapter or job API exists. FreeVideo's web studio was a visual/UX reference only — no code or assets copied, no ComfyUI involvement. | `qwen_engine/web/` (W2 server, stdlib-only) |
+| `qwen_engine/web_static/` | **Original web workspace**: self-contained HTML/CSS/JS, same-origin relative status/plan/export/job calls, no framework/CDN/external fonts. W3 enables real generation when the operator starts the local server with `--enable-generation`; Preview, session History, cancellation and measured timings use actual engine jobs. Opened without a server it stays disconnected. The W1 zero-network and W2 always-disabled-generation statements are historical. FreeVideo was a visual reference only; no copied assets/code or ComfyUI involvement. See `docs/web-generation-w3.md`. | `qwen_engine/web/` (stdlib transport; ML imports deferred to job execution) |
 
 **Boundary invariant (tested):** `python -c "import qwen_engine"` and
 `cli_gen.py --help` / `--dry-run` must succeed on a machine with **no torch, no
@@ -482,9 +482,13 @@ disclosure, stat cards, creations history. Engine stays ComfyUI-free.
   `scripts/web_integration_check.mjs` (spawns its own ephemeral-port server,
   Chrome leg strictly opt-in). CLI unchanged; generation stays W3. Design +
   evidence: `docs/web-interface.md`.
-- **W3** — generation wiring: job submit/status endpoints over the real engine
-  path (`core` + adapter), real results into the preview + History, honest
-  timings. Gated on the engine milestones (M3/M4) — the UI never invents output.
+- **W3 (implemented 2026-10-24)** — opt-in serial generation over the real
+  `core` + default adapter, job submit/list/status/cancel/forget/image endpoints,
+  real Preview and session History, exact seeds, measured timings, and cooperative
+  shutdown. Existing loopback/request protections retained. Real browser-driven
+  V100 1024²/20-step job completed in 86.7 s, including weight verification.
+  Exact calibration preflight remains separate; submission availability is not
+  a memory-fit claim. See [W3 instructions and evidence](docs/web-generation-w3.md).
 
 ---
 
