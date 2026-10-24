@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ComfyUI NVIDIA V100
+Comment=Image generation on the Tesla V100
+Exec=/home/euan/.local/bin/comfyui-nvidia-open
+Icon=applications-graphics
+Terminal=false
+Categories=Graphics;
+StartupNotify=false

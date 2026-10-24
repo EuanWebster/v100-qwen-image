@@ -1,0 +1,3 @@
+# Volta V100 requires the CUDA 12.6 wheels with sm_70 kernels.
+torch==2.14.1+cu126
+torchvision==0.29.1+cu126

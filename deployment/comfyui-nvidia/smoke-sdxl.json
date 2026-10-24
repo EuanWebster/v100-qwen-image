@@ -1,0 +1,12 @@
+{
+  "client_id": "v100-install-check",
+  "prompt": {
+    "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "Juggernaut-XL_v9.safetensors"}},
+    "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "A small white lighthouse on a rocky coast at sunrise, gentle waves, warm golden light, photographic detail, wide landscape composition", "clip": ["1", 1]}},
+    "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry, low quality, text, watermark", "clip": ["1", 1]}},
+    "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 1}},
+    "5": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 12, "cfg": 6.5, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0]}},
+    "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+    "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": "validation/v100-sdxl-smoke", "images": ["6", 0]}}
+  }
+}

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl --user start comfyui-nvidia.service
+for ((attempt=0; attempt<60; attempt++)); do
+  if curl --silent --fail --max-time 1 http://127.0.0.1:8189/system_stats >/dev/null; then
+    exec xdg-open http://127.0.0.1:8189
+  fi
+  if ! systemctl --user is-active --quiet comfyui-nvidia.service; then
+    printf 'ComfyUI NVIDIA failed to start. Check: journalctl --user -u comfyui-nvidia.service\n' >&2
+    exit 1
+  fi
+  sleep 1
+done
+printf 'ComfyUI NVIDIA is still starting. Check: journalctl --user -u comfyui-nvidia.service\n' >&2
+exit 1

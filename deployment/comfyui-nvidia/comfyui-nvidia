@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+app=/home/euan/ComfyUI-NVIDIA
+unset PYTHONHOME PYTHONPATH HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES GPU_DEVICE_ORDINAL
+export PYTHONNOUSERSITE=1
+export CUDA_VISIBLE_DEVICES=GPU-4a20902a-772a-15a9-6d1e-8b6bc2820751
+cd "$app"
+exec "$app/.venv/bin/python" "$app/main.py" \
+  --listen 127.0.0.1 --port 8189 \
+  --user-directory "$app/user" \
+  --input-directory "$app/input" \
+  --output-directory "$app/output" \
+  --temp-directory "$app/temp" \
+  --fp16-unet --fp32-vae --use-pytorch-cross-attention "$@"

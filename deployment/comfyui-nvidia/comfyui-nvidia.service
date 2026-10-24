@@ -1,0 +1,12 @@
+[Unit]
+Description=ComfyUI NVIDIA V100
+
+[Service]
+Type=simple
+WorkingDirectory=/home/euan/ComfyUI-NVIDIA
+ExecStart=/home/euan/.local/bin/comfyui-nvidia
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
