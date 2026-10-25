@@ -60,6 +60,7 @@ _OVERRIDES = {
     "models_dir": "models_dir",
     "manifest": "manifest_path",
     "q8_manifest": "q8_manifest_path",
+    "output_format": "output_format",
 }
 MAX_CONFIG_BYTES = 1 << 20
 
@@ -107,6 +108,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="true CFG scale (>= 1.0; guidance active only with a "
                         "negative prompt AND scale > 1)")
     p.add_argument("--seed", type=int)
+    p.add_argument("--output-format", choices=("jpg", "png", "webp"),
+                   help="saved image format (default: jpg; JPEG flattens alpha on white)")
     p.add_argument("--quant", choices=QUANT_CHOICES)
     p.add_argument("--offload", choices=OFFLOAD_CHOICES)
     p.add_argument("--attention-backend", dest="attention_backend",

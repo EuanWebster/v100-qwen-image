@@ -84,6 +84,32 @@ async function check() {
   await send('Page.navigate', {url: origin + '/'});
   await until(`document.getElementById('generate-btn') && !document.getElementById('generate-btn').disabled`);
   console.log('PASS generation-enabled status recognized');
+  assert.equal(await evaluate(`document.getElementById('output-format').value`), 'jpg');
+  const imported = await evaluate(`QwenStudio.importConfigFile(new File([
+    '{"prompt":"imported cube","seed":18446744073709551615,"output_format":"webp"}'
+  ], 'config.json', {type:'application/json'}))`);
+  assert.equal(imported, true);
+  assert.equal(await evaluate(`document.getElementById('seed').value`), '18446744073709551615');
+  assert.equal(await evaluate(`document.getElementById('output-format').value`), 'webp');
+  assert.equal((await jobIds()).length, 0);
+  assert.equal(await evaluate(`(async () => {
+    const pending=QwenStudio.importConfigFile(new File(['{"prompt":"late import"}'],'config.json'));
+    document.getElementById('prompt').value='newer draft';
+    document.getElementById('prompt').dispatchEvent(new Event('input'));
+    return await pending;
+  })()`), false);
+  assert.equal(await evaluate(`document.getElementById('prompt').value`), 'newer draft');
+  await evaluate(`document.getElementById('output-format').value='jpg'`);
+  for (const theme of ['original', 'neon', 'paper']) {
+    await evaluate(`document.getElementById('theme-select').value='${theme}'; document.getElementById('theme-select').dispatchEvent(new Event('change'))`);
+    assert.equal(await evaluate(`document.documentElement.dataset.theme`), theme);
+    const shot = await send('Page.captureScreenshot', {format:'png'});
+    writeFileSync(join(artifactDir, 'theme-' + theme + '.png'), Buffer.from(shot.data,'base64'));
+  }
+  await send('Page.reload');
+  await until(`document.getElementById('generate-btn') && !document.getElementById('generate-btn').disabled`);
+  assert.equal(await evaluate(`document.documentElement.dataset.theme`), 'paper');
+  console.log('PASS raw configuration import preserves uint64 seed, does not generate; three themes persist');
   for (const [preset, width, height] of [['square2k',2048,2048], ['landscape2k',2688,1536], ['portrait2k',1536,2688]]) {
     const result = await evaluate(`(() => {
       document.querySelector('[data-preset="${preset}"]').click();
@@ -128,11 +154,12 @@ async function check() {
   console.log(`PASS real UI submit → successful job → loaded Preview + History (${(job.elapsed_ms/1000).toFixed(1)} s)`);
   writeFileSync(join(artifactDir, 'job.json'), JSON.stringify(job, null, 2));
   const image = await fetch(origin + job.image_url);
-  assert.equal(image.headers.get('content-type'), 'image/png');
+  assert.equal(image.headers.get('content-type'), 'image/jpeg');
   assert.equal(image.headers.get('x-content-type-options'), 'nosniff');
   const imageBytes = Buffer.from(await image.arrayBuffer());
-  assert.equal(imageBytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
-  writeFileSync(join(artifactDir, 'result.png'), imageBytes);
+  assert.equal(imageBytes.subarray(0, 3).toString('hex'), 'ffd8ff');
+  assert.match(job.image_filename, /^qi21-\d{8}-\d+\.jpg$/);
+  writeFileSync(join(artifactDir, 'result.jpg'), imageBytes);
   await send('Page.reload');
   await until(`document.getElementById('preview-image').naturalWidth > 0 && document.querySelectorAll('.history-card').length === 1`);
   console.log('PASS reload recovers server history and completed image');
@@ -144,6 +171,8 @@ async function check() {
     await send('Emulation.setDeviceMetricsOverride', {width, height: 1000, deviceScaleFactor: 1, mobile: width < 500});
     await delay(150);
     assert(await evaluate('document.documentElement.scrollWidth <= window.innerWidth + 1'));
+    await evaluate(`document.getElementById('advanced').open=true; window.scrollTo(0,500)`);
+    assert(await evaluate(`(() => {const r=document.getElementById('generate-btn').getBoundingClientRect(); return r.top>=0 && r.bottom<window.innerHeight;})()`));
     const shot = await send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: true});
     writeFileSync(join(artifactDir, `studio-${width}.png`), Buffer.from(shot.data, 'base64'));
   }

@@ -48,7 +48,7 @@ WEB_ERROR_SCHEMA = "qwen_engine.web_error.v1"
 EDITABLE_FIELDS = frozenset({
     "prompt", "negative_prompt", "width", "height", "steps",
     "true_cfg_scale", "seed", "quant", "offload", "attention_backend",
-    "vae_tiled_decode",
+    "vae_tiled_decode", "output_format",
 })
 
 #: Server-controlled runtime path fields (never editable from the browser).
@@ -556,6 +556,27 @@ def export_response(runtime: WebRuntime, raw_body: bytes) -> ApiResponse:
         headers=(("Content-Disposition",
                   'attachment; filename="qwen-editable-config.json"'),),
     )
+
+
+def import_response(runtime: WebRuntime, raw_body: bytes) -> ApiResponse:
+    """Validate an editable export without rounding its numeric uint64 seed.
+
+    Files contain raw JSON config; Python parses integers exactly before the
+    ordinary browser envelope validator rejects runtime/unknown fields.
+    """
+    try:
+        data = parse_request_json(raw_body)
+        if not isinstance(data, Mapping):
+            raise ApiError(400, "invalid_config_file", "configuration file must contain a JSON object")
+        config = dict(data)
+        if type(config.get("seed")) is int:
+            config["seed"] = str(config["seed"])
+        envelope = {"schema": WEB_PLAN_REQUEST_SCHEMA, "config": config}
+        # Reuse plan projection so the browser has one authoritative config
+        # parser, with paths omitted and seeds always decimal strings.
+        return plan_response(runtime, json.dumps(envelope, ensure_ascii=False).encode("utf-8"))
+    except ApiError as exc:
+        return ApiResponse(exc.status, exc.to_payload())
 
 
 def internal_error_response() -> ApiResponse:

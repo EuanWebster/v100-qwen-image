@@ -19,6 +19,16 @@
     <a href="#history" id="nav-history" class="nav-link">History</a>
     <a href="#settings" id="nav-settings" class="nav-link nav-settings">Settings</a>
   </nav>
+  <div class="theme-picker">
+    <label for="theme-select">Theme</label>
+    <select id="theme-select" aria-describedby="theme-help">
+      <option value="original" selected>Original</option>
+      <option value="neon">Neon</option>
+      <option value="paper">Paper</option>
+    </select>
+    <span id="theme-help" class="visually-hidden">Theme choice is the only
+      thing this page stores in your browser.</span>
+  </div>
   <p class="connection-chip" id="connection-chip" role="status"
      aria-label="Backend connection status">Not connected</p>
 </header>
@@ -32,6 +42,19 @@
 
       <aside class="controls" aria-label="Generation controls">
         <form id="create-form" novalidate>
+
+          <div class="actions job-actions sticky-actions">
+            <button type="submit" id="generate-btn" class="btn-primary" disabled>
+              Generate</button>
+            <p class="disabled-reason" id="generate-reason" role="status"></p>
+            <p id="job-feedback" class="job-feedback" role="status" aria-live="polite">Ready to submit a generation.</p>
+            <div id="job-progress-panel" hidden>
+              <label for="job-progress" id="job-progress-label">Waiting for generation</label>
+              <progress id="job-progress" max="1" aria-labelledby="job-progress-label"></progress>
+            </div>
+            <button type="button" id="view-result" class="btn-secondary" hidden>View completed image</button>
+            <button type="button" id="cancel-job" class="btn-secondary" disabled>Cancel selected job</button>
+          </div>
 
           <div class="field">
             <label for="prompt">Prompt</label>
@@ -71,6 +94,15 @@
                    step="1" value="40" inputmode="numeric"
                    aria-describedby="steps-error">
             <p class="error" id="steps-error" aria-live="polite"></p>
+          </div>
+
+          <div class="field">
+            <label for="output-format">Output format</label>
+            <select id="output-format" name="output_format">
+              <option value="jpg" selected>jpg</option>
+              <option value="png">png</option>
+              <option value="webp">webp</option>
+            </select>
           </div>
 
           <div class="field seed-field">
@@ -161,19 +193,6 @@
               authoritatively and has the final say.</p>
           </details>
 
-          <div class="actions">
-            <button type="submit" id="generate-btn" class="btn-primary" disabled>
-              Generate</button>
-            <p class="disabled-reason" id="generate-reason" role="status"></p>
-            <p id="job-feedback" class="job-feedback" role="status" aria-live="polite">Ready to submit a generation.</p>
-            <div id="job-progress-panel" hidden>
-              <label for="job-progress" id="job-progress-label">Waiting for generation</label>
-              <progress id="job-progress" max="1" aria-labelledby="job-progress-label"></progress>
-            </div>
-            <button type="button" id="view-result" class="btn-secondary" hidden>View completed image</button>
-            <button type="button" id="cancel-job" class="btn-secondary" disabled>Cancel selected job</button>
-          </div>
-
           <div class="actions api-actions" role="group"
                aria-label="Configuration and planning">
             <button type="button" class="btn-secondary" id="btn-check-config">
@@ -184,6 +203,10 @@
             <button type="button" class="btn-secondary" id="btn-export" disabled
                     title="enabled after the server status is recognized; use Check configuration to reconnect">
               Export editable configuration</button>
+            <button type="button" class="btn-secondary" id="btn-import" disabled
+                    title="enabled after the server status is recognized; use Check configuration to reconnect">
+              Import editable configuration</button>
+            <input id="import-file" type="file" accept=".json,application/json" hidden>
             <p class="api-status" id="api-message" role="status"
                aria-live="polite"></p>
           </div>
@@ -293,12 +316,17 @@
         when it is reachable.</dd></div>
       <div><dt>Privacy</dt><dd>This page makes no third-party requests and
         loads no external fonts, scripts or analytics; its only requests
-        are same-origin calls to the local server. Plain static hosting
-        serves these files but enforces nothing by itself — locality is
-        controlled by the qwen-web server's explicit bind addresses. Remote
-        access uses the LAN or Tailscale address selected by the operator.</dd></div>
-      <div><dt>Drafts</dt><dd>Nothing is saved by the browser automatically.
-        An opt-in draft store for validated form values may come later.</dd></div>
+        are same-origin calls to the local server. The only thing the
+        browser stores is your chosen theme (Original, Neon or Paper), kept
+        under one local key; your prompt, draft and settings are never
+        saved by the browser. Plain static hosting serves these files but
+        enforces nothing by itself — locality is controlled by the qwen-web
+        server's explicit bind addresses. Remote access uses the LAN or
+        Tailscale address selected by the operator.</dd></div>
+      <div><dt>Drafts</dt><dd>Nothing is saved by the browser automatically
+        except the theme choice above. Prompts, seeds and form values are
+        never stored; an opt-in draft store for validated form values may
+        come later.</dd></div>
     </dl>
     <p><a class="back-link" href="#create">← Back to Create</a></p>
   </section>

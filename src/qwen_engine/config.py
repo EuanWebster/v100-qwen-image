@@ -51,6 +51,12 @@ class Quant(StrEnum):
     Q4 = "q4"
 
 
+class OutputFormat(StrEnum):
+    JPG = "jpg"
+    PNG = "png"
+    WEBP = "webp"
+
+
 class OffloadMode(StrEnum):
     RESIDENT = "resident"
     STREAMED = "streamed"
@@ -144,6 +150,7 @@ class GenerationConfig:
     offload: OffloadMode = OffloadMode.RESIDENT
     attention_backend: AttentionBackend = AttentionBackend.AUTO
     vae_tiled_decode: bool = False
+    output_format: OutputFormat = OutputFormat.JPG
     # Relocatable runtime paths (R7). None = not configured -> nothing is
     # written there; tests redirect all of these to tmp_path.
     output_dir: str | None = None
@@ -158,6 +165,7 @@ class GenerationConfig:
         "quant": Quant,
         "offload": OffloadMode,
         "attention_backend": AttentionBackend,
+        "output_format": OutputFormat,
     }
 
     def __post_init__(self) -> None:

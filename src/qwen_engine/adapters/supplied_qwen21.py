@@ -275,13 +275,10 @@ class SuppliedQwen21Adapter:
         if (config.output_dir is None or not isinstance(image, self._image.Image)
                 or image.mode not in ("RGB", "RGBA") or image.size != (config.width, config.height)):
             raise EngineError("an explicit output directory and correctly sized RGB/RGBA image are required")
-        from qwen_engine.encoder_worker import _response_destination, _publish_response
-        path = Path(config.output_dir).absolute() / (uuid.uuid4().hex + ".png")
-        with _BoundedPNG() as buffer:
-            image.save(buffer, format="PNG")
-            self._check("decoded", config)
-            with _response_destination(path) as (parent, name, directory):
-                _publish_response(parent, name, directory, buffer.getvalue())
+        from qwen_engine.image_output import save_output_image
+        path = save_output_image(image, config.output_dir, config.output_format.value,
+                                 self.actual_seed,
+                                 check_cancelled=lambda: self._check("decoded", config))
         self._state = "saved"
         return path
 

@@ -2,7 +2,8 @@
    Dark charcoal shell, fine borders, one warm restrained accent.
    No external fonts, no CDN, no analytics. System font stack only. */
 
-:root {
+:root,
+:root[data-theme="original"] {
   --bg: #16181b;
   --bg-panel: #1d2024;
   --bg-raised: #23262b;
@@ -14,10 +15,56 @@
   --accent-dim: #b9854c;
   --error: #e07b7b;
   --focus: #e6b87e;
+  --on-accent: #14161a;
+  --ok: #9fd6a8;
+  --ok-border: #3f6b4b;
   --radius: 8px;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
           Arial, sans-serif;
 }
+
+/* Neon theme: dark base, cyan/magenta accents. Text pairs chosen for
+   readable contrast on the dark surfaces (accent text is light cyan). */
+:root[data-theme="neon"] {
+  --bg: #07090f;
+  --bg-panel: #0d1220;
+  --bg-raised: #131a2c;
+  --border: #1f4557;
+  --border-soft: #14293a;
+  --text: #dff6ff;
+  --text-muted: #8fc7d9;
+  --accent: #22d3ee;
+  --accent-dim: #0e7490;
+  --error: #f77fb1;
+  --focus: #67e8f9;
+  --on-accent: #062026;
+  --ok: #5eead4;
+  --ok-border: #155e63;
+}
+
+/* Paper theme: light surfaces, warm ink. Muted/accent pairs keep
+   readable contrast on the light backgrounds. */
+:root[data-theme="paper"] {
+  --bg: #f6f3ec;
+  --bg-panel: #fffdf7;
+  --bg-raised: #ece7db;
+  --border: #c9c2b2;
+  --border-soft: #ddd6c6;
+  --text: #23262b;
+  --text-muted: #5c626b;
+  --accent: #8a5a24;
+  --accent-dim: #6d4619;
+  --error: #a13a3a;
+  --focus: #6d4619;
+  --on-accent: #fffdf7;
+  --ok: #2c6e3f;
+  --ok-border: #9fc7a8;
+}
+
+:root[data-theme="neon"] .brand-mark {
+  box-shadow: 0 0 18px #22d3ee55, 0 0 28px #db36ff33;
+}
+:root[data-theme="neon"] .sticky-actions { border-color: #9445ad; }
 
 * { box-sizing: border-box; }
 
@@ -40,7 +87,7 @@ body { min-height: 100vh; display: flex; flex-direction: column; }
 
 .skip-link {
   position: absolute; left: 8px; top: -40px; z-index: 10;
-  background: var(--accent); color: #14161a; padding: 6px 12px;
+  background: var(--accent); color: var(--on-accent); padding: 6px 12px;
   border-radius: var(--radius); text-decoration: none;
   transition: top 120ms ease;
 }
@@ -65,7 +112,7 @@ body { min-height: 100vh; display: flex; flex-direction: column; }
 .brand-mark {
   display: inline-flex; align-items: center; justify-content: center;
   width: 30px; height: 30px; border-radius: 7px;
-  background: var(--accent); color: #14161a;
+  background: var(--accent); color: var(--on-accent);
   font-weight: 700; font-size: 17px;
 }
 
@@ -93,7 +140,18 @@ body { min-height: 100vh; display: flex; flex-direction: column; }
   color: var(--text-muted); font-size: 13px; white-space: nowrap;
 }
 .connection-chip.is-ready {
-  color: #9fd6a8; border-color: #3f6b4b;
+  color: var(--ok); border-color: var(--ok-border);
+}
+
+.theme-picker {
+  display: flex; align-items: center; gap: 8px; margin-left: 12px;
+}
+.theme-picker label { margin: 0; white-space: nowrap; }
+.theme-picker select {
+  width: auto;
+  background: var(--bg-raised); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 8px; font-size: 13px;
 }
 
 /* ---------- Layout ---------- */
@@ -118,6 +176,22 @@ main { flex: 1; padding: 20px; }
 }
 
 .preview-column { min-width: 0; }
+
+/* ---------- Sticky job actions (top of form) ----------
+   Generate/progress/feedback/cancel/view live at the TOP of the form and
+   stay pinned below the header. The background is OPAQUE (no alpha) so
+   scrolled content — including an open Advanced section — never bleeds
+   through at desktop or mobile widths. */
+
+.sticky-actions {
+  position: sticky; top: 8px; z-index: 5;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  margin-top: 0;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
 
 /* ---------- Form ---------- */
 
@@ -175,7 +249,7 @@ input:invalid, textarea:invalid { border-color: var(--border); }
   padding: 8px 8px; cursor: pointer;
 }
 .preset-btn[aria-pressed="true"] {
-  color: #14161a; background: var(--accent); border-color: var(--accent-dim);
+  color: var(--on-accent); background: var(--accent); border-color: var(--accent-dim);
   font-weight: 600;
 }
 
@@ -199,7 +273,7 @@ details.advanced > .help { margin-top: 10px; }
 }
 .btn-primary {
   background: var(--accent); border-color: var(--accent-dim);
-  color: #14161a; font-weight: 650;
+  color: var(--on-accent); font-weight: 650;
 }
 .btn-primary:disabled {
   background: var(--bg-raised); color: var(--text-muted);
@@ -214,8 +288,8 @@ details.advanced > .help { margin-top: 10px; }
   font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
 .job-feedback[data-state="running"], .job-feedback[data-state="queued"],
 .job-feedback[data-state="submitting"] { border-color: var(--accent); }
-.job-feedback[data-state="succeeded"] { border-color: #69b879; }
-.job-feedback[data-state="failed"], .job-feedback[data-state="error"] { border-color: #dd7777; }
+.job-feedback[data-state="succeeded"] { border-color: var(--ok-border); }
+.job-feedback[data-state="failed"], .job-feedback[data-state="error"] { border-color: var(--error); }
 #job-progress-panel { margin: 12px 0; }
 #job-progress-label { display: block; font-size: 13px; line-height: 1.5; }
 #job-progress { display: block; width: 100%; height: 18px; accent-color: var(--accent); }
@@ -243,6 +317,9 @@ details.advanced > .help { margin-top: 10px; }
 .preview-empty-title { font-size: 16px; font-weight: 650; color: var(--text);
                        margin: 0 0 8px; }
 .preview-empty p { margin: 0 0 6px; }
+:root[data-theme="paper"] .preview-frame {
+  background: repeating-conic-gradient(#eee9df 0% 25%, #f7f3eb 0% 50%) 0 0 / 24px 24px;
+}
 
 #preview-image { width: 100%; height: 100%; object-fit: contain; }
 .history-card { min-width: 0; padding: 12px; border: 1px solid var(--border);
@@ -337,4 +414,8 @@ details.advanced > .help { margin-top: 10px; }
   main { padding: 14px; }
   .app-header { gap: 10px; padding: 10px 14px; }
   .connection-chip { margin-left: 0; }
+  .theme-picker { margin-left: 0; }
+  /* Sticky stays active on mobile; opaque background keeps the pinned
+     Generate/progress/feedback group fully readable while scrolling. */
+  .sticky-actions { top: 4px; padding: 10px; }
 }

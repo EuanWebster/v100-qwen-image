@@ -45,6 +45,7 @@
   var API_STATUS = '/api/v1/status';
   var API_PLAN = '/api/v1/plan';
   var API_EXPORT = '/api/v1/config/export';
+  var API_IMPORT = '/api/v1/config/import';
   var API_JOBS = '/api/v1/jobs';
   var PLAN_REQUEST_SCHEMA = 'qwen_engine.web_plan_request.v1';
   var STATUS_SCHEMA = 'qwen_engine.web_status.v1';
@@ -81,6 +82,21 @@
   // here. This mirrors the transport contract — it is deliberately NOT an
   // invented generation limit (config.py imposes no prompt-length limit).
   var MAX_CONFIG_STRING_CHARS = 65536;
+
+  // Import reads the SELECTED FILE locally before uploading it: the same
+  // 64 KiB bound the server imposes on request bodies. The file is read as
+  // raw bytes and POSTed verbatim — the browser NEVER JSON.parses it (the
+  // export carries an exact uint64 numeric seed that JSON.parse would
+  // round through Number; the server parses it in Python exactly).
+  var MAX_IMPORT_FILE_BYTES = 65536;
+
+  // Output formats — the exact OutputFormat enum values of config.py.
+  var OUTPUT_FORMATS = ['jpg', 'png', 'webp'];
+
+  // Closed theme set (the only values ever written to documentElement's
+  // data-theme; the ONLY localStorage key the app ever touches).
+  var THEMES = ['original', 'neon', 'paper'];
+  var THEME_STORAGE_KEY = 'qwen-studio-theme';
 
   // CPython str.strip() whitespace set EXACTLY (JS trim() differs: it drops
   // U+FEFF, and a plain character class without \x20 would KEEP the most
@@ -273,7 +289,8 @@
       quant: $('quant').value,                 // fp16 | q8 | q4 (exact config.py values)
       offload: $('offload').value,             // resident | streamed | offload
       attention_backend: $('attention').value, // auto | sdpa | efficient | eager
-      vae_tiled_decode: $('vae-tiling').checked
+      vae_tiled_decode: $('vae-tiling').checked,
+      output_format: $('output-format').value  // jpg | png | webp (exact config.py enum)
     };
   }
 
@@ -299,7 +316,8 @@
           quant: snap.quant,
           offload: snap.offload,
           attention_backend: snap.attention_backend,
-          vae_tiled_decode: snap.vae_tiled_decode
+          vae_tiled_decode: snap.vae_tiled_decode,
+          output_format: snap.output_format
         }
       }
     };
@@ -443,6 +461,7 @@
     apiConnected = available;
     $('btn-plan').disabled = !available;
     $('btn-export').disabled = !available;
+    $('btn-import').disabled = !available;
     if (!available) generationConnected = false;
     updateGenerate();
   }
@@ -652,6 +671,13 @@
   var planNoteBase = '';          // the note of the currently RENDERED result
   var planShownSignature = null;  // draft signature that panel validated
                                   // (null: no rendered result to keep fresh)
+  // Monotonic DRAFT revision: bumped synchronously by syncPlanStaleness,
+  // which every existing input/preset/random/change handler already calls.
+  // An in-flight import captures it BEFORE the request and re-checks it
+  // before applying, so a draft edit (or a newer import) that happened
+  // while the request was in flight can never be silently overwritten.
+  var draftRevision = 0;
+  var importSeq = 0;              // newest import wins; late answers die
 
   function envelopeSignature(built) {
     return built.ok ? JSON.stringify(built.envelope) : null;
@@ -662,6 +688,7 @@
   // produce no inline errors. The panel stays visible but is clearly
   // labelled stale; nothing is silently re-trusted.
   function syncPlanStaleness() {
+    draftRevision++;   // any observable draft change bumps the revision
     var panel = $('plan-panel');
     if (panel.hidden || planShownSignature === null) return;
     var stale = envelopeSignature(buildEnvelope()) !== planShownSignature;
@@ -815,7 +842,8 @@
   var PLAN_ENUMS = {
     quant: ['fp16', 'q8', 'q4'],
     offload: ['resident', 'streamed', 'offload'],
-    attention_backend: ['auto', 'sdpa', 'efficient', 'eager']
+    attention_backend: ['auto', 'sdpa', 'efficient', 'eager'],
+    output_format: OUTPUT_FORMATS
   };
 
   // The WHOLE public plan response is validated before anything renders:
@@ -837,7 +865,7 @@
     if (!c || typeof c !== 'object') return null;
     var want = ['prompt', 'negative_prompt', 'width', 'height', 'steps',
                 'true_cfg_scale', 'seed', 'quant', 'offload',
-                'attention_backend', 'vae_tiled_decode'];
+                'attention_backend', 'vae_tiled_decode', 'output_format'];
     var have = Object.keys(c);
     if (have.length !== want.length) return null;   // no extra runtime fields
     for (var i = 0; i < want.length; i++) {
@@ -869,6 +897,7 @@
     if (PLAN_ENUMS.offload.indexOf(c.offload) === -1) return null;
     if (PLAN_ENUMS.attention_backend.indexOf(c.attention_backend) === -1) return null;
     if (typeof c.vae_tiled_decode !== 'boolean') return null;
+    if (PLAN_ENUMS.output_format.indexOf(c.output_format) === -1) return null;
     // cfg_active must EQUAL the server's single source of truth
     // (config.py): a non-blank negative prompt under PYTHON strip rules
     // AND a scale strictly above 1.0.
@@ -1002,6 +1031,219 @@
     });
   }
 
+  /* ---------------- Theme (the ONLY persisted preference) ----------------
+   * Closed value set; documentElement.dataset.theme is the single live
+   * switch. localStorage is touched ONLY under 'qwen-studio-theme', every
+   * access is wrapped (private-mode/denied storage degrades to 'original'
+   * silently — an honest fallback, never a crash), and no other storage
+   * API is ever used.
+   */
+
+  function applyTheme(name) {
+    var theme = THEMES.indexOf(name) !== -1 ? name : 'original';
+    document.documentElement.dataset.theme = theme;
+    var select = $('theme-select');
+    if (select && THEMES.indexOf(select.value) === -1) select.value = theme;
+    return theme;
+  }
+
+  function readStoredTheme() {
+    try {
+      var stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+      return THEMES.indexOf(stored) !== -1 ? stored : 'original';
+    } catch (err) {
+      return 'original';   // storage denied/unavailable: honest fallback
+    }
+  }
+
+  function storeTheme(theme) {
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch (err) {
+      // Denied storage: the live theme still applies for this session;
+      // nothing else is claimed and no other storage is attempted.
+    }
+  }
+
+  function initTheme() {
+    var select = $('theme-select');
+    var theme = applyTheme(readStoredTheme());
+    if (select) {
+      select.value = theme;
+      select.addEventListener('change', function () {
+        var applied = applyTheme(select.value);
+        if (THEMES.indexOf(select.value) === -1) select.value = applied;
+        storeTheme(applied);
+      });
+    }
+    return theme;
+  }
+
+  /* ---------------- Config import ----------------
+   * The selected file is read as RAW BYTES (never JSON.parsed in the
+   * browser: the export carries an exact uint64 numeric seed that
+   * JSON.parse would round through Number — the server parses it in
+   * Python exactly) and POSTed verbatim to /api/v1/config/import, which
+   * returns a full web_plan.v1 payload. The response goes through the
+   * SAME strict parsePlan as the plan flow before ANY field is applied.
+   * Concurrency is honest: importSeq makes only the newest import land,
+   * and draftRevision (bumped by every existing input/preset/random/
+   * change handler via syncPlanStaleness) means an in-flight import can
+   * NEVER overwrite a draft edit made after the file was picked. On any
+   * failure the draft stays exactly as typed and nothing is generated.
+   */
+
+  function readFileLimited(file) {
+    return new Promise(function (resolve, reject) {
+      if (!file || typeof file.size !== 'number' ||
+          file.size > MAX_IMPORT_FILE_BYTES) {
+        reject(new Error('too_large'));
+        return;
+      }
+      var reader = new FileReader();
+      reader.onerror = function () { reject(new Error('unreadable')); };
+      reader.onload = function () {
+        var bytes = reader.result;
+        if (!(bytes instanceof ArrayBuffer) ||
+            bytes.byteLength > MAX_IMPORT_FILE_BYTES) {
+          reject(new Error('too_large'));
+          return;
+        }
+        // Re-read the live file size: a file changed on disk between
+        // selection and read must not slip past the bound.
+        if (typeof file.size === 'number' && file.size > MAX_IMPORT_FILE_BYTES) {
+          reject(new Error('too_large'));
+          return;
+        }
+        resolve(new Uint8Array(bytes));
+      };
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  function applyImportedPlan(plan) {
+    var c = plan.config;
+    $('prompt').value = c.prompt;
+    $('negative').value = c.negative_prompt;
+    $('width').value = String(c.width);
+    $('height').value = String(c.height);
+    $('steps').value = String(c.steps);
+    $('cfg').value = String(c.true_cfg_scale);
+    // Seed stays a decimal STRING end to end — never a Number.
+    $('seed').value = c.seed === null ? '' : c.seed;
+    $('quant').value = c.quant;
+    $('offload').value = c.offload;
+    $('attention').value = c.attention_backend;
+    $('vae-tiling').checked = c.vae_tiled_decode;
+    $('output-format').value = c.output_format;
+  }
+
+  function importConfigFile(file) {
+    setText('api-message', '');
+    if (!apiConnected) {
+      setText('api-message', 'Import is unavailable without a recognized ' +
+                             'server status. Use "Check configuration" first.');
+      return Promise.resolve(false);
+    }
+    var seq = ++importSeq;
+    var revisionAtPick = draftRevision;   // captured BEFORE any await
+    return readFileLimited(file).then(function (bytes) {
+      if (seq !== importSeq) return false;   // a newer import superseded this
+      return apiRequest(API_IMPORT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Qwen-UI': '1' },
+        body: bytes   // raw export bytes, verbatim — never reserialized
+      }, 'json').then(function (r) {
+        if (seq !== importSeq) return false;   // newer import wins; never land
+        if (draftRevision !== revisionAtPick) {
+          setText('api-message', 'Import discarded: the draft was edited ' +
+                                 'while the file was being imported. Your ' +
+                                 'current values were kept untouched; ' +
+                                 'nothing was generated.');
+          return false;
+        }
+        if (r.network) {
+          setApiAvailable(false);
+          renderChip('Not connected',
+            r.timedOut ? 'Not connected — the request timed out'
+                       : 'Not connected — request failed');
+          setText('api-message', 'Import failed (no reachable local server, ' +
+                                 'or it timed out). Your draft is unchanged; ' +
+                                 'nothing was generated.');
+          return false;
+        }
+        if (!r.res.ok) {
+          renderApiError(r.res, r.json === undefined ? null : r.json);
+          setText('api-message', $('api-message').textContent +
+            ' Nothing was imported; your draft is unchanged.');
+          return false;
+        }
+        if (r.bodyError) {
+          // A rejected import payload is a broken server contract, exactly
+          // like a rejected plan: availability is invalidated, nothing is
+          // applied, the draft stays as typed.
+          setApiAvailable(false);
+          renderChip('Status rejected',
+            'Status rejected — server contract broken');
+          setText('api-message', 'The import response body was not usable (' +
+                                 (r.bodyError === 'too_large'
+                                   ? 'over the fixed response cap'
+                                   : r.bodyError === 'unsupported'
+                                     ? 'unreadable bounded body'
+                                     : 'not decodable JSON') +
+                                ') — a schema rejection, not a disconnect; ' +
+                                'nothing was applied and your draft is ' +
+                                'unchanged.');
+          return false;
+        }
+        var plan = parsePlan(r.json);   // full strict validation FIRST
+        if (!plan || plan.planning_available !== true) {
+          setApiAvailable(false);
+          renderChip('Status rejected',
+            'Status rejected — server contract broken');
+          setText('api-message', 'The import payload did not match the ' +
+                                 'expected plan schema — nothing was ' +
+                                 'applied and your draft is unchanged.');
+          return false;
+        }
+        // Final synchronous guard immediately before touching the DOM:
+        // nothing between this check and the assignment can interleave.
+        if (draftRevision !== revisionAtPick) {
+          setText('api-message', 'Import discarded: the draft was edited ' +
+                                 'while the file was being imported. Your ' +
+                                 'current values were kept untouched; ' +
+                                 'nothing was generated.');
+          return false;
+        }
+        applyImportedPlan(plan);
+        planSeq++;                 // any in-flight PLAN answer is now stale
+        planShownSignature = null;
+        $('plan-panel').hidden = true;   // imported draft is not yet validated
+        promptTouched = true;
+        syncPresetButtons();
+        setPreviewAspect(plan.config.width, plan.config.height);
+        renderValidation(validateForm().errors);
+        syncPlanStaleness();       // keeps staleness bookkeeping consistent
+        setText('api-message', 'Imported configuration into the draft ' +
+                               '(validated server-side; the file itself was ' +
+                               'never parsed in the browser). The draft is ' +
+                               'not yet planned — run "Check configuration" ' +
+                               'or Plan. Nothing was generated.');
+        return true;
+      });
+    }).catch(function (err) {
+      if (seq !== importSeq) return false;
+      var why = (err && err.message === 'too_large')
+        ? 'the file exceeds the ' + MAX_IMPORT_FILE_BYTES +
+          '-byte configuration bound'
+        : 'the file could not be read';
+      setText('api-message', 'Import refused: ' + why +
+                             '. Your draft is unchanged; nothing was sent ' +
+                             'or generated.');
+      return false;
+    });
+  }
+
   /* ---------------- Presets & preview ---------------- */
 
   function presetNameFor(width, height) {
@@ -1115,7 +1357,18 @@
         !(job.phase === null || JOB_PHASES.indexOf(job.phase) !== -1) ||
         typeof job.cancel_requested !== 'boolean') return null;
     var c = job.config;
-    if (!c || Object.keys(c).length !== 11 || typeof c.prompt !== 'string' ||
+    if (!c || typeof c !== 'object') return null;
+    // Current servers echo all 12 editable fields. An older 11-key config
+    // without output_format is accepted ONLY via this explicit
+    // backward-compat branch and defaults to PNG — the format the older
+    // server actually saved. Anything else (10 keys, 13 keys, extra
+    // runtime fields) is a schema rejection, never a guess.
+    var ckeys = Object.keys(c);
+    var legacyNoFormat = ckeys.length === 11 &&
+      !Object.prototype.hasOwnProperty.call(c, 'output_format');
+    if (!(ckeys.length === 12 || legacyNoFormat)) return null;
+    if (legacyNoFormat) c.output_format = 'png';
+    if (typeof c.prompt !== 'string' ||
         !pyStrip(c.prompt) || c.prompt.length > MAX_CONFIG_STRING_CHARS ||
         typeof c.negative_prompt !== 'string' || c.negative_prompt.length > MAX_CONFIG_STRING_CHARS ||
         typeof c.seed !== 'string' || !/^\d{1,20}$/.test(c.seed) ||
@@ -1123,7 +1376,8 @@
         typeof c.true_cfg_scale !== 'number' || !isFinite(c.true_cfg_scale) || c.true_cfg_scale < 1 ||
         typeof c.vae_tiled_decode !== 'boolean' ||
         PLAN_ENUMS.quant.indexOf(c.quant) === -1 || PLAN_ENUMS.offload.indexOf(c.offload) === -1 ||
-        PLAN_ENUMS.attention_backend.indexOf(c.attention_backend) === -1) return null;
+        PLAN_ENUMS.attention_backend.indexOf(c.attention_backend) === -1 ||
+        PLAN_ENUMS.output_format.indexOf(c.output_format) === -1) return null;
     if (['width', 'height'].some(function (key) {
       return !Number.isInteger(c[key]) || c[key] < 64 || c[key] > 4096 || c[key] % 32 !== 0;
     })) return null;
@@ -1142,6 +1396,21 @@
         job.progress.total_steps !== c.steps || job.progress.completed_steps < 0 ||
         job.progress.completed_steps > c.steps)) return null;
     return job;
+  }
+
+  // Safe download name ONLY: a server-supplied filename must match a strict
+  // conservative pattern (no separators, no control chars, bounded length)
+  // or we fall back to a locally built name. Never a raw server string.
+  var SAFE_FILENAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+
+  function jobDownloadName(job) {
+    if (typeof job.image_filename === 'string' &&
+        SAFE_FILENAME_RE.test(job.image_filename)) {
+      return job.image_filename;
+    }
+    var fmt = OUTPUT_FORMATS.indexOf(job.config.output_format) !== -1
+      ? job.config.output_format : 'png';
+    return 'qi21-' + job.config.seed + '.' + fmt;
   }
 
   function updateGenerate() {
@@ -1406,6 +1675,16 @@
     });
     $('btn-plan').addEventListener('click', function () { runPlan(true); });
     $('btn-export').addEventListener('click', function () { exportConfig(); });
+    $('btn-import').addEventListener('click', function () {
+      if ($('btn-import').disabled) return;
+      $('import-file').click();   // opens the native file picker
+    });
+    $('import-file').addEventListener('change', function (ev) {
+      var input = ev.currentTarget;
+      var file = input.files && input.files[0];
+      input.value = '';   // reset FIRST: the same file can be re-picked
+      if (file) importConfigFile(file);
+    });
     $('view-result').addEventListener('click', function () {
       $('preview-frame').scrollIntoView({behavior: 'smooth', block: 'center'});
     });
@@ -1417,7 +1696,7 @@
       if (!job || job.state !== 'succeeded') return;
       var link = document.createElement('a');
       link.href = job.image_url;
-      link.download = 'qwen-' + job.job_id + '.png';
+      link.download = jobDownloadName(job);
       link.click();
     });
     $('action-open').addEventListener('click', function () {
@@ -1459,7 +1738,7 @@
 
     // Change-only fields (they never carry inline errors) must ALSO make a
     // visible result clearly stale, not leave it looking validated.
-    ['quant', 'offload', 'attention', 'vae-tiling'].forEach(function (id) {
+    ['quant', 'offload', 'attention', 'vae-tiling', 'output-format'].forEach(function (id) {
       $(id).addEventListener('change', function () {
         renderValidation(validateForm().errors);
         syncPlanStaleness();
@@ -1467,6 +1746,7 @@
     });
 
     window.addEventListener('hashchange', routeOnHashchange);
+    initTheme();   // persisted theme applied before first paint of content
     initialRoute();
     syncPresetButtons();
     renderValidation(validateForm().errors);
@@ -1505,6 +1785,10 @@
     parseJob: parseJob,
     randomSeedString: randomSeedString,
     checkStatus: checkStatus,
+    importConfigFile: importConfigFile,
+    applyTheme: applyTheme,
+    readStoredTheme: readStoredTheme,
+    jobDownloadName: jobDownloadName,
     setFetchTimeoutForChecks: function (ms) {
       if (Number.isInteger(ms) && ms > 0 && ms <= 60000) FETCH_TIMEOUT_MS = ms;
     }

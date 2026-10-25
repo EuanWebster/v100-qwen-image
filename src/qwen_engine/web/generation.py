@@ -6,6 +6,7 @@ owned; the browser supplies only the shared editable config envelope.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import sys
 import threading
@@ -108,6 +109,7 @@ class WebGeneration:
             "error_code": record.error_code,
             "progress": {"completed_steps": completed, "total_steps": record.config.steps},
             "image_url": (f"/api/v1/jobs/{record.job_id}/image" if record.artifact else None),
+            "image_filename": record.artifact.filename if record.artifact else None,
         }
 
     def submit(self, body):
@@ -156,11 +158,29 @@ class WebGeneration:
     def image(self, job_id):
         try:
             data = self.controller.read_artifact(job_id)
-            if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-                raise JobError("not a PNG")
+            self.image_content_type(data)
             return data
         except (JobError, OSError):
             raise ApiError(404, "image_unavailable", "completed image is unavailable or has changed") from None
+
+    def image_filename(self, job_id):
+        try:
+            artifact = self.controller.get(job_id).artifact
+            if artifact is None or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", artifact.filename) is None:
+                raise JobError("unsafe image filename")
+            return artifact.filename
+        except JobError:
+            raise ApiError(404, "image_unavailable", "completed image is unavailable") from None
+
+    @staticmethod
+    def image_content_type(data):
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if data.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            return "image/webp"
+        raise JobError("not a supported image")
 
     def close(self):
         return self.controller.close(timeout_s=60)

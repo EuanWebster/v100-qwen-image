@@ -99,6 +99,7 @@ STATIC_ROUTES = {
 STATUS_ROUTE = "/api/v1/status"
 PLAN_ROUTE = "/api/v1/plan"
 EXPORT_ROUTE = "/api/v1/config/export"
+IMPORT_ROUTE = "/api/v1/config/import"
 JOBS_ROUTE = "/api/v1/jobs"
 _JOB_ROUTE = re.compile(r"/api/v1/jobs/([0-9a-f]{32})(?:/(image|cancel|forget))?\Z")
 
@@ -267,6 +268,8 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "plan", target
         if target == EXPORT_ROUTE:
             return "export", target
+        if target == IMPORT_ROUTE:
+            return "import", target
         if target == JOBS_ROUTE:
             return "submit", target
     match = _JOB_ROUTE.fullmatch(target)
@@ -280,9 +283,9 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
     if target == JOBS_ROUTE:
         raise ApiError(405, "method_not_allowed", "this route does not accept that method",
                        headers=(("Allow", "GET, POST"),))
-    known = set(STATIC_ROUTES) | {STATUS_ROUTE, PLAN_ROUTE, EXPORT_ROUTE}
+    known = set(STATIC_ROUTES) | {STATUS_ROUTE, PLAN_ROUTE, EXPORT_ROUTE, IMPORT_ROUTE}
     if target in known:
-        allow = "POST" if target in (PLAN_ROUTE, EXPORT_ROUTE) else "GET"
+        allow = "POST" if target in (PLAN_ROUTE, EXPORT_ROUTE, IMPORT_ROUTE) else "GET"
         raise ApiError(405, "method_not_allowed",
                        "this route does not accept that method",
                        headers=(("Allow", allow),))
@@ -590,7 +593,10 @@ class _Handler(BaseHTTPRequestHandler):
                 if jobs is None:
                     raise ApiError(503, "generation_disabled", "generation is disabled on this server")
                 if kind == "image":
-                    self._send(200, jobs.image(arg), "image/png")
+                    filename = jobs.image_filename(arg)
+                    image_bytes = jobs.image(arg)
+                    self._send(200, image_bytes, jobs.image_content_type(image_bytes),
+                               (("Content-Disposition", f'inline; filename="{filename}"'),))
                 else:
                     self._send_api(jobs.list_response() if kind == "jobs" else jobs.job_response(arg))
             else:
@@ -603,6 +609,8 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send_api(api.plan_response(self.server.web_runtime, body))
                 elif kind == "export":
                     self._send_api(api.export_response(self.server.web_runtime, body))
+                elif kind == "import":
+                    self._send_api(api.import_response(self.server.web_runtime, body))
                 else:
                     jobs = getattr(self.server, "generation", None)
                     if jobs is None:

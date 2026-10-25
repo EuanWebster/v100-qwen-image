@@ -234,9 +234,11 @@ def test_routing_focuses_headings_only_on_user_hashchange():
 
 def test_no_storage_or_service_apis_in_w1():
     js = _read("app.js")
-    for forbidden in ("localStorage", "sessionStorage", "indexedDB",
+    for forbidden in ("sessionStorage", "indexedDB",
                       "navigator.serviceWorker"):
         assert forbidden not in js, f"W1 must not use {forbidden}"
+    assert "localStorage.setItem(THEME_STORAGE_KEY, theme)" in js
+    assert js.count("localStorage.setItem(") == 1
 
 
 def test_privacy_wording_is_factual_about_locality():
@@ -448,9 +450,10 @@ def test_parse_plan_rejects_blank_prompt_exactly_like_generation_config():
 
 def test_w2_failure_paths_preserve_the_draft():
     js = _read("app.js")
-    # only applyPreset (2 writes) and the Random button (1 write) may write
-    # an input value — no server response ever populates the form.
-    assert js.count(".value = ") - js.count("progress.value = ") == 3, "server data must never write form fields"
+    # Explicit import is the only server response allowed to populate fields.
+    assert js.count("applyImportedPlan(plan);") == 1
+    assert "draftRevision !== revisionAtPick" in js
+    assert js.index("var plan = parsePlan(r.json);") < js.index("applyImportedPlan(plan);")
     assert "draft was preserved" in js or "draft stays" in js or \
            "Nothing was sent or changed" in js
 
@@ -518,7 +521,7 @@ def test_w2_staleness_covers_preset_random_and_change_only_edits():
     assert m and "syncPlanStaleness()" in m.group(1), "preset edits must stale"
     m = re.search(r"\$\('random-seed'\)\.addEventListener[\s\S]*?\}\);", js)
     assert m and "syncPlanStaleness()" in m.group(0), "random seed must stale"
-    m = re.search(r"\['quant', 'offload', 'attention', 'vae-tiling'\]"
+    m = re.search(r"\['quant', 'offload', 'attention', 'vae-tiling', 'output-format'\]"
                   r"[\s\S]*?'change'[\s\S]*?syncPlanStaleness\(\);[\s\S]*?\}\);", js)
     assert m, "change-only fields must also mark a visible result stale"
     m = re.search(r"function syncPlanStaleness\(\)\s*\{([\s\S]*?)\n  \}", js)

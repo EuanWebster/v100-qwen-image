@@ -28,8 +28,11 @@ def execute(context):
                 context._cancel.wait(.20)
         context._cancel.wait(.35)
         context.check_cancelled()
-    path = Path(context.config.output_dir) / 'fixture.png'
-    path.write_bytes(png())
+    from PIL import Image
+    from qwen_engine.image_output import save_output_image
+    path = save_output_image(Image.new('RGB', (32, 32), (192, 48, 48)),
+                             context.config.output_dir, context.config.output_format.value,
+                             context.config.seed)
     return GenerationResult(str(path))
 
 
