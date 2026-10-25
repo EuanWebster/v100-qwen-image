@@ -38,6 +38,21 @@ SEED_MIN, SEED_MAX = 0, 2**64 - 1
 CFG_SCALE_MIN = 1.0
 DEFAULT_STEPS = 40
 
+# --- transparency wrapper (core) ---------------------------------------------
+#: Versioned identity of the exact wrapper text below. Future metadata/audit
+#: records should cite this constant so a later wrapper revision can never be
+#: confused with this one. It is identity only — it changes no behaviour.
+TRANSPARENCY_WRAPPER_REVISION = "qwen-engine.transparent-wrapper.v1"
+
+#: Exact upstream wrapper contract. Applied to the *positive* prompt only, via
+#: the derived :attr:`GenerationConfig.effective_prompt`; ``prompt`` itself is
+#: never mutated. Deterministic pure concatenation — no stripping, no
+#: normalization — so repeated property calls can never accumulate wrappers.
+TRANSPARENCY_PROMPT_PREFIX = "This is an RGBA image with transparency. "
+TRANSPARENCY_PROMPT_SUFFIX = (
+    " The image has alpha channel and the background is transparent."
+)
+
 #: Fields that must name an existing *directory* when they exist on disk.
 _DIR_FIELDS = ("output_dir", "cache_dir", "log_dir", "benchmarks_dir",
                "models_dir")
@@ -54,6 +69,11 @@ class OutputFormat(StrEnum):
     JPG = "jpg"
     PNG = "png"
     WEBP = "webp"
+
+
+#: Formats that can carry an alpha channel. JPEG cannot, so a transparent
+#: background is refused with ``output_format=jpg``.
+ALPHA_OUTPUT_FORMATS = frozenset({OutputFormat.PNG, OutputFormat.WEBP})
 
 
 class OffloadMode(StrEnum):
@@ -150,6 +170,10 @@ class GenerationConfig:
     attention_backend: AttentionBackend = AttentionBackend.AUTO
     vae_tiled_decode: bool = False
     output_format: OutputFormat = OutputFormat.JPG
+    #: Native transparency core flag: when True the positive prompt sent to the
+    #: encoder carries the upstream RGBA wrapper (see ``effective_prompt``) and
+    #: the output format must be alpha-capable (PNG/WEBP). Strict bool.
+    transparent_background: bool = False
     # Relocatable runtime paths (R7). None = not configured -> nothing is
     # written there; tests redirect all of these to tmp_path.
     output_dir: str | None = None
@@ -260,6 +284,24 @@ class GenerationConfig:
                     f"must be a boolean, got {self.vae_tiled_decode!r}",
                 )
             )
+        if not isinstance(self.transparent_background, bool):
+            errors.append(
+                FieldError(
+                    "transparent_background",
+                    f"must be a boolean, got {self.transparent_background!r}",
+                )
+            )
+        elif self.transparent_background and self.output_format not in ALPHA_OUTPUT_FORMATS:
+            # Alpha cannot survive JPEG; refuse clearly instead of silently
+            # flattening or silently rewriting the user's chosen format.
+            errors.append(
+                FieldError(
+                    "output_format",
+                    "transparent_background=True requires an alpha-capable "
+                    "output format (png or webp); alpha cannot be stored in "
+                    f"jpg, got {self.output_format.value!r}",
+                )
+            )
 
         if errors:
             raise ConfigError(errors)
@@ -286,6 +328,20 @@ class GenerationConfig:
         (CFG duplication in the R4 descriptor keys off it).
         """
         return bool(self.negative_prompt.strip()) and self.true_cfg_scale > 1.0
+
+    @property
+    def effective_prompt(self) -> str:
+        """Positive prompt actually sent to the encoder.
+
+        With ``transparent_background=True`` this is exactly the upstream
+        wrapper applied to the untouched ``prompt``:
+        ``TRANSPARENCY_PROMPT_PREFIX + prompt + TRANSPARENCY_PROMPT_SUFFIX``.
+        Otherwise it is ``prompt`` verbatim. Pure function of frozen fields —
+        repeated calls never mutate, accumulate, or normalize anything.
+        """
+        if self.transparent_background:
+            return TRANSPARENCY_PROMPT_PREFIX + self.prompt + TRANSPARENCY_PROMPT_SUFFIX
+        return self.prompt
 
     # --- JSON / dict round-trip -----------------------------------------------
 

@@ -116,6 +116,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int)
     p.add_argument("--output-format", choices=("jpg", "png", "webp"),
                    help="saved image format (default: jpg; JPEG flattens alpha on white)")
+    p.add_argument("--transparent", dest="transparent",
+                   action=argparse.BooleanOptionalAction, default=None,
+                   help="native transparency: wraps the positive prompt with "
+                        "the RGBA/transparency prompt and requires an "
+                        "alpha-capable format (PNG/WEBP). With --transparent "
+                        "and no explicit --output-format, a jpg/default "
+                        "format switches to PNG automatically; an explicit "
+                        "--output-format jpg is refused. --no-transparent "
+                        "overrides a config-file true and keeps the format")
     p.add_argument("--quant", choices=QUANT_CHOICES)
     p.add_argument("--offload", choices=OFFLOAD_CHOICES)
     p.add_argument("--attention-backend", dest="attention_backend",
@@ -170,6 +179,17 @@ def _load_config(args: argparse.Namespace) -> GenerationConfig:
             data[field] = str(value) if isinstance(value, Path) else value
     if args.tiled_decode is not None:
         data["vae_tiled_decode"] = args.tiled_decode
+    if getattr(args, "transparent", None) is not None:
+        data["transparent_background"] = args.transparent
+        if args.transparent:
+            # Auto-flip only when --output-format was NOT explicitly given and
+            # the effective format is not already alpha-capable. Explicit
+            # --output-format jpg (or a config-file jpg) is left untouched and
+            # refused by config validation — never a hidden rewrite.
+            explicit_format = args.output_format is not None
+            current = str(data.get("output_format", "jpg")).lower()
+            if not explicit_format and current not in ("png", "webp"):
+                data["output_format"] = "png"
     return GenerationConfig.from_dict(data)
 
 

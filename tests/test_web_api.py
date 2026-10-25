@@ -108,6 +108,47 @@ def test_plan_config_echo_is_editable_only():
         assert path_field not in json.dumps(payload)
 
 
+def test_plan_echoes_transparent_background_and_refuses_jpg():
+    ok = plan_payload(plan_bytes({"prompt": "x", "transparent_background": True,
+                                  "output_format": "webp"}))
+    assert ok["config"]["transparent_background"] is True
+    assert ok["config"]["output_format"] == "webp"
+    # Absent from the envelope: defaults to false, exactly as config.py does.
+    assert plan_payload(plan_bytes({"prompt": "x"}))["config"]["transparent_background"] is False
+    # JPEG cannot store alpha: a typed FIELD error, never a silent rewrite.
+    refused = plan_payload(plan_bytes({"prompt": "x", "transparent_background": True,
+                                       "output_format": "jpg"}))
+    error_shape(refused)
+    assert refused["code"] == "invalid_config"
+    assert [f["field"] for f in refused["fields"]] == ["output_format"]
+    # A non-boolean is a typed field error on its own field, not a coercion.
+    typed = plan_payload(plan_bytes({"prompt": "x", "transparent_background": 1}))
+    assert typed["code"] == "invalid_config"
+    assert [f["field"] for f in typed["fields"]] == ["transparent_background"]
+
+
+def test_export_import_roundtrips_transparent_background():
+    rt = runtime()
+    exported = api.export_response(rt, plan_bytes({"prompt": "a jar",
+                                                   "transparent_background": True,
+                                                   "output_format": "png"}))
+    assert exported.status == 200
+    data = json.loads(exported.body)
+    assert data["transparent_background"] is True
+    imported = api.import_response(rt, exported.body)
+    assert imported.status == 200, imported.payload
+    assert imported.payload["config"]["transparent_background"] is True
+    assert imported.payload["config"]["output_format"] == "png"
+    # Legacy export without the key stays importable and means false.
+    legacy = api.import_response(rt, b'{"prompt": "old", "output_format": "webp"}')
+    assert legacy.status == 200
+    assert legacy.payload["config"]["transparent_background"] is False
+    # A legacy file asking for jpg is still refused (no silent format change).
+    refused = api.import_response(rt, b'{"prompt": "old", "transparent_background": true}')
+    assert refused.status == 422
+    assert [f["field"] for f in refused.payload["fields"]] == ["output_format"]
+
+
 def test_plan_never_leaks_server_runtime_paths(tmp_path):
     rt = runtime(output_dir=str(tmp_path / "out"), cache_dir=str(tmp_path / "cache"))
     text = json.dumps(api.plan_response(rt, plan_bytes({"prompt": "x"})).payload)

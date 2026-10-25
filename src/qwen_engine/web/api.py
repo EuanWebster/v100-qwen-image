@@ -48,7 +48,7 @@ WEB_ERROR_SCHEMA = "qwen_engine.web_error.v1"
 EDITABLE_FIELDS = frozenset({
     "prompt", "negative_prompt", "width", "height", "steps",
     "true_cfg_scale", "seed", "quant", "offload", "attention_backend",
-    "vae_tiled_decode", "output_format",
+    "vae_tiled_decode", "output_format", "transparent_background",
 })
 
 #: Server-controlled runtime path fields (never editable from the browser).

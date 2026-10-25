@@ -15,6 +15,7 @@ suite and both require ``CHROME_PATH``.
 from __future__ import annotations
 
 import dataclasses
+import json
 import re
 from pathlib import Path
 
@@ -722,3 +723,152 @@ def test_api_requests_bypass_the_http_cache():
     m = re.search(r"function apiRequest\([^)]*\)\s*\{([\s\S]*?)\n  \}", js)
     assert m, "apiRequest not found"
     assert "requestOpts.cache = 'no-store'" in m.group(1)
+
+
+# ------------------------------------------------------ transparency (D1)
+
+
+def test_transparency_control_markup_is_labelled_and_described():
+    html = _read("index.html")
+    block = re.search(r'<div class="field transparency-field">.*?\n          </div>',
+                      html, re.S)
+    assert block, "transparency field block missing"
+    body = block.group(0)
+    assert 'id="transparent"' in body and 'name="transparent_background"' in body
+    assert 'type="checkbox"' in body
+    assert '<label for="transparent">Transparent background</label>' in body
+    assert 'aria-describedby="transparency-help transparency-note"' in body
+    assert 'id="transparency-help"' in body and 'id="transparency-note"' in body
+    # The effective prompt is display-only: no input control, starts hidden.
+    effective = re.search(r'<p id="effective-prompt-field"[^>]*>', body)
+    assert effective and "hidden" in effective.group(0)
+    assert '<span id="effective-prompt"' in body
+    assert 'readonly' not in body   # it is not an editable field at all
+    # The format error id the JS writes must exist, and the select points at it.
+    assert 'id="format-error"' in html
+    select = re.search(r'<select id="output-format"[^>]*>', html).group(0)
+    assert 'aria-describedby="format-error"' in select
+    # Plain-language explanation names the jpg restriction.
+    assert "JPEG cannot store transparency" in body
+
+
+def test_transparency_wrapper_literals_match_config_py_exactly():
+    from qwen_engine.config import (TRANSPARENCY_PROMPT_PREFIX,
+                                    TRANSPARENCY_PROMPT_SUFFIX,
+                                    TRANSPARENCY_WRAPPER_REVISION)
+    js = _read("app.js")
+
+    def js_string(value: str) -> str:
+        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+    assert f"var TRANSPARENT_PREFIX = {js_string(TRANSPARENCY_PROMPT_PREFIX)};" in js
+    assert f"var TRANSPARENT_SUFFIX =\n    {js_string(TRANSPARENCY_PROMPT_SUFFIX)};" in js
+    # The revision constant is cited so a later wrapper bump is traceable.
+    assert TRANSPARENCY_WRAPPER_REVISION in js
+    from qwen_engine.config import ALPHA_OUTPUT_FORMATS
+    assert set(re.findall(r"'(\w+)'", re.search(r"var ALPHA_FORMATS = \[([^\]]*)\]", js).group(1))) \
+        == {fmt.value for fmt in ALPHA_OUTPUT_FORMATS}
+
+
+def test_transparency_checkbox_switches_jpg_to_png_and_explains_it():
+    js = _read("app.js")
+    m = re.search(r"function onTransparencyChange\(\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "onTransparencyChange not found"
+    body = m.group(1)
+    assert "ALPHA_FORMATS.indexOf($('output-format').value) === -1" in body
+    assert "$('output-format').value = 'png'" in body
+    assert "switched from jpg to png" in body
+    # Unticking never rewrites the format: the switch is gated on .checked.
+    switch = body[body.index("$('transparent').checked"):]
+    assert "= 'jpg'" not in body and "= 'webp'" not in body
+    assert switch.index("$('transparent').checked") < switch.index("value = 'png'")
+    # Wired as a real handler, and validated/staled like every other edit.
+    assert "$('transparent').addEventListener('change', onTransparencyChange);" in js
+    assert "syncPlanStaleness();" in body
+    # The explanation is a persistent note, not a one-frame flash.
+    assert "transparencySwitchNote" in js
+
+
+def test_transparency_state_renders_effective_prompt_and_format_reason():
+    js = _read("app.js")
+    m = re.search(r"function syncTransparency\(\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "syncTransparency not found"
+    body = m.group(1)
+    assert "TRANSPARENT_PREFIX + $('prompt').value + TRANSPARENT_SUFFIX" in body
+    assert "$('effective-prompt-field').hidden = !on" in body
+    # The prompt FIELD itself is never rewritten by the wrapper.
+    assert "$('prompt').value =" not in body
+    # The mismatch reason is stated, never auto-corrected silently here.
+    assert "JPEG cannot keep transparency" in body
+    # Wired into the validation pass (so aria-invalid/format errors agree).
+    m = re.search(r"function renderValidation\(errors\)\s*\{(.*?)\n  \}", js, re.S)
+    assert m and "syncTransparency();" in m.group(1)
+    assert "setText('format-error', errors.format || '')" in m.group(1)
+    assert "setAriaInvalid('output-format', !!errors.format)" in m.group(1)
+
+
+def test_transparency_local_validation_mirrors_the_server_rule():
+    js = _read("app.js")
+    m = re.search(r"function validateForm\(\)\s*\{(.*?)\n  \}", js, re.S)
+    assert m, "validateForm not found"
+    assert "transparencyFormatMismatch()" in m.group(1)
+    assert "errors.format" in m.group(1)
+    m = re.search(r"function transparencyFormatMismatch\(\)\s*\{(.*?)\n  \}", js, re.S)
+    assert m, "transparencyFormatMismatch not found"
+    assert "ALPHA_FORMATS.indexOf($('output-format').value) === -1" in m.group(1)
+
+
+def test_plan_parsing_requires_transparent_boolean_and_alpha_format():
+    js = _read("app.js")
+    m = re.search(r"function parsePlan\(raw\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m
+    body = m.group(1)
+    assert "'transparent_background'" in body, "parsePlan exact-key list must include it"
+    assert "typeof c.transparent_background !== 'boolean'" in body
+    assert "ALPHA_FORMATS.indexOf(c.output_format) === -1" in body
+
+
+def test_parse_job_accepts_13_keys_and_keeps_legacy_shapes_honest():
+    js = _read("app.js")
+    m = re.search(r"function parseJob\(job\)\s*\{([\s\S]*?)\n    return job;\n  \}", js)
+    assert m, "parseJob not found"
+    body = m.group(0)
+    assert "ckeys.length === 13" in body
+    assert "ckeys.length === 12" in body and "ckeys.length === 11" in body
+    assert "!hasKey('transparent_background')" in body
+    assert "c.transparent_background = false" in body
+    assert "typeof c.transparent_background !== 'boolean'" in body
+
+
+def test_import_applies_transparent_background_without_auto_switch():
+    js = _read("app.js")
+    m = re.search(r"function applyImportedPlan\(plan\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "applyImportedPlan not found"
+    body = m.group(1)
+    assert "$('transparent').checked = c.transparent_background;" in body
+    # An imported, server-validated plan is applied verbatim: no local rewrite.
+    assert "onTransparencyChange" not in body
+    assert body.index("$('output-format').value = c.output_format;") < \
+        body.index("$('transparent').checked = c.transparent_background;")
+
+
+def test_plan_panel_shows_the_transparency_row():
+    html = _read("index.html")
+    assert 'id="plan-transparency"' in html
+    js = _read("app.js")
+    m = re.search(r"function planRenderFields\(plan\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m and "setText('plan-transparency'" in m.group(1)
+    assert "plan.config.transparent_background" in m.group(1)
+
+
+def test_alpha_results_are_previewed_on_a_checkerboard_only():
+    css = _read("app.css")
+    rule = re.search(r"\.history-card img \{([^}]*)\}", css)
+    assert rule and "repeating-conic-gradient" in rule.group(1), \
+        "transparent thumbnails need a checkerboard behind them"
+    assert 'data-theme="paper"' in css and ".history-card img" in css
+    # Preview only: nothing in the CSS or JS writes pixels into the saved file.
+    js = _read("app.js")
+    assert "canvas" not in js and "toBlob" not in js
+    # The transparency row has its own visible styles.
+    assert ".transparency-field" in css and ".effective-prompt-text" in css

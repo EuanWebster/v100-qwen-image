@@ -95,6 +95,18 @@ Useful options: `--quant {fp16,q8}`, `--negative` with `--true-cfg-scale`,
 tiling), `--config FILE` (JSON `GenerationConfig`). Run `python cli_gen.py
 --help` for the full list.
 
+### Transparent backgrounds
+
+`--transparent` (or the web workspace checkbox) asks the model for a
+see-through background and keeps the alpha channel in the saved file. JPEG
+cannot store alpha, so the format must be `png` or `webp`: the CLI selects
+`png` when no format was given explicitly and **refuses** an explicit `jpg`
+rather than silently changing it; the UI switches `jpg` to `png` and says so.
+Your prompt text is never modified — a fixed instruction is added only to the
+text the model reads (`GenerationConfig.effective_prompt`). The result is
+model-dependent, not a guaranteed cutout. See
+[`docs/transparency.md`](docs/transparency.md).
+
 ## Tests
 
 ```bash

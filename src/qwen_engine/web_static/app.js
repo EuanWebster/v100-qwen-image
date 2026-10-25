@@ -93,6 +93,30 @@
   // Output formats — the exact OutputFormat enum values of config.py.
   var OUTPUT_FORMATS = ['jpg', 'png', 'webp'];
 
+  // Formats that can carry an alpha channel (config.py ALPHA_OUTPUT_FORMATS).
+  // JPEG cannot store transparency, so a transparent background REQUIRES one
+  // of these; the UI switches jpg to png and says so rather than silently
+  // flattening the image.
+  var ALPHA_FORMATS = ['png', 'webp'];
+
+  // The EXACT feedback wrapper config.py appends to the model-visible prompt
+  // when transparent_background is true (TRANSPARENCY_PROMPT_PREFIX/SUFFIX,
+  // TRANSPARENCY_WRAPPER_REVISION 'qwen-engine.transparent-wrapper.v1').
+  // Mirrored here only to DISPLAY the text the model reads — the draft's
+  // prompt field itself is never rewritten. tests/test_web_static.py pins
+  // these literals against the Python constants.
+  var TRANSPARENT_PREFIX = 'This is an RGBA image with transparency. ';
+  var TRANSPARENT_SUFFIX =
+    ' The image has alpha channel and the background is transparent.';
+
+  // True when the draft asks for transparency but the chosen format cannot
+  // store it. The change handlers keep this from ever being the submitted
+  // state; it exists so a mismatch is REFUSED locally, never silently saved.
+  function transparencyFormatMismatch() {
+    return $('transparent').checked &&
+           ALPHA_FORMATS.indexOf($('output-format').value) === -1;
+  }
+
   // Closed theme set (the only values ever written to documentElement's
   // data-theme; the ONLY localStorage key the app ever touches).
   var THEMES = ['original', 'neon', 'paper'];
@@ -321,6 +345,15 @@
       errors.dims = 'Width and height must be multiples of 32 between 64 ' +
                     'and 4096.';
     }
+    // config.py refuses transparent_background=True with a format that has
+    // no alpha channel. The change handlers auto-switch jpg -> png so this
+    // is unreachable in normal use; it stays as the honest local mirror of
+    // the server rule (rejected, never silently flattened).
+    if (transparencyFormatMismatch()) {
+      errors.format = 'Transparent background needs PNG or WebP — JPEG ' +
+                      'cannot store transparency. Choose png or webp, or ' +
+                      'untick Transparent background.';
+    }
     return { ok: Object.keys(errors).length === 0, errors: errors };
   }
 
@@ -347,6 +380,8 @@
     setText('seed-error', errors.seed || '');
     setText('cfg-error', errors.cfg || '');
     setText('dims-error', errors.dims || '');
+    setText('format-error', errors.format || '');
+    syncTransparency();
     // The prompt error only appears once the user has edited the prompt or
     // attempted to submit — never as a first-load alert.
     var showPrompt = promptTouched && !!errors.prompt;
@@ -355,9 +390,57 @@
     setAriaInvalid('seed', !!errors.seed);
     setAriaInvalid('cfg', !!errors.cfg);
     setAriaInvalid('prompt', showPrompt);
+    setAriaInvalid('output-format', !!errors.format);
     // The dimension error message is shared, so it marks BOTH controls.
     setAriaInvalid('width', !!errors.dims);
     setAriaInvalid('height', !!errors.dims);
+  }
+
+  // Set only by the jpg -> png auto-switch, so the explanation survives the
+  // validation re-renders that follow (typing in the prompt, etc.) instead
+  // of flashing once. Cleared by an explicit format or checkbox change.
+  var transparencySwitchNote = '';
+
+  // The transparency row's derived state: WHY the format changed (only ever
+  // a visible, explained switch), and the exact text the model will read.
+  // Never rewrites the prompt field itself — the wrapper is display only.
+  function syncTransparency() {
+    var on = $('transparent').checked;
+    var format = $('output-format').value;
+    var why = '';
+    if (on && ALPHA_FORMATS.indexOf(format) === -1) {
+      why = 'JPEG cannot keep transparency — choose PNG or WebP, or untick this option.';
+    } else if (on) {
+      why = transparencySwitchNote ||
+            ('Saving as ' + format.toUpperCase() + ', which keeps the ' +
+             'transparency. The result is not guaranteed to be transparent ' +
+             '— check the image.');
+    }
+    setText('transparency-note', why);
+    $('transparency-note').hidden = why === '';
+    $('effective-prompt-field').hidden = !on;
+    if (on) {
+      setText('effective-prompt',
+        TRANSPARENT_PREFIX + $('prompt').value + TRANSPARENT_SUFFIX);
+    } else {
+      setText('effective-prompt', '');
+    }
+  }
+
+  // Ticking transparency with a non-alpha format switches jpg -> png and
+  // SAYS so (transparency-note). Unticking never rewrites the user's format:
+  // PNG stays PNG, because that is the format the user last had selected.
+  function onTransparencyChange() {
+    transparencySwitchNote = '';
+    if ($('transparent').checked &&
+        ALPHA_FORMATS.indexOf($('output-format').value) === -1) {
+      $('output-format').value = 'png';
+      transparencySwitchNote =
+        'Output format switched from jpg to png: JPEG cannot store a ' +
+        'transparent background. PNG keeps it.';
+    }
+    renderValidation(validateForm().errors);
+    syncPlanStaleness();
   }
 
   /* ---------------- UI wire snapshot and request envelope ----------------
@@ -381,7 +464,8 @@
       offload: $('offload').value,             // resident | streamed | offload
       attention_backend: $('attention').value, // auto | sdpa | efficient | eager
       vae_tiled_decode: $('vae-tiling').checked,
-      output_format: $('output-format').value  // jpg | png | webp (exact config.py enum)
+      output_format: $('output-format').value, // jpg | png | webp (exact config.py enum)
+      transparent_background: $('transparent').checked
     };
   }
 
@@ -408,7 +492,8 @@
           offload: snap.offload,
           attention_backend: snap.attention_backend,
           vae_tiled_decode: snap.vae_tiled_decode,
-          output_format: snap.output_format
+          output_format: snap.output_format,
+          transparent_background: snap.transparent_background
         }
       }
     };
@@ -914,6 +999,11 @@
     setText('plan-quant', plan.config.quant + ' · ' + plan.config.offload + ' · ' +
                           plan.config.attention_backend + ' · VAE tiling ' +
                           (plan.config.vae_tiled_decode ? 'on' : 'off'));
+    setText('plan-transparency',
+      plan.config.transparent_background
+        ? 'on — prompts the model for a transparent background; saved as ' +
+          plan.config.output_format + ', which can keep it (not guaranteed)'
+        : 'off — saved as ' + plan.config.output_format);
     setText('plan-manifest',
       plan.manifest.ready === false && plan.manifest.verification === 'not_performed'
         ? 'metadata only — verification not performed, fit not evaluated, not ready'
@@ -956,7 +1046,8 @@
     if (!c || typeof c !== 'object') return null;
     var want = ['prompt', 'negative_prompt', 'width', 'height', 'steps',
                 'true_cfg_scale', 'seed', 'quant', 'offload',
-                'attention_backend', 'vae_tiled_decode', 'output_format'];
+                'attention_backend', 'vae_tiled_decode', 'output_format',
+                'transparent_background'];
     var have = Object.keys(c);
     if (have.length !== want.length) return null;   // no extra runtime fields
     for (var i = 0; i < want.length; i++) {
@@ -989,6 +1080,11 @@
     if (PLAN_ENUMS.attention_backend.indexOf(c.attention_backend) === -1) return null;
     if (typeof c.vae_tiled_decode !== 'boolean') return null;
     if (PLAN_ENUMS.output_format.indexOf(c.output_format) === -1) return null;
+    if (typeof c.transparent_background !== 'boolean') return null;
+    // The server refuses transparency without an alpha-capable format; an
+    // echo claiming both is a broken contract, never a value to render.
+    if (c.transparent_background &&
+        ALPHA_FORMATS.indexOf(c.output_format) === -1) return null;
     // cfg_active must EQUAL the server's single source of truth
     // (config.py): a non-blank negative prompt under PYTHON strip rules
     // AND a scale strictly above 1.0.
@@ -1227,6 +1323,11 @@
     $('attention').value = c.attention_backend;
     $('vae-tiling').checked = c.vae_tiled_decode;
     $('output-format').value = c.output_format;
+    // Import is an explicit server-validated application: an imported
+    // transparency setting never triggers the jpg -> png auto-switch, so a
+    // stale switch explanation must not survive it either.
+    transparencySwitchNote = '';
+    $('transparent').checked = c.transparent_background;
   }
 
   function importConfigFile(file) {
@@ -1449,16 +1550,22 @@
         typeof job.cancel_requested !== 'boolean') return null;
     var c = job.config;
     if (!c || typeof c !== 'object') return null;
-    // Current servers echo all 12 editable fields. An older 11-key config
-    // without output_format is accepted ONLY via this explicit
-    // backward-compat branch and defaults to PNG — the format the older
-    // server actually saved. Anything else (10 keys, 13 keys, extra
-    // runtime fields) is a schema rejection, never a guess.
+    // Current servers echo all 13 editable fields. Two older shapes are
+    // accepted ONLY via explicit backward-compat branches and default the
+    // missing key to what those servers actually did: 12 keys without
+    // transparent_background (never transparent), and 11 keys without
+    // output_format either (saved PNG). Anything else (10 keys, 14 keys,
+    // extra runtime fields) is a schema rejection, never a guess.
     var ckeys = Object.keys(c);
-    var legacyNoFormat = ckeys.length === 11 &&
-      !Object.prototype.hasOwnProperty.call(c, 'output_format');
-    if (!(ckeys.length === 12 || legacyNoFormat)) return null;
+    var hasKey = function (key) {
+      return Object.prototype.hasOwnProperty.call(c, key);
+    };
+    var legacyNoFormat = ckeys.length === 11 && !hasKey('output_format');
+    var legacyNoTransparency = ckeys.length === 12 &&
+      !hasKey('transparent_background') && hasKey('output_format');
+    if (!(ckeys.length === 13 || legacyNoFormat || legacyNoTransparency)) return null;
     if (legacyNoFormat) c.output_format = 'png';
+    if (legacyNoFormat || legacyNoTransparency) c.transparent_background = false;
     if (typeof c.prompt !== 'string' ||
         !pyStrip(c.prompt) || c.prompt.length > MAX_CONFIG_STRING_CHARS ||
         typeof c.negative_prompt !== 'string' || c.negative_prompt.length > MAX_CONFIG_STRING_CHARS ||
@@ -1468,7 +1575,12 @@
         typeof c.vae_tiled_decode !== 'boolean' ||
         PLAN_ENUMS.quant.indexOf(c.quant) === -1 || PLAN_ENUMS.offload.indexOf(c.offload) === -1 ||
         PLAN_ENUMS.attention_backend.indexOf(c.attention_backend) === -1 ||
-        PLAN_ENUMS.output_format.indexOf(c.output_format) === -1) return null;
+        PLAN_ENUMS.output_format.indexOf(c.output_format) === -1 ||
+        typeof c.transparent_background !== 'boolean') return null;
+    // A job config asking for transparency in a format that cannot store it
+    // cannot have come from a validated server config.
+    if (c.transparent_background &&
+        ALPHA_FORMATS.indexOf(c.output_format) === -1) return null;
     if (['width', 'height'].some(function (key) {
       return !Number.isInteger(c[key]) || c[key] < 64 || c[key] > 4096 || c[key] % 32 !== 0;
     })) return null;
@@ -1841,10 +1953,16 @@
     // visible result clearly stale, not leave it looking validated.
     ['quant', 'offload', 'attention', 'vae-tiling', 'output-format'].forEach(function (id) {
       $(id).addEventListener('change', function () {
+        // An explicit format choice replaces any auto-switch explanation.
+        if (id === 'output-format') transparencySwitchNote = '';
         renderValidation(validateForm().errors);
         syncPlanStaleness();
       });
     });
+
+    // Transparency owns the jpg -> png switch, so it is wired separately
+    // from the change-only group above.
+    $('transparent').addEventListener('change', onTransparencyChange);
 
     window.addEventListener('hashchange', routeOnHashchange);
     initTheme();   // persisted theme applied before first paint of content

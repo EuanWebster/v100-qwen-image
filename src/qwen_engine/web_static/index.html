@@ -89,11 +89,33 @@
 
           <div class="field">
             <label for="output-format">Output format</label>
-            <select id="output-format" name="output_format">
+            <select id="output-format" name="output_format"
+                    aria-describedby="format-error">
               <option value="jpg" selected>jpg</option>
               <option value="png">png</option>
               <option value="webp">webp</option>
             </select>
+            <p class="error" id="format-error" aria-live="polite"></p>
+          </div>
+
+          <div class="field transparency-field">
+            <div class="checkbox-field">
+              <input id="transparent" name="transparent_background" type="checkbox"
+                     title="Asks the model for a transparent background and saves PNG or WebP, which keep it. JPEG cannot store transparency, so the format switches to PNG while this is ticked."
+                     aria-describedby="transparency-help transparency-note">
+              <label for="transparent">Transparent background</label>
+            </div>
+            <p id="transparency-help" class="help">Asks the model for an image with a
+              see-through background and saves it in a format that can keep one
+              (PNG or WebP). JPEG cannot store transparency, so ticking this switches
+              jpg to PNG. Your prompt text is kept exactly as typed — a short fixed
+              instruction is added only to the text the model reads. The result is
+              not guaranteed to be transparent: check the image.</p>
+            <p id="transparency-note" class="help transparency-note" role="status"></p>
+            <p id="effective-prompt-field" class="effective-prompt-field" hidden>
+              <span class="stat-label">Text the model reads (read-only)</span>
+              <span id="effective-prompt" class="effective-prompt-text"></span>
+            </p>
           </div>
 
           <div class="field seed-field">
@@ -257,6 +279,7 @@
             <div><dt>CFG</dt><dd id="plan-cfg">—</dd></div>
             <div><dt>Latent tokens</dt><dd id="plan-tokens">—</dd></div>
             <div><dt>Quant / offload / attention</dt><dd id="plan-quant">—</dd></div>
+            <div><dt>Transparent background</dt><dd id="plan-transparency">—</dd></div>
             <div><dt>Manifest</dt><dd id="plan-manifest">—</dd></div>
             <div><dt>Hardware</dt><dd id="plan-hardware">—</dd></div>
             <div><dt>Calibration</dt><dd id="plan-calibration">—</dd></div>

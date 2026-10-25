@@ -350,7 +350,29 @@ details.advanced > .help { margin-top: 10px; }
 #preview-image { width: 100%; height: 100%; object-fit: contain; }
 .history-card { min-width: 0; padding: 12px; border: 1px solid var(--border);
   border-radius: 12px; overflow-wrap: anywhere; }
-.history-card img { display: block; width: 100%; height: 180px; object-fit: contain; }
+.history-card img { display: block; width: 100%; height: 180px; object-fit: contain;
+  /* Checkerboard UNDER the thumbnail: a transparent PNG/WebP must read as
+     transparent, not as a flat dark rectangle. Preview only — the saved
+     file is never altered. */
+  background:
+    repeating-conic-gradient(#1a1c20 0% 25%, #1f2226 0% 50%) 0 0 / 16px 16px;
+  border-radius: 6px; }
+:root[data-theme="paper"] .history-card img {
+  background: repeating-conic-gradient(#eee9df 0% 25%, #f7f3eb 0% 50%) 0 0 / 16px 16px;
+}
+
+/* ---------- Transparent background ---------- */
+
+.transparency-field { border-top: 1px solid var(--border); padding-top: 10px; }
+.transparency-field .help { margin-top: 6px; }
+.transparency-note { color: var(--accent); }
+.effective-prompt-field { margin: 6px 0 0; display: flex; flex-direction: column;
+  gap: 3px; }
+.effective-prompt-text {
+  font-size: 12.5px; line-height: 1.45; color: var(--text-muted);
+  border: 1px dashed var(--border); border-radius: 6px; padding: 6px 8px;
+  overflow-wrap: anywhere; white-space: pre-wrap;
+}
 .history-card button { margin: 4px; }
 #job-status, #job-timings { overflow-wrap: anywhere; }
 

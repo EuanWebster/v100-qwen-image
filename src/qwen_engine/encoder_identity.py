@@ -364,7 +364,7 @@ def project_encoder_seed(config: GenerationConfig, manifest: ModelManifest, *,
     """
     if not isinstance(config, GenerationConfig):
         raise EncoderRequestError("a GenerationConfig is required")
-    return EncoderRequest(**_projection_fields(manifest, prompt=config.prompt,
+    return EncoderRequest(**_projection_fields(manifest, prompt=config.effective_prompt,
         negative=config.negative_prompt, dtype=encoder_dtype, cfg_active=config.cfg_active))
 
 
@@ -400,7 +400,8 @@ def project_encoder_request(config: GenerationConfig, manifest: ModelManifest, *
     """
     if not isinstance(config, GenerationConfig):
         raise EncoderRequestError("a GenerationConfig is required")
-    return _project_request(manifest, prompt=config.prompt, negative=config.negative_prompt,
+    return _project_request(manifest, prompt=config.effective_prompt,
+                            negative=config.negative_prompt,
                             dtype=encoder_dtype, cfg_active=config.cfg_active)
 
 

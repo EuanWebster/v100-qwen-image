@@ -106,6 +106,49 @@ def test_png_webp_preserve_alpha_jpg_flattens_white(tmp_path):
     assert flat.getpixel((0, 0)) == (255, 255, 255)  # transparent -> white
 
 
+def _varying_alpha_image():
+    """Every pixel a DIFFERENT alpha value: a channel dropped or flattened
+    anywhere in the encode path is visible, not averaged away."""
+    image = Image.new("RGBA", (4, 2))
+    alphas = [0, 1, 17, 64, 127, 128, 200, 255]
+    for index, alpha in enumerate(alphas):
+        image.putpixel((index % 4, index // 4), (30 + index * 10, 200 - index * 5,
+                                                90, alpha))
+    return image
+
+
+@pytest.mark.parametrize("fmt", ["png", "webp"])
+def test_alpha_channel_survives_lossless_roundtrip_exactly(tmp_path, fmt):
+    source = _varying_alpha_image()
+    out = save_output_image(source, tmp_path, fmt, 3, date=DATE)
+    got = decoded(out)
+    assert got.mode == "RGBA" and got.size == source.size
+    pixels = [(x, y) for y in range(source.height) for x in range(source.width)]
+    expected = [source.getpixel(p) for p in pixels]
+    # A fully transparent pixel's RGB is not observable and WebP may zero it;
+    # every NON-ZERO alpha pixel must round-trip with exact alpha and RGB.
+    actual = [got.image.convert("RGBA").getpixel(p) for p in pixels]
+    assert len(actual) == len(expected)
+    assert sorted(pixel[3] for pixel in actual) == sorted(pixel[3] for pixel in expected)
+    for want, have in zip(expected, actual):
+        if want[3] == 0:
+            assert have[3] == 0
+            continue
+        assert have == want
+
+
+def test_opaque_rgb_png_webp_bytes_unchanged_by_alpha_support(tmp_path):
+    # The pre-existing opaque path must be untouched: the module publishes
+    # exactly what Pillow encodes for the same RGB image and settings.
+    source = rgb_image()
+    for fmt, pillow_format, kwargs in (("png", "PNG", {}),
+                                       ("webp", "WEBP", {"lossless": True, "quality": 100})):
+        direct = io.BytesIO()
+        source.save(direct, format=pillow_format, **kwargs)
+        out = save_output_image(source.copy(), tmp_path, fmt, 11, date=DATE)
+        assert out.read_bytes() == direct.getvalue(), f"{fmt} bytes drifted"
+
+
 def test_existing_file_never_overwritten(tmp_path):
     target = tmp_path / f"{STEM}.png"
     target.write_bytes(b"sentinel")
