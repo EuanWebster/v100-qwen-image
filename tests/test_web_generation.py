@@ -51,7 +51,8 @@ def test_enabled_status_means_submission_only_not_verified_memory(runtime):
     assert status['manifest']['verification'] == 'not_performed'
 
 
-def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, monkeypatch):
+@pytest.mark.parametrize("performance", [False, True])
+def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, monkeypatch, performance):
     events = []
 
     class Adapter:
@@ -83,7 +84,7 @@ def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, 
 
     monkeypatch.setattr(cli, '_verify_assets', verify)
     monkeypatch.setattr(cli, '_make_adapter', factory)
-    service = WebGeneration(runtime, trust_unbounded_host=True)
+    service = WebGeneration(runtime, trust_unbounded_host=True, performance=performance)
     try:
         submitted = service.submit(envelope()).payload
         record = service.controller.wait(submitted['job_id'])
@@ -97,15 +98,23 @@ def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, 
         assert doc['progress'] == {'completed_steps': 40, 'total_steps': 40}
         assert str(Path(runtime.output_dir).parent) not in json.dumps(doc)
         assert service.image(record.job_id) == PNG
+        report = Path(record.config.output_dir) / "performance.json"
+        assert report.exists() is performance
+        if performance:
+            metrics = json.loads(report.read_text())
+            assert metrics["status"] == "succeeded"
+            assert metrics["stages"][-1]["stage"] == "total_job"
+            assert 'red cube' not in report.read_text()
     finally:
         assert service.close()
 
 
-def test_assets_failure_never_creates_adapter_and_error_is_private(runtime, monkeypatch):
+@pytest.mark.parametrize("performance", [False, True])
+def test_assets_failure_never_creates_adapter_and_error_is_private(runtime, monkeypatch, performance):
     def fail(config): raise RuntimeError('/private/model/path secret detail')
     monkeypatch.setattr(cli, '_verify_assets', fail)
     monkeypatch.setattr(cli, '_make_adapter', lambda **kw: pytest.fail('adapter loaded'))
-    service = WebGeneration(runtime)
+    service = WebGeneration(runtime, performance=performance)
     try:
         job_id = service.submit(envelope()).payload['job_id']
         service.controller.wait(job_id)
@@ -113,6 +122,11 @@ def test_assets_failure_never_creates_adapter_and_error_is_private(runtime, monk
         assert doc['state'] == 'failed' and doc['error_code'] == 'execution_failed'
         assert '/private' not in json.dumps(doc) and 'secret detail' not in json.dumps(doc)
         assert doc['image_url'] is None
+        report = Path(service.controller.get(job_id).config.output_dir) / "performance.json"
+        assert report.exists() is performance
+        if performance:
+            assert json.loads(report.read_text())["status"] == "failed"
+            assert 'secret detail' not in report.read_text()
     finally:
         assert service.close()
 
