@@ -105,7 +105,7 @@ required plan corrections"); the ledger exists so nobody re-imports a dead claim
 |---|---|---|
 | C1 | Pipeline class `QwenImage2Pipeline` | Correct class is **`QwenImage21Pipeline`** (diffusers `pipelines/qwenimage21/`). |
 | C2 | "Volta requires PyTorch ≤2.10"; pin torch 2.7.* | **Wrong.** Official CUDA 12.6 wheels retain sm_70 support beyond 2.10; PyTorch announced **2.14 as the last release publishing cu126 wheels**. Pin an exact tested wheel and verify `torch.cuda.get_arch_list()` + real CUDA execution — not just device detection. |
-| C3 | GGUF Q4_K_M resident as the quality default | **Rejected as a default.** Q4 is a capacity-fallback candidate only. Quality baseline = full-precision/higher-quality reference; compare resident **Q8** (and other higher-quality quants) against it and pick from measurement + human review. |
+| C3 | GGUF Q4_K_M resident as the quality default | **Rejected and removed at Euan's request, 2026-10-25**, following evaluation. FP16 and Q8 remain the supported choices; retain the comparison evidence. |
 | C4 | 4-step Lightning LoRA in presets and the CPU smoke | **Rejected.** The generic 4-step Lightning dependency is not an identified, validated Qwen-Image-2.1 recipe. Default = **full base sampling recipe**. One concrete *optional* accelerator candidate: `Viggle/Qwen-Image-2.1-viggle-turbo` v0.3 (6 steps, prescribed sigmas/scheduler; its card says keep the LoRA **unmerged or merged in FP32 before quantization** — contradicting the draft's blanket "merge wins"). Inspect the exact current recipe before adopting. |
 | C5 | "bf16 tensors must raise at load" (BF16 rejected) | **Contradictory in the draft; resolved:** BF16 checkpoints are *accepted for conversion* (→ fp16 for GPU execution); V100's lack of BF16 hardware does not forbid BF16 storage, and does **not** force FP16 CPU execution either — the CPU encoder's dtype is a separate, measured decision. |
 | C6 | VAE tiling as the mitigation for 2K attention OOM | **Misconception removed.** VAE tiling reduces *decode* memory only; it does nothing for denoising-attention memory. Confirmed token counts: **4096 at 1024², 16384 at 2048²**; a dense FP32 attention-score tensor (32 heads × 16384 tokens) alone is **32 GiB**. Attention-backend selection is load-bearing at 2K; 2K stays experimental. |
@@ -374,8 +374,9 @@ unexpected (logged with context, traceback only into the log sink).
 
 - **5.1** Reference vs quant ladder: higher-precision/offloaded reference first, then
   resident **Q8** and other higher-quality quants compared against it (numerical
-  comparison on equivalent execution paths + human eval on the genre set). Q4 only as a
-  capacity fallback with the quality delta documented (C3).
+  comparison on equivalent execution paths + human eval on the genre set).
+  Q4 was evaluated and removed at Euan's request on2026-10-25 (C3); its downloaded
+  weights and active evaluation tooling are removed, while results are retained.
   Experimental Q8 weight-only loading/dequantization and pinned artifact checks
   are implemented (`fde631f`). Matched 1K40 seed42 testing on 2026-10-25 saved
   memory (9678.5 vs 15612.5 MiB peak) with visually similar cube output, but was
@@ -667,7 +668,7 @@ disclosure, stat cards, creations history. Engine stays ComfyUI-free.
 
 - **W4 usability — option explanations (requested 2026-10-25).** Add accessible
   tooltips/help for each Quantization and Layer offload option. Explain what
-  FP16, Q8 and Q4 change, the possible quality/VRAM trade-offs, and what resident
+  FP16 and Q8 change, the possible quality/VRAM trade-offs, and what resident
   versus streamed offload means for VRAM, host RAM and loading/PCIe costs.
   Keep current support/experimental/refused states explicit; do not promise
   faster inference or model fit without measurements. Descriptions must be

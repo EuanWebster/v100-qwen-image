@@ -13,8 +13,8 @@ Boundary rules:
 * Only the reviewed resident profile is implemented: unquantized FP16 on one
   V100, native SDPA, transformer + VAE resident, no text encoder in-process
   (the Qwen3-VL encoder runs in the subprocess worker), no hooks/offload.
-  Q8/Q4 and streaming are M5 work and are refused here rather than silently
-  ignored.
+  Q8 uses the separately verified GGUF path. Streaming remains unimplemented
+  and is refused rather than silently ignored.
 * The adapter **loads and attaches**; it grants no memory fit, no calibration
   and no image-quality acceptance. The measured memory policy (M5.3) remains a
   separate gate, and the CPU encoder's own conservative host-memory preflight
@@ -196,7 +196,7 @@ def _validate_policy(config: GenerationConfig) -> None:
     errors: list[FieldError] = []
     if config.quant not in (Quant.FP16, Quant.Q8):
         errors.append(FieldError(
-            "quant", "the resident loader supports fp16 or reviewed Q8_0; q4 is not implemented"))
+            "quant", "the resident loader supports fp16 or reviewed Q8_0 only"))
     if config.quant is Quant.Q8 and config.q8_manifest_path is None:
         errors.append(FieldError("q8_manifest_path", "Q8 requires an explicit --q8-manifest sidecar"))
     if config.quant is Quant.Q8:

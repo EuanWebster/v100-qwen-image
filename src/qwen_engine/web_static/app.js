@@ -366,7 +366,7 @@
       steps: Number($('steps').value),
       seed: seedWireString($('seed').value),   // decimal STRING or null (UI-only)
       true_cfg_scale: Number($('cfg').value),
-      quant: $('quant').value,                 // fp16 | q8 | q4 (exact config.py values)
+      quant: $('quant').value,                 // fp16 | q8 (exact config.py values)
       offload: $('offload').value,             // resident | streamed | offload
       attention_backend: $('attention').value, // auto | sdpa | efficient | eager
       vae_tiled_decode: $('vae-tiling').checked,
@@ -920,7 +920,7 @@
   }
 
   var PLAN_ENUMS = {
-    quant: ['fp16', 'q8', 'q4'],
+    quant: ['fp16', 'q8'],
     offload: ['resident', 'streamed', 'offload'],
     attention_backend: ['auto', 'sdpa', 'efficient', 'eager'],
     output_format: OUTPUT_FORMATS

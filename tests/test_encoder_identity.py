@@ -412,7 +412,7 @@ def test_own_source_digest_and_invalid_request_prechecks(manifest, monkeypatch):
                                                  (2, "  ", False), (2, " bad ", True)])
 def test_config_cfg_semantics_and_manifest_components(manifest, reviewed_fixture, scale, negative, active):
     config = GenerationConfig(prompt="  exact positive  ", negative_prompt=negative,
-                              true_cfg_scale=scale, quant="q4")
+                              true_cfg_scale=scale, quant="q8")
     req = ei.project_encoder_request(config, manifest, encoder_dtype="bf16")
     assert req.prompt == config.prompt and req.negative_prompt == negative
     assert req.dtype == "bf16" and dict(req.kwargs) == {"cfg_active": active}

@@ -1,5 +1,10 @@
 # Q4_K_M evaluation — 2026-10-25
 
+**Subsequent decision:** Euan requested Q4 removal after reviewing these results.
+The UI/config/CLI choice, downloaded weights and active evaluation preparer,
+test and sidecar were removed. The results and images below remain historical
+evidence; reproduction instructions refer to the earlier evaluation commit.
+
 Requested: check the practical difference from Q8/FP16 before deciding whether
 Q4 should be offered. This is an isolated evaluation; **the production app still
 refuses Q4**. No default, loader, driver or service configuration was changed.

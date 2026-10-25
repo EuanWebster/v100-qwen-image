@@ -234,7 +234,7 @@ def test_incomplete_generation_runtime_refuses_before_socket_or_writes(monkeypat
 @pytest.mark.parametrize('values,code', [
     ({'output_dir': '/tmp/injected'}, 'unknown_config_field'),
     ({'seed': 42}, 'invalid_seed'),
-    ({'quant': 'q4'}, 'unsupported_generation_config'),
+    ({'quant': 'q4'}, 'invalid_config'),
     ({'width': 2048, 'height': 2048}, 'tiled_decode_required'),
 ])
 def test_bad_submissions_create_no_job_or_output(runtime, values, code):

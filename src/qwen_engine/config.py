@@ -48,7 +48,6 @@ _FILE_FIELDS = ("manifest_path", "q8_manifest_path")
 class Quant(StrEnum):
     FP16 = "fp16"
     Q8 = "q8"
-    Q4 = "q4"
 
 
 class OutputFormat(StrEnum):

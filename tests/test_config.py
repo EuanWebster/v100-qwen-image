@@ -96,8 +96,15 @@ def test_enum_error_lists_valid_choices():
     with pytest.raises(ConfigError) as exc:
         GenerationConfig(quant="int4")
     err = next(e for e in exc.value.errors if e.field == "quant")
-    for choice in ("fp16", "q8", "q4"):
+    for choice in ("fp16", "q8"):
         assert choice in err.message
+
+
+def test_q4_is_no_longer_a_quantization_choice():
+    assert {q.value for q in Quant} == {"fp16", "q8"}
+    with pytest.raises(ConfigError) as exc:
+        GenerationConfig(quant="q4")
+    assert "quant" in _err_fields(exc)
 
 
 def test_multiple_bad_fields_are_all_reported():
