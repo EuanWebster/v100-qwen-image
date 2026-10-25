@@ -120,5 +120,5 @@ docs/                 design contracts, measurements and review notes
 
 ## License
 
-No license has been chosen yet, so all rights are reserved by default.
-Qwen-Image-2.1 model weights are subject to their own upstream license.
+[MIT](LICENSE). This covers the code in this repository only; Qwen-Image-2.1
+model weights are subject to their own upstream license.
