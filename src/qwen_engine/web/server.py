@@ -102,6 +102,13 @@ EXPORT_ROUTE = "/api/v1/config/export"
 IMPORT_ROUTE = "/api/v1/config/import"
 JOBS_ROUTE = "/api/v1/jobs"
 _JOB_ROUTE = re.compile(r"/api/v1/jobs/([0-9a-f]{32})(?:/(image|cancel|forget))?\Z")
+REFERENCES_ROUTE = "/api/v1/references"
+#: Strict lowercase-content-id grammar; anything else never matches (404).
+_REFERENCE_ROUTE = re.compile(r"/api/v1/references/([0-9a-f]{64})(/thumb)?\Z")
+
+#: The one route that accepts raw bytes instead of JSON (design §2.4).
+_OCTET_STREAM_CONTENT_TYPE_RE = re.compile(r"application/octet-stream\Z",
+                                           re.IGNORECASE)
 
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; "
        "connect-src 'self'; img-src 'self'; base-uri 'none'; "
@@ -176,9 +183,11 @@ def validate_host(values: list[str], bound_ip: str,
 
 
 def header_policy(method: str, headers: dict[str, list[str]],
-                  expected_origin: str) -> ApiError | None:
+                  expected_origin: str, *, upload: bool = False) -> ApiError | None:
     """Post-Host header policy, pure. ``headers`` maps lowercase names to
-    their raw values in wire order."""
+    their raw values in wire order. ``upload`` selects the reference-upload
+    route's rules: raw ``application/octet-stream`` instead of JSON and the
+    store's 32 MiB cap instead of the 64 KiB JSON cap."""
     def dup(name: str) -> ApiError | None:
         values = headers.get(name, [])
         if len(values) > 1:
@@ -223,8 +232,13 @@ def header_policy(method: str, headers: dict[str, list[str]],
         return ApiError(417, "expectation_failed",
                         "this server supports no Expect extensions")
     types = headers.get("content-type", [])
-    if not types or not _JSON_CONTENT_TYPE_RE.match(types[0].strip()):
+    expected_type = (_OCTET_STREAM_CONTENT_TYPE_RE if upload
+                     else _JSON_CONTENT_TYPE_RE)
+    if not types or not expected_type.match(types[0].strip()):
         return ApiError(415, "unsupported_media_type",
+                        "reference uploads must be exactly "
+                        "application/octet-stream (refused before the body "
+                        "is read)" if upload else
                         "POST body must be application/json (a form or "
                         "other content type is refused before the body is "
                         "read)")
@@ -239,9 +253,10 @@ def header_policy(method: str, headers: dict[str, list[str]],
                         "without signs or whitespace")
     # Bounded digit conversion BEFORE int() (arbitrary-length digit strings
     # must be typed refusals, never a ValueError -> 500).
-    if len(raw) > 6 or int(raw) > MAX_BODY_BYTES:
+    cap = api.MAX_REFERENCE_UPLOAD_BYTES if upload else MAX_BODY_BYTES
+    if len(raw) > (9 if upload else 6) or int(raw) > cap:
         return ApiError(413, "request_too_large",
-                        f"request bodies are capped at {MAX_BODY_BYTES} bytes")
+                        f"request bodies are capped at {cap} bytes")
     return None
 
 
@@ -263,6 +278,9 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "status", target
         if target == JOBS_ROUTE:
             return "jobs", target
+        match = _REFERENCE_ROUTE.fullmatch(target)
+        if match:
+            return ("reference_thumb" if match[2] else "reference"), match[1]
     elif method == "POST":
         if target == PLAN_ROUTE:
             return "plan", target
@@ -272,6 +290,15 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "import", target
         if target == JOBS_ROUTE:
             return "submit", target
+        if target == REFERENCES_ROUTE:
+            return "upload", REFERENCES_ROUTE
+    ref_match = _REFERENCE_ROUTE.fullmatch(target)
+    if ref_match:
+        raise ApiError(405, "method_not_allowed", "this route does not accept that method",
+                       headers=(("Allow", "GET"),))
+    if target == REFERENCES_ROUTE:
+        raise ApiError(405, "method_not_allowed", "this route does not accept that method",
+                       headers=(("Allow", "POST"),))
     match = _JOB_ROUTE.fullmatch(target)
     if match:
         action = match[2] or "job"
@@ -572,22 +599,29 @@ class _Handler(BaseHTTPRequestHandler):
                 err = ApiError(400, "invalid_host", host_err)
                 self._send_api(ApiResponse(status=err.status, payload=err.to_payload()))
                 return
-            err = header_policy(method, headers, host_origin)
-            if err is not None:
-                self._send_api(ApiResponse(status=err.status, payload=err.to_payload(),
-                                           headers=err.headers))
-                return
             # Route on the RAW wire target ONLY (never the stdlib-normalized
             # self.path): the stdlib folds '//' in self.path before the app
             # sees it, and TAB request lines reach self.path normalized too.
             # An uncapturable/absent raw target is '' -> resolve_route refuses.
             target = getattr(self, "raw_target", "")
+            # The upload route's content-type/length rules differ, so the
+            # header policy needs to know the route BEFORE it is applied.
+            err = header_policy(method, headers, host_origin,
+                                upload=method == "POST" and target == REFERENCES_ROUTE)
+            if err is not None:
+                self._send_api(ApiResponse(status=err.status, payload=err.to_payload(),
+                                           headers=err.headers))
+                return
             kind, arg = resolve_route(method, target)
             if kind == "static":
                 asset, ctype = STATIC_ROUTES[arg]
                 self._send(200, self.server.assets[asset], ctype)
             elif kind == "status":
                 self._send_api(api.status_response(self.server.web_runtime))
+            elif kind in ("reference", "reference_thumb"):
+                data, ctype = api.reference_bytes(self.server.web_runtime, arg,
+                                                  thumb=kind == "reference_thumb")
+                self._send(200, data, ctype)
             elif kind in ("jobs", "job", "image"):
                 jobs = getattr(self.server, "generation", None)
                 if jobs is None:
@@ -612,6 +646,10 @@ class _Handler(BaseHTTPRequestHandler):
                 elif kind == "import":
                     self._send_api(api.import_response(self.server.web_runtime, body))
                 else:
+                    if kind == "upload":
+                        self._send_api(api.upload_reference_response(
+                            self.server.web_runtime, body))
+                        return
                     jobs = getattr(self.server, "generation", None)
                     if jobs is None:
                         raise ApiError(503, "generation_disabled", "generation is disabled on this server")
@@ -904,7 +942,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="write opt-in prompt-free synchronized metrics in each job directory")
     p.add_argument("--attest-unbounded-host", action="store_true",
                    help="operator attestation of no cgroup RAM cap; encoder uses fresh host MemAvailable")
-    for flag in ("output-dir", "cache-dir", "log-dir", "benchmarks-dir"):
+    for flag in ("output-dir", "cache-dir", "log-dir", "benchmarks-dir",
+                 "references-dir"):
         p.add_argument(f"--{flag}", default=None,
                        help=f"server runtime path {flag!r} (never settable "
                             "from the browser; omitted = unconfigured/no writes)")
@@ -946,6 +985,21 @@ def main(argv: list[str] | None = None) -> int:
         "manifest_path": None if args.manifest is None else os.path.realpath(args.manifest),
         "q8_manifest_path": None if args.q8_manifest is None else os.path.realpath(args.q8_manifest),
     }
+    if args.references_dir is not None:
+        paths["references_dir"] = os.path.realpath(args.references_dir)
+    elif paths["cache_dir"] is not None:
+        paths["references_dir"] = os.path.join(paths["cache_dir"], "references")
+    else:
+        paths["references_dir"] = None
+    if paths["references_dir"] is not None:
+        # Server-owned store: created 0700 at startup (uploads are the only
+        # writes; the browser never sees this path).
+        try:
+            os.makedirs(paths["references_dir"], mode=0o700, exist_ok=True)
+        except OSError:
+            print("error: the server reference store directory cannot be created",
+                  file=sys.stderr)
+            return 1
     status = _startup_config_or_exit(paths)
     if status:
         return status

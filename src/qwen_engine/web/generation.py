@@ -135,6 +135,12 @@ class WebGeneration:
 
     def submit(self, body):
         config = build_config(self.runtime, parse_request_json(body))
+        if config.references:
+            # Every id must resolve to a hash-verified blob BEFORE enqueue:
+            # a job may not fail deep in the worker over something the server
+            # can see now. Public message carries the ORDINAL only — never
+            # the id, never the store path (design §2.4).
+            self._require_references(config.references)
         from qwen_engine.adapters.qwen21_diffusers import _validate_policy
 
         try:
@@ -155,6 +161,20 @@ class WebGeneration:
         except (JobError, OSError):
             raise ApiError(409, "job_submission_refused", "job queue/history is full or its output storage is unavailable") from None
         return ApiResponse(202, self.public_job(record))
+
+    def _require_references(self, references):
+        from qwen_engine import reference_store
+        root = self.runtime.references_dir
+        if root is None:  # unreachable via build_config pairing; belt and braces
+            raise ApiError(422, "reference_unavailable",
+                           "the server reference store is not configured")
+        for ordinal, reference_id in enumerate(references, start=1):
+            try:
+                reference_store.read_blob(root, reference_id)
+            except reference_store.ReferenceStoreError:
+                raise ApiError(422, "reference_unavailable",
+                               f"reference {ordinal} is not available in the "
+                               "server reference store") from None
 
     def list_response(self):
         return ApiResponse(200, {"schema": JOBS_SCHEMA,

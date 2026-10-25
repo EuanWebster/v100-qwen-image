@@ -27,12 +27,14 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from typing import Any
 
 from qwen_engine import _jsonsafe
+from qwen_engine import reference_store as _reference_store
 from qwen_engine.config import SEED_MAX, ConfigError, GenerationConfig
 from qwen_engine.core import plan as core_plan
 
@@ -41,6 +43,16 @@ WEB_STATUS_SCHEMA = "qwen_engine.web_status.v1"
 WEB_PLAN_SCHEMA = "qwen_engine.web_plan.v1"
 WEB_PLAN_REQUEST_SCHEMA = "qwen_engine.web_plan_request.v1"
 WEB_ERROR_SCHEMA = "qwen_engine.web_error.v1"
+WEB_REFERENCE_SCHEMA = "qwen_engine.web_reference.v1"
+
+#: Route cap for raw reference uploads — the store's own byte cap is the
+#: single source of truth; JSON routes keep the small 64 KiB MAX_BODY_BYTES.
+MAX_REFERENCE_UPLOAD_BYTES = _reference_store.MAX_REFERENCE_BYTES
+
+#: Sniffed-store-format -> response Content-Type (design §2.4; identical
+#: magic table, one source of truth: the store).
+_REFERENCE_CONTENT_TYPES = {"png": "image/png", "jpeg": "image/jpeg",
+                            "webp": "image/webp"}
 
 #: The browser-editable GenerationConfig fields — exactly these, no more.
 #: Runtime paths (output/cache/log/benchmarks/models/manifest) are
@@ -49,11 +61,13 @@ EDITABLE_FIELDS = frozenset({
     "prompt", "negative_prompt", "width", "height", "steps",
     "true_cfg_scale", "seed", "quant", "offload", "attention_backend",
     "vae_tiled_decode", "output_format", "transparent_background",
+    "references",
 })
 
 #: Server-controlled runtime path fields (never editable from the browser).
 RUNTIME_PATH_FIELDS = ("output_dir", "cache_dir", "log_dir",
-                       "benchmarks_dir", "models_dir", "manifest_path", "q8_manifest_path")
+                       "benchmarks_dir", "models_dir", "manifest_path",
+                       "q8_manifest_path", "references_dir")
 
 #: Seed wire grammar: ASCII decimal digits only, at most 20 characters
 #: (the full uint64 range stays an exact string; range is validated later
@@ -118,6 +132,9 @@ class WebRuntime:
     models_dir: str | None = None
     manifest_path: str | None = None
     q8_manifest_path: str | None = None
+    #: Server-owned content-addressed reference store (uploads land here;
+    #: the browser exchanges ids only, never paths).
+    references_dir: str | None = None
     manifest_summary: Mapping[str, Any] = field(default_factory=dict)
     generation_enabled: bool = False
 
@@ -327,6 +344,7 @@ def editable_config_dict(config: GenerationConfig) -> dict[str, Any]:
     for name in RUNTIME_PATH_FIELDS:
         out.pop(name, None)
     out["seed"] = _public_seed(config)
+    out["references"] = list(config.references)
     return out
 
 
@@ -579,6 +597,71 @@ def import_response(runtime: WebRuntime, raw_body: bytes) -> ApiResponse:
         return ApiResponse(exc.status, exc.to_payload())
 
 
+def upload_reference_response(runtime: WebRuntime, raw: bytes) -> ApiResponse:
+    """Store one raw uploaded reference image (design §2.4).
+
+    Validation is the store's (magic sniff, Pillow decode, size/dimension
+    caps, store fullness); every refusal is typed and prompt-free: 415 for
+    non-images, 409 when the store is at its cap, 503 when the server has no
+    usable store — never a path, never a library message. Idempotent: the
+    same bytes return the same id.
+    """
+    if runtime.references_dir is None:
+        raise ApiError(503, "reference_store_unconfigured",
+                       "the server reference store directory is not configured")
+    if not raw:
+        raise ApiError(415, "unsupported_media_type",
+                       "an empty body is not an image")
+    try:
+        # The server-owned store directory: created 0700 at startup by the
+        # server, re-created here if an operator removed it mid-run (uploads
+        # are the only writers; content-addressed, so no clobbering).
+        os.makedirs(runtime.references_dir, mode=0o700, exist_ok=True)
+    except OSError:
+        raise ApiError(503, "reference_store_unavailable",
+                       "the reference store directory is not usable") from None
+    try:
+        reference_id = _reference_store.put_bytes(runtime.references_dir, raw)
+        sidecar = _reference_store.read_sidecar(runtime.references_dir, reference_id)
+    except _reference_store.ReferenceStoreError as exc:
+        text = str(exc)
+        if text.startswith(("cannot publish", "reference root is not")):
+            raise ApiError(503, "reference_store_unavailable",
+                           "the reference store could not accept the upload") from None
+        if "store is full" in text:
+            raise ApiError(409, "reference_store_full",
+                           "the reference store is at its cap; an operator must "
+                           "prune it") from None
+        raise ApiError(415, "unsupported_media_type",
+                       "the body must be a valid PNG, JPEG or WebP image "
+                       "within the size and dimension caps") from None
+    return ApiResponse(201, {"schema": WEB_REFERENCE_SCHEMA, "id": reference_id,
+                             "width": sidecar["width"], "height": sidecar["height"],
+                             "has_alpha": bool(sidecar["has_alpha"]),
+                             "bytes": len(raw)})
+
+
+def reference_bytes(runtime: WebRuntime, reference_id: str, *,
+                    thumb: bool = False) -> tuple[bytes, str]:
+    """Hash-verified stored bytes (original or PNG thumbnail) + sniffed
+    Content-Type. Unknown/malformed ids and unreadable blobs are ONE 404 —
+    the client learns nothing beyond absence."""
+    if runtime.references_dir is None:
+        raise ApiError(404, "reference_unknown", "no such reference")
+    try:
+        data = (_reference_store.read_thumb(runtime.references_dir, reference_id)
+                if thumb else
+                _reference_store.read_blob(runtime.references_dir, reference_id))
+    except _reference_store.ReferenceStoreError:
+        raise ApiError(404, "reference_unknown", "no such reference") from None
+    if thumb:
+        return data, "image/png"
+    try:
+        return data, _REFERENCE_CONTENT_TYPES[_reference_store.sniff_format(data)]
+    except _reference_store.ReferenceStoreError:
+        raise ApiError(404, "reference_unknown", "no such reference") from None
+
+
 def internal_error_response() -> ApiResponse:
     """Catch-all typed failure: no traceback, no exception text, no paths."""
     exc = ApiError(500, "internal_error",
@@ -594,6 +677,8 @@ __all__ = [
     "export_response", "internal_error_response", "manifest_plan_state",
     "parse_request_json", "plan_response", "status_response",
     "summarize_manifest_bytes",
+    "MAX_REFERENCE_UPLOAD_BYTES", "WEB_REFERENCE_SCHEMA",
+    "reference_bytes", "upload_reference_response",
 ]
 
 
