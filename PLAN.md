@@ -645,6 +645,14 @@ disclosure, stat cards, creations history. Engine stays ComfyUI-free.
   actual recipe steps, cancellation and desktop/mobile accessibility in real
   Chrome. This is planned UI work, not a newly enabled capability.
 
+- **W4 usability — option explanations (requested 2026-10-25).** Add accessible
+  tooltips/help for each Quantization and Layer offload option. Explain what
+  FP16, Q8 and Q4 change, the possible quality/VRAM trade-offs, and what resident
+  versus streamed offload means for VRAM, host RAM and loading/PCIe costs.
+  Keep current support/experimental/refused states explicit; do not promise
+  faster inference or model fit without measurements. Descriptions must be
+  available on keyboard focus and touch as well as mouse hover.
+
 ## Tests / validation
 
 - Full: `cd /work && .venv/bin/pytest -q`; every numbered task ships a test.
