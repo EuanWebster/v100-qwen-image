@@ -172,6 +172,20 @@ async function check() {
     await delay(150);
     assert(await evaluate('document.documentElement.scrollWidth <= window.innerWidth + 1'));
     await evaluate(`document.getElementById('advanced').open=true; window.scrollTo(0,500)`);
+    if (width > 940) {
+      const positions = await evaluate(`(() => {
+        const panel=document.querySelector('.prompt-panel');
+        const preview=document.getElementById('preview-frame');
+        const settings=document.querySelector('.settings-scroll');
+        const before=[panel.getBoundingClientRect().top,preview.getBoundingClientRect().top];
+        settings.scrollTop=500;
+        return {before, after:[panel.getBoundingClientRect().top,preview.getBoundingClientRect().top],
+          scroll:settings.scrollTop, page:window.scrollY};
+      })()`);
+      assert.deepEqual(positions.before, positions.after);
+      assert(positions.scroll > 0);
+      assert.equal(positions.page, 0);
+    }
     assert(await evaluate(`(() => {const r=document.getElementById('generate-btn').getBoundingClientRect(); return r.top>=0 && r.bottom<window.innerHeight;})()`));
     const shot = await send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: true});
     writeFileSync(join(artifactDir, `studio-${width}.png`), Buffer.from(shot.data, 'base64'));
