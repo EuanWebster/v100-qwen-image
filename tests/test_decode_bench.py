@@ -58,13 +58,14 @@ def test_capture_wrapper_uses_the_bound_cancellation_event(tmp_path):
 
 def test_probe_records_actual_allocator_retry_delta():
     from types import SimpleNamespace
+    from collections import OrderedDict
     class Cuda:
         retries = 4
         def is_available(self): return True
         def synchronize(self): pass
         def empty_cache(self): pass
         def reset_peak_memory_stats(self): pass
-        def memory_stats(self): return {'num_alloc_retries': self.retries}
+        def memory_stats(self): return OrderedDict(num_alloc_retries=self.retries)
         def max_memory_allocated(self): return 100
         def max_memory_reserved(self): return 200
     cuda = Cuda()

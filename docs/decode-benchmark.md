@@ -94,3 +94,6 @@ mkdir -p output/decode-profiles/example
 These are diagnostic benchmark profiles, not new production configuration
 choices or memory-policy calibration evidence. Production geometry must only
 change after inspecting the saved images and recording the memory trade-off.
+Profiles run after capture in the same process; library caches may already be
+warm even though the Torch allocator is cleared. Confirm a proposed new default
+with a complete fresh-process generation before claiming production headroom.
