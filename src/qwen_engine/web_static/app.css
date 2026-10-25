@@ -192,6 +192,33 @@ main { flex: 1; padding: 20px; }
 .prompt-panel .prompt-field { margin-bottom: 10px; }
 .prompt-panel .job-actions { margin-top: 0; }
 
+/* Quiet scrollbars that follow all three themes; retain a visible drag target. */
+:where(.settings-scroll, .prompt-panel, .plan-panel, main, textarea) {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+:where(.settings-scroll, .prompt-panel, .plan-panel, main, textarea):is(:hover, :focus-within) {
+  scrollbar-color: var(--text-muted) transparent;
+}
+:where(.settings-scroll, .prompt-panel, .plan-panel, main, textarea)::-webkit-scrollbar {
+  width: 8px; height: 8px;
+}
+:where(.settings-scroll, .prompt-panel, .plan-panel, main, textarea)::-webkit-scrollbar-track {
+  background: transparent;
+}
+:where(.settings-scroll, .prompt-panel, .plan-panel, main, textarea)::-webkit-scrollbar-thumb {
+  background: var(--border); border: 2px solid var(--bg-panel);
+  border-radius: 8px;
+}
+:where(.settings-scroll, .prompt-panel, .plan-panel, main, textarea)::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+@media (forced-colors: active) {
+  :where(.settings-scroll, .prompt-panel, .plan-panel, main, textarea) {
+    scrollbar-color: auto;
+  }
+}
+
 /* ---------- Form ---------- */
 
 .field { margin-bottom: 14px; }
