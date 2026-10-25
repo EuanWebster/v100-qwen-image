@@ -385,6 +385,12 @@ unexpected (logged with context, traceback only into the log sink).
   Q8 2048²/40/tiled also completed on 2026-10-25, but fp32 tiled decoding peaked
   at15946.5MiB and emitted an allocator-retry warning. Treat this as a narrow
   successful trial, not comfortable fit or calibration of the other six shapes.
+  Q4_K_M was evaluated in an isolated package on 2026-10-25 (production still
+  refuses it). Three1K/40-step scene comparisons stayed coherent, but sampling
+  took50–51s versusFP16's42–43s. Whole-run peak9320.5MiB barely improves on
+  Q8's9678.5MiB because VAE decoding dominates. A2K/four-step capacity probe
+  still peaked15942.5MiB during decode, with an allocator-retry warning; it is
+  not a2K quality test. See [Q4 evaluation](docs/handoffs/2026-10-25-q4-evaluation.md).
 - **5.2** Streaming block offload mode where it preserves quality or is needed for
   capacity; cost it against the measured link (M3.4). Equivalence test: streamed vs
   resident at fixed seed, max abs diff within fp16 tolerance — this is an *equivalent
