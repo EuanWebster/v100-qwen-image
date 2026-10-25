@@ -77,6 +77,8 @@ import hashlib
 import json
 import os
 import stat as stat_module
+import threading
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -967,6 +969,80 @@ def _probe_regular_file_under_root(expected: Path, role: str,
             "file (unexpected layout)")
 
 
+#: A successful full-bytes verification by :func:`resolve_local_bundle` is
+#: the SAME verification the CLI already ran minutes-to-seconds earlier in
+#: the SAME process: :func:`qwen_engine.cli._verify_assets` and the adapter's
+#: ``load`` reverify hash the identical bytes with the identical trusted
+#: resolver (measured 2026-10-25 on the shipped trees: base 33 GB ≈ 19 s per
+#: pass, turbo 14 GB ≈ 9 s per pass, every pass paid twice per run — the
+#: Turbo model_initialisation surcharge WAS the second turbo-tree hash).
+#: Reusing a verification this recent, keyed on manifest content + profile +
+#: the root's filesystem identity, is not a weaker guarantee than re-hashing:
+#: a fresh hash never protected against bytes changed afterwards either (see
+#: the honest-limits paragraph of :func:`resolve_local_bundle`). Outside the
+#: window, or for any different manifest/root/profile identity, and for every
+#: REFUSAL, nothing is reused — the trusted resolver runs in full.
+RESOLUTION_REUSE_WINDOW_SECONDS = 30.0
+
+#: Clock witness (tests substitute a deterministic one).
+_MONOTONIC = time.monotonic
+_resolution_memo: dict[tuple[Any, ...], tuple[float, LocalReferenceBundle]] = {}
+_resolution_memo_lock = threading.Lock()
+
+
+def clear_resolution_memo() -> None:
+    """Forget every reusable verification (test seam; never needed on a run)."""
+    with _resolution_memo_lock:
+        _resolution_memo.clear()
+
+
+def _resolution_key(manifest: ModelManifest, models_dir: str | Path,
+                    spec: BundleProfile) -> tuple[Any, ...] | None:
+    """Identity under which a full-bytes verification may be reused: profile,
+    manifest CONTENT (the artifact-set digest the bundle publishes from the
+    very rows the resolver verified), and the root directory's filesystem
+    identity (st_dev/st_ino of the fully resolved path — never the lexical
+    string alone). ``None`` means uncacheable: the caller must run the
+    resolver so its own typed errors surface unchanged."""
+    try:
+        root = Path(models_dir).resolve()
+        info = os.stat(root)
+        return (spec.name, artifact_set_fingerprint(manifest.artifacts),
+                str(root), info.st_dev, info.st_ino)
+    except (OSError, LocalBundleError):
+        return None
+
+
+
+def prime_resolution_memo(manifest: ModelManifest,
+                          models_dir: str | Path,
+                          report: ResolutionReport,
+                          profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
+                          ) -> LocalReferenceBundle:
+    """Project a FRESH trusted-resolver report and remember the projection as
+    this process's verification for :data:`RESOLUTION_REUSE_WINDOW_SECONDS`.
+
+    This is the CLI half of the reuse: :func:`qwen_engine.cli._verify_assets`
+    runs the trusted resolver itself, and the adapter's
+    :func:`resolve_local_bundle` in ``load`` would otherwise re-hash the
+    identical bytes seconds later in the same process (measured: 19 s base +
+    9 s turbo, every pass paid twice per run). The projection here runs
+    EVERY check :func:`project_resolution_report` runs — ok/coherence/
+    positional/file probes — so only a full, honest, successful report can
+    ever be remembered; typed refusals propagate and remember nothing. The
+    same key/window/expiry rules as :func:`resolve_local_bundle` apply, so
+    the adapter hit reuses exactly the bytes the resolver just verified.
+    """
+    spec = get_profile(profile)
+    validate_layout(manifest, spec)
+    bundle = project_resolution_report(manifest, report, models_dir, spec)
+    key = _resolution_key(manifest, models_dir, spec)
+    if key is not None:
+        with _resolution_memo_lock:
+            _resolution_memo[key] = (_MONOTONIC(), bundle)
+    return bundle
+
+
 def resolve_local_bundle(manifest: ModelManifest,
                          models_dir: str | Path,
                          profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
@@ -980,7 +1056,12 @@ def resolve_local_bundle(manifest: ModelManifest,
     real 33 GB reference set its cost is a full byte re-verification of that
     set (the same cost as any honest resolve). Callers that already hold a
     fresh resolver report use :func:`project_resolution_report` (which
-    *trusts that report*) and avoid the rehash.
+    *trusts that report*) and avoid the rehash. Within ONE process, an
+    identical resolve completed within :data:`RESOLUTION_REUSE_WINDOW_SECONDS`
+    is returned from the freshness memo without rehashing (see that constant:
+    this is the CLI-verify → adapter-reverify handoff, the identical bytes
+    hashed by the identical resolver seconds apart); every other call hashes
+    in full, and refusals are never memoized.
 
     The manifest layout (including the profile's exact pinned repo/revision)
     is validated BEFORE the resolver runs, so an off-profile manifest never
@@ -998,10 +1079,24 @@ def resolve_local_bundle(manifest: ModelManifest,
     """
     spec = get_profile(profile)
     validate_layout(manifest, spec)
+    key = _resolution_key(manifest, models_dir, spec)
+    if key is not None:
+        now = _MONOTONIC()
+        with _resolution_memo_lock:
+            for stale in [entry_key for entry_key, (when, _) in _resolution_memo.items()
+                          if now - when > RESOLUTION_REUSE_WINDOW_SECONDS]:
+                del _resolution_memo[stale]
+            entry = _resolution_memo.get(key)
+            if entry is not None:
+                return entry[1]
     report = resolve_manifest(manifest, models_dir)
     # project_resolution_report re-checks ok/coherence (the resolver's own
     # negative verdict must never project, whoever built the report).
-    return project_resolution_report(manifest, report, models_dir, spec)
+    bundle = project_resolution_report(manifest, report, models_dir, spec)
+    if key is not None:
+        with _resolution_memo_lock:
+            _resolution_memo[key] = (_MONOTONIC(), bundle)
+    return bundle
 
 
 def project_resolution_report(manifest: ModelManifest,

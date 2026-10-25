@@ -738,6 +738,180 @@ def test_api_docstrings_state_the_provenance_split():
 
 
 # ---------------------------------------------------------------------------
+# Fresh-verification memo (Turbo init fix): the CLI-verify → adapter-reverify
+# handoff hashes the identical bytes with the identical resolver seconds
+# apart in ONE process; the second pass must not re-hash. Refusals, other
+# identities, and stale entries always re-hash in full.
+# ---------------------------------------------------------------------------
+
+
+def test_resolution_memo_reuses_fresh_verification_then_expires(tmp_path, monkeypatch):
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(lb, "_MONOTONIC", lambda: clock["now"])
+    lb.clear_resolution_memo()
+    try:
+        first = lb.resolve_local_bundle(manifest, root)
+        # Same manifest content, same root inode, same profile, inside the
+        # window: the verified bundle is returned as-is — no rehash.
+        assert lb.resolve_local_bundle(manifest, root) is first
+        # Past the window a full honest resolve runs again.
+        clock["now"] += lb.RESOLUTION_REUSE_WINDOW_SECONDS + 1
+        again = lb.resolve_local_bundle(manifest, root)
+        assert again is not first
+        assert again.to_dict() == first.to_dict()
+        # The memo expires on its own: an identical resolve just past the
+        # window stores the FRESH verification, reusable again.
+        clock["now"] += 1.0
+        assert lb.resolve_local_bundle(manifest, root) is again
+    finally:
+        lb.clear_resolution_memo()
+
+
+def test_resolution_memo_refusals_and_other_identities_never_reuse(tmp_path, monkeypatch):
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(lb, "_MONOTONIC", lambda: clock["now"])
+    lb.clear_resolution_memo()
+    try:
+        # A REFUSAL never enters the memo: every honest resolve of a broken
+        # tree re-runs the resolver in full, no matter how recent the last
+        # refusal was.
+        root = tmp_path / "assets"
+        manifest = build_tiny_tree(root)
+        (root / "processor" / "tokenizer.json").unlink()
+        calls = []
+        real = lb.resolve_manifest
+
+        def spy(manifest_, models_dir):
+            calls.append(models_dir)
+            return real(manifest_, models_dir)
+
+        monkeypatch.setattr(lb, "resolve_manifest", spy)
+        for _ in range(2):
+            with pytest.raises(lb.BundleReportError, match="not successful"):
+                lb.resolve_local_bundle(manifest, root)
+        assert calls == [root, root]
+        # Different ROOT filesystem identity → full resolve, never a hit:
+        # an identical tree at a different root resolves independently.
+        other_root = tmp_path / "other"
+        other_manifest = build_tiny_tree(other_root)
+        twin = lb.resolve_local_bundle(other_manifest, other_root)
+        assert calls == [root, root, other_root]
+        # Same inode, different lexical spelling → the SAME memo entry
+        # (the key is the filesystem identity, not the string).
+        monkeypatch.setattr(lb, "resolve_manifest",
+                            lambda *_a: (_ for _ in ()).throw(
+                                AssertionError("lexical respell must hit")))
+        assert lb.resolve_local_bundle(other_manifest,
+                                       other_root / ".." / "other") is twin
+    finally:
+        lb.clear_resolution_memo()
+
+
+def test_resolution_memo_documents_in_window_tamper_semantics(tmp_path, monkeypatch):
+    """Bytes changed AFTER a verified resolve are outside every guarantee
+    this module ever made (the factory's honest-limits paragraph says the
+    rehash never protected after-the-fact changes; hostile concurrent-
+    filesystem TOCTOU is explicitly not closed). Pinned here as the accepted
+    tradeoff of not re-hashing 47 GB twice per run: within the window the
+    memo serves the fresh verification; past it the tamper is caught."""
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(lb, "_MONOTONIC", lambda: clock["now"])
+    lb.clear_resolution_memo()
+    try:
+        first = lb.resolve_local_bundle(manifest, root)
+        (root / "vae" / "diffusion_pytorch_model.safetensors").write_bytes(
+            b"tampered-within-the-window")
+        assert lb.resolve_local_bundle(manifest, root) is first   # documented
+        clock["now"] += lb.RESOLUTION_REUSE_WINDOW_SECONDS + 1
+        with pytest.raises(lb.BundleReportError, match="not successful"):
+            lb.resolve_local_bundle(manifest, root)
+    finally:
+        lb.clear_resolution_memo()
+
+
+def test_prime_resolution_memo_stores_and_replays_full_report(tmp_path, monkeypatch):
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    lb.clear_resolution_memo()
+    try:
+        bundle = lb.prime_resolution_memo(manifest, root,
+                                          resolve_manifest(manifest, root))
+
+        def boom(manifest_, models_dir):
+            raise AssertionError("resolver must not re-hash inside the window")
+
+        monkeypatch.setattr(lb, "resolve_manifest", boom)
+        assert lb.resolve_local_bundle(manifest, root) is bundle
+        # Profile is part of the identity: the same bytes under the turbo
+        # profile are refused by layout validation before any memo or the
+        # resolver is touched.
+        with pytest.raises(lb.BundleLayoutError):
+            lb.resolve_local_bundle(manifest, root,
+                                    profile=lb.TURBO_REFERENCE_PROFILE)
+    finally:
+        lb.clear_resolution_memo()
+
+
+def test_prime_resolution_memo_never_stores_a_failed_report(tmp_path, monkeypatch):
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    (root / "processor" / "tokenizer.json").unlink()
+    bad = resolve_manifest(manifest, root)
+    assert not bad.ok
+    lb.clear_resolution_memo()
+    try:
+        with pytest.raises(lb.BundleReportError, match="not successful"):
+            lb.prime_resolution_memo(manifest, root, bad)
+        calls = []
+        real = lb.resolve_manifest
+
+        def spy(manifest_, models_dir):
+            calls.append(models_dir)
+            return real(manifest_, models_dir)
+
+        monkeypatch.setattr(lb, "resolve_manifest", spy)
+        with pytest.raises(lb.BundleReportError, match="not successful"):
+            lb.resolve_local_bundle(manifest, root)
+        assert calls == [root]   # nothing stored: honest full resolve ran
+    finally:
+        lb.clear_resolution_memo()
+
+
+def test_verify_assets_primes_the_adapter_resolve(tmp_path, monkeypatch):
+    """End-to-end of the measured Turbo-init fix: the resolver pass inside
+    the CLI's _verify_assets IS what the adapter's resolve_local_bundle
+    reuses seconds later — the resolver never re-runs for the same bytes."""
+    from qwen_engine.cli import _verify_assets
+    from qwen_engine.config import GenerationConfig
+    root = tmp_path / "models" / "assets"
+    manifest = build_tiny_tree(root)
+    manifest_path = tmp_path / "models" / "manifest.json"
+    manifest_path.write_text(json.dumps({"schema_version": 1, "artifacts": [
+        {"role": a.role, "repo": a.repo, "revision": a.revision,
+         "filename": a.filename, "sha256": a.sha256, "bytes": a.bytes}
+        for a in manifest.artifacts]}))
+    lb.clear_resolution_memo()
+    try:
+        report = _verify_assets(GenerationConfig(
+            manifest_path=str(manifest_path), models_dir=str(root)))
+        assert report.ok
+
+        def boom(manifest_, models_dir):
+            raise AssertionError("adapter re-hashed despite fresh priming")
+
+        monkeypatch.setattr(lb, "resolve_manifest", boom)
+        bundle = lb.resolve_local_bundle(load_manifest(manifest_path),
+                                         str(root))
+        assert bundle.assets["dit"]
+    finally:
+        lb.clear_resolution_memo()
+
+
+# ---------------------------------------------------------------------------
 # Structural probes: forged 'present' statuses must not survive the probe
 # ---------------------------------------------------------------------------
 

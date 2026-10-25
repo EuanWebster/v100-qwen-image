@@ -41,6 +41,8 @@ from qwen_engine.errors import (
     MemoryGuardError,
 )
 from qwen_engine.log import PhaseLogger, file_sink
+from qwen_engine.local_bundle import (TURBO_REFERENCE_PROFILE, LocalBundleError,
+                                      prime_resolution_memo)
 from qwen_engine.manifest import ManifestError, load_manifest, manifest_status, resolve_manifest
 
 _OVERRIDES = {
@@ -286,6 +288,19 @@ def _verify_assets(config: GenerationConfig):
             f"{len(report.errors)} model artifact(s) unresolved; nothing "
             f"downloaded (fetching is a separate operator action)"
         )
+    # Fresh-verification priming (measured 2026-10-25): adapter.load's
+    # resolve_local_bundle re-hashed every byte the line just above hashed
+    # (~19 s base + ~9 s turbo, every pass paid twice per run). Project the
+    # honest report through the SAME trusted projection and remember it for
+    # the adapter's reverify seconds later in this process. Best effort by
+    # design: a manifest outside the reviewed profile will be refused by the
+    # adapter's own trusted resolve with the same typed error it raises
+    # today — priming is a reuse, never a gate, and never stores for a
+    # refusal.
+    try:
+        prime_resolution_memo(manifest, root, report)
+    except LocalBundleError:
+        pass
     if config.recipe is Recipe.TURBO:
         # Turbo's fail-closed path (turbo-plan §3.3): its own manifest and
         # root, resolved exactly like the base assets, then role-merged on
@@ -306,6 +321,11 @@ def _verify_assets(config: GenerationConfig):
             raise ManifestError(
                 f"{len(turbo_report.errors)} turbo artifact(s) unresolved; "
                 f"nothing downloaded (fetching is a separate operator action)")
+        try:
+            prime_resolution_memo(turbo_manifest, turbo_root, turbo_report,
+                                  profile=TURBO_REFERENCE_PROFILE)
+        except LocalBundleError:
+            pass  # the adapter's trusted resolve owns the refusal
         report = replace(report, resolved={**report.resolved,
                                            **turbo_report.resolved})
     return report
