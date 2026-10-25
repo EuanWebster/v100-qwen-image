@@ -296,11 +296,13 @@ would force `api.py:40`, `app.js:51` and `tests/test_web_api.py:52` to change to
   **Landed** (R1/R2): the transport seam keeps that exact signature; the HTTP transport
   raises the module's own typed errors, so `complete()` maps nothing. Two refinements
   from implementation: `parse_endpoint` also refuses *any* whitespace and requires an
-  explicit port, and only `temperature`/`top_p`/`max_tokens` are sent
-  (`SAMPLING_WIRE_FIELDS`) — `top_k`/`min_p`/`presence_penalty` go out only via
-  `extra_sampling` after measuring that the service honours them. So t2i runs at
-  `presence_penalty = 0` against the shared service instead of the trained 1.5; that
-  deviation must be stated wherever rewrite quality is reported.
+  explicit port, and the whole trained profile is sent
+  (`SAMPLING_WIRE_FIELDS`): `temperature`, `top_p`, `top_k`, `min_p`,
+  `presence_penalty`, `max_tokens`. An earlier revision sent only the three
+  OpenAI-standard fields, which ran t2i at `presence_penalty = 0` instead of the
+  trained 1.5 — the quiet distribution change upstream's README warns about. That
+  is fixed: `tests/test_web_rewrite_service.py` pins the exact end-to-end body for
+  both tasks. `image_max_pixels` is client-side preprocessing and never travels.
 - **`web/api.py`** — `REWRITE_REQUEST_SCHEMA`, `WEB_REWRITE_SCHEMA`,
   `build_rewrite_request(raw_body)` (strict JSON, exact keys, non-negative int revision,
   non-empty prompt ≤ cap, `image_ids == []`), `rewrite_response(...)`, and the status

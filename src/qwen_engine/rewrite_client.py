@@ -248,26 +248,31 @@ class RewriteClient:
                    extra_sampling: Mapping[str, Any] | None = None) -> bytes:
         """The exact request bytes for one rewrite.
 
-        Sends the verified subset of the profile (``SAMPLING_WIRE_FIELDS``);
-        `extra_sampling` adds further profile values under their wire names,
-        which is how an operator enables ``presence_penalty`` etc. after
-        measuring the service actually honours them. Unknown keys are refused —
-        a silently ignored sampling field is the failure this guards against.
+        Every wire-carrying profile field is sent (``SAMPLING_WIRE_FIELDS``), so
+        the request reproduces the trained sampling rather than an OpenAI-only
+        subset: omitting ``presence_penalty = 1.5`` for t2i changed the
+        distribution upstream warns about, quietly.
+
+        `extra_sampling` overrides profile values *by profile name*; each
+        override is written under that field's wire name, so overriding
+        ``max_new_tokens`` still emits ``max_tokens``. Unknown keys are refused
+        -- a silently ignored sampling field is the failure this guards against.
         """
         check_task(task)
         if not isinstance(messages, list) or not messages:
             raise RewriteClientError("messages must be a non-empty list")
         profile = sampling(task)
+        overrides = dict(extra_sampling or {})
+        unknown = [name for name in overrides if name not in SAMPLING_WIRE_FIELDS]
+        if unknown:
+            raise RewriteClientError(
+                f"unknown sampling field {sorted(unknown)[0]!r}; expected one "
+                f"of {sorted(SAMPLING_WIRE_FIELDS)}")
+        profile.update(overrides)
         body: dict[str, Any] = {"model": self.model, "messages": messages,
                                 "stream": False}
         for name, wire in SAMPLING_WIRE_FIELDS.items():
             body[wire] = profile[name]
-        for name, value in (extra_sampling or {}).items():
-            if name not in profile:
-                raise RewriteClientError(
-                    f"unknown sampling field {name!r}; expected one of "
-                    f"{sorted(profile)}")
-            body[name] = value
         body["chat_template_kwargs"] = dict(_THINKING_ON)
         try:
             return json.dumps(body, ensure_ascii=False, allow_nan=False,

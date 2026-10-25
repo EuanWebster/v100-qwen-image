@@ -106,7 +106,14 @@ def test_timeout_must_be_a_positive_bounded_number(timeout):
 # ---------------------------------------------------------------------------
 
 
-def test_request_body_is_exactly_the_documented_json():
+def test_request_body_is_exactly_the_t2i_profile():
+    """Every wire-carrying profile value, and nothing else.
+
+    ``presence_penalty = 1.5`` is the load-bearing one: upstream warns a wrong
+    value changes the distribution without failing, and this client used to
+    omit it entirely (running t2i at penalty 0). The exact-set comparison is
+    what makes that unrepresentable now.
+    """
     body = client().build_body(messages("a cat"), "t2i")
     document = json.loads(body)
     assert document == {
@@ -116,9 +123,23 @@ def test_request_body_is_exactly_the_documented_json():
         "stream": False,
         "temperature": 1.0,
         "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
         "max_tokens": 16256,
         "chat_template_kwargs": {"enable_thinking": True},
     }
+
+
+def test_request_body_is_exactly_the_edit_profile():
+    """The edit profile differs in exactly the penalty and the budget."""
+    document = json.loads(client().build_body(messages("x"), "edit"))
+    assert document["presence_penalty"] == 0.0
+    assert document["max_tokens"] == 24000
+    assert document["temperature"] == 1.0
+    assert document["top_p"] == 0.95
+    assert document["top_k"] == 20
+    assert document["min_p"] == 0.0
 
 
 def test_request_body_is_compact_utf8_and_not_ascii_escaped():
@@ -133,17 +154,45 @@ def test_edit_budget_differs_and_is_carried():
     assert json.loads(client().build_body(messages("x"), "edit"))["max_tokens"] == 24000
 
 
-def test_unsent_profile_fields_are_absent_by_default():
-    """top_k/min_p/presence_penalty were never exercised against the service."""
-    document = json.loads(client().build_body(messages("x"), "t2i"))
-    for name in ("top_k", "min_p", "presence_penalty"):
-        assert name not in document
+def test_every_wire_field_is_sent_for_both_tasks():
+    """No profile value that travels is left behind on either task.
+
+    Guards the regression directly: the body's keys must equal the wire map's
+    values plus the envelope, so adding a profile field to
+    ``SAMPLING_WIRE_FIELDS`` without sending it (or vice versa) fails here.
+    """
+    envelope = {"model", "messages", "stream", "chat_template_kwargs"}
+    for task in rw.TASKS:
+        document = json.loads(client().build_body(messages("x"), task))
+        assert set(document) == envelope | set(rw.SAMPLING_WIRE_FIELDS.values())
+        for name, wire in rw.SAMPLING_WIRE_FIELDS.items():
+            assert document[wire] == rw.sampling(task)[name]
 
 
-def test_extra_sampling_sends_measured_fields_only():
+def test_image_max_pixels_is_never_sent():
+    """It is client-side preprocessing upstream, not a wire field."""
+    for task in rw.TASKS:
+        document = json.loads(client().build_body(messages("x"), task))
+        assert "image_max_pixels" not in document
+
+
+def test_extra_sampling_overrides_by_profile_name():
     body = client().build_body(messages("x"), "t2i",
-                              extra_sampling={"presence_penalty": 1.5})
-    assert json.loads(body)["presence_penalty"] == 1.5
+                              extra_sampling={"presence_penalty": 0.7})
+    assert json.loads(body)["presence_penalty"] == 0.7
+
+
+def test_extra_sampling_maps_renamed_fields_to_their_wire_name():
+    """An override of a renamed field must not emit the profile name.
+
+    ``max_new_tokens`` travels as ``max_tokens``; writing the override straight
+    into the body would send a ``max_new_tokens`` key the server ignores.
+    """
+    body = client().build_body(messages("x"), "t2i",
+                              extra_sampling={"max_new_tokens": 512})
+    document = json.loads(body)
+    assert document["max_tokens"] == 512
+    assert "max_new_tokens" not in document
 
 
 def test_extra_sampling_refuses_unknown_fields():

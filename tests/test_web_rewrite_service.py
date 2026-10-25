@@ -182,6 +182,50 @@ def test_the_system_prompt_selected_matches_the_task():
     assert seen["doc"]["messages"][0]["content"] == PROMPTS["edit"]
 
 
+def test_the_production_path_sends_the_whole_trained_profile():
+    """The end-to-end body through RewriteService, field for field.
+
+    This is the regression that mattered: the service used to transmit only
+    temperature/top_p/max_tokens, so t2i ran at presence_penalty 0 instead of
+    the trained 1.5. Asserting the exact document (not "contains") is what stops
+    a future field from being dropped in silence.
+    """
+    seen = {}
+
+    def transport(body):
+        seen["doc"] = json.loads(body)
+        return answer()
+
+    service(transport).submit(request(task="t2i", prompt="a corgi in rain"))
+    document = seen["doc"]
+    assert document["temperature"] == 1.0
+    assert document["top_p"] == 0.95
+    assert document["top_k"] == 20
+    assert document["min_p"] == 0.0
+    assert document["presence_penalty"] == 1.5
+    assert document["max_tokens"] == 16256
+    assert document["chat_template_kwargs"] == {"enable_thinking": True}
+    assert set(document) == {
+        "model", "messages", "stream", "temperature", "top_p", "top_k",
+        "min_p", "presence_penalty", "max_tokens", "chat_template_kwargs",
+    }
+
+
+def test_the_edit_path_sends_penalty_zero_and_its_own_budget():
+    seen = {}
+
+    def transport(body):
+        seen["doc"] = json.loads(body)
+        return answer()
+
+    service(transport).submit(request(task="edit", prompt="recolour it"))
+    document = seen["doc"]
+    assert document["presence_penalty"] == 0.0
+    assert document["max_tokens"] == 24000
+    assert document["top_k"] == 20
+    assert document["min_p"] == 0.0
+
+
 def test_sampling_comes_from_the_r1_profile_not_the_service():
     seen = {}
 

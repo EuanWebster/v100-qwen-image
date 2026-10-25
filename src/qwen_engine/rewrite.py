@@ -82,16 +82,27 @@ _SAMPLING: Mapping[str, Mapping[str, Any]] = {
     },
 }
 
-#: Which profile values are transmitted, and under which wire name. This is the
-#: verified subset: the probe against the shared service sent exactly these.
-#: ``top_k``/``min_p``/``presence_penalty`` are part of the official profile but
-#: were NOT exercised against that service, so they are sent only when the
-#: caller passes them explicitly (``extra_sampling``) after measuring. Omitting
-#: ``presence_penalty = 1.5`` for t2i is a real deviation from the trained
-#: distribution and must be stated wherever rewrite quality is reported.
+#: Which profile values are transmitted, and under which wire name. The full
+#: profile travels: ``presence_penalty`` is the load-bearing difference between
+#: the tasks (1.5 t2i / 0.0 edit) and upstream's README warns that a wrong value
+#: changes the sampled distribution without failing loudly, so sending only the
+#: OpenAI-standard fields silently ran t2i at penalty 0 -- a real deviation from
+#: the trained profile, not a conservative default.
+#:
+#: ``top_k``/``min_p`` are vLLM extensions (not OpenAI fields) and go out at the
+#: top level, which is what ``client.py`` puts in ``extra_body`` upstream. A
+#: strict OpenAI-only server would refuse them; this client is built for the
+#: vLLM-backed backend the profile came from, and :meth:`RewriteClient.complete`
+#: surfaces the refusal as a typed error rather than silently dropping fields.
+#:
+#: ``image_max_pixels`` is deliberately absent: it is client-side preprocessing
+#: (upstream downscales before sending), not a wire field.
 SAMPLING_WIRE_FIELDS: Mapping[str, str] = {
     "temperature": "temperature",
     "top_p": "top_p",
+    "top_k": "top_k",
+    "min_p": "min_p",
+    "presence_penalty": "presence_penalty",
     "max_new_tokens": "max_tokens",
 }
 

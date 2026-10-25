@@ -63,8 +63,9 @@ def test_wire_fields_are_a_subset_of_the_profile():
         for name, wire in rw.SAMPLING_WIRE_FIELDS.items():
             assert name in profile, f"{name} is not a profile field"
             assert isinstance(wire, str) and wire
-    # The three values that were actually exercised against the service.
-    assert set(rw.SAMPLING_WIRE_FIELDS) == {"temperature", "top_p", "max_new_tokens"}
+    # Every profile field travels except the client-side preprocessing knob.
+    assert set(rw.SAMPLING_WIRE_FIELDS) == (
+        set(rw.sampling("t2i")) - {"image_max_pixels"})
 
 
 def test_unknown_task_is_a_typed_refusal():
