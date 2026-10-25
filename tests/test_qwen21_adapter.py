@@ -314,6 +314,7 @@ def test_denoise_takes_the_vae_off_the_card_and_decode_restores_it():
     adapter._torch = SimpleNamespace(float16="fp16", float32="fp32",
                                      device=lambda *a: ("cuda", a[1]))
     adapter._tiled_decode = True
+    adapter._fp32_decode = True
 
     latents = adapter.denoise(GenerationConfig(), None)
     assert order[0] == ("denoise", None)        # VAE already gone
@@ -350,6 +351,33 @@ def test_untiled_decode_restores_the_vae_in_fp16():
     assert path == "/models/vae"
     assert kwargs == {"torch_dtype": "fp16", "local_files_only": True}
     assert pipeline.vae.moved == {"device": ("cuda", 0), "dtype": "fp16"}
+    assert pipeline.vae.tiling is False
+
+
+def test_transparent_output_decodes_untiled_in_fp32():
+    # Measured on the V100: fp16 decode of transparent (RGBA) latents was
+    # non-finite at 1024², fp32 decode was finite with a real alpha channel.
+    from types import SimpleNamespace
+
+    from qwen_engine.adapters.qwen21_diffusers import _fp32_decode
+
+    assert _fp32_decode(GenerationConfig()) is False
+    assert _fp32_decode(GenerationConfig(vae_tiled_decode=True)) is True
+    assert _fp32_decode(GenerationConfig(transparent_background=True,
+                                         output_format="png")) is True
+    order = []
+    adapter = cli._make_adapter()
+    pipeline = SimpleNamespace(vae=None)
+    adapter._pipeline = pipeline
+    adapter._vae_cls = _FakeVaeClass(order)
+    adapter._vae_dir = "/models/vae"
+    adapter._torch = SimpleNamespace(float16="fp16", float32="fp32",
+                                     device=lambda *a: ("cuda", a[1]))
+    adapter._tiled_decode = False
+    adapter._fp32_decode = True
+    adapter._restore_vae()
+    _, kwargs = adapter._vae_cls.calls[0]
+    assert kwargs == {"torch_dtype": "fp32", "local_files_only": True}
     assert pipeline.vae.tiling is False
 
 

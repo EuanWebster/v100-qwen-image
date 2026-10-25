@@ -190,6 +190,11 @@ def _require_v100(torch) -> Any:
     return properties
 
 
+def _fp32_decode(config: GenerationConfig) -> bool:
+    """Decode precision policy: fp32 for tiled decode and transparent output."""
+    return config.vae_tiled_decode or config.transparent_background
+
+
 def _validate_policy(config: GenerationConfig) -> None:
     """Review-scope refusals, before any manifest read or ML import."""
     if not isinstance(config, GenerationConfig):
@@ -251,6 +256,7 @@ class Qwen21DiffusersAdapter:
         self._vae_cls: Any = None
         self._vae_dir: Path | None = None
         self._tiled_decode = False
+        self._fp32_decode = False
         self._mlp_chunk_tokens = 0
         self._mlp_chunked_blocks = 0
         self._trust_unbounded_host = trust_unbounded_host
@@ -306,7 +312,7 @@ class Qwen21DiffusersAdapter:
         if current() is not None:
             current().metadata.update(vae_tile=TILED_DECODE_TILE if config.vae_tiled_decode else None,
                                       vae_stride=TILED_DECODE_STRIDE if config.vae_tiled_decode else None,
-                                      vae_precision="fp32" if config.vae_tiled_decode else "fp16")
+                                      vae_precision="fp32" if _fp32_decode(config) else "fp16")
         device = torch.device("cuda", LOGICAL_DEVICE_INDEX)
 
         try:
@@ -387,6 +393,7 @@ class Qwen21DiffusersAdapter:
         self._vae_cls = vae_cls
         self._vae_dir = bundle.component_dirs["vae"]
         self._tiled_decode = config.vae_tiled_decode
+        self._fp32_decode = _fp32_decode(config)
         self._inner = inner
         self._state = "loaded"
 
@@ -451,7 +458,11 @@ class Qwen21DiffusersAdapter:
         # (13.4 GiB peak with 1024 px tiles). Untiled decode stays fp16 — it
         # fits the 1024² envelope, and fp16/fp32 differ by at most 1/255 there
         # (2/255 with 2K tiling), so precision is not buying visible quality.
-        dtype = torch.float32 if self._tiled_decode else torch.float16
+        # Transparent output also decodes in fp32: at 1024² the fp16 decode of
+        # RGBA latents was non-finite for all three measured prompts, while the
+        # same run with fp32 decode produced a finite image with a real alpha
+        # channel.
+        dtype = torch.float32 if self._fp32_decode else torch.float16
         vae = self._vae_cls.from_pretrained(
             self._vae_dir, torch_dtype=dtype, local_files_only=True)
         vae.to(device=torch.device("cuda", LOGICAL_DEVICE_INDEX),
