@@ -442,6 +442,7 @@ def validate_worker_request_identity(request: EncoderRequest, manifest: ModelMan
     """
     validated = validate_production_request(request)
     expected = _project_request(manifest, prompt=request.prompt, negative=request.negative_prompt,
-                                dtype=request.dtype, cfg_active=validated.cfg_active)
+                                dtype=request.dtype, cfg_active=validated.cfg_active,
+                                images=request.images)
     if request.key_document() != expected.key_document():
         raise EncoderRequestError("production request disagrees with worker/manifest identity")

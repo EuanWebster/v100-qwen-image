@@ -426,6 +426,18 @@ def test_config_cfg_semantics_and_manifest_components(manifest, reviewed_fixture
     ei.validate_worker_request_identity(req, manifest)
 
 
+def test_worker_identity_accepts_reference_requests_and_binds_their_images(manifest, reviewed_fixture):
+    # Regression: the worker-side projection dropped the ordered image hashes,
+    # so every real reference edit was refused before encoding on the V100.
+    first, second = "a" * 64, "b" * 64
+    config = GenerationConfig(references=(first, second, first), references_dir="/store")
+    req = ei.project_encoder_request(config, manifest, encoder_dtype="bf16")
+    assert req.images == (first, second, first)
+    # Image content/order binding is enforced by the seed comparison and the
+    # worker's per-file re-hash; this check binds code and manifest identity.
+    ei.validate_worker_request_identity(req, manifest)
+
+
 def test_generation_only_parameters_do_not_fragment_encoder_cache(manifest, reviewed_fixture):
     config = GenerationConfig(negative_prompt="negative", true_cfg_scale=2)
     first = ei.project_encoder_request(config, manifest, encoder_dtype="fp16")
