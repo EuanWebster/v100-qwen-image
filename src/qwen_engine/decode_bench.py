@@ -453,7 +453,7 @@ class PeakMemoryProbe:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
-        stats = torch.cuda.memory_stats()
+        stats = dict(torch.cuda.memory_stats())
         if type(stats) is not dict or "num_alloc_retries" not in stats:
             raise EngineError(
                 "torch.cuda.memory_stats() lacks num_alloc_retries; retries cannot be measured")
@@ -526,7 +526,7 @@ class PeakMemoryProbe:
                 torch.cuda.synchronize()
                 self._peak_allocated = int(torch.cuda.max_memory_allocated())
                 self._peak_reserved = int(torch.cuda.max_memory_reserved())
-                retries_after = torch.cuda.memory_stats()
+                retries_after = dict(torch.cuda.memory_stats())
         finally:
             # Lifecycle teardown runs even when the measured phase raised.
             self._active = False

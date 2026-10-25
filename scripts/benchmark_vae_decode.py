@@ -492,7 +492,6 @@ def main(argv=None) -> int:
         check_output_collisions(out_dir, declared)
 
         # ---- exact production gate: pins, V100, bundle, Q8, runtime ----------
-        import torch
         from qwen_engine.adapters.qwen21_diffusers import (
             LOGICAL_DEVICE_INDEX, _libraries, _require_v100,
         )
@@ -501,7 +500,7 @@ def main(argv=None) -> int:
         # _libraries() validates the installed pins before importing torch ML.
         torch_mod, pipeline_cls, transformer_cls, vae_cls, scheduler_cls, _ = _libraries()
         properties = _require_v100(torch_mod)  # exit-5 refusal on anything else
-        device = torch.device("cuda", LOGICAL_DEVICE_INDEX)
+        device = torch_mod.device("cuda", LOGICAL_DEVICE_INDEX)
         runtime = observe_generation_runtime()
         if not runtime.matches_cuda_device(uuid=str(properties.uuid),
                                            logical_device_index=LOGICAL_DEVICE_INDEX):
