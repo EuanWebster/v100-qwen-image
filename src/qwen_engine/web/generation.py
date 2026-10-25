@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import traceback
+from pathlib import Path
 from dataclasses import replace
 
 from qwen_engine.config import ConfigError
@@ -29,10 +30,14 @@ JOBS_SCHEMA = "qwen_engine.web_jobs.v1"
 
 
 class WebGeneration:
-    def __init__(self, runtime: WebRuntime, *, trust_unbounded_host=False, executor=None):
+    def __init__(self, runtime: WebRuntime, *, trust_unbounded_host=False, executor=None,
+                 performance=False):
         if _blockers(runtime):
             raise ValueError("generation runtime is incomplete or disabled")
         self.runtime = runtime
+        if type(performance) is not bool:
+            raise ValueError("performance must be boolean")
+        self.performance = performance
         self.trust_unbounded_host = trust_unbounded_host
         self._lock = threading.Lock()
         self._metrics = {}
@@ -67,6 +72,18 @@ class WebGeneration:
                                              "phase_ms": {}, "completed_steps": 0,
                                              "total_steps": context.config.steps}
         try:
+            if self.performance:
+                from qwen_engine.performance import PerformanceRecorder, stage
+                recorder = PerformanceRecorder(context.config)
+                with (Path(context.config.output_dir) / "performance.json").open("x", encoding="utf-8") as handle:
+                    status = "failed"
+                    try:
+                        with recorder.activate(), stage("total_job"):
+                            result = self._executor(context)
+                        status = "succeeded"
+                        return result
+                    finally:
+                        recorder.write(handle, status)
             return self._executor(context)
         except (JobCancelled, GenerationCancelled):
             raise

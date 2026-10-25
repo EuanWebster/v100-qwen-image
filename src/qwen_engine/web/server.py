@@ -900,6 +900,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="server-owned Q8 GGUF sidecar manifest; never selectable by browser paths")
     p.add_argument("--enable-generation", action="store_true",
                    help="enable real serial engine jobs (requires manifest, models, output and cache paths)")
+    p.add_argument("--performance", action="store_true",
+                   help="write opt-in prompt-free synchronized metrics in each job directory")
     p.add_argument("--attest-unbounded-host", action="store_true",
                    help="operator attestation of no cgroup RAM cap; encoder uses fresh host MemAvailable")
     for flag in ("output-dir", "cache-dir", "log-dir", "benchmarks-dir"):
@@ -989,7 +991,8 @@ def main(argv: list[str] | None = None) -> int:
         from qwen_engine.web.generation import WebGeneration
         try:
             Path(runtime.output_dir).mkdir(parents=True, exist_ok=True)
-            httpd.generation = WebGeneration(runtime, trust_unbounded_host=args.attest_unbounded_host)
+            httpd.generation = WebGeneration(runtime, trust_unbounded_host=args.attest_unbounded_host,
+                                            performance=args.performance)
         except (OSError, ValueError, RuntimeError):
             for listener in listeners:
                 listener.server_close()

@@ -32,6 +32,7 @@ from qwen_engine.encoder_production import encode_with_supplied_model, validate_
 from qwen_engine.local_bundle import ENCODER_ROLES, validate_local_reference_layout
 from qwen_engine.manifest import ManifestError, ManifestFormatError, manifest_from_dict
 from qwen_engine.mem_preflight import MemoryPreflightError, require_encoder_memory_fit
+from qwen_engine.performance import stage, PerformanceRecorder
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
@@ -242,8 +243,16 @@ def _encode_request(request, manifest, models_dir, headroom_bytes, *,
     if assets.encoder_artifact_set_sha256 != request.implementation_identity.encoder_artifact_set_sha256:
         raise EncoderRequestError("verified encoder artifacts disagree with request identity")
     validate_shard_index(assets)
-    model, processor = _load_local_components(assets, request.dtype)
-    return encode_with_supplied_model(model, processor, request)
+    with stage("text_encoder_loading"):
+        model, processor = _load_local_components(assets, request.dtype)
+    try:
+        with stage("prompt_encoding"):
+            return encode_with_supplied_model(model, processor, request)
+    finally:
+        with stage("text_encoder_cleanup"):
+            # The child exits after publishing. Drop owned references here;
+            # no allocator flushing or extra collection in this CPU process.
+            model = processor = None
 
 
 def result_bytes(payload: EncodedPayload, request_id: str, cap=DEFAULT_MAX_RESPONSE_BYTES) -> bytes:
@@ -381,6 +390,7 @@ def main(argv=None) -> int:
         parser.add_argument(f"--{flag}", required=True)
     parser.add_argument("--project-identity", action="store_true",
                         help="metadata-only seed projection; no ML/model-root access or loading")
+    parser.add_argument("--performance-report", type=Path)
     parser.add_argument("--models-dir")
     parser.add_argument("--headroom-bytes", type=_headroom_arg)
     parser.add_argument("--attest-unbounded-host", action="store_true",
@@ -390,7 +400,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.project_identity:
         if (args.models_dir is not None or args.headroom_bytes is not None
-                or args.attest_unbounded_host):
+                or args.attest_unbounded_host or args.performance_report is not None):
             parser.error("--project-identity refuses loading flags "
                          "--models-dir/--headroom-bytes/--attest-unbounded-host")
     elif args.models_dir is None or args.headroom_bytes is None:
@@ -399,9 +409,19 @@ def main(argv=None) -> int:
         if args.project_identity:
             execute_projection(args.request, args.response, args.manifest)
         else:
-            execute_worker(args.request, args.response, args.manifest, args.models_dir,
-                           headroom_bytes=args.headroom_bytes,
-                           attested_unbounded_host=args.attest_unbounded_host)
+            from contextlib import nullcontext
+            perf = PerformanceRecorder() if args.performance_report is not None else None
+            with (args.performance_report.open("x", encoding="utf-8") if perf else nullcontext()) as handle:
+                status = "failed"
+                try:
+                    with (perf.activate() if perf else nullcontext()):
+                        execute_worker(args.request, args.response, args.manifest, args.models_dir,
+                                       headroom_bytes=args.headroom_bytes,
+                                       attested_unbounded_host=args.attest_unbounded_host)
+                    status = "succeeded"
+                finally:
+                    if perf:
+                        perf.write(handle, status)
         return 0
     except MemoryPreflightError as exc:
         return _report_failure(3, exc)

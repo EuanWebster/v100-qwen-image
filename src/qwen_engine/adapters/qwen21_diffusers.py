@@ -50,6 +50,7 @@ from qwen_engine.errors import EngineError, HardwareAbsentError
 from qwen_engine.local_bundle import LocalReferenceBundle, resolve_local_bundle
 from qwen_engine.manifest import load_manifest
 from qwen_engine.runtime_identity import observe_generation_runtime
+from qwen_engine.performance import stage, attach_cuda, current
 
 #: The only encoder dtype this loader asks the CPU worker for. The checkpoint is
 #: BF16, so this expands no weights; fp16/fp32 are alternatives only after a
@@ -297,24 +298,31 @@ class Qwen21DiffusersAdapter:
             processor_cls,
         ) = _libraries()
         properties = _require_v100(torch)
+        attach_cuda(torch)
+        if current() is not None:
+            current().metadata.update(vae_tile=TILED_DECODE_TILE if config.vae_tiled_decode else None,
+                                      vae_stride=TILED_DECODE_STRIDE if config.vae_tiled_decode else None,
+                                      vae_precision="fp32" if config.vae_tiled_decode else "fp16")
         device = torch.device("cuda", LOGICAL_DEVICE_INDEX)
 
         try:
             # Load and place one component at a time: the CPU copy of each is
             # released before the next component's weights are read, so host
             # peak stays near one model rather than the whole stack.
-            if q8_artifact is None:
-                transformer = transformer_cls.from_pretrained(
-                    bundle.component_dirs["dit"], torch_dtype=torch.float16,
+            with stage("transformer_loading", cuda=True):
+                if q8_artifact is None:
+                    transformer = transformer_cls.from_pretrained(
+                        bundle.component_dirs["dit"], torch_dtype=torch.float16,
+                        local_files_only=True)
+                    transformer.to(device=device, dtype=torch.float16).eval()
+                else:
+                    from qwen_engine.adapters.q8_loader import load_q8_transformer
+                    transformer = load_q8_transformer(transformer_cls, bundle, q8_artifact, torch, device)
+            with stage("initial_vae_loading", cuda=True):
+                vae = vae_cls.from_pretrained(
+                    bundle.component_dirs["vae"], torch_dtype=torch.float16,
                     local_files_only=True)
-                transformer.to(device=device, dtype=torch.float16).eval()
-            else:
-                from qwen_engine.adapters.q8_loader import load_q8_transformer
-                transformer = load_q8_transformer(transformer_cls, bundle, q8_artifact, torch, device)
-            vae = vae_cls.from_pretrained(
-                bundle.component_dirs["vae"], torch_dtype=torch.float16,
-                local_files_only=True)
-            vae.to(device=device, dtype=torch.float16).eval()
+                vae.to(device=device, dtype=torch.float16).eval()
             scheduler = scheduler_cls.from_pretrained(
                 bundle.component_dirs["scheduler"], local_files_only=True)
             processor = processor_cls.from_pretrained(
@@ -332,6 +340,13 @@ class Qwen21DiffusersAdapter:
                 uuid=str(properties.uuid), logical_device_index=LOGICAL_DEVICE_INDEX):
             raise EngineError(
                 "generation runtime identity is not bound to the reviewed CUDA device")
+        if current() is not None:
+            artifact_identity = bundle.fingerprints.bundle
+            if q8_artifact is not None:
+                from qwen_engine.adapters.q8_loader import artifact_set_identity
+                artifact_identity = artifact_set_identity(artifact_identity, q8_artifact.identity_sha256)
+            current().metadata.update(runtime_identity_sha256=runtime.sha256,
+                                      artifact_set_sha256=artifact_identity)
 
         cache_root = Path(config.cache_dir)
         scratch = cache_root / "encoder-scratch"
@@ -377,20 +392,29 @@ class Qwen21DiffusersAdapter:
         return self._inner
 
     def encode(self, config: GenerationConfig):
-        return self._attached().encode(config)
+        result = self._attached().encode(config)
+        if current() is not None:
+            facts = self._attached().calibration_facts()
+            for key in ("embedding_cache_hit", "prompt_tokens", "negative_prompt_tokens"):
+                current().metadata[key] = facts[key]
+        return result
 
     def calibration_facts(self):
         """Delegate the exact conditioning facts to the attached adapter."""
         return self._attached().calibration_facts()
 
     def denoise(self, config: GenerationConfig, conditioning):
-        self._release_vae()
-        latents = self._attached().denoise(config, conditioning)
-        self._release_denoiser()
+        with stage("initial_vae_cleanup", cuda=True):
+            self._release_vae()
+        with stage("denoising", cuda=True):
+            latents = self._attached().denoise(config, conditioning)
+        with stage("transformer_cleanup", cuda=True):
+            self._release_denoiser()
         return latents
 
     def decode(self, latents):
-        self._restore_vae()
+        with stage("vae_loading", cuda=True):
+            self._restore_vae()
         return self._attached().decode(latents)
 
     def _release_vae(self) -> None:

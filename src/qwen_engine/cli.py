@@ -98,6 +98,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "calibration observations to PATH (requires --run). A "
                         "mid-run measurement failure keeps the generated image but "
                         "exits 1 without writing a record")
+    p.add_argument("--performance-report", type=Path, default=None, metavar="PATH",
+                   help="opt-in synchronized substage metrics without prompt contents; "
+                        "write a new JSON file (requires --run; separate from calibration)")
     # Field overrides (take precedence over --config):
     p.add_argument("--prompt")
     p.add_argument("--negative", default=None)
@@ -229,11 +232,30 @@ def _make_adapter(*, trust_unbounded_host: bool = False) -> Any:
 def _run_generate(config: GenerationConfig, logger: PhaseLogger,
                   assets: Any = None, adapter: Any = None,
                   trust_unbounded_host: bool = False,
-                  calibration_record: Path | None = None) -> int:
+                  calibration_record: Path | None = None,
+                  performance_report: Path | None = None) -> int:
     # Refuse an unconfigured output BEFORE the adapter exists at all: an
     # adapter import/load failure is an exit-1 boundary and must not mask
     # the config-error-2 for a run with nowhere to save.
     require_run_config(config)
+    if performance_report is not None:
+        if calibration_record is not None:
+            raise ConfigError("performance and calibration collectors reset CUDA peaks; run them separately")
+        from qwen_engine.performance import PerformanceRecorder, stage
+        recorder = PerformanceRecorder(config, human_sink=lambda line: print(line, file=sys.stderr))
+        try:
+            handle = Path(performance_report).open("x", encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError("performance_report must name a new writable file") from exc
+        with handle, recorder.activate():
+            status = "failed"
+            try:
+                with stage("total_job"):
+                    code = _run_generate(config, logger, assets, adapter, trust_unbounded_host)
+                status = "succeeded"
+                return code
+            finally:
+                recorder.write(handle, status)
     adapter = adapter if adapter is not None else _make_adapter(
         trust_unbounded_host=trust_unbounded_host)
     collector = None
@@ -283,8 +305,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("error: --run and --dry-run are mutually exclusive", file=sys.stderr)
         parser.print_usage(sys.stderr)
         return int(ExitCode.CONFIG)
-    if args.calibration_record is not None and not args.run:
-        print("error: --calibration-record requires --run", file=sys.stderr)
+    if (args.calibration_record is not None or args.performance_report is not None) and not args.run:
+        print("error: a measurement report requires --run", file=sys.stderr)
         parser.print_usage(sys.stderr)
         return int(ExitCode.CONFIG)
     logger = PhaseLogger()
@@ -314,7 +336,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                       attestation="unbounded-host", source="operator")
         return _run_generate(config, logger, assets=report.resolved,
                              trust_unbounded_host=args.attest_unbounded_host,
-                             calibration_record=args.calibration_record)
+                             calibration_record=args.calibration_record,
+                             performance_report=args.performance_report)
     except ConfigError as exc:
         for err in exc.errors:
             print(f"config error: {err}", file=sys.stderr)

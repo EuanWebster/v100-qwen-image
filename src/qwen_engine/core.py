@@ -22,6 +22,7 @@ from qwen_engine.adapters.base import (
 from qwen_engine.config import ConfigError, FieldError, GenerationConfig
 from qwen_engine.errors import EngineError, GenerationCancelled
 from qwen_engine.log import PhaseLogger
+from qwen_engine.performance import stage
 
 #: Schema tag of the dry-run document (versioned like the bench schemas, R6).
 DRY_RUN_SCHEMA = "qwen_engine.dry_run.v1"
@@ -141,15 +142,15 @@ def generate(
         binder = getattr(adapter, "set_cancel_event", None)
         if binder is not None:
             binder(cancel_event)
-        with phase("load"):
+        with phase("load"), stage("model_initialisation"):
             adapter.load(config, assets)
-        with phase("encode"):
+        with phase("encode"), stage("text_encoder_request"):
             conditioning = adapter.encode(config)
         with phase("denoise"):
             latents = adapter.denoise(config, conditioning)
         with phase("decode"):
             image = adapter.decode(latents)
-        with phase("save"):
+        with phase("save"), stage("output_saving"):
             output = adapter.save(image, config)
             output_path = _validate_output(output, config)
             saved = True
@@ -163,7 +164,8 @@ def generate(
         try:
             closer = getattr(adapter, "close", None)
             if closer is not None:
-                closer()
+                with stage("adapter_cleanup", cuda=True):
+                    closer()
         except Exception:
             if primary is None and not saved:
                 raise

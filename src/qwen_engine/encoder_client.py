@@ -127,7 +127,7 @@ class ProductionEncoder:
         if attested_unbounded_host:
             loading_flags.append("--attest-unbounded-host")
         self._loader = EncoderWorker(command=[*command, *loading_flags],
-                                     timeout_s=timeout_s, **common)
+                                     timeout_s=timeout_s, performance_supported=True, **common)
 
     def encode(self, config: GenerationConfig, *, encoder_dtype: str,
                cancel_event: threading.Event | None = None) -> ProductionEncoding:

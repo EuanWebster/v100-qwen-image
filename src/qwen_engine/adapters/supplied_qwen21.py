@@ -22,6 +22,7 @@ from qwen_engine.local_bundle import (
     reference_bundle_fingerprints,
 )
 from qwen_engine.manifest import ModelManifest
+from qwen_engine.performance import stage, current
 
 MAX_PNG_BYTES = 256 * 1024 * 1024
 
@@ -227,6 +228,8 @@ class SuppliedQwen21Adapter:
         generator = torch.Generator(device=self._device)
         self.actual_seed = generator.seed() if config.seed is None else config.seed
         generator.manual_seed(self.actual_seed)
+        if current() is not None:
+            current().metadata["seed"] = self.actual_seed
 
         def callback(pipe, index, timestep, tensors):
             self._check("encoded", config)
@@ -261,9 +264,11 @@ class SuppliedQwen21Adapter:
                 raise EngineError("invalid VAE latent normalization")
             normalized = unpacked.to(vae_dtype) * std + mean
             self._finite(normalized, tuple(unpacked.shape), vae_dtype)
-            decoded = pipe.vae.decode(normalized, return_dict=False)[0][:, :, 0]
-            self._finite(decoded, (1, 4, config.height, config.width), vae_dtype)
-            images = pipe.image_processor.postprocess(decoded, output_type="pil")
+            with stage("vae_decoding", cuda=True):
+                decoded = pipe.vae.decode(normalized, return_dict=False)[0][:, :, 0]
+                self._finite(decoded, (1, 4, config.height, config.width), vae_dtype)
+            with stage("output_conversion", cuda=True):
+                images = pipe.image_processor.postprocess(decoded, output_type="pil")
         self._check("denoised")
         if len(images) != 1 or not isinstance(images[0], self._image.Image) or images[0].size != (config.width, config.height):
             raise EngineError("VAE postprocessor did not return one correctly sized image")

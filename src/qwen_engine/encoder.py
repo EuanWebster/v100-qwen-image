@@ -1503,7 +1503,11 @@ class EncoderWorker:
                  cancel_grace_s: float = 5.0,
                  python: str | None = None,
                  max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
-                 logger: PhaseLogger | None = None) -> None:
+                 logger: PhaseLogger | None = None,
+                 performance_supported: bool = False) -> None:
+        if type(performance_supported) is not bool:
+            raise EncoderSetupError("performance_supported must be boolean")
+        self.performance_supported = performance_supported
         cmd = list(command) if (not isinstance(command, (str, bytes))
                                 and isinstance(command, Sequence)) else None
         if cmd is None:
@@ -1614,6 +1618,10 @@ class EncoderWorker:
                    .replace("{request}", str(req_path))
                    .replace("{response}", str(resp_path))
                    for tok in self.command]
+            from qwen_engine.performance import current
+            performance = current() if self.performance_supported else None
+            if performance is not None:
+                cmd += ["--performance-report", str(resp_path) + ".performance.json"]
             self._event("encoder_worker_start", cache_key=key, request_id=rid,
                         command=cmd)
             # stdio goes to scratch *files*: repeated polling can never lose
@@ -1647,6 +1655,8 @@ class EncoderWorker:
                     # KeyboardInterrupt, ...) must never orphan the child.
                     if proc.poll() is None:
                         self._terminate(proc)
+                    if performance is not None:
+                        performance.import_encoder_report(str(resp_path) + ".performance.json")
             finally:
                 for fh in (out_fh, err_fh):
                     try:
