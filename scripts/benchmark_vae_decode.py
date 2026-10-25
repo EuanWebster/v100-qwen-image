@@ -367,7 +367,9 @@ def profile_geometry(geometry, *, latents, vae_dir, vae_cls, image_processor,
     if png_path.exists():
         raise EngineError(f"refusing to overwrite existing PNG: {png_path.name}")
     properties = torch.cuda.get_device_properties(0)
-    probe = PeakMemoryProbe(device_uuid=str(properties.uuid),
+    from qwen_engine.calibration import _uuid
+    device_uuid = _uuid(str(properties.uuid))
+    probe = PeakMemoryProbe(device_uuid=device_uuid,
                             device_total_bytes=int(properties.total_memory),
                             interval_ms=NVML_INTERVAL_MS, torch_module=torch)
     # probe.start() runs gc + synchronize + empty_cache + reset_peak_memory_stats
@@ -416,7 +418,7 @@ def profile_geometry(geometry, *, latents, vae_dir, vae_cls, image_processor,
             raise KeyboardInterrupt
     finally:
         # Sampler thread + NVML session close even when the decode raised.
-        observation = probe.finish(device_uuid=str(properties.uuid))
+        observation = probe.finish(device_uuid=device_uuid)
         if vae is not None:
             del vae
         import gc
