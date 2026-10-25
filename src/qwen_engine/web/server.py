@@ -59,8 +59,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib import resources
 from typing import Any
 
+from qwen_engine import rewrite as rw
+from qwen_engine import rewrite_client as rc
 from qwen_engine.config import ConfigError, GenerationConfig
 from qwen_engine.web import api
+from qwen_engine.web import rewrite_service as _rewrite_service
 from qwen_engine.web.api import ApiError, ApiResponse, WebRuntime
 
 DEFAULT_HOST = "127.0.0.1"
@@ -100,6 +103,7 @@ STATUS_ROUTE = "/api/v1/status"
 PLAN_ROUTE = "/api/v1/plan"
 EXPORT_ROUTE = "/api/v1/config/export"
 IMPORT_ROUTE = "/api/v1/config/import"
+REWRITE_ROUTE = "/api/v1/rewrite"
 JOBS_ROUTE = "/api/v1/jobs"
 _JOB_ROUTE = re.compile(r"/api/v1/jobs/([0-9a-f]{32})(?:/(image|cancel|forget))?\Z")
 REFERENCES_ROUTE = "/api/v1/references"
@@ -183,11 +187,15 @@ def validate_host(values: list[str], bound_ip: str,
 
 
 def header_policy(method: str, headers: dict[str, list[str]],
-                  expected_origin: str, *, upload: bool = False) -> ApiError | None:
+                  expected_origin: str, *, upload: bool = False,
+                  max_body_bytes: int | None = None) -> ApiError | None:
     """Post-Host header policy, pure. ``headers`` maps lowercase names to
     their raw values in wire order. ``upload`` selects the reference-upload
     route's rules: raw ``application/octet-stream`` instead of JSON and the
-    store's 32 MiB cap instead of the 64 KiB JSON cap."""
+    store's 32 MiB cap instead of the 64 KiB JSON cap. ``max_body_bytes``
+    tightens the JSON cap for ONE route (the rewriter's derived limit); it
+    never loosens it and it is ignored for uploads, whose cap belongs to the
+    store."""
     def dup(name: str) -> ApiError | None:
         values = headers.get(name, [])
         if len(values) > 1:
@@ -253,8 +261,15 @@ def header_policy(method: str, headers: dict[str, list[str]],
                         "without signs or whitespace")
     # Bounded digit conversion BEFORE int() (arbitrary-length digit strings
     # must be typed refusals, never a ValueError -> 500).
-    cap = api.MAX_REFERENCE_UPLOAD_BYTES if upload else MAX_BODY_BYTES
-    if len(raw) > (9 if upload else 6) or int(raw) > cap:
+    if upload:
+        cap, digits = api.MAX_REFERENCE_UPLOAD_BYTES, 9
+    elif max_body_bytes is not None:
+        # One route (the rewriter) is capped TIGHTER than the generic JSON
+        # limit; a caller can never raise it above MAX_BODY_BYTES.
+        cap, digits = min(max_body_bytes, MAX_BODY_BYTES), 6
+    else:
+        cap, digits = MAX_BODY_BYTES, 6
+    if len(raw) > digits or int(raw) > cap:
         return ApiError(413, "request_too_large",
                         f"request bodies are capped at {cap} bytes")
     return None
@@ -288,6 +303,8 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "export", target
         if target == IMPORT_ROUTE:
             return "import", target
+        if target == REWRITE_ROUTE:
+            return "rewrite", target
         if target == JOBS_ROUTE:
             return "submit", target
         if target == REFERENCES_ROUTE:
@@ -310,9 +327,11 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
     if target == JOBS_ROUTE:
         raise ApiError(405, "method_not_allowed", "this route does not accept that method",
                        headers=(("Allow", "GET, POST"),))
-    known = set(STATIC_ROUTES) | {STATUS_ROUTE, PLAN_ROUTE, EXPORT_ROUTE, IMPORT_ROUTE}
+    known = set(STATIC_ROUTES) | {STATUS_ROUTE, PLAN_ROUTE, EXPORT_ROUTE,
+                                  IMPORT_ROUTE, REWRITE_ROUTE}
     if target in known:
-        allow = "POST" if target in (PLAN_ROUTE, EXPORT_ROUTE, IMPORT_ROUTE) else "GET"
+        allow = "POST" if target in (PLAN_ROUTE, EXPORT_ROUTE, IMPORT_ROUTE,
+                                     REWRITE_ROUTE) else "GET"
         raise ApiError(405, "method_not_allowed",
                        "this route does not accept that method",
                        headers=(("Allow", allow),))
@@ -606,8 +625,15 @@ class _Handler(BaseHTTPRequestHandler):
             target = getattr(self, "raw_target", "")
             # The upload route's content-type/length rules differ, so the
             # header policy needs to know the route BEFORE it is applied.
-            err = header_policy(method, headers, host_origin,
-                                upload=method == "POST" and target == REFERENCES_ROUTE)
+            # The rewrite route also carries a TIGHTER body cap than the
+            # generic JSON limit (its body is one bounded prompt), chosen
+            # from the same constant the browser enforces locally.
+            err = header_policy(
+                method, headers, host_origin,
+                upload=method == "POST" and target == REFERENCES_ROUTE,
+                max_body_bytes=(api.MAX_REWRITE_REQUEST_BYTES
+                                if method == "POST" and target == REWRITE_ROUTE
+                                else None))
             if err is not None:
                 self._send_api(ApiResponse(status=err.status, payload=err.to_payload(),
                                            headers=err.headers))
@@ -634,6 +660,23 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     self._send_api(jobs.list_response() if kind == "jobs" else jobs.job_response(arg))
             else:
+                if kind == "rewrite":
+                    # The service exists on EVERY server (a disabled one holds
+                    # no client), so this is only None when the handler was
+                    # built without one — the same typed refusal either way.
+                    service = getattr(self.server, "rewrite", None)
+                    if service is None:
+                        raise ApiError(503, "rewrite_disabled",
+                                       "rewriting is not enabled on this server")
+                    length = int(headers["content-length"][0])
+                    body = self.rfile.read(length)
+                    if len(body) != length:
+                        self.send_error(400, "request body ended early")
+                        return
+                    # Envelope + semantics are validated by the wire contract
+                    # BEFORE the service sees the prompt.
+                    self._send_api(service.submit(api.build_rewrite_request(body)))
+                    return
                 length = int(headers["content-length"][0])
                 body = self.rfile.read(length)
                 if len(body) != length:
@@ -942,6 +985,26 @@ def build_parser() -> argparse.ArgumentParser:
                    help="write opt-in prompt-free synchronized metrics in each job directory")
     p.add_argument("--attest-unbounded-host", action="store_true",
                    help="operator attestation of no cgroup RAM cap; encoder uses fresh host MemAvailable")
+    # -- prompt rewriting (opt-in; off by default) --------------------------
+    p.add_argument("--rewrite-backend", choices=("off",) + _rewrite_service.BACKENDS,
+                   default="off",
+                   help="prompt-rewriter backend (default off: the UI hides the "
+                        "Rewrite action and /api/v1/rewrite answers 503)")
+    p.add_argument("--rewrite-endpoint", default=None,
+                   help="OpenAI-compatible base URL for the rewriter "
+                        "(http(s) only; no credentials are accepted here)")
+    p.add_argument("--rewrite-model", default=None,
+                   help="model name the rewriter backend serves")
+    p.add_argument("--rewrite-prompt-t2i", default=None,
+                   help="system prompt file for text-to-image rewriting "
+                        "(digest-pinned; a mismatch refuses to start)")
+    p.add_argument("--rewrite-prompt-edit", default=None,
+                   help="system prompt file for image-edit rewriting "
+                        "(digest-pinned; a mismatch refuses to start)")
+    p.add_argument("--rewrite-timeout", type=float,
+                   default=_rewrite_service.DEFAULT_TIMEOUT_SECONDS,
+                   help="seconds a single rewrite may take before the request "
+                        f"times out (default {_rewrite_service.DEFAULT_TIMEOUT_SECONDS:g})")
     for flag in ("output-dir", "cache-dir", "log-dir", "benchmarks-dir",
                  "references-dir"):
         p.add_argument(f"--{flag}", default=None,
@@ -958,6 +1021,38 @@ def _startup_config_or_exit(paths: dict[str, str | None]) -> int:
             print(f"config error: {err}", file=sys.stderr)
         return 2
     return 0
+
+
+def build_rewrite_service(args: argparse.Namespace) -> _rewrite_service.RewriteService:
+    """Construct the rewriter from the CLI flags, or refuse at startup.
+
+    Operator errors are startup errors: a bad endpoint, a missing prompt or a
+    digest mismatch prints ONE bounded line to stderr and exits 2 — the server
+    never starts in a half-configured state, and the browser never learns any
+    of this (its status block is four fixed keys).
+
+    ``off`` still yields a real service (holding no client) so the status block
+    and the typed 503 exist uniformly.
+    """
+    if args.rewrite_backend == "off":
+        return _rewrite_service.RewriteService(_rewrite_service.RewriteSettings.disabled())
+    prompts: dict[str, str] = {}
+    for task, flag in (("t2i", args.rewrite_prompt_t2i),
+                       ("edit", args.rewrite_prompt_edit)):
+        if flag is None:
+            raise rc.RewriteConfigError(
+                f"--rewrite-backend {args.rewrite_backend} needs "
+                f"--rewrite-prompt-{task}")
+        # Digest-pinned: a drifted prompt refuses here, never at request time.
+        prompts[task] = rw.load_system_prompt(flag, task)
+    settings = _rewrite_service.RewriteSettings(
+        backend=args.rewrite_backend,
+        endpoint=args.rewrite_endpoint,
+        model=args.rewrite_model,
+        prompts=prompts,
+        timeout=args.rewrite_timeout,
+    )
+    return _rewrite_service.RewriteService(settings)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1004,6 +1099,15 @@ def main(argv: list[str] | None = None) -> int:
     if status:
         return status
 
+    try:
+        rewrite = build_rewrite_service(args)
+    except (rc.RewriteConfigError, rw.RewriteError) as exc:
+        # Bounded operator diagnostic: the message may name a path, which is
+        # fine on a local console and MUST NOT reach the browser (it does not:
+        # the status block is four fixed keys and the 503 is a fixed string).
+        print(f"rewrite error: {exc}", file=sys.stderr)
+        return 2
+
     if paths["manifest_path"] is None:
         summary = api.summarize_manifest_bytes(None)
     else:
@@ -1011,7 +1115,8 @@ def main(argv: list[str] | None = None) -> int:
         summary = api.summarize_manifest_bytes(raw, unreadable)
 
     runtime = WebRuntime(**paths, manifest_summary=summary,
-                         generation_enabled=args.enable_generation)
+                         generation_enabled=args.enable_generation,
+                         rewrite_block=rewrite.status_block())
     if args.enable_generation and api._blockers(runtime):
         print("error: generation requires valid manifest metadata and explicit "
               "--manifest, --models-dir, --output-dir and --cache-dir", file=sys.stderr)
@@ -1032,6 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
             port = int(httpd.server_address[1])
             httpd.web_runtime = runtime
             httpd.assets = assets
+            httpd.rewrite = rewrite
             httpd.bound_ip = host
             httpd.bound_port = port
     except OSError as exc:
@@ -1058,8 +1164,13 @@ def main(argv: list[str] | None = None) -> int:
 
     for listener in listeners:
         listener.generation = httpd.generation
+        listener.rewrite = rewrite
         print(f"qwen-web listening on http://{listener.bound_ip}:{port}")
     mode = "generation enabled (serial jobs)" if httpd.generation else "planning only (no generation)"
+    if rewrite.available:
+        mode += f"; prompt rewriting enabled ({rewrite.settings.backend})"
+    else:
+        mode += "; prompt rewriting off"
     print(f"qwen-web: {mode}; explicit address binds with per-listener "
           "Host and same-origin request checks.")
     sys.stdout.flush()
@@ -1083,6 +1194,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         for listener in listeners:
             listener.server_close()
+        # Bounded: a blocked backend socket is abandoned, never waited on.
+        rewrite.close()
         if httpd.generation is not None:
             stopped = httpd.generation.close()
         signal.signal(signal.SIGTERM, old_term)

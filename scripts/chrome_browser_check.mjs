@@ -141,8 +141,9 @@ async function main() {
         /Not connected/.test(chip), chip);
 
   /* ---- 2. app surface + initial honest state ---- */
-  check('QwenStudio exposes w4-refs',
-        await evaluate('window.QwenStudio && window.QwenStudio.version') === 'w4-refs');
+  check('QwenStudio exposes a versioned test surface',
+        /^w[0-9]+-[a-z0-9-]+$/.test(
+          await evaluate('window.QwenStudio && window.QwenStudio.version')));
   check('Generate starts disabled',
         await evaluate('document.getElementById("generate-btn").disabled') === true);
   check('no autofocus on load (activeElement is body)',
@@ -650,6 +651,210 @@ async function main() {
   check('a failed thumbnail does not claim the store lost the image',
         thumbs.noUnprovenClaim === true && thumbs.metaHonest === true,
         JSON.stringify(thumbs));
+
+  /* ---- 10b. rewrite flow: gate, strict answer, stale discard ---- */
+  // Without a status document the button stays hidden AND disabled: an
+  // unavailable rewriter must not look like a broken one.
+  check('rewrite button hidden and disabled with no rewriter',
+        await evaluate(`(function(){var b=document.getElementById('rewrite-btn');
+          return b.hidden===true && b.disabled===true;})()`) === true);
+  check('rewrite hint explains the rewriter is unavailable',
+        await evaluate(`(function(){var h=document.getElementById('rewrite-hint');
+          return h.hidden===false && /unavailable/.test(h.textContent);})()`) === true);
+  await setVal('prompt', 'a red fox in the snow');
+  const revBefore = await evaluate('window.QwenStudio.rewriteState().revision');
+  await setVal('prompt', 'a red fox in deep snow');
+  // A width change must NOT invalidate a prompt suggestion: the prompt text
+  // is what the revision tracks.
+  const revAfterWidth = await evaluate(`(function(){
+    var before = window.QwenStudio.rewriteState().revision;
+    var el = document.getElementById('width');
+    el.value = '1152'; el.dispatchEvent(new Event('input'));
+    return window.QwenStudio.rewriteState().revision === before;})()`);
+  check('a resolution change leaves the prompt revision alone',
+        revAfterWidth === true);
+  const revAfter = await evaluate('window.QwenStudio.rewriteState().revision');
+  check('typing bumps the draft revision exactly once',
+        revAfter === revBefore + 1, `before=${revBefore} after=${revAfter}`);
+
+  // Enable the rewriter the way production does — from a parsed status block.
+  // Exactly the four server keys, exactly the available pair.
+  const parsed = await evaluate(`(function(){
+    var block = {state:'available', code:'rewrite_available',
+                 backend:'local-llm', reason:''};
+    return JSON.stringify(window.QwenStudio.parseRewriteBlock(block));})()`);
+  check('status block parses to an available rewriter',
+        /local-llm/.test(parsed), parsed);
+  await evaluate(`window.QwenStudio.setRewriterState(${parsed})`);
+  check('rewrite button becomes visible and enabled',
+        await evaluate(`(function(){var b=document.getElementById('rewrite-btn');
+          return b.hidden===false && b.disabled===false;})()`) === true);
+  check('rewrite hint hides once available',
+        await evaluate(`document.getElementById('rewrite-hint').hidden`) === true);
+
+  // Refusing to rewrite an empty draft sends nothing (checked while the
+  // rewriter IS available, so the refusal is the empty-draft guard and not
+  // the missing-rewriter early return).
+  const draftBefore = await evaluate(`document.getElementById('prompt').value`);
+  await setVal('prompt', '');
+  const refuse = await evaluate(`(function(){
+    window.QwenStudio.requestRewrite();
+    return [document.getElementById('rewrite-error').textContent,
+            window.QwenStudio.rewriteState().inFlight];})()`);
+  check('empty draft is refused locally and nothing is sent',
+        /Write a draft first/.test(refuse[0]) && refuse[1] === false,
+        JSON.stringify(refuse));
+  await setVal('prompt', draftBefore);
+
+  // Strictness of the answer document: each mutation must be REJECTED.
+  const base = {schema: 'qwen_engine.web_rewrite.v1', task: 't2i', draft_revision: 3,
+    original_prompt: 'a', rewritten_prompt: 'b', parse_ok: true,
+    backend: 'local-llm', elapsed_ms: 12, ratio: null,
+    ratio_conflict: false, unparsed_answer: null};
+  const mutations = [
+    ['schema', 'x'], ['task', 'video'], ['draft_revision', -1],
+    ['original_prompt', 5], ['rewritten_prompt', null],
+    ['parse_ok', 'yes'], ['backend', ''], ['elapsed_ms', 1.5],
+    ['ratio', {kind: 'wh_ratio', value: '16x9'}],
+    ['ratio', {kind: 'ratio_follow', image: 0}],
+    ['ratio', {kind: 'ratio_follow', image: 99}],
+    ['ratio_conflict', 'no'], ['unparsed_answer', 7],
+    ['parse_ok', true], ['rewritten_prompt', '   '],
+  ];
+  const rejected = await evaluate(`(function(){
+    var base=${JSON.stringify(base)}; var bad=0;
+    ${JSON.stringify(mutations)}.forEach(function(m){
+      var doc=JSON.parse(JSON.stringify(base));
+      if (m[0]==='parse_ok' && m[1]===true) { doc.parse_ok=true; doc.rewritten_prompt='   '; }
+      else { doc[m[0]]=m[1]; }
+      if (window.QwenStudio.parseRewriteAnswer(doc)!==null) bad++;
+    });
+    return bad;})()`);
+  check('every malformed answer document is rejected', rejected === 0,
+        `${rejected} accepted`);
+  // An UNPARSABLE model answer (parse_ok false) is diagnostic text, never a
+  // pending suggestion: a forced apply must not blank the draft.
+  const unparsable = await evaluate(`(function(){
+    var before = document.getElementById('prompt').value;
+    window.QwenStudio.showProposalRawForChecks({schema:'qwen_engine.web_rewrite.v1',
+      task:'t2i', draft_revision: 0, original_prompt: before,
+      rewritten_prompt:'', parse_ok:false, backend:'local-llm',
+      elapsed_ms: 1, ratio:null, ratio_conflict:false,
+      unparsed_answer:'{"not":"a proposal"}'});
+    var stateAfterShow = window.QwenStudio.rewriteState().hasProposal;
+    window.QwenStudio.applyProposal();
+    window.QwenStudio.editProposal();
+    return {before: before,
+            after: document.getElementById('prompt').value,
+            stateAfterShow: stateAfterShow,
+            applyHidden: document.getElementById('rewrite-apply').hidden,
+            editHidden: document.getElementById('rewrite-edit').hidden,
+            err: document.getElementById('rewrite-error').textContent,
+            shown: document.getElementById('rewrite-suggested').textContent};})()`);
+  check('an unparsable answer is never a pending proposal',
+        unparsable.stateAfterShow === false, JSON.stringify(unparsable.stateAfterShow));
+  check('an unparsable answer withholds Apply and Edit',
+        unparsable.applyHidden === true && unparsable.editHidden === true,
+        JSON.stringify([unparsable.applyHidden, unparsable.editHidden]));
+  check('a forced apply of an unparsable answer cannot blank the draft',
+        unparsable.after === unparsable.before && unparsable.after !== '',
+        JSON.stringify([unparsable.before, unparsable.after]));
+  check('the unparsable answer is kept as diagnostic text',
+        /not.*a proposal/.test(unparsable.shown) && /usable prompt/.test(unparsable.err),
+        JSON.stringify(unparsable.shown));
+
+  check('absent rewrite block parses to null, malformed to a refusal',
+        await evaluate(`(function(){
+          var a = window.QwenStudio.parseRewriteBlock(undefined) === null;
+          var b = window.QwenStudio.parseRewriteBlock(
+            {state:'unavailable', code:'rewrite_disabled', backend:null,
+             reason:'off'});
+          var c = window.QwenStudio.parseRewriteBlock(
+            {state:'available', code:'rewrite_available', backend:'',
+             reason:''});
+          var d = window.QwenStudio.parseRewriteBlock(
+            {state:'available', code:'rewrite_available', backend:'x',
+             reason:'', extra:1});
+          // b: legitimately unavailable -> null. c/d: malformed -> a refusal
+          // object, never null, so the caller rejects the whole status.
+          return a && b === null && c !== null && d !== null;})()`) === true);
+
+  // Render a real proposal and drive Apply.
+  const shown = await evaluate(`(function(){
+    var doc=${JSON.stringify(base)};
+    doc.draft_revision = window.QwenStudio.rewriteState().revision;
+    doc.original_prompt = document.getElementById('prompt').value;
+    doc.rewritten_prompt = 'a red fox, deep snow, low sun';
+    doc.ratio = {kind:'wh_ratio', value:'16:9'};
+    var ok = window.QwenStudio.showProposalForChecks(doc);
+    var p = document.getElementById('rewrite-proposal');
+    return [ok, p.hidden, document.getElementById('rewrite-suggested').textContent,
+            document.getElementById('rewrite-ratio').textContent,
+            document.getElementById('rewrite-apply-ratio').hidden,
+            document.getElementById('rewrite-original').textContent];
+  })()`);
+  check('a valid answer renders a visible proposal with both texts',
+        shown[0] === true && shown[1] === false &&
+        shown[2] === 'a red fox, deep snow, low sun' &&
+        shown[5] === 'a red fox in deep snow', JSON.stringify(shown));
+  check('suggestion is NOT applied while the proposal is shown',
+        await evaluate(`document.getElementById('prompt').value`) === 'a red fox in deep snow');
+  check('16:9 maps to an exact preset, so the ratio button is offered',
+        shown[4] === false && /16:9/.test(shown[3]), JSON.stringify(shown[3]));
+  // The button names a REAL preset, and one whose ratio is exactly 16:9:
+  // never an invented name, never a nearest match.
+  const ratioPreset = await evaluate(`(function(){
+    var name = document.getElementById('rewrite-apply-ratio').dataset.preset;
+    var btn = document.querySelector('.preset-btn[data-preset="' + name + '"]');
+    if (!name || !btn) return 'missing:' + name;
+    btn.click();
+    return [name, document.getElementById('width').value + 'x' +
+            document.getElementById('height').value].join(' ');})()`);
+  check('the ratio button names a real 16:9 preset and applies it',
+        ratioPreset === 'landscape 1344x768' || ratioPreset === 'landscape2k 2752x1536',
+        ratioPreset);
+  const applied = await evaluate(`(function(){
+    var before = window.QwenStudio.rewriteState().revision;
+    document.getElementById('rewrite-apply').click();
+    return [document.getElementById('prompt').value,
+            window.QwenStudio.rewriteState().revision > before,
+            document.getElementById('rewrite-proposal').hidden,
+            document.activeElement.id];})()`);
+  check('Apply replaces the draft, bumps the revision, hides the block, refocuses',
+        applied[0] === 'a red fox, deep snow, low sun' && applied[1] === true &&
+        applied[2] === true && applied[3] === 'prompt', JSON.stringify(applied));
+
+  // Escape abandons a proposal without touching the draft.
+  const escaped = await evaluate(`(function(){
+    var doc=${JSON.stringify(base)};
+    doc.draft_revision = window.QwenStudio.rewriteState().revision;
+    doc.original_prompt = document.getElementById('prompt').value;
+    doc.rewritten_prompt = 'something else entirely';
+    window.QwenStudio.showProposalForChecks(doc);
+    var p = document.getElementById('rewrite-proposal');
+    p.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape', bubbles:true}));
+    return [p.hidden, document.getElementById('prompt').value,
+            window.QwenStudio.rewriteState().hasProposal];})()`);
+  check('Escape closes the proposal and keeps the draft intact',
+        escaped[0] === true && escaped[1] === 'a red fox, deep snow, low sun' &&
+        escaped[2] === false, JSON.stringify(escaped));
+
+  // A draft edit stales any visible proposal.
+  const staled = await evaluate(`(function(){
+    var doc=${JSON.stringify(base)};
+    doc.draft_revision = window.QwenStudio.rewriteState().revision;
+    doc.original_prompt = document.getElementById('prompt').value;
+    doc.rewritten_prompt = 'x';
+    window.QwenStudio.showProposalForChecks(doc);
+    var el=document.getElementById('prompt');
+    el.value='typed over it'; el.dispatchEvent(new Event('input'));
+    return document.getElementById('rewrite-proposal').hidden;})()`);
+  check('editing the draft while a proposal is shown closes it',
+        staled === true);
+  await evaluate(`window.QwenStudio.setRewriterState(null)`);
+  check('losing the rewriter hides the button again',
+        await evaluate(`document.getElementById('rewrite-btn').hidden`) === true);
+  await setVal('prompt', 'a red fox in deep snow');
 
   /* ---- 11. overflow at 1440 / 375 / 320 ---- */
   for (const width of [1440, 375, 320]) {

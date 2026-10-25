@@ -684,3 +684,66 @@ def test_server_close_is_idempotent_and_never_double_signals():
     assert "still_alive = stop_workers(self._queue, self._workers)" in src
     assert "self._workers = still_alive" in src, \
         "workers that failed to join keep references — no false all-joined claim"
+
+
+# ------------------------------------------------- rewrite startup flags
+
+def test_rewrite_flags_default_off_with_the_service_timeout():
+    from qwen_engine.web import rewrite_service as rs
+    args = server.build_parser().parse_args([])
+    assert args.rewrite_backend == "off"
+    assert args.rewrite_timeout == rs.DEFAULT_TIMEOUT_SECONDS
+    for flag in ("rewrite_endpoint", "rewrite_model", "rewrite_prompt_t2i",
+                 "rewrite_prompt_edit"):
+        assert getattr(args, flag) is None, flag
+
+
+def test_rewrite_backend_choices_are_closed():
+    from qwen_engine.web import rewrite_service as rs
+    parser = server.build_parser()
+    for bad in ("local", "openai", "llm", ""):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--rewrite-backend", bad])
+    args = parser.parse_args(["--rewrite-backend", "local-llm"])
+    assert args.rewrite_backend in rs.BACKENDS
+
+
+def test_off_backend_builds_a_real_disabled_service():
+    args = server.build_parser().parse_args([])
+    svc = server.build_rewrite_service(args)
+    assert svc.available is False
+    assert svc.status_block()["code"] == "rewrite_disabled"
+
+
+def test_enabled_backend_without_prompt_paths_is_a_startup_error():
+    from qwen_engine import rewrite_client as rc
+    args = server.build_parser().parse_args(["--rewrite-backend", "local-llm"])
+    with pytest.raises(rc.RewriteConfigError):
+        server.build_rewrite_service(args)
+
+
+def test_prompt_files_are_digest_pinned_at_startup(tmp_path):
+    from qwen_engine import rewrite as rw
+    prompt = tmp_path / "sys.txt"
+    prompt.write_text("not the pinned prompt\n", encoding="utf-8")
+    args = server.build_parser().parse_args([
+        "--rewrite-backend", "local-llm", "--rewrite-endpoint",
+        "http://127.0.0.1:8079/v1/chat/completions", "--rewrite-model", "m",
+        "--rewrite-prompt-t2i", str(prompt), "--rewrite-prompt-edit", str(prompt)])
+    with pytest.raises(rw.RewriteError) as excinfo:
+        server.build_rewrite_service(args)
+    assert "pinned digest" in str(excinfo.value)
+
+
+def test_main_returns_2_for_a_rewrite_configuration_error(monkeypatch, capsys):
+    # Operator error: one bounded stderr line, exit 2, never a partial server.
+    # main() must fail BEFORE any bind, so no socket is created here.
+    args = ["--rewrite-backend", "local-llm"]
+    monkeypatch.setattr(server, "build_rewrite_service",
+                        lambda _args: (_ for _ in ()).throw(
+                            __import__("qwen_engine.rewrite_client",
+                                       fromlist=["x"]).RewriteConfigError(
+                                "operator misconfiguration")))
+    assert server.main(args) == 2
+    err = capsys.readouterr().err
+    assert "rewrite error:" in err and "operator misconfiguration" in err

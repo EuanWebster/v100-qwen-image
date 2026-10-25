@@ -50,8 +50,34 @@
                 placeholder="Describe the image you want to generate…"
                 aria-describedby="prompt-help prompt-error"></textarea>
               <p id="prompt-help" class="help">Your words are used exactly as typed.
-                Nothing is generated or auto-filled for you.</p>
+                Nothing is generated or auto-filled for you. The optional
+                Rewrite action <em>suggests</em> a reworded version — it never
+                replaces your draft unless you press Apply.</p>
               <p class="error" id="prompt-error" aria-live="polite"></p>
+              <div class="rewrite-actions">
+                <button type="button" id="rewrite-btn" class="btn-secondary" hidden disabled>
+                  Rewrite prompt</button>
+                <p id="rewrite-hint" class="help">Rewriting is unavailable:
+                  this server was started without a rewriter.</p>
+                <p id="rewrite-status" class="help" role="status" aria-live="polite"></p>
+              </div>
+              <div id="rewrite-proposal" class="rewrite-proposal" hidden tabindex="-1"
+                   role="group" aria-labelledby="rewrite-proposal-heading">
+                <h3 id="rewrite-proposal-heading">Suggested prompt — not applied</h3>
+                <p class="rewrite-label">Your draft</p>
+                <p id="rewrite-original" class="rewrite-original"></p>
+                <p class="rewrite-label">Suggestion</p>
+                <p id="rewrite-suggested" class="rewrite-suggested"></p>
+                <p id="rewrite-ratio" class="help"></p>
+                <div class="rewrite-buttons">
+                  <button type="button" id="rewrite-apply" class="btn-primary">Apply</button>
+                  <button type="button" id="rewrite-edit" class="btn-secondary">Edit</button>
+                  <button type="button" id="rewrite-keep" class="btn-secondary">Keep original</button>
+                  <button type="button" id="rewrite-apply-ratio" class="btn-secondary" hidden>
+                    Apply ratio</button>
+                </div>
+                <p class="error" id="rewrite-error" aria-live="polite"></p>
+              </div>
             </div>
 
           <div class="actions job-actions">

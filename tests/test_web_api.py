@@ -459,3 +459,186 @@ def test_manifest_public_projection_is_closed_and_blocker_agrees(summary):
         assert response.payload["manifest"]["valid"] is False
         assert response.payload["manifest"]["reason"] == api.MANIFEST_INVALID
         assert "manifest_invalid" in response.payload["generation_blockers"]
+
+
+# ---------------------------------------------------------------------------
+# Prompt rewriting: the PURE request/response contract (R3/R4).
+#
+# The wire-level path is covered in test_web_rewrite.py; these tests pin the
+# api-level functions on their own, so a regression is attributed here rather
+# than to routing.
+# ---------------------------------------------------------------------------
+
+def rewrite_bytes(**fields) -> bytes:
+    body = {"schema": api.REWRITE_REQUEST_SCHEMA, "task": "t2i",
+            "prompt": "a red bicycle", "draft_revision": 0, "image_ids": []}
+    body.update(fields)
+    return json.dumps(body).encode()
+
+
+def test_rewrite_request_accepts_the_exact_five_key_envelope():
+    assert api.build_rewrite_request(rewrite_bytes()) == {
+        "task": "t2i", "prompt": "a red bicycle", "draft_revision": 0,
+        "image_ids": []}
+
+
+@pytest.mark.parametrize("mutate, status, code", [
+    (lambda d: d.pop("task"), 400, "invalid_envelope"),
+    (lambda d: d.pop("image_ids"), 400, "invalid_envelope"),
+    (lambda d: d.update(extra=1), 400, "invalid_envelope"),
+    (lambda d: d.update(schema="qwen_engine.web_rewrite.v1"), 400, "invalid_envelope"),
+    (lambda d: d.update(task="video"), 422, "task_unsupported"),
+    (lambda d: d.update(image_ids=[1]), 422, "task_unsupported"),
+    (lambda d: d.update(image_ids=["abc"]), 400, "invalid_envelope"),
+    (lambda d: d.update(draft_revision=-1), 400, "invalid_envelope"),
+    (lambda d: d.update(draft_revision=True), 400, "invalid_envelope"),
+    (lambda d: d.update(draft_revision=1.5), 400, "invalid_envelope"),
+    (lambda d: d.update(prompt=""), 400, "invalid_envelope"),
+    (lambda d: d.update(prompt="   "), 400, "invalid_envelope"),
+    (lambda d: d.update(prompt=5), 400, "invalid_envelope"),
+])
+def test_rewrite_request_refusals_are_typed(mutate, status, code):
+    body = json.loads(rewrite_bytes())
+    mutate(body)
+    with pytest.raises(api.ApiError) as caught:
+        api.build_rewrite_request(json.dumps(body).encode())
+    assert (caught.value.status, caught.value.code) == (status, code)
+
+
+def test_rewrite_prompt_cap_is_exact_and_never_echoes_the_draft():
+    """The boundary: cap length passes, cap+1 is refused, and the message
+    carries only a LENGTH — never the prompt text."""
+    limit = api._rewrite.PROMPT_MAX_CHARS
+    assert api.build_rewrite_request(rewrite_bytes(prompt="x" * limit))["prompt"] == "x" * limit
+    with pytest.raises(api.ApiError) as caught:
+        api.build_rewrite_request(rewrite_bytes(prompt="s" * (limit + 1)))
+    assert caught.value.code == "prompt_too_long" and caught.value.status == 422
+    assert "s" * 40 not in caught.value.message
+    assert str(limit + 1) in caught.value.message
+
+
+def test_rewrite_body_cap_bounds_the_prompt_envelope():
+    # The route's derived body cap must admit a maximal legal request and
+    # refuse anything larger, so the transport and the field cap agree.
+    limit = api._rewrite.PROMPT_MAX_CHARS
+    assert api.MAX_REWRITE_REQUEST_BYTES == limit * 4 + 1024
+    assert len(rewrite_bytes(prompt="x" * limit)) < api.MAX_REWRITE_REQUEST_BYTES
+
+
+def test_rewrite_status_block_is_the_canonical_disabled_pair():
+    rt = runtime()
+    block = api.rewrite_status_block(rt)
+    assert block == dict(api.REWRITE_DISABLED_BLOCK)
+    assert set(block) == {"state", "code", "backend", "reason"}
+    assert block["state"] == "unavailable" and block["backend"] is None
+    # Never a gate: rewriting must not appear able to block generation.
+    status = api.status_response(rt).payload
+    assert "rewrite" in status
+    assert set(status["gates"]) == {"adapter", "assets", "calibration", "hardware"}
+
+
+def test_rewrite_status_block_serves_the_configured_pair():
+    configured = {"state": "available", "code": "rewrite_available",
+                  "backend": "local-llm", "reason": ""}
+    rt = runtime(rewrite_block=configured)
+    assert api.rewrite_status_block(rt) == configured
+    assert api.status_response(rt).payload["rewrite"] == configured
+
+
+@pytest.mark.parametrize("bad", [
+    {"state": "available"},
+    {"state": "available", "code": "rewrite_available", "backend": "x",
+     "reason": "", "extra": 1},
+    {"state": "available", "code": "nope", "backend": "x", "reason": ""},
+])
+def test_rewrite_block_is_refused_at_construction_not_filtered(bad):
+    """WebRuntime refuses a non-canonical block outright: a widened block is a
+    programming error, and silently filtering it would hide the bug."""
+    with pytest.raises(ValueError):
+        runtime(rewrite_block=bad)
+
+
+def test_rewrite_status_block_never_discloses_a_location():
+    """The reason is operator prose served to a page, so an address or path in
+    it is refused at construction rather than shipped to the browser."""
+    for reason in ("connected to http://127.0.0.1:8079/v1",
+                   "backend at 127.0.0.1:8079 is down",
+                   "see /etc/qwen/rewriter.toml"):
+        with pytest.raises(ValueError):
+            runtime(rewrite_block={"state": "unavailable",
+                                   "code": "rewrite_disabled",
+                                   "backend": None, "reason": reason})
+    # The canonical shipped block passes, and contains no location.
+    text = json.dumps(api.status_response(runtime()).payload)
+    assert "://" not in text.split('"rewrite"')[-1]
+
+
+def test_rewrite_is_not_an_editable_or_exported_field():
+    """A suggestion is not config: it must never enter the plan/export
+    envelope, so a rewritten prompt cannot be smuggled into a job."""
+    assert "rewrite" not in api.EDITABLE_FIELDS
+    assert "rewritten_prompt" not in api.EDITABLE_FIELDS
+    assert not set(api.DEFERRED_WIRE_FIELDS) & {"rewrite", "rewritten_prompt"}
+
+
+def test_validate_rewrite_fields_is_the_same_rule_the_builder_applies():
+    """The service validates an already-parsed mapping through this function;
+    it must agree with the wire builder rather than drift into a second rule."""
+    good = {"task": "t2i", "prompt": "a red bicycle",
+            "draft_revision": 0, "image_ids": []}
+    assert api.validate_rewrite_fields(good) == good
+    assert api.validate_rewrite_fields(dict(good, task="edit"))["task"] == "edit"
+    assert api.build_rewrite_request(rewrite_bytes()) == good
+    for bad, status, code in [
+        ({"task": "t2i", "prompt": "x", "draft_revision": 0}, 400, "invalid_envelope"),
+        (dict(good, prompt="  "), 400, "invalid_envelope"),
+        (dict(good, task="video"), 422, "task_unsupported"),
+        # `edit` with NO references is legal (that is what the UI sends when
+        # the draft is edit-shaped but no image is attached); with references
+        # it is announced-unsupported, never silently downgraded to t2i.
+        (dict(good, task="edit", image_ids=[4]), 422, "task_unsupported"),
+    ]:
+        with pytest.raises(api.ApiError) as caught:
+            api.validate_rewrite_fields(bad)
+        assert (caught.value.status, caught.value.code) == (status, code), bad
+
+
+def test_validate_rewrite_fields_never_mutates_or_aliases_its_input():
+    request = {"task": "t2i", "prompt": "a red bicycle",
+               "draft_revision": 3, "image_ids": []}
+    out = api.validate_rewrite_fields(request)
+    out["prompt"] = "changed"
+    assert request["prompt"] == "a red bicycle"
+
+
+@pytest.mark.parametrize("block", [
+    {"state": "available", "code": "rewrite_available", "backend": "", "reason": ""},
+    {"state": "available", "code": "rewrite_available", "backend": "x", "reason": "why"},
+    {"state": "unavailable", "code": "rewrite_disabled", "backend": "x", "reason": "off"},
+    {"state": "unavailable", "code": "rewrite_disabled", "backend": None, "reason": "  "},
+    {"state": "enabled", "code": "rewrite_available", "backend": "x", "reason": ""},
+    {"state": "available", "code": "rewrite_disabled", "backend": "x", "reason": ""},
+])
+def test_validate_rewrite_block_closes_the_state_code_pair(block):
+    with pytest.raises(ValueError):
+        api.validate_rewrite_block(block)
+
+
+def test_validate_rewrite_block_copies_so_callers_cannot_mutate_shared_state():
+    src = {"state": "available", "code": "rewrite_available",
+           "backend": "local-llm", "reason": ""}
+    out = api.validate_rewrite_block(src)
+    out["backend"] = "other"
+    assert src["backend"] == "local-llm"
+
+
+@pytest.mark.parametrize("backend", [
+    "http://127.0.0.1:8079/v1", "/usr/bin/llama", "local llm", "", "x" * 65,
+    "C:\\\\models", "local-llm;rm -rf /",
+])
+def test_validate_rewrite_block_requires_a_backend_label(backend):
+    """`backend` is displayed by the UI, so it is a label, never an address."""
+    with pytest.raises(ValueError):
+        api.validate_rewrite_block({"state": "available",
+                                    "code": "rewrite_available",
+                                    "backend": backend, "reason": ""})

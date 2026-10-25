@@ -118,21 +118,28 @@ def test_seed_row_is_a_full_row_with_short_helper_and_accessible_range():
 
 
 def test_generation_is_status_gated_with_only_same_origin_api_calls():
-    # W2 truth: the page may talk ONLY to the three same-origin relative
-    # endpoints (/api/v1/status, /api/v1/plan, /api/v1/config/export).
-    # Generate stays unconditionally disabled (generation is W3); the
-    # submit handlers refuse directly — the disabled button is not the gate.
+    # W2 truth: the page may talk ONLY to the same-origin relative endpoints
+    # (/api/v1/status, /api/v1/plan, /api/v1/config/export, and — R4 — the
+    # rewrite route). Generate stays unconditionally disabled (generation is
+    # W3); the submit handlers refuse directly — the disabled button is not
+    # the gate.
+    #
+    # The "capability" ban is about BROWSER capability probing (navigator.gpu,
+    # WebGPU/WebNN feature detection): the server's rewrite status block is
+    # named for what it is (a rewriter state), never "capability", so this
+    # assertion keeps its original force.
     for name in ASSETS:
         text = _read(name)
         assert "capability" not in text.lower(), f"{name} still probes capability"
         assert "location.protocol" not in text
     js = _read("app.js")
-    # Every fetch target is one of the three relative API constants — never
+    # Every fetch target is one of the four relative API constants — never
     # a string-literal URL, never a host, never an absolute origin.
     assert not re.search(r"fetch\(\s*['\"]", js), "fetch must use API constants only"
     for const, route in (("API_STATUS", "/api/v1/status"),
                          ("API_PLAN", "/api/v1/plan"),
-                         ("API_EXPORT", "/api/v1/config/export")):
+                         ("API_EXPORT", "/api/v1/config/export"),
+                         ("API_REWRITE", "/api/v1/rewrite")):
         m = re.search(rf"var {const} = '([^']+)'", js)
         assert m, f"{const} missing"
         assert m.group(1) == route
@@ -159,10 +166,12 @@ def test_form_snapshot_uses_exact_config_enums_and_keys():
     assert keys - {"kind"} <= config_fields, \
         f"snapshot keys outside GenerationConfig fields: {keys - config_fields}"
     # Path fields belong to the SERVER's runtime; use the API's own closed
-    # set instead of a literal list so a new path field cannot silently pass.
-    from qwen_engine.web.api import RUNTIME_PATH_FIELDS
-    assert keys - {"kind"} == config_fields - set(RUNTIME_PATH_FIELDS), \
-        "snapshot must carry every non-path GenerationConfig field, no aliases"
+    # sets instead of a literal list so a new path field cannot silently pass,
+    # and so an announced deferral (recipe — docs/turbo-plan.md §6) is the
+    # only other class of field the wire may omit.
+    from qwen_engine.web.api import DEFERRED_WIRE_FIELDS, RUNTIME_PATH_FIELDS
+    assert keys - {"kind"} == config_fields - set(RUNTIME_PATH_FIELDS) - set(DEFERRED_WIRE_FIELDS), \
+        "snapshot must carry every non-path, non-deferred GenerationConfig field, no aliases"
 
     # Selects expose EXACTLY the config.py enum values — no invented options,
     # no aliases, compared against the real Python enums.
@@ -1220,10 +1229,92 @@ def test_w4_each_card_gets_its_own_closure_scope():
     assert "list.children" not in card
 
 
-def test_w4_reference_surface_is_exposed_for_the_browser_checks():
+def test_test_surface_is_exposed_for_the_browser_checks():
     js = _read("app.js")
     surface = js[js.index("window.QwenStudio = {"):]
-    assert "version: 'w4-refs'" in surface
+    # The version is a cache-buster/attribution marker, not a contract: assert
+    # its SHAPE so a deliberate bump never fails this check.
+    assert re.search(r"version: 'w[0-9]+-[a-z0-9-]+'", surface), "version marker missing"
     for name in ("referenceIds", "addReferenceFiles", "removeReference",
-                 "moveReference", "parseReferenceResponse", "MAX_REFERENCES"):
+                 "moveReference", "parseReferenceResponse", "MAX_REFERENCES",
+                 "parseRewriteBlock", "parseRewriteAnswer", "setRewriterState",
+                 "presetForRatio", "requestRewrite", "applyProposal",
+                 "keepOriginal", "rewriteState"):
         assert f"{name}: {name}" in surface, f"QwenStudio must expose {name}"
+
+
+def test_w5_rewrite_ui_is_a_suggestion_flow_not_an_automatic_edit():
+    """The Rewrite action must never change the draft on its own.
+
+    Pins the four load-bearing properties (plan R4): the proposal block is a
+    separate, initially-hidden region; Apply/Edit are the ONLY writers of
+    ``prompt`` from the rewrite module; the fetch carries the separate long
+    timeout; and an unavailable rewriter is hidden, not disabled-and-explained.
+    """
+    html = _read("index.html")
+    js = _read("app.js")
+
+    # -- markup: the block starts hidden and is a labelled group ----------
+    block = re.search(r'<div id="rewrite-proposal".*?\n {14}</div>', html, re.S)
+    assert block, "the proposal block must exist"
+    block = block.group(0)
+    assert "hidden" in block.split(">", 1)[0], "proposal starts hidden"
+    assert 'tabindex="-1"' in block, "proposal must be focusable for a11y"
+    assert 'role="group"' in block
+    assert 'aria-labelledby="rewrite-proposal-heading"' in block
+    for node in ("rewrite-original", "rewrite-suggested", "rewrite-ratio",
+                 "rewrite-apply", "rewrite-edit", "rewrite-keep",
+                 "rewrite-apply-ratio", "rewrite-error"):
+        assert f'id="{node}"' in block, f"proposal must contain #{node}"
+    # The button starts hidden AND disabled: an absent rewriter is not a
+    # broken one, so there is nothing to press.
+    button = re.search(r'<button[^>]*id="rewrite-btn"[^>]*>', html).group(0)
+    assert "hidden" in button and "disabled" in button
+    assert 'id="rewrite-hint"' in html
+    # The help copy names the action and that it is opt-in.
+    help_text = re.search(r'<p id="prompt-help".*?</p>', html, re.S).group(0)
+    assert "Rewrite" in help_text and "Apply" in help_text
+
+    # -- the ONLY prompt writes from the rewrite module -------------------
+    rewrite_region = js[js.index("function setRewriterState"):
+                        js.index("function apiErrorPayloadFromBytes")]
+    for fn in ("applyProposal", "editProposal"):
+        body = _js_function(js, fn)
+        assert "$('prompt').value = proposal.prompt;" in body
+    # Showing a proposal never writes the textarea.
+    assert "$('prompt').value =" not in _js_function(js, "showProposal")
+    assert "$('prompt').value =" not in _js_function(js, "requestRewrite")
+    assert "$('prompt').value =" not in rewrite_region.split("function applyProposal")[0]
+
+    # -- separate, longer timeout; shared one untouched -------------------
+    assert re.search(r"var REWRITE_TIMEOUT_MS = \d+;", js)
+    assert "REWRITE_TIMEOUT_MS" in _js_function(js, "requestRewrite")
+    assert "timeoutMs: REWRITE_TIMEOUT_MS" in js
+    assert int(re.search(r"var REWRITE_TIMEOUT_MS = (\d+);", js).group(1)) >= 240000
+    assert int(re.search(r"var FETCH_TIMEOUT_MS = (\d+);", js).group(1)) <= 30000
+    # The route constant is the only rewrite URL, and it is relative.
+    assert re.search(r"var API_REWRITE = '/api/v1/rewrite';", js)
+    assert re.search(r"var REWRITE_REQUEST_SCHEMA = 'qwen_engine\.web_rewrite_request\.v1';", js)
+    assert re.search(r"var REWRITE_SCHEMA = 'qwen_engine\.web_rewrite\.v1';", js)
+
+    # -- stale discard: BOTH the revision and the echoed text -------------
+    req = _js_function(js, "requestRewrite")
+    assert "answer.draft_revision !== promptRevision" in req
+    assert "answer.original_prompt !== $('prompt').value" in req
+    # A suggestion dies when the prompt text moves — but a width/steps change
+    # must NOT throw it away, so the counter is its own.
+    assert re.search(r"var promptRevision = 0;", js)
+    assert re.search(r"var draftRevision = 0;", js), \
+        "the plan/import revision must stay separate from the prompt revision"
+    # syncPlanStaleness owns draftRevision; it must NOT bump the prompt one,
+    # or a resolution change would silently discard a good suggestion.
+    staleness = _js_function(js, "syncPlanStaleness")
+    assert "draftRevision++" in staleness
+    assert "promptRevision" not in staleness
+
+    # -- no model-generated text is ever treated as HTML ------------------
+    for fn in ("showProposal", "renderRewriteError", "setRewriterState",
+               "requestRewrite", "bumpPromptRevision"):
+        body = _js_function(js, fn)
+        assert "innerHTML" not in body, f"{fn} must not assign innerHTML"
+        assert "insertAdjacentHTML" not in body, f"{fn} must not insert HTML"

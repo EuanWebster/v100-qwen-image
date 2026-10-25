@@ -48,11 +48,14 @@
   var API_IMPORT = '/api/v1/config/import';
   var API_JOBS = '/api/v1/jobs';
   var API_REFERENCES = '/api/v1/references';
+  var API_REWRITE = '/api/v1/rewrite';
   var PLAN_REQUEST_SCHEMA = 'qwen_engine.web_plan_request.v1';
   var STATUS_SCHEMA = 'qwen_engine.web_status.v1';
   var PLAN_SCHEMA = 'qwen_engine.web_plan.v1';
   var ERROR_SCHEMA = 'qwen_engine.web_error.v1';
   var REFERENCE_SCHEMA = 'qwen_engine.web_reference.v1';
+  var REWRITE_REQUEST_SCHEMA = 'qwen_engine.web_rewrite_request.v1';
+  var REWRITE_SCHEMA = 'qwen_engine.web_rewrite.v1';
   var UI_HEADER = 'X-Qwen-UI';
 
   // Reference images (design §5). The caps MIRROR the server contract
@@ -82,6 +85,25 @@
     'manifest_invalid', 'manifest_unreadable'
   ];
 
+  /* Rewrite availability (plan §4.1). CLOSED state/code pairs: the code is the
+     key, the state is the value it must pair with. Rewriting is optional and
+     NEVER a generation gate, so it is deliberately absent from GATE_STATES. */
+  var REWRITE_STATES = {
+    rewrite_available: 'available',
+    rewrite_disabled: 'unavailable'
+  };
+  // Sentinel meaning "present but malformed" — distinct from null
+  // ("absent or legitimately unavailable"), so a bad block rejects the
+  // whole status document instead of silently hiding a feature.
+  var INVALID = { invalid: true };
+
+  var REWRITE_TASKS = ['t2i', 'edit'];
+  // The server's rewrite prompt cap (rewrite.PROMPT_MAX_CHARS). Refused
+  // locally so an over-long draft is never sent; the server re-checks.
+  var PROMPT_MAX_CHARS = 8000;
+  // Local generation of a full paragraph is slow; the short general-purpose
+  // deadline would abort a working rewrite. Still finite.
+  var REWRITE_TIMEOUT_MS = 240000;
   // Manifest failures always block submission. Hardware/assets/calibration
   // evidence stays separate: enabling submission is not a memory-fit claim.
   var MANIFEST_REASON_CODES = [
@@ -610,14 +632,20 @@
   function apiRequest(url, opts, mode) {
     var controller = new AbortController();
     var timedOut = false;
+    // Per-call deadline override. Only the rewriter uses it: a local LLM
+    // generating a paragraph legitimately takes minutes, while every other
+    // call must stay bounded by the short default.
+    var budget = (opts && typeof opts.timeoutMs === 'number' &&
+                  opts.timeoutMs > 0) ? opts.timeoutMs : FETCH_TIMEOUT_MS;
     var timer = setTimeout(function () {
       timedOut = true;
       controller.abort();
-    }, FETCH_TIMEOUT_MS);
+    }, budget);
     var requestOpts = {};
     if (opts) {
       for (var k in opts) {
-        if (Object.prototype.hasOwnProperty.call(opts, k)) requestOpts[k] = opts[k];
+        if (k !== 'timeoutMs' &&
+            Object.prototype.hasOwnProperty.call(opts, k)) requestOpts[k] = opts[k];
       }
     }
     requestOpts.signal = controller.signal;
@@ -667,6 +695,7 @@
     $('btn-export').disabled = !available;
     $('btn-import').disabled = !available;
     if (!available) generationConnected = false;
+    if (!available) setRewriterState(null);   // rewriter availability is status-gated
     updateReferenceControls();   // uploads are writes: status-gated too
     updateGenerate();
   }
@@ -698,7 +727,35 @@
     if (!manifest) return null;   // status ALWAYS carries the manifest block
     if (!blockersExact(s.generation_blockers, manifest.blocker)) return null;
     if (s.generation_available !== (s.generation_blockers.length === 0)) return null;
-    return { recognized: true, planning: true, generation: s.generation_available };
+    // The rewrite block is OPTIONAL and additive: an older server omits it,
+    // which simply means "no rewriter". Once present it must be EXACTLY the
+    // four closed keys — a partial or widened block is rejected, and with it
+    // the rewriter (never a guessed backend).
+    var rewrite = parseRewriteBlock(s.rewrite);
+    if (rewrite === INVALID) return null;
+    return { recognized: true, planning: true, generation: s.generation_available,
+             rewrite: rewrite };
+  }
+
+  /* The rewrite availability, strictly. `undefined` (absent) and the disabled
+     pair both mean unavailable; only the exact available pair yields the
+     backend string. Anything else — a fifth key, a missing key, an unknown
+     state/code pair, a non-string backend — is INVALID and rejects the whole
+     status document, exactly like every other closed-set parse here. */
+  function parseRewriteBlock(block) {
+    if (block === undefined) return null;
+    if (!block || typeof block !== 'object' || Array.isArray(block)) return INVALID;
+    if (Object.keys(block).length !== 4) return INVALID;
+    if (typeof block.state !== 'string' || typeof block.code !== 'string' ||
+        typeof block.reason !== 'string') return INVALID;
+    if (block.backend !== null && typeof block.backend !== 'string') return INVALID;
+    var pair = REWRITE_STATES[block.code];
+    if (!pair || pair !== block.state) return INVALID;
+    if (block.state !== 'available') return null;   // disabled / unavailable
+    if (typeof block.backend !== 'string' || !block.backend) return INVALID;
+    if (block.backend.length > 64) return INVALID;
+    if (block.reason !== '') return INVALID;        // available carries no reason
+    return { backend: block.backend };
   }
 
   function statusUnrecognizedText(reason) {
@@ -808,6 +865,7 @@
         setApiAvailable(true);
         generationConnected = status.generation;
         updateGenerate();
+        setRewriterState(status.rewrite);
         renderChip(status.generation ? 'Connected — engine jobs' : 'Connected — planning only',
                    status.generation ? 'Connected — engine jobs' : 'Connected — planning only');
         setText('settings-backend',
@@ -849,6 +907,301 @@
       }
     }
     setText('api-message', message.slice(0, 600));
+  }
+
+  /* ---------------- Prompt rewriting (plan §3/§4) ----------------
+   * A SUGGESTION, never an edit: the server returns a proposed prompt; the
+   * draft only changes when the user presses Apply. Everything here is
+   * gated on a strictly-parsed `available` rewriter block, and every
+   * reply is checked against the draft it was requested for — a response
+   * for older text is discarded, never applied to newer text.
+   */
+
+  var rewriteBackend = null;      // non-null ONLY when status said available
+  var rewriteInFlight = false;
+  // Monotonic PROMPT revision: bumped by every change to the prompt TEXT,
+  // however it was made (typing, Apply, import). Deliberately NOT the plan
+  // module's draftRevision: that one also moves on width/steps changes, and a
+  // resolution tweak must not throw away a perfectly good prompt suggestion.
+  // The server echoes the value it was given; a reply is only ever accepted
+  // while the prompt has not moved since.
+  var promptRevision = 0;
+  var rewriteSeq = 0;
+  var proposal = null;            // { prompt, original, revision }
+
+  function setRewriterState(rewriter) {
+    rewriteBackend = rewriter ? rewriter.backend : null;
+    var button = $('rewrite-btn');
+    if (button) {
+      button.hidden = !rewriteBackend;
+      button.disabled = !rewriteBackend || rewriteInFlight;
+    }
+    var hint = $('rewrite-hint');
+    if (hint) hint.hidden = !!rewriteBackend;
+    if (!rewriteBackend) hideProposal();
+  }
+
+  function bumpPromptRevision() {
+    promptRevision++;
+    // A newer draft invalidates any visible suggestion: it was derived from
+    // text that is no longer on screen.
+    if (proposal) hideProposal();
+    var status = $('rewrite-status');
+    if (status) status.textContent = '';
+  }
+
+  function hideProposal() {
+    proposal = null;
+    var block = $('rewrite-proposal');
+    if (block) block.hidden = true;
+    setText('rewrite-original', '');
+    setText('rewrite-suggested', '');
+    setText('rewrite-ratio', '');
+    var applyRatio = $('rewrite-apply-ratio');
+    if (applyRatio) applyRatio.hidden = true;
+    setText('rewrite-error', '');
+  }
+
+  function rewriteTask() {
+    // Reference images imply editing; the request must never claim a task the
+    // draft's own references contradict.
+    return referenceIds().length ? 'edit' : 't2i';
+  }
+
+  function requestRewrite() {
+    if (!rewriteBackend || rewriteInFlight) return;
+    var draft = $('prompt').value;
+    if (!draft.trim()) {
+      setText('rewrite-error',
+        'Write a draft first — the rewriter improves text, it does not invent a prompt.');
+      return;
+    }
+    if (draft.length > PROMPT_MAX_CHARS) {
+      // The server cap, refused locally: nothing is sent.
+      setText('rewrite-error', 'The draft is ' + draft.length +
+        ' characters; the rewriter accepts at most ' + PROMPT_MAX_CHARS + ' — nothing was sent.');
+      return;
+    }
+    var revision = promptRevision;
+    var seq = ++rewriteSeq;
+    rewriteInFlight = true;
+    $('rewrite-btn').disabled = true;
+    $('rewrite-btn').setAttribute('aria-busy', 'true');
+    setText('rewrite-status', 'Rewriting…');
+    setText('rewrite-error', '');
+    apiRequest(API_REWRITE, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json',
+                 'X-Qwen-UI': '1' },
+      // The one call that legitimately needs minutes; still finite.
+      timeoutMs: REWRITE_TIMEOUT_MS,
+      body: JSON.stringify({
+        schema: REWRITE_REQUEST_SCHEMA,
+        task: rewriteTask(),
+        prompt: draft,
+        draft_revision: revision,
+        image_ids: []
+      })
+    }, 'json').then(function (r) {
+      if (seq !== rewriteSeq) return;        // a newer attempt superseded this
+      rewriteInFlight = false;
+      var button = $('rewrite-btn');
+      if (button) {
+        button.disabled = !rewriteBackend;
+        button.removeAttribute('aria-busy');
+      }
+      setText('rewrite-status', '');
+      if (r.network) {
+        // The draft is untouched: this is a failure to CONSULT, never an edit.
+        setText('rewrite-error', r.timedOut
+          ? 'The rewriter did not answer in time; your draft is unchanged.'
+          : 'The local engine server is unreachable; your draft is unchanged.');
+        return;
+      }
+      if (r.bodyError) {
+        setText('rewrite-error', 'The rewriter reply could not be read (' +
+          (r.bodyError === 'too_large' ? 'response over the size cap' : 'not JSON') +
+          '); your draft is unchanged.');
+        return;
+      }
+      if (!r.res.ok) {
+        renderRewriteError(r.res.status, r.json);
+        return;
+      }
+      var answer = parseRewriteAnswer(r.json);
+      if (!answer) {
+        setText('rewrite-error', 'The rewriter reply did not match the expected ' +
+          'schema; your draft is unchanged.');
+        return;
+      }
+      // Stale discard, twice over: the revision must still be the current
+      // one AND the text the server rewrote must still be the textarea's
+      // content. Either mismatch means the answer is for text the user moved
+      // away from — dropped silently, because it is not an error.
+      if (answer.draft_revision !== promptRevision ||
+          answer.original_prompt !== $('prompt').value) return;
+      showProposal(answer);
+    });
+  }
+
+  function renderRewriteError(status, payload) {
+    var message = 'The rewriter refused the request (HTTP ' + status + ').';
+    if (payload && payload.schema === ERROR_SCHEMA &&
+        typeof payload.code === 'string' && /^[a-z0-9_]{1,64}$/.test(payload.code)) {
+      message = payload.code + ': ' +
+        (typeof payload.message === 'string' ? payload.message.slice(0, 200)
+                                            : 'no message');
+    }
+    setText('rewrite-error', message.slice(0, 400) + ' Your draft is unchanged.');
+  }
+
+  // The answer document, strictly: exact schema, an echoed revision, the
+  // original prompt, and a NON-EMPTY suggestion. A model that produced no
+  // parsable prompt yields parse_ok false with an empty suggestion — that is
+  // a usable diagnostic, rendered as text, never as an applyable proposal.
+  function parseRewriteAnswer(s) {
+    if (!s || typeof s !== 'object') return null;
+    if (s.schema !== REWRITE_SCHEMA) return null;
+    if (REWRITE_TASKS.indexOf(s.task) === -1) return null;
+    if (!Number.isInteger(s.draft_revision) || s.draft_revision < 0) return null;
+    if (typeof s.original_prompt !== 'string') return null;
+    if (typeof s.rewritten_prompt !== 'string') return null;
+    if (typeof s.parse_ok !== 'boolean') return null;
+    if (typeof s.backend !== 'string' || !s.backend) return null;
+    if (!Number.isInteger(s.elapsed_ms) || s.elapsed_ms < 0) return null;
+    var ratio = s.ratio;
+    if (ratio !== null) {
+      if (!ratio || typeof ratio !== 'object') return null;
+      if (ratio.kind === 'wh_ratio') {
+        if (typeof ratio.value !== 'string' || !/^[0-9]{1,4}:[0-9]{1,4}$/.test(ratio.value)) return null;
+      } else if (ratio.kind === 'ratio_follow') {
+        if (!Number.isInteger(ratio.image) || ratio.image < 1 || ratio.image > 10) return null;
+      } else return null;
+    }
+    if (typeof s.ratio_conflict !== 'boolean') return null;
+    if (s.unparsed_answer !== null && typeof s.unparsed_answer !== 'string') return null;
+    if (s.parse_ok && !s.rewritten_prompt.trim()) return null;  // parser invariant
+    return s;
+  }
+
+  function showProposal(answer) {
+    // Only a USABLE answer becomes pending state. An unparsable answer is
+    // diagnostic text rendered in the block; keeping it as `proposal` would
+    // let a forced apply write an empty draft.
+    var usable = answer.parse_ok && !!answer.rewritten_prompt.trim();
+    proposal = usable
+      ? { prompt: answer.rewritten_prompt, original: answer.original_prompt,
+          revision: answer.draft_revision }
+      : null;
+    var block = $('rewrite-proposal');
+    if (!block) return;
+    setText('rewrite-original', answer.original_prompt);
+    setText('rewrite-suggested', answer.rewritten_prompt);
+    setText('rewrite-error', '');
+    var apply = $('rewrite-apply');
+    var edit = $('rewrite-edit');
+    var keep = $('rewrite-keep');
+    if (apply) apply.hidden = !usable;
+    if (edit) edit.hidden = !usable;
+    if (keep) keep.hidden = false;
+    if (!usable) {
+      setText('rewrite-error',
+        'The rewriter did not return a usable prompt' +
+        (answer.unparsed_answer
+          ? ' — its answer was kept below as text, not as a proposal.'
+          : '. Your draft is unchanged.'));
+      setText('rewrite-suggested', answer.unparsed_answer || '');
+    }
+    // Ratio is a HINT: text always; a button ONLY when the value matches a
+    // preset ratio exactly, so the control can never send a ratio the preset
+    // table cannot represent.
+    var ratioText = '';
+    var ratioButton = $('rewrite-apply-ratio');
+    var presetName = null;
+    if (answer.ratio_conflict) {
+      ratioText = 'The rewriter suggested both a ratio and an image to follow; ' +
+                  'neither is offered.';
+    } else if (answer.ratio && answer.ratio.kind === 'wh_ratio') {
+      presetName = presetForRatio(answer.ratio.value);
+      ratioText = 'Suggested aspect ratio: ' + answer.ratio.value +
+        (presetName ? ' (available as a preset)' : ' (no preset matches exactly, so no button)');
+    } else if (answer.ratio && answer.ratio.kind === 'ratio_follow') {
+      ratioText = 'The rewriter suggests following reference image ' +
+                  answer.ratio.image + '; pick a preset yourself.';
+    }
+    setText('rewrite-ratio', ratioText);
+    if (ratioButton) {
+      ratioButton.hidden = !presetName;
+      if (presetName) ratioButton.dataset.preset = presetName;
+    }
+    block.hidden = false;
+    block.focus();
+  }
+
+  // Exact ratio -> preset name, never a nearest match. Prefers the tier the
+  // draft currently uses, so applying a hint does not silently quadruple the
+  // resolution; falls back to 1K.
+  function presetForRatio(ratio) {
+    var currentTier = currentDraftTier();
+    var fallback = null;
+    for (var name in PRESETS) {
+      if (!Object.prototype.hasOwnProperty.call(PRESETS, name)) continue;
+      if (PRESETS[name].ratio !== ratio) continue;
+      if (PRESETS[name].tier === currentTier) return name;
+      if (!fallback) fallback = name;
+    }
+    return fallback;
+  }
+
+  function currentDraftTier() {
+    var w = Number($('width').value);
+    var h = Number($('height').value);
+    for (var name in PRESETS) {
+      if (!Object.prototype.hasOwnProperty.call(PRESETS, name)) continue;
+      var p = PRESETS[name];
+      if (p.width === w && p.height === h) return p.tier;
+    }
+    return '1K';
+  }
+
+  function applyProposal() {
+    // `proposal` is only ever assigned a real, non-empty suggestion (the one
+    // assignment site guards it), so a null here means "nothing pending".
+    if (!proposal) return;
+    $('prompt').value = proposal.prompt;
+    hideProposal();
+    bumpPromptRevision();
+    promptTouched = true;          // a programmatic edit is a real edit
+    renderValidation(validateForm().errors);
+    syncPlanStaleness();
+    $('prompt').focus();
+  }
+
+  function editProposal() {
+    // Edit moves the suggestion INTO the textarea but keeps the user in
+    // control: same as apply, then the caret is theirs.
+    if (!proposal) return;
+    $('prompt').value = proposal.prompt;
+    hideProposal();
+    bumpPromptRevision();
+    promptTouched = true;
+    renderValidation(validateForm().errors);
+    syncPlanStaleness();
+    var area = $('prompt');
+    area.focus();
+    area.setSelectionRange(area.value.length, area.value.length);
+  }
+
+  function keepOriginal() {
+    hideProposal();
+    $('prompt').focus();
+  }
+
+  // Observable state for the browser checks (no server, no model).
+  function rewriteState() {
+    return { backend: rewriteBackend, revision: promptRevision,
+             inFlight: rewriteInFlight, hasProposal: !!proposal,
+             proposal: proposal ? proposal.prompt : null };
   }
 
   function apiErrorPayloadFromBytes(bytes) {
@@ -1352,6 +1705,9 @@
   function applyImportedPlan(plan) {
     var c = plan.config;
     $('prompt').value = c.prompt;
+    // The draft text changed wholesale: any visible rewrite proposal is for
+    // text that no longer exists.
+    bumpPromptRevision();
     $('negative').value = c.negative_prompt;
     $('width').value = String(c.width);
     $('height').value = String(c.height);
@@ -2420,13 +2776,31 @@
       syncPlanStaleness();   // a random seed stale any visible result
     });
 
+    // Prompt rewriting: a suggestion flow, never an automatic edit. The
+    // proposal block is focusable so keyboard and screen-reader users land on
+    // it when it appears; Escape abandons it and returns to the prompt.
+    $('rewrite-btn').addEventListener('click', requestRewrite);
+    $('rewrite-apply').addEventListener('click', applyProposal);
+    $('rewrite-edit').addEventListener('click', editProposal);
+    $('rewrite-keep').addEventListener('click', keepOriginal);
+    $('rewrite-apply-ratio').addEventListener('click', function (ev) {
+      var name = ev.currentTarget.dataset.preset;
+      if (name) applyPreset(name);
+    });
+    $('rewrite-proposal').addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        keepOriginal();
+      }
+    });
+
     ['steps', 'seed', 'cfg', 'width', 'height', 'prompt', 'negative'].forEach(function (id) {
       $(id).addEventListener('input', function () {
         if (id === 'width' || id === 'height') {
           setPreviewAspect(Number($('width').value), Number($('height').value));
           syncPresetButtons();
         }
-        if (id === 'prompt') promptTouched = true;
+        if (id === 'prompt') { promptTouched = true; bumpPromptRevision(); }
         renderValidation(validateForm().errors);
         syncPlanStaleness();
       });
@@ -2477,7 +2851,7 @@
   // that shortens the whole-operation timeout so a stalled response BODY
   // can be observed quickly — production code never calls it.
   window.QwenStudio = {
-    version: 'w4-refs',
+    version: 'w5-rewrite',
     formSnapshot: formSnapshot,
     buildEnvelope: buildEnvelope,
     validateForm: validateForm,
@@ -2509,6 +2883,32 @@
     },
     setFetchTimeoutForChecks: function (ms) {
       if (Number.isInteger(ms) && ms > 0 && ms <= 60000) FETCH_TIMEOUT_MS = ms;
-    }
+    },
+    // Rewrite surface: the checks drive the suggestion flow offline (the
+    // rewriter gate, the strict answer parser, stale discard and the
+    // ratio->preset mapping) without a server or a model.
+    parseRewriteBlock: parseRewriteBlock,
+    parseRewriteAnswer: parseRewriteAnswer,
+    setRewriterState: setRewriterState,
+    presetForRatio: presetForRatio,
+    requestRewrite: requestRewrite,
+    applyProposal: applyProposal,
+    editProposal: editProposal,
+    keepOriginal: keepOriginal,
+    rewriteState: rewriteState,
+    // Renders a proposal the caller already validated with parseRewriteAnswer;
+    // the offline render check uses it so the proposal DOM is exercised for real.
+    showProposalForChecks: function (answer) {
+      var parsed = parseRewriteAnswer(answer);
+      if (parsed) showProposal(parsed);
+      return !!parsed;
+    },
+    // The RAW renderer, bypassing the parser: the offline check must be able
+    // to feed showProposal an answer the wire parser would reject, proving the
+    // renderer itself refuses to become an applyable suggestion.
+    showProposalRawForChecks: showProposal,
+    bumpPromptRevisionForChecks: function () { bumpPromptRevision(); },
+    PROMPT_MAX_CHARS: PROMPT_MAX_CHARS,
+    REWRITE_TIMEOUT_MS: REWRITE_TIMEOUT_MS
   };
 })();

@@ -657,3 +657,25 @@ def test_nothing_is_logged_while_a_rewrite_runs(capsys, caplog):
     assert secret not in captured.out and secret not in captured.err
     for record in caplog.records:
         assert secret not in record.getMessage()
+
+
+def test_status_block_is_built_by_the_shared_validator():
+    """The service must not hand-roll its block: api.validate_rewrite_block is
+    the one rule, so the server can never emit a shape its own UI rejects."""
+    from qwen_engine.web import api as web_api
+    for svc in (service(answer()), rs.RewriteService(rs.RewriteSettings.disabled())):
+        block = svc.status_block()
+        assert web_api.validate_rewrite_block(block) == block
+    # The disabled block is the canonical constant, not a paraphrase of it.
+    assert rs.RewriteService(rs.RewriteSettings.disabled()).status_block() == \
+        dict(web_api.REWRITE_DISABLED_BLOCK)
+
+
+def test_status_block_refuses_a_backend_name_that_would_leak_a_location():
+    """A backend string is echoed to the browser, so a location in it is a
+    configuration error caught at startup, not a leaked address."""
+    from qwen_engine.web import api as web_api
+    configured = {"state": "available", "code": "rewrite_available",
+                  "backend": "http://127.0.0.1:8079/v1", "reason": ""}
+    with pytest.raises(ValueError):
+        web_api.validate_rewrite_block(configured)

@@ -79,17 +79,18 @@ from typing import Any, Callable
 
 from qwen_engine import rewrite as rw
 from qwen_engine import rewrite_client as rc
+from qwen_engine.web import api as web_api
 from qwen_engine.web.api import ApiError, ApiResponse, _safe
 
-#: Wire tags for the future route. Defined here (R3 owns the service) because
-#: ``web/api.py`` is being edited by another coder; root should have ``api.py``
-#: import these so there is one source of truth, not a copy.
-REWRITE_REQUEST_SCHEMA = "qwen_engine.web_rewrite_request.v1"
-WEB_REWRITE_SCHEMA = "qwen_engine.web_rewrite.v1"
+#: Re-exported so a caller that already imports the service never needs a
+#: second import for the wire tags. The DEFINITION lives in ``web/api.py``
+#: (the transport's contract boundary), so the two can never drift apart.
+REWRITE_REQUEST_SCHEMA = web_api.REWRITE_REQUEST_SCHEMA
+WEB_REWRITE_SCHEMA = web_api.WEB_REWRITE_SCHEMA
 
-#: Route body cap: the longest legal prompt at 4 bytes/char plus the envelope.
-#: Derived, never chosen independently of ``PROMPT_MAX_CHARS``.
-MAX_REQUEST_BYTES = rw.PROMPT_MAX_CHARS * 4 + 1024
+#: Route body cap, re-exported under the name the service contract used.
+#: Derived from ``PROMPT_MAX_CHARS`` in one place only (``web/api.py``).
+MAX_REQUEST_BYTES = web_api.MAX_REWRITE_REQUEST_BYTES
 
 #: The only backend that exists. ``off`` is not a backend, it is the default.
 BACKENDS = ("local-llm",)
@@ -189,12 +190,13 @@ class RewriteService:
     def status_block(self) -> dict[str, Any]:
         """The additive status block. Never carries a host, port or path."""
         if self._client is None:
-            return {"state": "unavailable", "code": "rewrite_disabled",
-                    "backend": None,
-                    "reason": "rewriting is off by default; start the server "
-                              "with --rewrite-backend local-llm to enable it"}
-        return {"state": "available", "code": "rewrite_available",
-                "backend": self.settings.backend, "reason": ""}
+            return dict(web_api.REWRITE_DISABLED_BLOCK)
+        # Built through the ONE validator (web_api.validate_rewrite_block), so
+        # this block can never be a shape the browser parser rejects — and can
+        # never carry a host, port or path in `reason`.
+        return web_api.validate_rewrite_block(
+            {"state": "available", "code": "rewrite_available",
+             "backend": self.settings.backend, "reason": ""})
 
     # -- execution ----------------------------------------------------------
 
@@ -323,45 +325,8 @@ class RewriteService:
 
     @staticmethod
     def _validate(request: Mapping[str, Any]) -> dict[str, Any]:
-        if not isinstance(request, Mapping):
-            raise ApiError(400, "invalid_envelope",
-                           "the rewrite request must be a JSON object")
-        allowed = {"task", "prompt", "draft_revision", "image_ids"}
-        unknown = sorted(set(request) - allowed)
-        if unknown:
-            raise ApiError(400, "invalid_envelope",
-                           f"unknown rewrite field(s): {', '.join(map(str, unknown))}")
-        missing = sorted(allowed - set(request))
-        if missing:
-            raise ApiError(400, "invalid_envelope",
-                           f"missing rewrite field(s): {', '.join(missing)}")
-        try:
-            task = rw.check_task(request["task"])
-        except rw.RewriteError as exc:
-            raise ApiError(422, "task_unsupported", str(exc)) from None
-        image_ids = request["image_ids"]
-        if not isinstance(image_ids, list) or any(
-                isinstance(i, bool) or not isinstance(i, int) for i in image_ids):
-            raise ApiError(400, "invalid_envelope",
-                           "image_ids must be a list of integers")
-        if image_ids:
-            # Reference-image rewriting is gated on edit support landing.
-            raise ApiError(422, "task_unsupported",
-                           "rewriting with reference images is not supported yet")
-        revision = request["draft_revision"]
-        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
-            raise ApiError(400, "invalid_envelope",
-                           "draft_revision must be a non-negative integer")
-        prompt = request["prompt"]
-        if not isinstance(prompt, str):
-            raise ApiError(400, "invalid_envelope", "prompt must be a string")
-        if len(prompt) > rw.PROMPT_MAX_CHARS:
-            raise ApiError(422, "prompt_too_long",
-                           f"the prompt is {len(prompt)} characters; the limit "
-                           f"is {rw.PROMPT_MAX_CHARS}")
-        if not prompt.strip():
-            raise ApiError(400, "invalid_envelope", "prompt must be non-empty")
-        return {"task": task, "prompt": prompt, "draft_revision": revision}
+        # ONE definition of a legal request, shared with the transport.
+        return web_api.validate_rewrite_fields(request)
 
 
 def _payload(task: str, fields: Mapping[str, Any], content: str,

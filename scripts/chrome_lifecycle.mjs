@@ -20,6 +20,7 @@
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { isAbsolute } from 'node:path';
 
 export const DEFAULTS = {
   devtoolsAnnounceMs: 45000,
@@ -49,6 +50,19 @@ export function cgroupCapacity() {
  * wrapper, not Chrome itself; signal only its PID to request scoped cleanup.
  */
 export function launchChrome({ chromePath, profileDir, extraArgs = [] }) {
+  // A profile dir is NEVER optional. `--user-data-dir=undefined` is not
+  // rejected by Chrome: it silently creates a literal `./undefined` profile
+  // in the CURRENT WORKING DIRECTORY, which pollutes the worktree and can
+  // leak a real session's state. Fail loudly instead of launching.
+  if (typeof profileDir !== 'string' || profileDir === '' ||
+      profileDir === 'undefined' || profileDir === 'null' ||
+      !isAbsolute(profileDir)) {
+    throw new Error(
+      `launchChrome: profileDir must be an absolute path, got ${JSON.stringify(profileDir)}`);
+  }
+  if (typeof chromePath !== 'string' || chromePath === '') {
+    throw new Error('launchChrome: chromePath must be a non-empty string');
+  }
   const args = [
     '--remote-debugging-port=0',
     `--user-data-dir=${profileDir}`,

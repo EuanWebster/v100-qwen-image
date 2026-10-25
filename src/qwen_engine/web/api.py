@@ -35,6 +35,7 @@ from typing import Any
 
 from qwen_engine import _jsonsafe
 from qwen_engine import reference_store as _reference_store
+from qwen_engine import rewrite as _rewrite
 from qwen_engine.config import SEED_MAX, ConfigError, GenerationConfig
 from qwen_engine.core import plan as core_plan
 
@@ -44,6 +45,18 @@ WEB_PLAN_SCHEMA = "qwen_engine.web_plan.v1"
 WEB_PLAN_REQUEST_SCHEMA = "qwen_engine.web_plan_request.v1"
 WEB_ERROR_SCHEMA = "qwen_engine.web_error.v1"
 WEB_REFERENCE_SCHEMA = "qwen_engine.web_reference.v1"
+#: Prompt-rewriting wire tags (plan §4.1). Defined HERE, next to the other
+#: wire tags, because this module is the transport's contract boundary; the
+#: service imports them from here rather than keeping a second copy.
+REWRITE_REQUEST_SCHEMA = "qwen_engine.web_rewrite_request.v1"
+WEB_REWRITE_SCHEMA = "qwen_engine.web_rewrite.v1"
+
+#: Route body cap for /api/v1/rewrite. DERIVED, never chosen independently:
+#: the longest legal draft (``PROMPT_MAX_CHARS``) at 4 bytes/char UTF-8 plus
+#: a ≤1 KiB envelope. The browser applies the same formula locally, so this
+#: is a backstop; ``MAX_BODY_BYTES`` (64 KiB) is larger than this and is NOT
+#: the binding cap for this route.
+MAX_REWRITE_REQUEST_BYTES = _rewrite.PROMPT_MAX_CHARS * 4 + 1024
 
 #: Route cap for raw reference uploads — the store's own byte cap is the
 #: single source of truth; JSON routes keep the small 64 KiB MAX_BODY_BYTES.
@@ -69,6 +82,18 @@ RUNTIME_PATH_FIELDS = ("output_dir", "cache_dir", "log_dir",
                        "benchmarks_dir", "models_dir", "manifest_path",
                        "q8_manifest_path", "references_dir")
 
+#: GenerationConfig fields that are deliberately NOT on the browser wire YET.
+#: Each entry is an announced deferral with its owning milestone, never a
+#: silent carve-out: the partition guard below FAILS for any field that is
+#: neither editable, a runtime path, nor listed here — so a new config field
+#: still cannot slip past this contract unnoticed.
+#:
+#: ``recipe`` — engine/CLI landed in the Turbo milestone; the browser-side
+#: recipe (EDITABLE_KEYS, locked steps under Turbo, export round-trip) is the
+#: separate web follow-up in docs/turbo-plan.md §6. Sending it before the UI
+#: validates it would let a stale page select a recipe it cannot represent.
+DEFERRED_WIRE_FIELDS = frozenset({"recipe"})
+
 #: Seed wire grammar: ASCII decimal digits only, at most 20 characters
 #: (the full uint64 range stays an exact string; range is validated later
 #: against ``config.SEED_MAX``). Leading zeros are allowed; whitespace,
@@ -77,6 +102,80 @@ _SEED_WIRE_RE = re.compile(r"[0-9]{1,20}\Z")
 
 #: Bound on any single public error message (safe, single-line, truncated).
 MAX_MESSAGE_CHARS = 200
+
+#: The rewrite status block is exactly these four keys (plan §4.1): the UI
+#: parser is strict, so the server never widens its own contract — an extra
+#: key would be a silent wire change.
+_REWRITE_BLOCK_KEYS = frozenset({"state", "code", "backend", "reason"})
+
+#: The CLOSED state/code pairs, mirroring ``REWRITE_STATES`` in app.js: the
+#: code is the key, the state is the value it must pair with. Rewriting is
+#: optional and never a gate, so these are deliberately NOT in ``_gates()``.
+_REWRITE_PAIRS: Mapping[str, str] = {
+    "rewrite_available": "available",
+    "rewrite_disabled": "unavailable",
+}
+
+#: Shapes that must never reach the browser: the status document is served to
+#: a page, and a reason is operator-facing prose, not a place to leak where the
+#: backend lives. Refusing is cheap; a leaked loopback address is not.
+_LOCATION_MARKERS = ("://", "/", "\\")
+_IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+
+#: A backend is a short label the UI displays, matching the CLI's own names
+#: (``local-llm``); anything address-shaped is a configuration error.
+_BACKEND_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+def validate_rewrite_block(block: Any) -> dict[str, Any]:
+    """The ONE definition of a legal rewrite status block, pure.
+
+    Shared by :class:`WebRuntime` (which refuses a bad block at construction,
+    never filtering it silently) and by the rewrite service (which builds its
+    block through here), so the server cannot emit a document its own UI
+    parser would reject. Raises :class:`ValueError` with a bounded message.
+
+    The rules are the UI's rules: exactly four keys, a CLOSED state/code pair,
+    a backend IFF available, a reason IFF unavailable, and no location in the
+    reason.
+    """
+    if not isinstance(block, Mapping):
+        raise ValueError("web rewrite block must be a JSON mapping")
+    if set(block) != _REWRITE_BLOCK_KEYS:
+        raise ValueError(
+            "web rewrite block must carry exactly "
+            f"{sorted(_REWRITE_BLOCK_KEYS)}; got {sorted(map(str, block))}")
+    state, code = block["state"], block["code"]
+    backend, reason = block["backend"], block["reason"]
+    if _REWRITE_PAIRS.get(code) != state:
+        raise ValueError(
+            f"web rewrite block state {state!r} does not pair with code {code!r}")
+    if not isinstance(reason, str):
+        raise ValueError("web rewrite block reason must be a string")
+    if state == "available":
+        if not isinstance(backend, str) or not backend or len(backend) > 64:
+            raise ValueError(
+                "an available rewrite block needs a non-empty backend (<= 64 chars)")
+        # The backend is echoed to the browser too: it is a LABEL ("local-llm"),
+        # never an address or path.
+        if not _BACKEND_LABEL_RE.match(backend):
+            raise ValueError(
+                "a rewrite backend must be a label (letters, digits, . _ -), "
+                "not an address or path")
+        if reason != "":
+            raise ValueError("an available rewrite block carries no reason")
+    else:
+        if backend is not None:
+            raise ValueError("an unavailable rewrite block has backend null")
+        if not reason.strip():
+            raise ValueError("an unavailable rewrite block needs a reason")
+    for marker in _LOCATION_MARKERS:
+        if marker in reason:
+            raise ValueError(
+                "a rewrite reason must not disclose a location (URL or path)")
+    if _IPV4_RE.search(reason):
+        raise ValueError("a rewrite reason must not disclose a location (address)")
+    return dict(block)
 
 
 def _safe(text: Any, limit: int = MAX_MESSAGE_CHARS) -> str:
@@ -137,6 +236,13 @@ class WebRuntime:
     references_dir: str | None = None
     manifest_summary: Mapping[str, Any] = field(default_factory=dict)
     generation_enabled: bool = False
+    #: The rewriter capability block, computed ONCE at startup from the
+    #: service configuration (never per request, never a filesystem read).
+    #: ``None`` means "rewriting is not available here" and is rendered as
+    #: the canonical disabled block — the same thing an unconfigured server
+    #: reports. Additive to the status document: the schema tag does not
+    #: change (plan §4.1).
+    rewrite_block: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if type(self.generation_enabled) is not bool:
@@ -146,6 +252,13 @@ class WebRuntime:
         if errors or not isinstance(summary, Mapping):
             raise ValueError("web manifest summary must be a strict JSON mapping")
         object.__setattr__(self, "manifest_summary", summary)
+        if self.rewrite_block is not None:
+            block = _jsonsafe.freeze_json(self.rewrite_block, "rewrite_block", errors)
+            if errors or not isinstance(block, Mapping):
+                raise ValueError("web rewrite block must be a strict JSON mapping")
+            # ONE validator, so the server can never emit a block its own UI
+            # parser would reject (and never leak a backend location).
+            object.__setattr__(self, "rewrite_block", validate_rewrite_block(block))
 
     def path_fields(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in RUNTIME_PATH_FIELDS}
@@ -339,9 +452,15 @@ def _public_seed(config: GenerationConfig) -> str | None:
 
 def editable_config_dict(config: GenerationConfig) -> dict[str, Any]:
     """The editable subset of a validated config with the public seed wire
-    (decimal string / null). This is what plan echoes back."""
+    (decimal string / null). This is what plan echoes back.
+
+    Deferred fields are dropped for the same reason runtime paths are: the
+    wire is only ever what the browser can send back. Echoing a field that
+    ``build_config`` refuses would break export -> import round-trips with a
+    config the server itself produced.
+    """
     out = config.to_dict()
-    for name in RUNTIME_PATH_FIELDS:
+    for name in (*RUNTIME_PATH_FIELDS, *DEFERRED_WIRE_FIELDS):
         out.pop(name, None)
     out["seed"] = _public_seed(config)
     out["references"] = list(config.references)
@@ -518,6 +637,9 @@ def status_response(runtime: WebRuntime) -> ApiResponse:
         "gates": _gates(),
         "manifest": _manifest_core(summary),
         "generation_blockers": _blockers(runtime),
+        # Additive and optional (plan §4.1): the schema tag is NOT bumped, and
+        # nothing here participates in the generation gate.
+        "rewrite": rewrite_status_block(runtime),
     }
     return ApiResponse(status=200, payload=payload)
 
@@ -566,7 +688,7 @@ def export_response(runtime: WebRuntime, raw_body: bytes) -> ApiResponse:
     except ApiError as exc:
         return ApiResponse(status=exc.status, payload=exc.to_payload())
     out = config.to_dict()
-    for name in RUNTIME_PATH_FIELDS:
+    for name in (*RUNTIME_PATH_FIELDS, *DEFERRED_WIRE_FIELDS):
         out.pop(name, None)
     body = (json.dumps(out, sort_keys=True) + "\n").encode("utf-8")
     return ApiResponse(
@@ -662,6 +784,123 @@ def reference_bytes(runtime: WebRuntime, reference_id: str, *,
         raise ApiError(404, "reference_unknown", "no such reference") from None
 
 
+def build_rewrite_request(raw: bytes) -> dict[str, Any]:
+    """``/api/v1/rewrite`` body -> the exact four-key request mapping.
+
+    The wire envelope carries EXACTLY
+    ``schema``/``task``/``prompt``/``draft_revision``/``image_ids``, so a typo
+    is a typed refusal rather than a silently ignored field. Envelope shape is
+    checked here; field SEMANTICS live in :func:`validate_rewrite_fields`,
+    which the service calls too — one implementation, so the transport and the
+    executor cannot disagree about what a legal request is.
+
+    The prompt is validated for shape and size only; it is never logged, never
+    echoed into an error message, and never copied anywhere but the single
+    ``original_prompt`` field of a successful response.
+    """
+    data = parse_request_json(raw)
+    if not isinstance(data, Mapping):
+        raise ApiError(400, "invalid_envelope",
+                       "the rewrite request must be a JSON object")
+    if any(not isinstance(key, str) for key in data):
+        raise ApiError(400, "invalid_envelope", "request keys must be strings")
+    allowed = ("schema", "task", "prompt", "draft_revision", "image_ids")
+    missing = sorted(set(allowed) - set(data))
+    extra = sorted(set(data) - set(allowed))
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append("missing key(s): " + ", ".join(missing))
+        if extra:
+            parts.append("unexpected key(s): " + ", ".join(extra))
+        raise ApiError(400, "invalid_envelope", "; ".join(parts))
+    if data["schema"] != REWRITE_REQUEST_SCHEMA:
+        raise ApiError(400, "invalid_envelope",
+                       f"schema must be {REWRITE_REQUEST_SCHEMA!r}")
+    return validate_rewrite_fields({k: v for k, v in data.items() if k != "schema"})
+
+
+def validate_rewrite_fields(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Semantic validation of the four request fields, pure.
+
+    Shared by the transport (after the envelope check) and by
+    ``RewriteService.submit`` (which is also called directly by tests), so
+    there is exactly ONE definition of a legal rewrite request.
+    """
+    if not isinstance(request, Mapping):
+        raise ApiError(400, "invalid_envelope",
+                       "the rewrite request must be a JSON object")
+    allowed = {"task", "prompt", "draft_revision", "image_ids"}
+    unknown = sorted(set(request) - allowed)
+    if unknown:
+        raise ApiError(400, "invalid_envelope",
+                       "unknown rewrite field(s): "
+                       + ", ".join(map(str, unknown)))
+    missing = sorted(allowed - set(request))
+    if missing:
+        raise ApiError(400, "invalid_envelope",
+                       "missing rewrite field(s): " + ", ".join(missing))
+    try:
+        task = _rewrite.check_task(request["task"])
+    except _rewrite.RewriteError as exc:
+        raise ApiError(422, "task_unsupported", str(exc)) from None
+    image_ids = request["image_ids"]
+    if not isinstance(image_ids, list) or any(
+            isinstance(i, bool) or not isinstance(i, int) for i in image_ids):
+        raise ApiError(400, "invalid_envelope",
+                       "image_ids must be a list of integers")
+    if image_ids:
+        # Reference-image rewriting is gated on edit support landing.
+        raise ApiError(422, "task_unsupported",
+                       "rewriting with reference images is not supported yet")
+    revision = request["draft_revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ApiError(400, "invalid_envelope",
+                       "draft_revision must be a non-negative integer")
+    prompt = request["prompt"]
+    if not isinstance(prompt, str):
+        raise ApiError(400, "invalid_envelope", "prompt must be a string")
+    if len(prompt) > _rewrite.PROMPT_MAX_CHARS:
+        # Length is the only prompt-derived fact ever put in a message.
+        raise ApiError(422, "prompt_too_long",
+                       f"the prompt is {len(prompt)} characters; the limit is "
+                       f"{_rewrite.PROMPT_MAX_CHARS}")
+    if not prompt.strip():
+        raise ApiError(400, "invalid_envelope", "prompt must be non-empty")
+    return {"task": task, "prompt": prompt, "draft_revision": revision,
+            "image_ids": []}
+
+
+#: The canonical "no rewriter here" block. One source of truth: an
+#: unconfigured server, a disabled flag and a failed service all report this
+#: exact shape, so the UI's strict parser has one thing to recognise.
+REWRITE_DISABLED_BLOCK: Mapping[str, Any] = {
+    "state": "unavailable",
+    "code": "rewrite_disabled",
+    "backend": None,
+    "reason": "rewriting is off by default; start the server with "
+              "--rewrite-backend local-llm to enable it",
+}
+
+
+def rewrite_status_block(runtime: WebRuntime) -> dict[str, Any]:
+    """The additive, OPTIONAL ``rewrite`` status block (plan §4.1).
+
+    Four keys, closed value sets, never a host, port or path: this document
+    is served to the browser, and the reason string is operator-facing prose
+    that must not disclose where the backend lives. ``GATE_STATES`` does not
+    grow — rewriting is an optional capability and must never block (or
+    appear to block) generation.
+
+    ``WebRuntime`` already refuses any block that is not legal, so this is a
+    copy, not a filter; :func:`validate_rewrite_block` is that single rule.
+    """
+    block = runtime.rewrite_block
+    if block is None:
+        return dict(REWRITE_DISABLED_BLOCK)
+    return dict(block)
+
+
 def internal_error_response() -> ApiResponse:
     """Catch-all typed failure: no traceback, no exception text, no paths."""
     exc = ApiError(500, "internal_error",
@@ -679,6 +918,11 @@ __all__ = [
     "summarize_manifest_bytes",
     "MAX_REFERENCE_UPLOAD_BYTES", "WEB_REFERENCE_SCHEMA",
     "reference_bytes", "upload_reference_response",
+    # Prompt rewriting (plan §4.1): the wire contract, not the transport.
+    "REWRITE_REQUEST_SCHEMA", "WEB_REWRITE_SCHEMA",
+    "MAX_REWRITE_REQUEST_BYTES", "REWRITE_DISABLED_BLOCK",
+    "build_rewrite_request", "validate_rewrite_fields", "validate_rewrite_block",
+    "rewrite_status_block",
 ]
 
 
@@ -686,8 +930,14 @@ __all__ = [
 def _check_editable_subset() -> None:
     names = {f.name for f in fields(GenerationConfig)}
     assert EDITABLE_FIELDS <= names, "EDITABLE_FIELDS references unknown config fields"
-    assert names - EDITABLE_FIELDS == set(RUNTIME_PATH_FIELDS), \
-        "editable + runtime-path fields must partition GenerationConfig fields"
+    assert not (EDITABLE_FIELDS & set(RUNTIME_PATH_FIELDS)), \
+        "a field cannot be both browser-editable and server-controlled"
+    assert names - EDITABLE_FIELDS - set(RUNTIME_PATH_FIELDS) == set(DEFERRED_WIRE_FIELDS), \
+        ("every GenerationConfig field must be browser-editable, a runtime "
+         "path, or an announced deferral — unclassified: "
+         f"{sorted(names - EDITABLE_FIELDS - set(RUNTIME_PATH_FIELDS) - set(DEFERRED_WIRE_FIELDS))}")
+    assert DEFERRED_WIRE_FIELDS <= names, \
+        f"DEFERRED_WIRE_FIELDS names unknown config fields: {sorted(DEFERRED_WIRE_FIELDS - names)}"
 
 
 _check_editable_subset()
