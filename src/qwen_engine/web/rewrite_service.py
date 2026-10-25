@@ -1,0 +1,429 @@
+"""Rewrite service: one in-flight rewrite, behind a typed refusal.
+
+**Entry-point contract** (what ``web/server.py`` and ``web/api.py`` call; the
+route itself is R3's later half and is not built here):
+
+*Build once at startup, from flags — never inside a request.* ::
+
+    settings = RewriteSettings(backend="local-llm", endpoint="http://127.0.0.1:8079/v1",
+                               model="Qwen3.8", prompts={"t2i": <system prompt text>},
+                               timeout=180.0)
+    settings = RewriteSettings.disabled()          # the default: flag ``off``
+    service = RewriteService(settings)             # transport= injected in tests only
+
+Construction is where a bad endpoint, model or missing prompt fails: those are
+operator errors and the server must refuse to start rather than 503 later.
+:meth:`RewriteService.status_block` is then served from the cached status.
+
+*Per request* (body already parsed to a mapping by ``api.build_rewrite_request``;
+this module re-validates, cheaply and defensively): ::
+
+    request = {"task": "t2i", "prompt": "<draft>", "draft_revision": 7,
+               "image_ids": []}
+    response = service.submit(request)   # -> ApiResponse(200, payload)
+
+Body keys are exactly ``task``/``prompt``/``draft_revision``/``image_ids``; any
+other key is refused rather than ignored. ``draft_revision`` is echoed verbatim
+so the UI can discard a stale suggestion; ``image_ids`` must be ``[]`` until
+reference-image support lands (non-empty is ``422 task_unsupported``).
+
+Response payload (``WEB_REWRITE_SCHEMA``): ``schema``, ``task``,
+``draft_revision``, ``original_prompt`` (exactly what was sent, bounded by the
+cap, so the UI can prove staleness), ``rewritten_prompt``, ``parse_ok``,
+``unparsed_answer`` (only when ``parse_ok`` is false), ``ratio``,
+``ratio_conflict``, ``backend``, ``elapsed_ms``. The server never maps a ratio
+to width/height — ``PRESETS`` in ``app.js`` is the single source of truth.
+
+*Typed failures* — :class:`~qwen_engine.web.api.ApiError`, messages bounded and
+**never containing prompt text**::
+
+    503 rewrite_disabled         flag is off, or the service was never configured
+    503 rewrite_busy             another rewrite is in flight (never a queue)
+    504 rewrite_timeout          the deadline expired; the draft is untouched
+    502 rewrite_unavailable      transport failure / non-2xx from the backend
+    502 rewrite_invalid_answer   transport violation (not a chat completion)
+    422 prompt_too_long          over ``PROMPT_MAX_CHARS``
+    422 task_unsupported         unknown task, or non-empty ``image_ids``
+    400 invalid_envelope         malformed body: unknown/missing key, bad types
+    503 rewrite_cancelled        cancelled by shutdown or operator; see below
+
+``rewrite_cancelled`` is an **addition** to the plan's typed set (the plan has
+no cancel route); it exists so shutdown can release a waiter with a typed
+refusal instead of a lie about time or capacity. Root can drop the code once
+the route decides how cancel is exposed.
+
+*Cancellation is cooperative, not an abort.* :meth:`RewriteService.cancel`
+prevents a pending answer being applied and releases the waiter immediately,
+but it cannot interrupt a blocked socket read — the client's connect/read
+timeout is the hard bound on wall time. Do not describe cancel as stopping the
+backend.
+
+*Single flight, no queue.* One slot: a second caller is refused at once rather
+than waiting behind the first or transparently retrying. The call runs on a
+worker thread so the four HTTP handlers (``MAX_CONCURRENT_HANDLERS``) are
+released. This service never touches ``JobController`` or the executor lease —
+a rewrite must not queue behind, or stall, an image job.
+
+*No prompt in logs or errors.* Nothing here logs. :meth:`RewriteService.event`
+returns the only fields the caller may log — ``task``, ``backend``,
+``elapsed_ms``, ``prompt_chars``, ``parse_ok``, ``outcome`` — deliberately no
+prompt, no endpoint, no path.
+"""
+from __future__ import annotations
+
+import threading
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from qwen_engine import rewrite as rw
+from qwen_engine import rewrite_client as rc
+from qwen_engine.web.api import ApiError, ApiResponse, _safe
+
+#: Wire tags for the future route. Defined here (R3 owns the service) because
+#: ``web/api.py`` is being edited by another coder; root should have ``api.py``
+#: import these so there is one source of truth, not a copy.
+REWRITE_REQUEST_SCHEMA = "qwen_engine.web_rewrite_request.v1"
+WEB_REWRITE_SCHEMA = "qwen_engine.web_rewrite.v1"
+
+#: Route body cap: the longest legal prompt at 4 bytes/char plus the envelope.
+#: Derived, never chosen independently of ``PROMPT_MAX_CHARS``.
+MAX_REQUEST_BYTES = rw.PROMPT_MAX_CHARS * 4 + 1024
+
+#: The only backend that exists. ``off`` is not a backend, it is the default.
+BACKENDS = ("local-llm",)
+
+#: Default deadline. Worst measured round trip against the shared service was
+#: 38 s; a slower backend needs this raised explicitly, as a flag decision.
+DEFAULT_TIMEOUT_SECONDS = rc.DEFAULT_TIMEOUT_SECONDS
+
+
+class _Cancelled(Exception):
+    """Internal: the answer arrived but was cancelled before it could be used."""
+
+
+@dataclass(frozen=True)
+class RewriteSettings:
+    """Startup-owned configuration; validated once, never per request."""
+
+    backend: str
+    endpoint: str | None = None
+    model: str | None = None
+    prompts: Mapping[str, str] = field(default_factory=dict)
+    timeout: float = DEFAULT_TIMEOUT_SECONDS
+
+    @classmethod
+    def disabled(cls) -> "RewriteSettings":
+        return cls(backend="off")
+
+    def __post_init__(self) -> None:
+        if self.backend != "off" and self.backend not in BACKENDS:
+            raise rc.RewriteConfigError(
+                f"unknown rewrite backend {self.backend!r}; choose 'off' or "
+                f"one of {list(BACKENDS)}")
+        if self.backend == "off":
+            if self.endpoint or self.model or self.prompts:
+                raise rc.RewriteConfigError(
+                    "a disabled rewriter must not carry an endpoint, model or "
+                    "system prompt: an operator who set those meant to enable it")
+            return
+        # Validate eagerly: a bad endpoint is a startup refusal, not a 503.
+        rc.parse_endpoint(self.endpoint)
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise rc.RewriteConfigError("rewrite model must be a non-empty string")
+        missing = [task for task in rw.TASKS
+                   if not isinstance(self.prompts.get(task), str)
+                   or not self.prompts[task].strip()]
+        if missing:
+            raise rc.RewriteConfigError(
+                f"system prompt missing for {missing}; every task needs the "
+                "prompt the weights were trained on")
+        if (isinstance(self.timeout, bool)
+                or not isinstance(self.timeout, (int, float))
+                or not 0 < float(self.timeout) <= 3600):
+            raise rc.RewriteConfigError(
+                f"rewrite timeout must be in (0, 3600] seconds, got {self.timeout!r}")
+
+    def build_client(self,
+                     transport: Callable[[bytes], bytes] | None = None) -> rc.RewriteClient:
+        """The client for this configuration. `transport` is for tests only."""
+        return rc.RewriteClient(endpoint=self.endpoint, model=self.model,
+                                timeout=self.timeout, transport=transport)
+
+
+class _Job:
+    """One in-flight rewrite's hand-off slot, guarded by the service Condition."""
+
+    __slots__ = ("cancel", "finished", "payload", "error", "elapsed_ms")
+
+    def __init__(self) -> None:
+        # Per-job, not per-service: a cancel aimed at one rewrite must never
+        # poison the next one.
+        self.cancel = threading.Event()
+        self.finished = False
+        self.payload: dict[str, Any] | None = None
+        self.error: BaseException | None = None
+        self.elapsed_ms: int | None = None
+
+
+class RewriteService:
+    """Single-slot rewrite executor. One instance per server."""
+
+    def __init__(self, settings: RewriteSettings,
+                 transport: Callable[[bytes], bytes] | None = None) -> None:
+        self.settings = settings
+        self._client = (None if settings.backend == "off"
+                        else settings.build_client(transport=transport))
+        self._cond = threading.Condition()
+        self._current: _Job | None = None
+        self._closing = False
+
+    # -- capability ---------------------------------------------------------
+
+    @property
+    def available(self) -> bool:
+        """True when a rewrite can actually be attempted (flag on + configured)."""
+        return self._client is not None
+
+    def status_block(self) -> dict[str, Any]:
+        """The additive status block. Never carries a host, port or path."""
+        if self._client is None:
+            return {"state": "unavailable", "code": "rewrite_disabled",
+                    "backend": None,
+                    "reason": "rewriting is off by default; start the server "
+                              "with --rewrite-backend local-llm to enable it"}
+        return {"state": "available", "code": "rewrite_available",
+                "backend": self.settings.backend, "reason": ""}
+
+    # -- execution ----------------------------------------------------------
+
+    def submit(self, request: Mapping[str, Any]) -> ApiResponse:
+        """Run one rewrite to completion (or refuse). Never queues."""
+        if self._client is None:
+            raise ApiError(503, "rewrite_disabled",
+                           "rewriting is not enabled on this server")
+        fields = self._validate(request)
+        job = self._claim()
+        thread = threading.Thread(target=self._run, args=(job, fields),
+                                  name="rewrite", daemon=True)
+        thread.start()
+        return self._await(job, fields)
+
+    def _claim(self) -> _Job:
+        """Take the single slot or refuse. The job owns its own cancel flag."""
+        with self._cond:
+            if self._closing:
+                raise ApiError(503, "rewrite_disabled",
+                               "the server is shutting down")
+            if self._current is not None:
+                raise ApiError(503, "rewrite_busy",
+                               "another rewrite is already in progress")
+            job = _Job()
+            self._current = job
+            return job
+
+    def _await(self, job: _Job, fields: dict[str, Any]) -> ApiResponse:
+        """Wait for `job`, honouring cancel and the deadline.
+
+        Leaving early does NOT free the slot: the worker still owns it, and it
+        releases the slot in its own ``finally``. So a timed-out or cancelled
+        rewrite cannot overlap the next one — the following attempt is refused
+        503 until the backend call actually returns.
+        """
+        deadline = time.monotonic() + self.settings.timeout
+        with self._cond:
+            while not job.finished:
+                if job.cancel.is_set():
+                    raise ApiError(503, "rewrite_cancelled",
+                                   "the rewrite was cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    job.cancel.set()  # discard whatever still arrives
+                    raise ApiError(
+                        504, "rewrite_timeout",
+                        f"the rewriter did not answer within "
+                        f"{self.settings.timeout:g} s")
+                self._cond.wait(remaining)
+        if job.error is not None:
+            raise _as_api_error(job.error, fields["prompt"])
+        if job.payload is None:  # internal invariant, never a backend failure
+            raise ApiError(502, "rewrite_unavailable",
+                           "the rewrite completed without a result")
+        return ApiResponse(status=200, payload=job.payload)
+
+    def _run(self, job: _Job, fields: dict[str, Any]) -> None:
+        """Worker body. Owns the slot release; never lets an exception escape."""
+        started = time.monotonic()
+        try:
+            task = fields["task"]
+            if job.cancel.is_set():
+                raise _Cancelled
+            messages = rw.build_messages(self.settings.prompts[task],
+                                         fields["prompt"])
+            content = self._client.complete(messages, task)
+            if job.cancel.is_set():
+                raise _Cancelled
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            job.payload = _payload(task, fields, content,
+                                   self.settings.backend, elapsed_ms)
+            job.elapsed_ms = elapsed_ms
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the waiter
+            job.payload = None
+            job.error = exc
+        finally:
+            with self._cond:
+                if self._current is job:
+                    self._current = None
+                job.finished = True
+                self._cond.notify_all()
+
+    # -- cancellation / shutdown -------------------------------------------
+
+    def cancel(self) -> bool:
+        """Cancel the in-flight rewrite's result. False if nothing was running.
+
+        Cooperative: the waiter returns immediately, but a blocked socket read
+        keeps running until the client's own timeout — no thread is killed, and
+        the slot stays taken until it does.
+        """
+        with self._cond:
+            if self._current is None:
+                return False
+            self._current.cancel.set()
+            self._cond.notify_all()
+            return True
+
+    def close(self, timeout_s: float = 5.0) -> bool:
+        """Cancel and wait briefly. Returns True when idle (no thread left)."""
+        with self._cond:
+            self._closing = True
+            if self._current is not None:
+                self._current.cancel.set()
+            self._cond.notify_all()
+            deadline = time.monotonic() + timeout_s
+            while self._current is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            return True
+
+    # -- logging surface ----------------------------------------------------
+
+    def event(self, task: str, *, prompt_chars: int, elapsed_ms: int | None,
+              parse_ok: bool | None, outcome: str) -> dict[str, Any]:
+        """The only rewrite fields that may be logged. No prompt, ever."""
+        return {"event": "rewrite", "task": task,
+                "backend": self.settings.backend,
+                "elapsed_ms": elapsed_ms, "prompt_chars": prompt_chars,
+                "parse_ok": parse_ok, "outcome": outcome}
+
+    # -- validation (defensive: api.py validates too) -----------------------
+
+    @staticmethod
+    def _validate(request: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(request, Mapping):
+            raise ApiError(400, "invalid_envelope",
+                           "the rewrite request must be a JSON object")
+        allowed = {"task", "prompt", "draft_revision", "image_ids"}
+        unknown = sorted(set(request) - allowed)
+        if unknown:
+            raise ApiError(400, "invalid_envelope",
+                           f"unknown rewrite field(s): {', '.join(map(str, unknown))}")
+        missing = sorted(allowed - set(request))
+        if missing:
+            raise ApiError(400, "invalid_envelope",
+                           f"missing rewrite field(s): {', '.join(missing)}")
+        try:
+            task = rw.check_task(request["task"])
+        except rw.RewriteError as exc:
+            raise ApiError(422, "task_unsupported", str(exc)) from None
+        image_ids = request["image_ids"]
+        if not isinstance(image_ids, list) or any(
+                isinstance(i, bool) or not isinstance(i, int) for i in image_ids):
+            raise ApiError(400, "invalid_envelope",
+                           "image_ids must be a list of integers")
+        if image_ids:
+            # Reference-image rewriting is gated on edit support landing.
+            raise ApiError(422, "task_unsupported",
+                           "rewriting with reference images is not supported yet")
+        revision = request["draft_revision"]
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ApiError(400, "invalid_envelope",
+                           "draft_revision must be a non-negative integer")
+        prompt = request["prompt"]
+        if not isinstance(prompt, str):
+            raise ApiError(400, "invalid_envelope", "prompt must be a string")
+        if len(prompt) > rw.PROMPT_MAX_CHARS:
+            raise ApiError(422, "prompt_too_long",
+                           f"the prompt is {len(prompt)} characters; the limit "
+                           f"is {rw.PROMPT_MAX_CHARS}")
+        if not prompt.strip():
+            raise ApiError(400, "invalid_envelope", "prompt must be non-empty")
+        return {"task": task, "prompt": prompt, "draft_revision": revision}
+
+
+def _payload(task: str, fields: Mapping[str, Any], content: str,
+             backend: str, elapsed_ms: int) -> dict[str, Any]:
+    """The 200 payload. `original_prompt` is echoed so the UI can prove staleness."""
+    parsed = rw.parse_answer(content, task)
+    return {
+        "schema": WEB_REWRITE_SCHEMA,
+        "task": task,
+        "draft_revision": fields["draft_revision"],
+        "original_prompt": fields["prompt"],
+        "rewritten_prompt": parsed.prompt,
+        "parse_ok": parsed.parse_ok,
+        "unparsed_answer": parsed.unparsed_answer,
+        "ratio": parsed.ratio,
+        "ratio_conflict": parsed.ratio_conflict,
+        "backend": backend,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+def _as_api_error(exc: BaseException, prompt: str = "") -> ApiError:
+    """Map a worker failure to a typed refusal. Messages carry no prompt.
+
+    A backend or client error may quote the request it failed on, so the draft
+    is scrubbed out of whatever text is forwarded. The diagnostics that matter
+    for an operator ("truncated: got 45 of 145 bytes", "unreachable") never
+    contain the draft, so scrubbing costs nothing real.
+    """
+    if isinstance(exc, _Cancelled):
+        return ApiError(503, "rewrite_cancelled", "the rewrite was cancelled")
+    if isinstance(exc, ApiError):
+        return _scrub_error(exc, prompt)
+    if isinstance(exc, rc.RewriteTimeout):
+        return ApiError(504, "rewrite_timeout",
+                        _scrub("the rewriter did not answer before its "
+                               "deadline", prompt))
+    if isinstance(exc, rc.RewriteInvalidAnswer):
+        return ApiError(502, "rewrite_invalid_answer",
+                        _scrub(_safe(exc) or
+                               "the rewriter's reply was not a completion", prompt))
+    if isinstance(exc, rc.RewriteClientError):
+        return ApiError(502, "rewrite_unavailable",
+                        _scrub(_safe(exc) or
+                               "the rewriter service is unavailable", prompt))
+    if isinstance(exc, rw.RewriteError):
+        # Our own message building refused the request: a caller bug, not a
+        # backend fault, and the text can only describe shape or length.
+        return ApiError(400, "invalid_envelope", _scrub(_safe(exc), prompt))
+    return ApiError(502, "rewrite_unavailable",
+                    f"the rewrite failed ({type(exc).__name__})")
+
+
+def _scrub(text: str, prompt: str) -> str:
+    """Remove the draft from `text`. The one leak this path must not have."""
+    for needle in (prompt, prompt.strip()):
+        if needle:
+            text = text.replace(needle, "[prompt]")
+    return text
+
+
+def _scrub_error(exc: ApiError, prompt: str) -> ApiError:
+    """A nested ApiError may still be quoting the draft."""
+    return ApiError(exc.status, exc.code, _scrub(exc.message, prompt),
+                    tuple((f, _scrub(m, prompt)) for f, m in exc.field_errors))
