@@ -30,3 +30,17 @@ def test_existing_output_and_unfixed_seed_refused_before_run(tmp_path):
     path.write_text(GenerationConfig().to_json())
     assert tool().main(["--config", str(path), "--output-dir", str(tmp_path), "--run"]) == 1
     assert not (tmp_path / "run-1").exists()
+
+
+def test_attention_profile_plans_without_gpu_or_output(tmp_path, capsys):
+    spec = importlib.util.spec_from_file_location("attention_probe", Path(__file__).resolve().parents[1]/"scripts/profile_generation_attention.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    path = tmp_path / "input.json"
+    path.write_text(GenerationConfig(prompt="private prompt").to_json())
+    output = tmp_path / "profile.json"
+    assert module.main(["--config", str(path), "--output", str(output)]) == 0
+    raw = capsys.readouterr().out
+    assert "private" not in raw
+    assert json.loads(raw)["run"] is False
+    assert not output.exists()
