@@ -306,12 +306,47 @@ repeat 4-ref at 2K preset with tiled decode. Decide defaults from data: max
 references at 1K (target 10 per plan §4 only if it fits with headroom), whether 2K
 editing ships at all, and the KV-cache default.
 
-Measurement script shape: new `scripts/benchmark_reference_memory.py` copying
-`scripts/benchmark_generation.py` (fresh-process `--run` gate, per-run
-`--performance-report`, `performance_summary.summarise_reports`, refuse existing
-output dir; :18-89) plus `--reference PATH` repeated (resolved through the store);
-the extended performance recorder must record joint token count and reference count
-in metadata (extend `calibration_facts`, supplied_qwen21.py:176-199).
+### 4.1 Running the measurement script (`scripts/benchmark_reference_memory.py`)
+
+Implemented (CPU tests: `tests/test_benchmark_reference_memory.py`); the
+recorder side it depends on is already in place — `calibration_facts` carries
+`references` and the measured `joint_tokens` (`prompt_tokens + packed
+reference tokens + latent_tokens`), and the standard adapter mirrors them
+into performance-report metadata. `performance_summary.summarise_reports`
+is not reused (it summarises T2I stage reports); the matrix report
+`matrix.json` plays that role for these cells.
+
+Plan-only default (no writes, no heavy imports; refuses an existing output
+dir and a seedless config); GPU execution only with `--run`, fresh process
+per cell, always through the lineage wrapper so an interrupt reaps the tree:
+
+```
+python -B scripts/process_lineage_owner.py -- \
+  python -B scripts/benchmark_reference_memory.py --run \
+    --config presets/1k-edit.json \
+    --reference img1.png --reference img2.png --reference img3.png --reference img4.png \
+    --counts 0,1,2,4 --kv-cache on,off --output-dir out/ref-matrix-$(date +%s)
+```
+
+Per cell (`counts` × KV policy; counts beyond the supplied files cycle them —
+duplicates are legal): the references are ingested into a private
+content store under the output dir (`reference_store`, ids recorded); the CLI
+generation runs under `decode_bench.PeakMemoryProbe` (whole-run NVML +
+allocator peaks + `num_alloc_retries` delta), a `PerformanceRecorder` report
+(`cell-N.perf.json`), per-step progress timestamps (`step_ms`), and a fresh
+allocator/NVML window around the adapter's `reference_vae_encode` stage
+(`vae_encode` block; peak reset on entry only — the CalibrationCollector's
+phase technique, never `empty_cache` mid-run; NVML from a second short-lived
+session, degrading to allocator-only with an explicit note). The KV knob is
+applied to the attached bridge adapter before its denoise and cross-checked
+against the adapter's measured facts — a mismatch fails the cell. OOM is a
+RECORDED cell outcome (`status: "failed", error_type: "OutOfMemoryError"`),
+never a matrix crash; a child that dies without a record is `crashed`.
+Artifacts: `plan.json`, per-cell `spec/cell-N.json/.perf.json/.log`, the
+shared `store/`, and `matrix.json`. All reports are bounded (256 KiB),
+prompt-free, exclusive-create; NVML peaks are interval samples
+(`samples`/`interval_ms` state the coverage). No numbers here exist until
+root runs it — the matrix decides §4's open defaults.
 
 ## 5. UI (web_static)
 
