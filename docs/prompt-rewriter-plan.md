@@ -293,6 +293,14 @@ would force `api.py:40`, `app.js:51` and `tests/test_web_api.py:52` to change to
   (`127.0.0.0/8` / `::1`; anything else is a startup error, never a runtime retry).
   Transport is injected (`send(bytes) -> bytes`) so tests never open a socket — the CPU
   guard denies socket construction outright (`tests/cpu_guard/sitecustomize.py:16-20`).
+  **Landed** (R1/R2): the transport seam keeps that exact signature; the HTTP transport
+  raises the module's own typed errors, so `complete()` maps nothing. Two refinements
+  from implementation: `parse_endpoint` also refuses *any* whitespace and requires an
+  explicit port, and only `temperature`/`top_p`/`max_tokens` are sent
+  (`SAMPLING_WIRE_FIELDS`) — `top_k`/`min_p`/`presence_penalty` go out only via
+  `extra_sampling` after measuring that the service honours them. So t2i runs at
+  `presence_penalty = 0` against the shared service instead of the trained 1.5; that
+  deviation must be stated wherever rewrite quality is reported.
 - **`web/api.py`** — `REWRITE_REQUEST_SCHEMA`, `WEB_REWRITE_SCHEMA`,
   `build_rewrite_request(raw_body)` (strict JSON, exact keys, non-negative int revision,
   non-empty prompt ≤ cap, `image_ids == []`), `rewrite_response(...)`, and the status
@@ -328,12 +336,14 @@ would force `api.py:40`, `app.js:51` and `tests/test_web_api.py:52` to change to
 
 §4 shapes are frozen; R3/R4 can start against them with a fake client.
 
-- **R1 contract** — NEW `src/qwen_engine/rewrite.py` + `tests/test_rewrite.py`. Prompt
-  loading and md5 refusal; message building; `parse_answer` over clean JSON, fenced JSON,
-  trailing prose, inline `think`, misspelled key, both ratios, unterminated thinking
-  (`parse_ok False` + raw text); `sampling` values; the char cap. No I/O, no sockets.
-- **R2 transport** — NEW `src/qwen_engine/rewrite_client.py` + `tests/test_rewrite_client.py`.
-  Injected transport: non-loopback target refused at construction, oversize response
+- **R1 contract — DONE** — NEW `src/qwen_engine/rewrite.py` + `tests/test_rewrite.py`.
+  Prompt loading and md5/sha256 refusal; message building; `parse_answer` over clean JSON,
+  fenced JSON, trailing prose, a nested object, misspelled key, both ratios, unterminated
+  thinking (`parse_ok False` + raw text); `sampling` values; the char cap. No I/O beyond
+  the prompt file, no sockets. 54 tests.
+- **R2 transport — DONE** — NEW `src/qwen_engine/rewrite_client.py` +
+  `tests/test_rewrite_client.py`. Injected transport: non-loopback target refused at
+  construction, oversize response
   refused, short read and deadline expiry typed, proxy env not consulted, request bytes
   exactly the JSON body.
 - **R3 web** — `web/api.py`, `web/server.py`, NEW `web/rewrite_service.py` +
