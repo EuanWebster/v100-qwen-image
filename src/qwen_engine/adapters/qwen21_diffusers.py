@@ -30,13 +30,15 @@ Boundary rules:
 from __future__ import annotations
 
 import gc
+import inspect
 import threading
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 from qwen_engine._jsonsafe import strict_json_loads
-from qwen_engine.adapters.supplied_qwen21 import SuppliedQwen21Adapter
+from qwen_engine.adapters.supplied_qwen21 import (load_reference_images,
+                                                  SuppliedQwen21Adapter)
 from qwen_engine.config import (
     AttentionBackend,
     ConfigError,
@@ -157,6 +159,16 @@ def _assert_turbo_scheduler(scheduler_dir: str | Path) -> None:
 #: The reviewed execution device is the first CUDA logical device. The
 #: hardware gate below still verifies its identity before anything is loaded.
 LOGICAL_DEVICE_INDEX = 0
+
+#: The pinned pipeline's ``output_resolution`` default. The bridge never
+#: overrides it, so reference preprocessing must target exactly this area —
+#: both at load time (precomputed latents) and inside ``__call__``.
+REFERENCE_OUTPUT_RESOLUTION = 1024
+
+#: Exact pinned ``QwenImage21Pipeline._encode_vae_image`` parameter list
+#: (bound). The load-phase encode and the per-call override refuse on ANY
+#: drift instead of guessing.
+_ENCODE_VAE_IMAGE_PARAMETERS = ("image", "generator")
 
 #: Latent-token count above which the transformer's SwiGLU MLP is evaluated in
 #: token chunks (1024² is exactly 4096, so 1024² and below stay unchunked).
@@ -400,6 +412,8 @@ class Qwen21DiffusersAdapter:
         self._mlp_chunk_tokens = 0
         self._joint_tokens = None
         self._reference_latents_hook = None
+        self._reference_vae_latents: tuple[Any, ...] | None = None
+        self._reference_latents_box: list | None = None
         self._mlp_chunked_blocks = 0
         self._trust_unbounded_host = trust_unbounded_host
         self._state = "new"
@@ -476,38 +490,61 @@ class Qwen21DiffusersAdapter:
         device = torch.device("cuda", LOGICAL_DEVICE_INDEX)
 
         try:
-            # Load and place one component at a time: the CPU copy of each is
-            # released before the next component's weights are read, so host
-            # peak stays near one model rather than the whole stack.
-            with stage("transformer_loading", cuda=True):
-                if q8_artifact is None:
-                    transformer = transformer_cls.from_pretrained(
-                        (turbo_bundle if turbo else bundle).component_dirs["dit"],
-                        torch_dtype=torch.float16, local_files_only=True)
-                    transformer.to(device=device, dtype=torch.float16).eval()
-                else:
-                    from qwen_engine.adapters.q8_loader import load_q8_transformer
-                    transformer = load_q8_transformer(transformer_cls, bundle, q8_artifact, torch, device)
-            with stage("initial_vae_loading", cuda=True):
-                vae = vae_cls.from_pretrained(
-                    bundle.component_dirs["vae"], torch_dtype=torch.float16,
-                    local_files_only=True)
-                vae.to(device=device, dtype=torch.float16).eval()
+            references = tuple(getattr(config, "references", ()))
+            pipeline_kwargs = ({}, {"sample_sigmas": list(TURBO_SAMPLE_SIGMAS)})[turbo]
+            if turbo:
+                _assert_turbo_scheduler(turbo_bundle.component_dirs["scheduler"])
             scheduler = scheduler_cls.from_pretrained(
                 (turbo_bundle if turbo else bundle).component_dirs["scheduler"],
                 local_files_only=True)
             processor = processor_cls.from_pretrained(
                 bundle.component_dirs["processor"], local_files_only=True)
+            if references:
+                # Reference residency order (measured on the V100): restoring
+                # the VAE inside ``__call__`` while the transformer is
+                # resident OOMs (15.05 GiB allocated, +384 MiB requested).
+                # So the VAE encodes every reference while it is the ONLY
+                # resident component, the tiny latents are kept, the VAE is
+                # dropped, and only then does the transformer load. The
+                # per-call override (see _install_reference_latents_hook)
+                # serves the stored latents during sampling.
+                with stage("initial_vae_loading", cuda=True):
+                    vae = vae_cls.from_pretrained(
+                        bundle.component_dirs["vae"], torch_dtype=torch.float16,
+                        local_files_only=True)
+                    vae.to(device=device, dtype=torch.float16).eval()
+                pipeline = pipeline_cls(scheduler=scheduler, vae=vae,
+                                        text_encoder=None, processor=processor,
+                                        transformer=None, **pipeline_kwargs)
+                self._pipeline = pipeline
+                with stage("reference_vae_encode", cuda=True):
+                    from PIL import Image
+                    self._reference_vae_latents = self._encode_reference_latents(
+                        pipeline, load_reference_images(config, Image), torch, device)
+                    self._release_vae()
+                with stage("transformer_loading", cuda=True):
+                    pipeline.transformer = self._load_transformer(
+                        transformer_cls, torch, device, bundle, q8_artifact,
+                        turbo_bundle, turbo)
+            else:
+                # Load and place one component at a time: the CPU copy of each is
+                # released before the next component's weights are read, so host
+                # peak stays near one model rather than the whole stack.
+                with stage("transformer_loading", cuda=True):
+                    transformer = self._load_transformer(
+                        transformer_cls, torch, device, bundle, q8_artifact,
+                        turbo_bundle, turbo)
+                with stage("initial_vae_loading", cuda=True):
+                    vae = vae_cls.from_pretrained(
+                        bundle.component_dirs["vae"], torch_dtype=torch.float16,
+                        local_files_only=True)
+                    vae.to(device=device, dtype=torch.float16).eval()
+                pipeline = pipeline_cls(scheduler=scheduler, vae=vae,
+                                        text_encoder=None, processor=processor,
+                                        transformer=transformer, **pipeline_kwargs)
         except Exception as exc:
             raise EngineError(
                 f"local component load refused: {type(exc).__name__}: {exc}") from exc
-
-        if turbo:
-            _assert_turbo_scheduler(turbo_bundle.component_dirs["scheduler"])
-        pipeline_kwargs = ({}, {"sample_sigmas": list(TURBO_SAMPLE_SIGMAS)})[turbo]
-        pipeline = pipeline_cls(
-            scheduler=scheduler, vae=vae, text_encoder=None,
-            processor=processor, transformer=transformer, **pipeline_kwargs)
 
         runtime = observe_generation_runtime()
         if not runtime.matches_cuda_device(
@@ -613,6 +650,12 @@ class Qwen21DiffusersAdapter:
                 self._install_reference_latents_hook()
             try:
                 latents = self._attached().denoise(config, conditioning)
+                if references and self._reference_latents_box:
+                    raise EngineError(
+                        "the pipeline consumed "
+                        f"{len(self._reference_vae_latents) - len(self._reference_latents_box)}"
+                        f" of {len(self._reference_vae_latents)} prepared "
+                        "reference VAE latents")
             finally:
                 if references:
                     self._remove_reference_latents_hook()
@@ -627,7 +670,7 @@ class Qwen21DiffusersAdapter:
         from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_dimensions
         dimensions = [
             tuple(int(value) for value in calculate_dimensions(
-                1024 * 1024, image.size[0] / image.size[1])[:2])
+                REFERENCE_OUTPUT_RESOLUTION * REFERENCE_OUTPUT_RESOLUTION, image.size[0] / image.size[1])[:2])
             for image in self._attached().reference_images(config)]
         return _reference_token_total(dimensions)
 
@@ -645,41 +688,131 @@ class Qwen21DiffusersAdapter:
                 self._torch, self._pipeline.transformer, MLP_CHUNK_TOKENS)
             self._mlp_chunk_tokens = MLP_CHUNK_TOKENS
 
-    def _install_reference_latents_hook(self) -> None:
-        """Keep the VAE resident for exactly the reference VAE encode.
+    def _load_transformer(self, transformer_cls, torch, device, bundle,
+                          q8_artifact, turbo_bundle, turbo):
+        """One transformer, one placement path — shared by both load orders."""
+        if q8_artifact is None:
+            transformer = transformer_cls.from_pretrained(
+                (turbo_bundle if turbo else bundle).component_dirs["dit"],
+                torch_dtype=torch.float16, local_files_only=True)
+            transformer.to(device=device, dtype=torch.float16).eval()
+        else:
+            from qwen_engine.adapters.q8_loader import load_q8_transformer
+            transformer = load_q8_transformer(transformer_cls, bundle,
+                                              q8_artifact, torch, device)
+        return transformer
 
-        With references, upstream's ``prepare_latents`` calls the VAE encoder
-        inside ``__call__`` before the loop; the measured transformer+VAE
-        residency (~14.8 GiB, see :meth:`_release_denoiser`) leaves no denoise
-        headroom on the 16 GiB card. This per-call instance override restores
-        the VAE (fp16, untiled), runs the pinned ``prepare_latents`` under a
-        prompt-free wall-time stage, and releases the VAE again in its own
-        ``finally`` — so the sampling loop runs transformer-only exactly like
-        text-to-image. Removed by :meth:`_remove_reference_latents_hook` in
-        the caller's ``finally``; nothing survives into memory measurement.
+    def _encode_reference_latents(self, pipeline, images, torch, device):
+        """Encode every reference through the PINNED pipeline's own
+        preprocessing and VAE encode, while the VAE is the only resident
+        component.
+
+        Mirrors ``QwenImage21Pipeline.__call__`` step 1 and the per-image
+        VAE call of ``prepare_latents`` exactly — RGBA conversion, the
+        ``calculate_dimensions`` resize target at
+        :data:`REFERENCE_OUTPUT_RESOLUTION` (the pinned ``output_resolution``
+        default, which the bridge never overrides),
+        ``image_processor.preprocess(...).unsqueeze(2)``, then the pipeline's
+        own ``_encode_vae_image`` — by calling those pinned objects, never a
+        re-implementation. ``argmax`` sampling ignores the generator, so the
+        latents are deterministic and match what an in-call VAE encode would
+        have produced; the reference identity itself is bound by the same
+        store-id rechecks ``reference_images`` performs at generation time.
+        """
+        from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import (
+            calculate_dimensions)
+        if tuple(inspect.signature(pipeline._encode_vae_image).parameters) \
+                != _ENCODE_VAE_IMAGE_PARAMETERS:
+            raise EngineError("pinned pipeline _encode_vae_image signature has "
+                              "changed; reference latents cannot be precomputed")
+        # The pinned ``__call__`` carries @torch.no_grad(); ``_encode_vae_image``
+        # itself does NOT, and a direct call outside that context traces the
+        # encoder: an fp16 untiled 1024² reference keeps ~14 GiB of autograd
+        # activations on the V100 and the SECOND reference OOMs (a grad-free
+        # VAE-alone encode peaks at 2.72 GiB and frees — measured on the
+        # card). argmax sampling ignores the generator, so dropping the graph
+        # does not change the latents the pinned call would have produced.
+        latents = []
+        for position, image in enumerate(images, start=1):
+            if hasattr(image, "mode") and image.mode != "RGBA":
+                image = image.convert("RGBA")
+            image_width, image_height = image.size
+            input_width, input_height, _ = calculate_dimensions(
+                REFERENCE_OUTPUT_RESOLUTION * REFERENCE_OUTPUT_RESOLUTION,
+                image_width / image_height)
+            vae_image = pipeline.image_processor.preprocess(
+                image, width=input_width, height=input_height).unsqueeze(2)
+            vae_image = vae_image.to(device=device, dtype=torch.float16)
+            with torch.no_grad():
+                encoded = pipeline._encode_vae_image(vae_image, None)
+            if tuple(encoded.shape[:3]) != (1, pipeline.latent_channels, 1):
+                raise EngineError(
+                    f"reference {position} produced an unexpected VAE latent "
+                    f"shape {tuple(encoded.shape)}")
+            # Store the INPUT (pixel) geometry beside the latent: at ``__call__``
+            # the override witnesses the pipeline's preprocessed pixel tensor,
+            # never a latent — comparing pixel and latent shapes (which never
+            # match) would reject every legitimate run.
+            latents.append((tuple(vae_image.shape),
+                            encoded.detach().to(device="cpu",
+                                                dtype=torch.float16)))
+        return tuple(latents)
+
+    def _install_reference_latents_hook(self) -> None:
+        """Serve the load-phase reference VAE latents during ``__call__``.
+
+        The VAE left the card before the transformer was even loaded
+        (:meth:`_encode_reference_latents`); restoring it mid-denoise is the
+        measured OOM this replaces. This is a per-call instance override of
+        the narrowest method the pinned ``prepare_latents`` invokes per
+        image — ``_encode_vae_image`` — returning the stored latents in
+        order. Each call's input tensor must still describe the same image
+        geometry, requesting more latents than were prepared is a refusal,
+        and the caller's ``finally`` (:meth:`_remove_reference_latents_hook`)
+        removes the override so nothing survives into memory measurement;
+        unconsumed latents are reported by the caller before publication.
         """
         pipeline = self._pipeline
-        if pipeline is None or not callable(getattr(pipeline, "prepare_latents", None)):
-            raise EngineError("reference generation requires the pinned prepare_latents")
-        if "prepare_latents" in vars(pipeline):
-            raise EngineError("a prepare_latents override is already installed")
-        original = pipeline.prepare_latents
+        if pipeline is None or not callable(getattr(pipeline, "_encode_vae_image", None)):
+            raise EngineError("reference generation requires the pinned _encode_vae_image")
+        if "_encode_vae_image" in vars(pipeline):
+            raise EngineError("a _encode_vae_image override is already installed")
+        if tuple(inspect.signature(pipeline._encode_vae_image).parameters) \
+                != _ENCODE_VAE_IMAGE_PARAMETERS:
+            raise EngineError("pinned pipeline _encode_vae_image signature has "
+                              "changed; cached reference latents cannot be "
+                              "injected blindly")
+        if not self._reference_vae_latents:
+            raise EngineError("reference generation has no VAE latents prepared at load")
+        pending = list(self._reference_vae_latents)
+        self._reference_latents_box = pending
 
-        def prepare_latents(*args, **kwargs):
-            self._restore_vae(reference=True)
-            try:
-                with stage("reference_vae_encode"):
-                    return original(*args, **kwargs)
-            finally:
-                self._release_vae()
+        def encode_vae_image(image, generator):
+            # The pinned call hands over the preprocessed PIXEL tensor
+            # (1, 4, 1, H, W) and the run generator; the stored latents were
+            # sampled argmax (generator-independent), so the only witness is
+            # geometry: the incoming shape must equal the PIXEL shape the
+            # stored latent was computed from at load (a latent's own, smaller
+            # shape can never match the pipeline's pixel input).
+            if not pending:
+                raise EngineError(
+                    "the pipeline requested more reference VAE encodes than "
+                    "the prepared latents cover")
+            input_shape, latent = pending.pop(0)
+            if tuple(image.shape) != input_shape:
+                raise EngineError(
+                    "the pipeline's reference preprocessing disagrees with the "
+                    "latents prepared at load")
+            return latent.to(device=image.device, dtype=image.dtype)
 
-        pipeline.prepare_latents = prepare_latents
+        pipeline._encode_vae_image = encode_vae_image
         self._reference_latents_hook = pipeline
 
     def _remove_reference_latents_hook(self) -> None:
         pipeline, self._reference_latents_hook = self._reference_latents_hook, None
-        if pipeline is not None and "prepare_latents" in vars(pipeline):
-            del pipeline.prepare_latents
+        self._reference_latents_box = None
+        if pipeline is not None and "_encode_vae_image" in vars(pipeline):
+            del pipeline._encode_vae_image
 
     def decode(self, latents):
         with stage("vae_loading", cuda=True):
@@ -719,15 +852,13 @@ class Qwen21DiffusersAdapter:
         # Transparent output also decodes in fp32: at 1024² the fp16 decode of
         # RGBA latents was non-finite for all three measured prompts, while the
         # same run with fp32 decode produced a finite image with a real alpha
-        # channel. A reference encode is fed the fp16 execution tensors and
-        # never uses the fp32 decode policy or decode tiling.
-        dtype = torch.float16 if reference else (
-            torch.float32 if self._fp32_decode else torch.float16)
+        # channel.
+        dtype = (torch.float32 if self._fp32_decode else torch.float16)
         vae = self._vae_cls.from_pretrained(
             self._vae_dir, torch_dtype=dtype, local_files_only=True)
         vae.to(device=torch.device("cuda", LOGICAL_DEVICE_INDEX),
                dtype=dtype).eval()
-        if self._tiled_decode and not reference:
+        if self._tiled_decode:
             vae.enable_tiling(
                 tile_sample_min_height=TILED_DECODE_TILE,
                 tile_sample_min_width=TILED_DECODE_TILE,
@@ -781,5 +912,7 @@ class Qwen21DiffusersAdapter:
         self._progress_callback = None
         self._joint_tokens = None
         self._reference_latents_hook = None
+        self._reference_vae_latents = None
+        self._reference_latents_box = None
         if inner is not None:
             inner.close()

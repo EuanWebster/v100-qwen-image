@@ -119,7 +119,7 @@ for the chosen preset area; the server recomputes nothing (§5).
 | upload/validation/thumbnail | web process (CPU) | new, §2.4 |
 | PIL resize → VL pixels + white composite | encoder child (CPU) | §1.7 |
 | Qwen3-VL forward (embeds, masks) | encoder child (CPU) | as today |
-| reference VAE encode | GPU parent | inside `__call__` `prepare_latents`, §1.6 |
+| reference VAE encode | GPU parent | during **load**, VAE alone before the transformer loads (§1.6 amendment 2) |
 | noise + denoise loop | GPU | upstream `__call__` loop, §1.6 |
 | decode | GPU (reloaded VAE) | unchanged |
 
@@ -138,9 +138,16 @@ height=…, width=…)` then runs upstream's own reference VAE encode (`prepare_
 KV cache and denoise loop unchanged, so no loop-drift guard is needed. Rejected
 alternative: an adapter-owned copy of the denoise loop reproducing the pinned inputs
 input-for-input with a frozen-hash drift test (rejected: the override keeps upstream's
-own loop as the single source of truth). Consequence: the VAE must be resident during
-`__call__`'s `prepare_latents`, so the per-call phase plan in
-`adapters/qwen21_diffusers.py` changes — root designs that with the adapter coder.
+own loop as the single source of truth). ~~Consequence: the VAE must be resident
+during `__call__`'s `prepare_latents`~~ **(amendment 2, measured on the V100):** a
+mid-`__call__` VAE restore beside the resident transformer OOMs (15.05 GiB
+allocated, +384 MiB requested, 1-reference 1K edit). The loader therefore encodes
+every reference at LOAD time through the pipeline's own
+`calculate_dimensions`/`image_processor`/`_encode_vae_image` while the VAE is the
+only resident component (`reference_vae_encode` stage), drops the VAE, then loads
+the transformer; a per-call `_encode_vae_image` override returns the stored
+latents in order inside `prepare_latents` (removed in `finally`, refusal on
+signature drift or count/geometry mismatch).
 
 ### 1.7 Passing reference images to the encoder child (IPC)
 
@@ -418,7 +425,7 @@ Interfaces frozen here; T2-T4 start only after T1's helpers land.
   `encode_prompt` instance override injecting the cached `image_pad_mask` + phase
   plan + calibration facts — no copied loop, §1.6 amendment), `image_output.py`
   untouched; tests. Delivers the §4 measurement script too. Phase plan co-designed
-  with root (VAE resident during `__call__`'s `prepare_latents`).
+  with root (reference VAE encode at load, VAE alone; §1.6 amendment 2).
 - **T2 encoder child** — `encoder.py` (request v3, `image_files` wire key),
   `encoder_client.py` (pass paths), `encoder_production.py` (policy/mask rules,
   `image=` call), `encoder_worker.py` (bounded read + hash bind + decode caps),

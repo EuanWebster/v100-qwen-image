@@ -447,7 +447,7 @@ def test_reference_images_load_in_order_with_duplicates(setup, monkeypatch):
     supplied, config, open_calls = _reference_run(
         setup, monkeypatch, ("first", "second", "first"),
         {b"first": first, b"second": second})
-    images = supplied._load_reference_images(config)
+    images = module.load_reference_images(config, supplied._image)
     assert images == [first, second, first]
     assert all(image.loaded for image in images)
     assert open_calls == [b"first", b"second", b"first"]
@@ -457,10 +457,10 @@ def test_reference_images_load_in_order_with_duplicates(setup, monkeypatch):
 def test_reference_images_require_id_and_store_pair(setup, monkeypatch):
     supplied, config, _ = _reference_run(setup, monkeypatch, (), {})
     with pytest.raises(EngineError, match="without ids or the store"):
-        supplied._load_reference_images(config)
+        module.load_reference_images(config, supplied._image)
     config2 = SimpleNamespace(references=("first",), references_dir=None)
     with pytest.raises(EngineError, match="without ids or the store"):
-        supplied._load_reference_images(config2)
+        module.load_reference_images(config2, supplied._image)
     supplied.close()
 
 
@@ -468,17 +468,17 @@ def test_reference_decode_failures_are_typed(tmp_path, setup, monkeypatch):
     big = _FakePIL((5000, 40))
     supplied, config, _ = _reference_run(setup, monkeypatch, ("big",), {b"big": big})
     with pytest.raises(EngineError, match="must not exceed"):
-        supplied._load_reference_images(config)
+        module.load_reference_images(config, supplied._image)
     supplied.close()
     supplied, config, _ = _reference_run(setup, monkeypatch, ("broken",),
                                          {b"broken": _FakePIL()}, fail_open=(b"broken",))
     with pytest.raises(EngineError, match="cannot be decoded"):
-        supplied._load_reference_images(config)
+        module.load_reference_images(config, supplied._image)
     supplied.close()
     supplied, config, _ = _reference_run(setup, monkeypatch, ("truncated",),
                                          {b"truncated": _FakePIL(fail=True)})
     with pytest.raises(EngineError, match="cannot be decoded"):
-        supplied._load_reference_images(config)
+        module.load_reference_images(config, supplied._image)
     supplied.close()
 
 
@@ -503,8 +503,9 @@ def test_reference_store_read_errors_propagate_verbatim(setup, monkeypatch):
     supplied.load(setup.config, setup.bundle.to_assets())
     supplied._image = SimpleNamespace(Image=None)
     with pytest.raises(ReferenceStoreError, match="hash mismatch"):
-        supplied._load_reference_images(
-            SimpleNamespace(references=("first",), references_dir="/store"))
+        module.load_reference_images(
+            SimpleNamespace(references=("first",), references_dir="/store"),
+            supplied._image)
     supplied.close()
 
 

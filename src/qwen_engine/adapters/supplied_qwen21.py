@@ -34,6 +34,45 @@ _ENCODE_PROMPT_PARAMETERS = ("prompt", "image", "device", "num_images_per_prompt
                              "prompt_embeds", "prompt_embeds_mask", "image_pad_mask")
 
 
+def load_reference_images(config, image_module):
+    """Hash-verified reference PILs in config order (module-level so the
+    loader can use it BEFORE the bridge is attached; ``image_module`` is the
+    caller's PIL.Image — the injection seam the supplied-adapter tests use).
+
+    Bytes come through ``reference_store.read_blob`` (bounded read +
+    sha256 == id recheck), so a blob replaced mid-run fails closed before
+    any decode. Decoding is capped: the declared side lengths are checked
+    against the store side bound first, then the pixels are loaded (PIL's
+    own decompression-bomb guard is the pixel-count backstop). Both views
+    of a run — the loader's load-phase reference VAE encode and this
+    adapter's ``reference_images`` — read the same store ids, so identical,
+    re-verified bytes are what each sees.
+    """
+    references = tuple(getattr(config, "references", ()))
+    directory = getattr(config, "references_dir", None)
+    if not references or directory is None:
+        raise EngineError("reference loading requested without ids or the store directory")
+    images = []
+    for position, reference_id in enumerate(references, start=1):
+        raw = reference_store.read_blob(directory, reference_id)
+        try:
+            image = image_module.open(io.BytesIO(raw))
+            width, height = image.size
+            if (not 1 <= width <= reference_store.MAX_REFERENCE_DIM
+                    or not 1 <= height <= reference_store.MAX_REFERENCE_DIM):
+                raise EngineError(
+                    f"reference {position} decodes to {width}x{height}; each side "
+                    f"must not exceed {reference_store.MAX_REFERENCE_DIM} pixels")
+            image.load()
+        except EngineError:
+            raise
+        except Exception:
+            raise EngineError(
+                f"reference {position} cannot be decoded as an image") from None
+        images.append(image)
+    return images
+
+
 def _libraries():
     from qwen_engine.encoder_identity import observe_installed_packages, validate_installed_packages
     validate_installed_packages(observe_installed_packages())
@@ -124,8 +163,19 @@ class SuppliedQwen21Adapter:
         pipe = self._pipeline
         if type(pipe) is not classes[0]:
             raise EngineError("supplied pipeline must be the exact pinned Qwen21 class")
-        components = (pipe, pipe.transformer, pipe.vae, pipe.scheduler)
-        if any(type(value) is not cls for value, cls in zip(components, classes)):
+        # A reference run does not require the VAE resident at load time:
+        # the loader computed the reference latents during load
+        # (reference_vae_encode), dropped the VAE before the transformer
+        # was loaded, and restores a fresh one for decode with its own
+        # tiling policy. Every other run demands full exact placement.
+        references = bool(tuple(getattr(config, "references", ())))
+        if references:
+            components = (pipe, pipe.transformer, pipe.scheduler)
+            expected = (classes[0], classes[1], classes[3])
+        else:
+            components = (pipe, pipe.transformer, pipe.vae, pipe.scheduler)
+            expected = classes
+        if any(type(value) is not cls for value, cls in zip(components, expected)):
             raise EngineError("supplied components must be the exact pinned Qwen21 classes")
         if pipe.text_encoder is not None or getattr(pipe, "_all_hooks", None):
             raise EngineError("resident generation must not retain an encoder/offload hooks")
@@ -133,7 +183,7 @@ class SuppliedQwen21Adapter:
         device = pipe._execution_device
         if self.execution_dtype == "fp32" and str(device).split(":", 1)[0] != "cpu":
             raise EngineError("fp32 supplied execution is CPU-witness-only")
-        for model in (pipe.transformer, pipe.vae):
+        for model in ((pipe.transformer,) if references else (pipe.transformer, pipe.vae)):
             if any(getattr(module, "_hf_hook", None) is not None for module in model.modules()):
                 raise EngineError("resident components must not have dispatch/offload hooks")
             if model is pipe.transformer and config.quant is Quant.Q8:
@@ -143,15 +193,22 @@ class SuppliedQwen21Adapter:
                 raise EngineError("supplied model placement/dtype disagrees with execution policy")
             if model.training:
                 raise EngineError("supplied components must already be in evaluation mode")
+        # latent_channels is projected from the live VAE's z_dim at pipeline
+        # construction, so a non-64 z_dim fails here even when the VAE has
+        # already left the card for a reference run.
         if (pipe.vae_scale_factor != 16 or pipe.latent_channels != 64
-                or pipe.vae.config.z_dim != 64 or pipe.transformer.config.in_channels != 64
-                or pipe.transformer.config.out_channels != 64):
+                or pipe.transformer.config.in_channels != 64
+                or pipe.transformer.config.out_channels != 64
+                or (pipe.vae is not None and pipe.vae.config.z_dim != 64)):
             raise EngineError("unsupported latent architecture")
         pipe.transformer.set_attention_backend("native")
-        if config.vae_tiled_decode:
-            pipe.vae.enable_tiling()
-        else:
-            pipe.vae.disable_tiling()
+        if pipe.vae is not None:
+            # Only meaningful for a still-resident VAE; the decode VAE is
+            # restored fresh by the loader with its own tiling policy.
+            if config.vae_tiled_decode:
+                pipe.vae.enable_tiling()
+            else:
+                pipe.vae.disable_tiling()
         self._torch, self._image, self._device, self._dtype = torch, image, device, dtype
         self._config, self._state = config, "loaded"
 
@@ -230,33 +287,8 @@ class SuppliedQwen21Adapter:
         """
         self._check("encoded", config)
         if self._reference_pils is None:
-            self._reference_pils = self._load_reference_images(config)
+            self._reference_pils = load_reference_images(config, self._image)
         return self._reference_pils
-
-    def _load_reference_images(self, config):
-        references = tuple(getattr(config, "references", ()))
-        directory = getattr(config, "references_dir", None)
-        if not references or directory is None:
-            raise EngineError("reference loading requested without ids or the store directory")
-        images = []
-        for position, reference_id in enumerate(references, start=1):
-            raw = reference_store.read_blob(directory, reference_id)
-            try:
-                image = self._image.open(io.BytesIO(raw))
-                width, height = image.size
-                if (not 1 <= width <= reference_store.MAX_REFERENCE_DIM
-                        or not 1 <= height <= reference_store.MAX_REFERENCE_DIM):
-                    raise EngineError(
-                        f"reference {position} decodes to {width}x{height}; each side "
-                        f"must not exceed {reference_store.MAX_REFERENCE_DIM} pixels")
-                image.load()
-            except EngineError:
-                raise
-            except Exception:
-                raise EngineError(
-                    f"reference {position} cannot be decoded as an image") from None
-            images.append(image)
-        return images
 
     def _install_image_pad_mask_hook(self, pairs):
         """Install a per-call instance override of the pinned ``encode_prompt``.

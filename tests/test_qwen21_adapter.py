@@ -529,97 +529,240 @@ def test_joint_chunking_is_decided_after_encode_once(monkeypatch):
     assert applied == []
 
 
-class _PrepareLatentsPipe:
-    def __init__(self, boom=False):
-        self.vae = None
-        self.transformer = object()
+_VAE_PIXEL_SHAPE = (1, 4, 1, 1024, 1024)  # pinned preprocessed reference input
+
+
+class _Latent:
+    """Minimal tensor witness: shape/dtype/device plus detach/to only."""
+    def __init__(self, tag, shape=(1, 64, 1, 2, 2), device="cpu", dtype="fp16"):
+        self.tag, self.shape, self.device, self.dtype = tag, tuple(shape), device, dtype
+    def detach(self):
+        return self
+    def to(self, device=None, dtype=None):
+        return _Latent(self.tag, self.shape, device, dtype)
+
+
+class _Pending:
+    def __init__(self, tag):
+        self.tag = tag
+    def unsqueeze(self, dimension):
+        assert dimension == 2  # the pinned call shape
+        # Pixels are not latents: the pinned VAE input for a reference is
+        # (1, 4, 1, 1024, 1024) while the fake latent is (1, 64, 1, 2, 2);
+        # an equal-shape fake would hide the pixel/latent confusion.
+        return _Latent(self.tag, shape=_VAE_PIXEL_SHAPE)
+
+
+class _RecordingImageProcessor:
+    def __init__(self):
+        self.preprocessed = []
+    def preprocess(self, image, width=None, height=None):
+        self.preprocessed.append((image.mode, width, height))
+        return _Pending(tag=f"pre-{len(self.preprocessed)}")
+
+
+class _VaeWitnessPipe:
+    """Pinned-shape witness for the load-phase encode and the per-call
+    override: bound signature ``_encode_vae_image(image, generator)``, a
+    recording ``image_processor``, deterministic per-call latents."""
+    def __init__(self):
         self.calls = []
-        self.boom = boom
-
-    def prepare_latents(self, **kwargs):
-        self.calls.append(kwargs)
-        if self.boom:
-            raise RuntimeError("pinned prepare_latents failed")
-        return "latents"
+        self.latent_channels = 64
+        self.image_processor = _RecordingImageProcessor()
+    def _encode_vae_image(self, image, generator):
+        self.calls.append((image, generator))
+        return _Latent(f"encoded-{len(self.calls)}")
 
 
-def _residency_adapter(pipe):
+class _DriftPipe(_VaeWitnessPipe):
+    def _encode_vae_image(self, image, generator, scale=1.0):
+        return None
+
+
+def _install_fake_diffusers_calc(monkeypatch):
+    """Stub ONLY the module the lazy calculate_dimensions import targets;
+    the fake echoes the pinned square target for any ratio."""
+    import sys
+    import types
+    leaf = types.ModuleType("diffusers.pipelines.qwenimage21.pipeline_qwenimage21")
+    leaf.calculate_dimensions = lambda area, ratio: (int(area ** 0.5), int(area ** 0.5), None)
+    for name in ("diffusers", "diffusers.pipelines", "diffusers.pipelines.qwenimage21"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "diffusers.pipelines.qwenimage21.pipeline_qwenimage21", leaf)
+
+
+class _GradMode:
+    """Witness that the load-phase encode runs grad-free: counts entries
+    into the fake torch.no_grad() context."""
+    def __init__(self):
+        self.entered = 0
+    def __call__(self):
+        grad = self
+        class _Ctx:
+            def __enter__(self):
+                grad.entered += 1
+            def __exit__(self, *exc):
+                return False
+        return _Ctx()
+
+
+def _stub_torch():
+    from types import SimpleNamespace
+    return SimpleNamespace(float16="fp16", float32="fp32", no_grad=_GradMode())
+
+
+def test_encode_reference_latents_uses_the_pinned_preprocessing(tmp_path, monkeypatch):
+    from PIL import Image as PILImage
+    _install_fake_diffusers_calc(monkeypatch)
+    pipe = _VaeWitnessPipe()
+    adapter = cli._make_adapter()
+    images = [PILImage.new("RGB", (64, 32), (200, 10, 10)),
+              PILImage.new("RGBA", (32, 64), (10, 10, 200, 255))]
+    torch_stub = _stub_torch()
+    latents = adapter._encode_reference_latents(pipe, images, torch_stub, ("cuda", 0))
+    # Both inputs reach the VAE as RGBA resized to the pinned
+    # output_resolution target; the generator is None (argmax sampling), so
+    # the latents are generator-independent.
+    assert pipe.image_processor.preprocessed == [("RGBA", 1024, 1024), ("RGBA", 1024, 1024)]
+    assert [generator for _, generator in pipe.calls] == [None, None]
+    assert [(tensor.device, tensor.dtype) for tensor, _ in pipe.calls] == [
+        (("cuda", 0), "fp16"), (("cuda", 0), "fp16")]
+    # Stored off-card, in pipeline order, as (input PIXEL shape, latent)
+    # pairs: the per-call override can only ever witness the pipeline's
+    # pixel tensor, and here the pixel (1, 4, 1, 1024, 1024) genuinely
+    # differs from the latent (1, 64, 1, 2, 2) — the shapes the GPU run
+    # produced, where an equal-shape comparison rejected every run.
+    assert [(shape, latent.tag) for shape, latent in latents] == [
+        ((1, 4, 1, 1024, 1024), "encoded-1"),
+        ((1, 4, 1, 1024, 1024), "encoded-2")]
+    assert all(latent.device == "cpu" for _, latent in latents)
+    # The pinned __call__ carries @torch.no_grad(); _encode_vae_image does
+    # not, so the load phase must enter it per encode — traced encoder
+    # activations (~14 GiB per 1024² reference on the V100) OOM the SECOND
+    # reference before the transformer is even placed.
+    assert torch_stub.no_grad.entered == 2
+
+
+def test_encode_reference_latents_refuses_drift_and_bad_shape(tmp_path, monkeypatch):
+    from PIL import Image as PILImage
+    _install_fake_diffusers_calc(monkeypatch)
+    adapter = cli._make_adapter()
+    images = [PILImage.new("RGB", (64, 32), (1, 2, 3))]
+    with pytest.raises(EngineError, match="signature"):
+        adapter._encode_reference_latents(_DriftPipe(), images, _stub_torch(), ("cuda", 0))
+
+    class _BadShape(_VaeWitnessPipe):
+        def _encode_vae_image(self, image, generator):
+            return _Latent("wide", shape=(4, 64, 1, 2, 2))
+
+    with pytest.raises(EngineError, match="unexpected VAE latent shape"):
+        adapter._encode_reference_latents(_BadShape(), images, _stub_torch(), ("cuda", 0))
+
+
+def test_reference_latents_override_serves_stored_latents_in_order():
+    pipe = _VaeWitnessPipe()
     adapter = cli._make_adapter()
     adapter._pipeline = pipe
-    adapter._order = order = []
-    adapter._restore_vae = lambda **kwargs: order.append(("restore", kwargs))
-    adapter._release_vae = lambda: order.append("release")
-    return adapter, order
-
-
-def test_reference_latents_hook_is_per_call_and_idempotent_to_remove():
-    pipe = _PrepareLatentsPipe()
-    adapter, order = _residency_adapter(pipe)
+    adapter._reference_vae_latents = (
+        (_VAE_PIXEL_SHAPE, _Latent("first")),
+        (_VAE_PIXEL_SHAPE, _Latent("second")))
     adapter._install_reference_latents_hook()
-    assert "prepare_latents" in vars(pipe)
-    assert pipe.prepare_latents(x=1) == "latents"
-    assert pipe.calls == [{"x": 1}]
-    # VAE resident ONLY for the encode: restored (fp16 policy flag) and released
-    # again before anything else in the call can allocate.
-    assert order == [("restore", {"reference": True}), "release"]
+    assert "_encode_vae_image" in vars(pipe)
+    served = [pipe._encode_vae_image(
+        _Latent(f"in-{i}", shape=_VAE_PIXEL_SHAPE, device=("cuda", 0), dtype="fp16"),
+        None) for i in range(2)]
+    assert [latent.tag for latent in served] == ["first", "second"]
+    assert all(latent.device == ("cuda", 0) and latent.dtype == "fp16"
+               for latent in served)
+    with pytest.raises(EngineError, match="more reference VAE encodes"):
+        pipe._encode_vae_image(_Latent("in-3", shape=_VAE_PIXEL_SHAPE), None)
     adapter._remove_reference_latents_hook()
-    assert "prepare_latents" not in vars(pipe)
-    assert pipe.prepare_latents(x=2) == "latents"  # pinned method restored verbatim
-    adapter._remove_reference_latents_hook()       # idempotent
+    assert "_encode_vae_image" not in vars(pipe)
+    adapter._remove_reference_latents_hook()  # idempotent
 
 
-def test_reference_latents_hook_releases_vae_after_a_failure():
-    pipe = _PrepareLatentsPipe(boom=True)
-    adapter, order = _residency_adapter(pipe)
+def test_override_refuses_geometry_drift():
+    pipe = _VaeWitnessPipe()
+    adapter = cli._make_adapter()
+    adapter._pipeline = pipe
+    # Two stored pairs: a refused encode still POPs (the run dies on the
+    # refusal, but the box must not be double-spent).
+    adapter._reference_vae_latents = ((_VAE_PIXEL_SHAPE, _Latent("stored")),
+                                      (_VAE_PIXEL_SHAPE, _Latent("next")))
     adapter._install_reference_latents_hook()
-    with pytest.raises(RuntimeError, match="pinned"):
-        pipe.prepare_latents()
-    assert order == [("restore", {"reference": True}), "release"]
+    with pytest.raises(EngineError, match="preprocessing disagrees"):
+        pipe._encode_vae_image(_Latent("tall", shape=(1, 4, 1, 512, 512)), None)
+    # A LATENT-shaped input — the identity the buggy pixel-vs-latent
+    # comparison could never satisfy — must also refuse: only the pixel
+    # geometry is the witness.
+    with pytest.raises(EngineError, match="preprocessing disagrees"):
+        pipe._encode_vae_image(_Latent("latent-shaped", shape=(1, 64, 1, 2, 2)), None)
     adapter._remove_reference_latents_hook()
 
 
-def test_reference_latents_hook_refuses_double_install_and_missing_method():
+def test_override_refuses_missing_method_missing_latents_drift_and_stale():
     from types import SimpleNamespace
     adapter = cli._make_adapter()
-    adapter._pipeline = SimpleNamespace()  # no prepare_latents at all
-    with pytest.raises(EngineError):
+    adapter._pipeline = SimpleNamespace()  # no _encode_vae_image at all
+    with pytest.raises(EngineError, match="pinned _encode_vae_image"):
         adapter._install_reference_latents_hook()
-    pipe = _PrepareLatentsPipe()
-    pipe.prepare_latents = lambda **kwargs: None  # stale override in instance vars
+    pipe = _VaeWitnessPipe()
     adapter._pipeline = pipe
-    with pytest.raises(EngineError):
+    adapter._reference_vae_latents = None
+    with pytest.raises(EngineError, match="no VAE latents prepared"):
+        adapter._install_reference_latents_hook()
+    drift = cli._make_adapter()
+    drift._pipeline = _DriftPipe()
+    drift._reference_vae_latents = ((_VAE_PIXEL_SHAPE, _Latent("a")),)
+    with pytest.raises(EngineError, match="signature"):
+        drift._install_reference_latents_hook()
+    adapter._reference_vae_latents = ((_VAE_PIXEL_SHAPE, _Latent("a")),)
+    pipe._encode_vae_image = lambda image, generator: None  # stale override in vars
+    with pytest.raises(EngineError, match="already installed"):
         adapter._install_reference_latents_hook()
 
 
 @needs_references
 def test_reference_denoise_wraps_inner_call_and_always_removes(monkeypatch, tmp_path):
     class Inner:
-        def __init__(self, pipe, order):
-            self.pipe, self.order = pipe, order
-
+        def __init__(self, pipe, order, consume):
+            self.pipe, self.order, self.consume = pipe, order, consume
         def denoise(self, config, conditioning):
-            self.order.append("override" if "prepare_latents" in vars(self.pipe) else "bare")
+            self.order.append("override" if "_encode_vae_image" in vars(self.pipe) else "bare")
+            for _ in range(self.consume):
+                self.pipe._encode_vae_image(
+                    _Latent("in", shape=_VAE_PIXEL_SHAPE), None)
             if conditioning == "boom":
                 raise EngineError("inner refusal")
             return ["latents"]
 
-    pipe = _PrepareLatentsPipe()
+    pipe = _VaeWitnessPipe()
     order = []
     adapter = cli._make_adapter()
     adapter._pipeline = pipe
-    adapter._inner = Inner(pipe, order)
     adapter._joint_tokens = 100
+    adapter._reference_vae_latents = ((_VAE_PIXEL_SHAPE, _Latent("a")),
+                                      (_VAE_PIXEL_SHAPE, _Latent("b")))
     monkeypatch.setattr(adapter, "_apply_joint_chunking", lambda: order.append("chunk"))
     monkeypatch.setattr(adapter, "_release_vae", lambda: None)
     monkeypatch.setattr(adapter, "_release_denoiser", lambda: None)
     config = _reference_config(tmp_path)
+
+    adapter._inner = Inner(pipe, order, consume=2)
     assert adapter.denoise(config, "cond") == ["latents"]
     assert order == ["chunk", "override"]
-    assert "prepare_latents" not in vars(pipe) and adapter._reference_latents_hook is None
+    assert "_encode_vae_image" not in vars(pipe) and adapter._reference_latents_hook is None
+    assert adapter._reference_latents_box is None
+
+    adapter._inner = Inner(pipe, order, consume=1)  # a truncated consumption
+    with pytest.raises(EngineError, match="consumed 1 of 2"):
+        adapter.denoise(config, "cond")
+    assert "_encode_vae_image" not in vars(pipe)    # removed even on refusal
+
+    adapter._inner = Inner(pipe, order, consume=0)
     with pytest.raises(EngineError, match="inner"):
         adapter.denoise(config, "boom")
-    assert order[-1] == "override"
-    assert "prepare_latents" not in vars(pipe)  # finally removed even on failure
+    assert "_encode_vae_image" not in vars(pipe)    # the finally always removes
 
 
 @needs_references
@@ -649,32 +792,181 @@ def test_encode_derives_joint_tokens_and_facts_merge_them(tmp_path):
 def test_t2i_denoise_path_never_touches_reference_hooks(tmp_path, monkeypatch):
     class Inner:
         def denoise(self, config, conditioning):
-            assert "prepare_latents" not in vars(pipe)
+            assert "_encode_vae_image" not in vars(pipe)
             return ["latents"]
 
-    pipe = _PrepareLatentsPipe()
+    pipe = _VaeWitnessPipe()
     adapter = cli._make_adapter()
     adapter._pipeline = pipe
     adapter._inner = Inner()
     monkeypatch.setattr(adapter, "_release_vae", lambda: None)
     monkeypatch.setattr(adapter, "_release_denoiser", lambda: None)
     assert adapter.denoise(_config(tmp_path), None) == ["latents"]
-    assert pipe.calls == []
+    assert pipe.calls == [] and pipe.image_processor.preprocessed == []
 
 
-def test_reference_vae_restore_stays_fp16_untiled_even_for_tiled_decode():
-    from types import SimpleNamespace
-    order = []
+@needs_references
+def test_close_drops_reference_latents():
     adapter = cli._make_adapter()
-    pipe = SimpleNamespace(vae=None)
-    adapter._pipeline = pipe
-    adapter._vae_cls = _FakeVaeClass(order)
-    adapter._vae_dir = "/models/vae"
-    adapter._torch = SimpleNamespace(float16="fp16", float32="fp32",
-                                     device=lambda *a: ("cuda", a[1]))
-    adapter._tiled_decode = True
-    adapter._restore_vae(reference=True)
-    path, kwargs = adapter._vae_cls.calls[0]
-    assert kwargs == {"torch_dtype": "fp16", "local_files_only": True}
-    assert pipe.vae.tiling is False
-    assert pipe.vae.moved == {"device": ("cuda", 0), "dtype": "fp16"}
+    adapter._reference_vae_latents = ((_VAE_PIXEL_SHAPE, _Latent("a")),)
+    adapter._reference_latents_box = [_Latent("a")]
+    adapter.close()
+    assert adapter._reference_vae_latents is None
+    assert adapter._reference_latents_box is None
+
+
+# -- load-phase residency order over the REAL supplied bridge --------------------
+
+
+def _load_env(tmp_path, monkeypatch, references):
+    """One full loader.load over fakes, real bundle/manifest/bridge.
+
+    Returns (adapter, order, pipe): ORDER records every component
+    load/encode so the residency order is directly assertable, and the
+    real SuppliedQwen21Adapter attachment proves the relaxed reference-run
+    component gate accepts a VAE that already left the card."""
+    import hashlib
+    import io
+    import json
+    from types import SimpleNamespace
+    from PIL import Image as PILImage
+    from qwen_engine import reference_store
+    from qwen_engine.adapters import qwen21_diffusers as qd
+    from qwen_engine.adapters import supplied_qwen21 as sp
+    from qwen_engine.local_bundle import (BASE_PROFILE, LOCAL_REFERENCE_LAYOUT,
+                                          resolve_local_bundle)
+    from qwen_engine.manifest import load_manifest
+
+    order = []
+    root = tmp_path / "models"
+    artifacts = []
+    for role, names in LOCAL_REFERENCE_LAYOUT.items():
+        for name in names:
+            raw = f"{role}:{name}".encode()
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+            artifacts.append({"role": role, "repo": BASE_PROFILE.repo,
+                              "revision": BASE_PROFILE.revision, "filename": name,
+                              "sha256": hashlib.sha256(raw).hexdigest(),
+                              "bytes": len(raw)})
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps({"schema_version": 1, "artifacts": artifacts}))
+
+    dev = SimpleNamespace(type="cpu")
+
+    class _Param:
+        is_meta = False
+        device = dev
+        dtype = "fp16"
+
+    class _FakeTransformer:
+        training = False
+
+        def __init__(self):
+            self.config = SimpleNamespace(in_channels=64, out_channels=64,
+                                          context_in_dim=16)
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            order.append("load-transformer")
+            return cls()
+        def to(self, **kwargs):
+            return self
+        def eval(self):
+            return self
+        def parameters(self):
+            return iter([_Param()])
+        def modules(self):
+            return iter([self])
+        def set_attention_backend(self, name):
+            self.backend = name
+
+    class _FakeVae(_FakeTransformer):
+        def __init__(self):
+            self.config = SimpleNamespace(z_dim=64)
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            order.append("load-vae")
+            return cls()
+        def enable_tiling(self, **kwargs):
+            pass
+        def disable_tiling(self):
+            pass
+
+    class _FakeScheduler:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            return cls()
+
+    class _FakeProcessor:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            return cls()
+
+    class _FakePipe:
+        def __init__(self, scheduler, vae, text_encoder, processor, transformer,
+                     sample_sigmas=None):
+            self.scheduler, self.vae, self.text_encoder = scheduler, vae, text_encoder
+            self.processor, self.transformer = processor, transformer
+            self.vae_scale_factor = 16
+            self.latent_channels = vae.config.z_dim if vae is not None else 64
+            self.image_processor = _RecordingImageProcessor()
+            self._execution_device = dev
+            self.encode_calls = []
+        def _encode_vae_image(self, image, generator):
+            order.append("encode")
+            self.encode_calls.append((image, generator))
+            return _Latent("reference-latent")
+
+    torch = SimpleNamespace(float16="fp16", float32="fp32", no_grad=_GradMode(),
+                            device=lambda kind, index: (kind, index))
+    runtime = SimpleNamespace(matches_cuda_device=lambda **kwargs: True,
+                              sha256="f" * 64)
+    monkeypatch.setattr(qd, "_libraries", lambda: (
+        torch, _FakePipe, _FakeTransformer, _FakeVae, _FakeScheduler, _FakeProcessor))
+    monkeypatch.setattr(sp, "_libraries", lambda: (
+        torch, SimpleNamespace(), (_FakePipe, _FakeTransformer, _FakeVae, _FakeScheduler)))
+    monkeypatch.setattr(qd, "_require_v100",
+                        lambda _torch: SimpleNamespace(uuid="GPU-fake"))
+    monkeypatch.setattr(qd, "attach_cuda", lambda _torch: None)
+    monkeypatch.setattr(qd, "observe_generation_runtime", lambda: runtime)
+    _install_fake_diffusers_calc(monkeypatch)
+
+    values = dict(manifest_path=str(manifest_path), models_dir=str(root),
+                  width=256, height=256)
+    if references:
+        store = tmp_path / "store"
+        store.mkdir()
+        stream = io.BytesIO()
+        PILImage.new("RGB", (48, 32), (9, 99, 200)).save(stream, format="PNG")
+        values.update(references=(reference_store.put_bytes(store, stream.getvalue()),),
+                      references_dir=str(store))
+    adapter = cli._make_adapter()
+    assets = resolve_local_bundle(load_manifest(manifest_path), root).to_assets()
+    adapter.load(_config(tmp_path, **values), assets)
+    return adapter, order, adapter._pipeline
+
+
+@needs_references
+def test_reference_load_encodes_before_the_transformer_and_attaches(tmp_path, monkeypatch):
+    adapter, order, pipe = _load_env(tmp_path, monkeypatch, references=True)
+    # The measured OOM fix, witnessed: the VAE encodes alone, leaves the
+    # card, and only then does the transformer load.
+    assert order == ["load-vae", "encode", "load-transformer"]
+    assert len(adapter._reference_vae_latents) == 1
+    assert pipe.vae is None                      # VAE off the card at sampling load-in
+    assert pipe.transformer is not None
+    assert pipe.encode_calls[0][1] is None       # argmax: generator-independent
+    # The REAL bridge attached with a non-resident VAE (relaxed reference gate).
+    assert adapter._inner._state == "loaded"
+    adapter.close()
+
+
+@needs_references
+def test_t2i_load_order_and_attachment_are_unchanged(tmp_path, monkeypatch):
+    adapter, order, pipe = _load_env(tmp_path, monkeypatch, references=False)
+    assert order == ["load-transformer", "load-vae"]   # unchanged T2I sequence
+    assert pipe.vae is not None                        # resident, as before
+    assert adapter._reference_vae_latents is None
+    assert adapter._inner._state == "loaded"
+    adapter.close()
