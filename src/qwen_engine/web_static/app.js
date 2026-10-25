@@ -110,14 +110,94 @@
     return s.replace(/^[\x20\x09\x0A\x0B\x0C\x0D\x1C\x1D\x1E\x1F\x85\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]+|[\x20\x09\x0A\x0B\x0C\x0D\x1C\x1D\x1E\x1F\x85\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]+$/g, '');
   }
 
+  // BEGIN GENERATED PRESETS (scripts/sync_presets.py)
   var PRESETS = {
-    square:    { width: 1024, height: 1024 },
-    landscape: { width: 1344, height: 768 },
-    portrait:  { width: 768,  height: 1344 },
-    square2k:    { width: 2048, height: 2048 },
-    landscape2k: { width: 2688, height: 1536 },
-    portrait2k:  { width: 1536, height: 2688 }
+    "square": {
+      "width": 1024,
+      "height": 1024,
+      "ratio": "1:1",
+      "tier": "1K"
+    },
+    "square2k": {
+      "width": 2048,
+      "height": 2048,
+      "ratio": "1:1",
+      "tier": "2K"
+    },
+    "fourthree": {
+      "width": 1152,
+      "height": 864,
+      "ratio": "4:3",
+      "tier": "1K"
+    },
+    "fourthree2k": {
+      "width": 2400,
+      "height": 1792,
+      "ratio": "4:3",
+      "tier": "2K"
+    },
+    "threefour": {
+      "width": 864,
+      "height": 1152,
+      "ratio": "3:4",
+      "tier": "1K"
+    },
+    "threefour2k": {
+      "width": 1792,
+      "height": 2400,
+      "ratio": "3:4",
+      "tier": "2K"
+    },
+    "threetwo": {
+      "width": 1248,
+      "height": 832,
+      "ratio": "3:2",
+      "tier": "1K"
+    },
+    "threetwo2k": {
+      "width": 2528,
+      "height": 1696,
+      "ratio": "3:2",
+      "tier": "2K"
+    },
+    "twothree": {
+      "width": 832,
+      "height": 1248,
+      "ratio": "2:3",
+      "tier": "1K"
+    },
+    "twothree2k": {
+      "width": 1696,
+      "height": 2528,
+      "ratio": "2:3",
+      "tier": "2K"
+    },
+    "landscape": {
+      "width": 1344,
+      "height": 768,
+      "ratio": "16:9",
+      "tier": "1K"
+    },
+    "landscape2k": {
+      "width": 2752,
+      "height": 1536,
+      "ratio": "16:9",
+      "tier": "2K"
+    },
+    "portrait": {
+      "width": 768,
+      "height": 1344,
+      "ratio": "9:16",
+      "tier": "1K"
+    },
+    "portrait2k": {
+      "width": 1536,
+      "height": 2752,
+      "ratio": "9:16",
+      "tier": "2K"
+    }
   };
+  // END GENERATED PRESETS
 
   var VIEWS = { create: 'view-create', history: 'view-history', settings: 'view-settings' };
   var VIEW_HEADINGS = { create: 'create-heading', history: 'history-heading', settings: 'settings-heading' };
@@ -1650,6 +1730,16 @@
   /* ---------------- Wiring ---------------- */
 
   function init() {
+    Object.keys(PRESETS).forEach(function (name) {
+      var preset = PRESETS[name];
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'preset-btn';
+      button.dataset.preset = name;
+      button.setAttribute('aria-pressed', String(name === 'square'));
+      button.textContent = preset.ratio + ' · ' + preset.width + '×' + preset.height;
+      $('presets-' + preset.tier.toLowerCase()).appendChild(button);
+    });
     $('create-form').addEventListener('submit', function (ev) {
       ev.preventDefault();
       promptTouched = true;

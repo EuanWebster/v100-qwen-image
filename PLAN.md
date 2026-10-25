@@ -454,7 +454,7 @@ sizes and conditioning lengths, recipe/schedule, alpha/decode mode and quant.
 Use fresh GPU/host budgets with measured headroom; invent no fixed memory or
 latency thresholds. Model downloads remain an explicit operator action.
 
-- **8.1 — All recommended aspect presets.** Add the complete table below to the
+- **8.1 — All recommended aspect presets (implemented 2026-10-25; per-shape GPU calibration pending).** Add the complete table below to the
   shared preset source and both front-ends. These are rounded upstream pixel
   sizes associated with nominal ratio labels. Replace/correct the current
   2688×1536 / 1536×2688 convenience presets when labeling canonical 16:9/9:16;
@@ -476,6 +476,13 @@ latency thresholds. Model downloads remain an explicit operator action.
   staleness agree in CLI/web. Record V100 peak memory, timing and image review
   per shape before treating it as calibrated; missing evidence stays explicit.
   Existing square-only 2K proof does not clear the other six shapes.
+
+  Implementation: `presets.py` is the shared catalog; `scripts/sync_presets.py`
+  generates the checked browser table. Both UI and CLI have fourteen presets.
+  CLI `--preset landscape2k` selects canonical 2752×1536 with tiled decode;
+  explicit dimensions and `--[no-]tiled-decode` override the preset. 1K choices
+  retain the original square/landscape/portrait and add aligned 4:3, 3:4, 3:2,
+  2:3 companions. Imported configs/custom sizes and existing jobs are unchanged.
 
 - **8.2 — Native transparent generation (RGBA).** Add an explicit transparent
   output choice and visible effective-prompt handling using the upstream RGBA

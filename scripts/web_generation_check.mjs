@@ -110,19 +110,26 @@ async function check() {
   await until(`document.getElementById('generate-btn') && !document.getElementById('generate-btn').disabled`);
   assert.equal(await evaluate(`document.documentElement.dataset.theme`), 'paper');
   console.log('PASS raw configuration import preserves uint64 seed, does not generate; three themes persist');
-  for (const [preset, width, height] of [['square2k',2048,2048], ['landscape2k',2688,1536], ['portrait2k',1536,2688]]) {
+  const catalog = [
+    ['square',1024,1024], ['fourthree',1152,864], ['threefour',864,1152],
+    ['threetwo',1248,832], ['twothree',832,1248], ['landscape',1344,768], ['portrait',768,1344],
+    ['square2k',2048,2048], ['fourthree2k',2400,1792], ['threefour2k',1792,2400],
+    ['threetwo2k',2528,1696], ['twothree2k',1696,2528],
+    ['landscape2k',2752,1536], ['portrait2k',1536,2752]
+  ];
+  for (const [preset, width, height] of catalog) {
     const result = await evaluate(`(() => {
       document.querySelector('[data-preset="${preset}"]').click();
       return {config:QwenStudio.formSnapshot(),pressed:document.querySelector('[data-preset="${preset}"]').getAttribute('aria-pressed')};
     })()`);
     assert.equal(result.config.width,width);
     assert.equal(result.config.height,height);
-    assert.equal(result.config.vae_tiled_decode,true);
+    assert.equal(result.config.vae_tiled_decode,preset.endsWith('2k'));
     assert.equal(result.pressed,'true');
   }
   await evaluate(`document.querySelector('[data-preset="square"]').click()`);
   assert.equal(await evaluate(`document.getElementById('vae-tiling').checked`),false);
-  console.log('PASS three 2K presets set dimensions/tiling; switching to 1K restores untiled decode');
+  console.log('PASS all fourteen presets set exact dimensions/tiling/pressed state');
   const bad = await evaluate(`fetch('/api/v1/jobs', {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>r.status)`);
   assert.equal(bad, 403);
   console.log('PASS job write requires exact UI header');

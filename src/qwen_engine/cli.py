@@ -82,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print the deterministic key-sorted plan JSON and exit 0")
     p.add_argument("--run", action="store_true",
                    help="actually generate (verifies manifest assets first; no downloads)")
-    p.add_argument("--tiled-decode", action="store_true",
+    p.add_argument("--tiled-decode", action=argparse.BooleanOptionalAction, default=None,
                    help="VAE tiling: required at 2048x2048, where an untiled "
                         "decode does not fit; uses fp32 1024 px tiles with a "
                         "768 px stride. At 1024x1024 the default untiled decode "
@@ -102,6 +102,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prompt")
     p.add_argument("--negative", default=None)
     p.add_argument("--width", type=int)
+    from qwen_engine.presets import PRESETS
+    p.add_argument("--preset", choices=tuple(PRESETS),
+                   help="aspect/size preset; explicit dimensions override it; 2K enables tiled decode")
     p.add_argument("--height", type=int)
     p.add_argument("--steps", type=int)
     p.add_argument("--true-cfg-scale", dest="true_cfg_scale", type=float, default=None,
@@ -155,12 +158,15 @@ def _load_config(args: argparse.Namespace) -> GenerationConfig:
         if not isinstance(loaded, Mapping):
             raise ConfigError("config: config file must contain a JSON object")
         data = dict(loaded)
+    if getattr(args, "preset", None) is not None:
+        from qwen_engine.presets import preset_config
+        data.update(preset_config(args.preset))
     for flag, field in _OVERRIDES.items():
         value = getattr(args, flag, None)
         if value is not None:
             data[field] = str(value) if isinstance(value, Path) else value
-    if args.tiled_decode:
-        data["vae_tiled_decode"] = True
+    if args.tiled_decode is not None:
+        data["vae_tiled_decode"] = args.tiled_decode
     return GenerationConfig.from_dict(data)
 
 
