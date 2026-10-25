@@ -275,7 +275,7 @@ def capture_latents(args, config, cancel_event, out_dir: Path, artifact_sha: str
     manifest = load_manifest(config.manifest_path)
     bundle = resolve_local_bundle(manifest, config.models_dir)
     runtime = observe_generation_runtime()
-    runtime_sha = runtime.sha256()
+    runtime_sha = runtime.sha256
     inner = Qwen21DiffusersAdapter(trust_unbounded_host=args.attest_unbounded_host)
     inner.set_cancel_event(cancel_event)
     snapshot_path = out_dir / f"latents-seed{config.seed}.pt"
@@ -506,7 +506,7 @@ def main(argv=None) -> int:
                                            logical_device_index=LOGICAL_DEVICE_INDEX):
             raise EngineError(
                 "generation runtime identity is not bound to the reviewed CUDA device")
-        runtime_sha = runtime.sha256()
+        runtime_sha = runtime.sha256
         artifact_sha = resolve_artifact_identity(config)  # Q8 sidecar folded in
         vae_dir = bundle_vae_dir(config)
 
