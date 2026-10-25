@@ -9,7 +9,7 @@ decompression-bomb refused), PNG/JPEG/WEBP RGB or RGBA only (palette/gray/CMYK
 is refused, never converted), and each candidate must match the reference size
 and mode — a JPEG against an RGBA PNG is refused with the reason, not silently
 re-encoded. Same-mode pairs in different containers are measured and flagged
-because codec error is inside those deltas. Numeric deltas do NOT establish
+because codec differences may affect those deltas. Numeric deltas do NOT establish
 perceptual equivalence; see docs/image-quality-benchmark.md.
 """
 from __future__ import annotations

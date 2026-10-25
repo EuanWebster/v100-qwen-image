@@ -264,6 +264,7 @@ def test_run_all_missing_exits_4_naming_every_file(tmp_path, monkeypatch, capsys
 
 def test_run_all_missing_in_process_no_heavy_imports_no_network(tmp_path, monkeypatch, capsys):
     block_network(monkeypatch)
+    adapter_before = sys.modules.get("qwen_engine.adapters.qwen21_diffusers")
 
     def exploding_make_adapter(*args, **kwargs):
         raise AssertionError("adapter creation was reached; missing assets "
@@ -280,7 +281,9 @@ def test_run_all_missing_in_process_no_heavy_imports_no_network(tmp_path, monkey
     # exit 4 asserted above); the sys.modules checks are valid here because
     # this variant runs the CLI *in this process*.
     assert "AssertionError" not in err
-    assert "qwen_engine.adapters.qwen21_diffusers" not in sys.modules
+    # Other offline tests may already have inspected the ML-free adapter.
+    # Missing assets must not import/replace it during THIS invocation.
+    assert sys.modules.get("qwen_engine.adapters.qwen21_diffusers") is adapter_before
     assert not set(HEAVY_MODULES) & set(sys.modules)
 
 

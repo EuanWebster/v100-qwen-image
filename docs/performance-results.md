@@ -17,7 +17,8 @@ cache, FP16/Q8 modes, output formats, dimensions and queue/API schemas remain.
 A confirmed single-step schedule defect is refused early (`85c9d21`): the pinned
 base scheduler emitted an invalid divide and sampling returned non-finite values
 in a real V100 run. The adapter now returns a `steps` configuration error before
-reading model weights/importing ML. Dry-run configuration remains compatible;
+constructing model objects/importing ML. CLI asset verification retains its
+existing precedence and still reads files for integrity checking. Dry-run configuration remains compatible;
 normal 40-step generation is unchanged. Regression: 90 focused tests passed.
 
 ## Repeated FP16 baseline and lifecycle
@@ -80,13 +81,54 @@ three FP32 geometries in one process:
 channel delta was0.502/255, maximum36/255. The 1024 replay matched the original
 generation PNG exactly. A 1:1 crop of detailed tree/mist boundaries showed no
 obvious seams, but one scene is insufficient to accept a new quality default.
-Warm library caches can affect replay results; a fresh-source capture, isolated
-candidate replay and broader shape/genre review are still required. Production
-geometry remains1024/768. There is no silent resolution/precision reduction.
+Warm library caches can affect replay results. A second complete fresh-source
+Q8/2048-square/40-step capture reproduced the historical reference image exactly:
+
+| Fresh capture replay geometry | Profile seconds | Sampled device peak GiB | Allocation retries |
+|---|---:|---:|---:|
+| 1024 / 768 | 6.845 | 15.565 | 1 |
+| 768 / 576 | 7.212 | 9.704 | 0 |
+| 512 / 384 | 7.314 | 5.493 | 0 |
+
+A separate fresh process decoding only768/576 from those verified latents used
+**9.690GiB**, took6.966s including VAE load and recorded zero retries. Its pixels
+were identical to the768/576 replay above. Evidence lives in
+`output/performance-validation/decode-2k-{fresh,768-isolated}/` and the adjacent
+`decode-2k-*-comparison.json` / reproducibility reports. This validates the
+isolated decode headroom for this shape/scene, not a new end-to-end production
+strategy. Broader shape/genre review is still required. Production geometry
+remains1024/768. There is no silent resolution/precision reduction.
+
+## Cancellation and recovery: confirmed delayed release
+
+The reviewed Qwen diagnostic (`81bd17b`) ran encoder-worker, sampling and actual
+VAE-decode cancellations, followed by a normal40-step FP16 job in the same
+process. All cancellations were acknowledged, none published an image, all
+owned timers/children terminated, and the follow-up produced the requested
+1024-square image. Encoder argv proves worker presence, not actual CPU prompt
+encoding progress; the report deliberately makes the narrower claim.
+
+| Scenario | Live CUDA after cancellation | After explicit diagnostic GC | GC milliseconds |
+|---|---:|---:|---:|
+| Encoder worker | 0 bytes | 0 bytes | 98.7 |
+| Sampling (request after step2) | 14,258,056,704 bytes | 8,519,680 bytes | 253.2 |
+| Actual VAE decode | 700,331,008 bytes | 8,519,680 bytes | 127.0 |
+
+The follow-up also ended at8,519,680 live bytes. The diagnostic releases its own
+exception reference and removes its VAE hook before these measurements; its GC
+observes naturally retained production frames/cycles. This confirms delayed
+tensor release after sampling/decode cancellation. It does **not** prove an
+uncollectable leak or a failed next job: the test intentionally collected between
+jobs. Deterministic production cleanup after the exception has unwound remains
+the next reliability change; it has not been implemented or deployed in this
+batch. Avoid collecting while a caller still deliberately retains the traceback,
+and do not add allocator flushing inside the sampling loop.
+
+Raw prompt-free evidence: `output/performance-validation/recovery-fp16/`.
 
 ## Open work and rollback
 
-Cancellation/failed-job cleanup, repeated2K and 1024/1536/2048/wide/tall geometry
+Production cancellation/failed-job cleanup, repeated2K and 1024/1536/2048/wide/tall geometry
 coverage, instrumentation-off overhead comparisons, CPU-weight retention and
 persistent-worker alternatives remain under investigation. Production GPU
 memory admission is still not wired; the accounting helper is diagnostic
@@ -94,9 +136,15 @@ groundwork, not an active admission guarantee. Fresh worker fallback remains
 available through the CLI/process executor; the current web path uses a serial
 server thread with fresh model objects per job, not a generation process per job.
 
-Run the full guarded offline suite after final integration. Baseline was2788pass,
-2skip; an intermediate instrumented run was2828pass,2skip. Later focused checks
-passed, but that intermediate full count is not a final release result.
+Final guarded offline suite: **2863 passed, 2 skipped, 27.52s**. Baseline was2788
+passed,2skipped. The skipped checks need separate `QWEN_ML_PYTHONS` interpreters
+and external pinned Diffusers/Transformers trees; these were not configured and
+are not claimed as passed. Root independently ran the workers'14 recovery and15
+image-comparison tests and the real GPU scenarios. The final suite initially
+exposed a test-order assumption in a missing-assets import test; it now verifies
+that the invocation introduces/replaces no adapter module, while retaining the
+factory sentinel and no-heavy-import checks. The rerun passed. No existing
+baseline failure was attributed to the new work.
 
 Remove measurement flags for the original default execution path. Revert
 `85c9d21` to remove the early one-step refusal; revert the instrumentation/tool
