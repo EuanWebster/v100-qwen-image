@@ -84,13 +84,27 @@ async function check() {
   await send('Page.navigate', {url: origin + '/'});
   await until(`document.getElementById('generate-btn') && !document.getElementById('generate-btn').disabled`);
   console.log('PASS generation-enabled status recognized');
+  for (const [id, values] of [['quant',['fp16','q8']], ['offload',['resident','streamed','offload']], ['attention',['auto','sdpa','efficient','eager']]]) {
+    for (const value of values) {
+      const help = await evaluate(`(() => {
+        const c=document.getElementById('${id}'); c.value='${value}'; c.dispatchEvent(new Event('change'));
+        return {title:c.title,help:document.getElementById('${id}-help').textContent,description:c.getAttribute('aria-describedby')};
+      })()`);
+      assert(help.title.length > 30);
+      assert.equal(help.help,help.title);
+      assert.equal(help.description,id+'-help');
+    }
+  }
+  await evaluate(`for (const [id,value] of [['quant','fp16'],['offload','resident'],['attention','auto']]) {const c=document.getElementById(id);c.value=value;c.dispatchEvent(new Event('change'));}`);
+  console.log('PASS option explanations match each selection and are accessible without hover');
   assert.equal(await evaluate(`document.getElementById('output-format').value`), 'jpg');
   const imported = await evaluate(`QwenStudio.importConfigFile(new File([
-    '{"prompt":"imported cube","seed":18446744073709551615,"output_format":"webp"}'
+    '{"prompt":"imported cube","seed":18446744073709551615,"output_format":"webp","quant":"q8"}'
   ], 'config.json', {type:'application/json'}))`);
   assert.equal(imported, true);
   assert.equal(await evaluate(`document.getElementById('seed').value`), '18446744073709551615');
   assert.equal(await evaluate(`document.getElementById('output-format').value`), 'webp');
+  assert(await evaluate(`document.getElementById('quant-help').textContent.includes('Compresses the model')`));
   assert.equal((await jobIds()).length, 0);
   assert.equal(await evaluate(`(async () => {
     const pending=QwenStudio.importConfigFile(new File(['{"prompt":"late import"}'],'config.json'));
@@ -192,6 +206,9 @@ async function check() {
       assert.deepEqual(positions.before, positions.after);
       assert(positions.scroll > 0);
       assert.equal(positions.page, 0);
+      await evaluate(`document.getElementById('quant').scrollIntoView({block:'center'})`);
+      const helpShot = await send('Page.captureScreenshot', {format:'png'});
+      writeFileSync(join(artifactDir, 'option-help-1440.png'), Buffer.from(helpShot.data,'base64'));
     }
     assert(await evaluate(`(() => {const r=document.getElementById('generate-btn').getBoundingClientRect(); return r.top>=0 && r.bottom<window.innerHeight;})()`));
     const shot = await send('Page.captureScreenshot', {format: 'png', captureBeyondViewport: true});

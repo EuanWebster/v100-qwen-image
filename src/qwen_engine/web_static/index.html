@@ -144,43 +144,45 @@
             <div class="field-row">
               <div class="field">
                 <label for="quant">Quantization</label>
-                <select id="quant" name="quant">
-                  <option value="fp16" selected>fp16</option>
-                  <option value="q8">q8 — experimental</option>
+                <select id="quant" name="quant" aria-describedby="quant-help">
+                  <option value="fp16" selected title="Uses more graphics-card memory to keep the model's original detail. Best starting point for maximum image quality when it fits.">fp16</option>
+                  <option value="q8" title="Compresses the model to use less graphics-card memory. Small image differences are possible. Looked similar to FP16 in our tests, but sampling was slightly slower. Experimental.">q8 — experimental</option>
                 </select>
+                <p id="quant-help" class="help" aria-live="polite">Uses more graphics-card memory to keep the model's original detail. Best starting point for maximum image quality when it fits.</p>
               </div>
               <div class="field">
                 <label for="offload">Layer offload</label>
-                <select id="offload" name="offload"
-                        title="OffloadMode values as declared by the engine config">
-                  <option value="resident" selected>resident</option>
-                  <option value="streamed">streamed</option>
-                  <option value="offload">offload</option>
+                <select id="offload" name="offload" aria-describedby="offload-help">
+                  <option value="resident" selected title="Keeps the image model on your graphics card while generating. Uses more video memory, but avoids repeatedly moving layers to and from system RAM. Available now.">resident</option>
+                  <option value="streamed" title="Planned: moves groups of model layers between system RAM and your graphics card as needed. Intended to use less video memory; moving data can make generation slower. Not available yet.">streamed — not available yet</option>
+                  <option value="offload" title="Planned graphics-memory-saving mode. Inactive model data would stay in system RAM to free graphics-card memory. The exact strategy is not implemented; use resident for now.">offload — not available yet</option>
                 </select>
+                <p id="offload-help" class="help" aria-live="polite">Keeps the image model on your graphics card while generating. Uses more video memory, but avoids repeatedly moving layers to and from system RAM. Available now.</p>
               </div>
             </div>
 
             <div class="field-row">
               <div class="field">
                 <label for="attention">Attention backend</label>
-                <select id="attention" name="attention"
-                        title="AttentionBackend values as declared by the engine config">
-                  <option value="auto" selected>auto</option>
-                  <option value="sdpa">sdpa</option>
-                  <option value="efficient">efficient</option>
-                  <option value="eager">eager</option>
+                <select id="attention" name="attention" aria-describedby="attention-help">
+                  <option value="auto" selected title="Automatically uses the attention method tested on your V100. Recommended.">auto</option>
+                  <option value="sdpa" title="Explicitly uses the attention method tested on your V100. Auto currently selects this same method.">sdpa</option>
+                  <option value="efficient" title="Alternative attention method. Not supported by this app's current V100 loader; use Auto.">efficient — not available yet</option>
+                  <option value="eager" title="Alternative attention method. Not supported by this app's current V100 loader; use Auto.">eager — not available yet</option>
                 </select>
+                <p id="attention-help" class="help" aria-live="polite">Automatically uses the attention method tested on your V100. Recommended.</p>
               </div>
               <div class="field checkbox-field">
-                <input id="vae-tiling" name="vae_tiled_decode" type="checkbox">
+                <input id="vae-tiling" name="vae_tiled_decode" type="checkbox"
+                       title="Converts the generated image in smaller overlapping sections to reduce video-memory use. Enabled by 2K presets. Tile boundaries can sometimes be visible.">
                 <label for="vae-tiling">VAE tiling</label>
               </div>
             </div>
 
-            <p class="help">Values are kept exactly as selected (no
-              browser-side remapping). They are sent only to the local
-              qwen-web server on this same origin, which validates them
-              authoritatively and has the final say.</p>
+            <p class="help">Start with FP16, resident and Auto for maximum
+              quality when they fit. Try Q8 for more video-memory headroom.
+              2K presets enable tiled decoding, but can still use almost all
+              of the V100's memory.</p>
           </details>
 
           <div class="actions api-actions" role="group"

@@ -331,7 +331,18 @@
 
   var promptTouched = false;
 
+  function syncOptionHelp() {
+    ['quant', 'offload', 'attention'].forEach(function (id) {
+      var control = $(id);
+      var option = control.options[control.selectedIndex];
+      var description = option ? option.title : 'Choose an option to see what it does.';
+      control.title = description;
+      if ($(id + '-help').textContent !== description) setText(id + '-help', description);
+    });
+  }
+
   function renderValidation(errors) {
+    syncOptionHelp();
     setText('steps-error', errors.steps || '');
     setText('seed-error', errors.seed || '');
     setText('cfg-error', errors.cfg || '');
