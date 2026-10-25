@@ -97,6 +97,19 @@ class AttentionBackend(StrEnum):
     EAGER = "eager"
 
 
+class Recipe(StrEnum):
+    """Weight/sampling recipe. ``base`` is the full reference pipeline at any
+    step count; ``turbo`` is the reviewed Turbo-transformer profile whose
+    shipped sigmas make ``num_inference_steps`` inert — the recipe therefore
+    OWNS the step count (docs/turbo-plan.md §3.1)."""
+    BASE = "base"
+    TURBO = "turbo"
+
+
+#: The Turbo recipe runs exactly the eight shipped sigmas — nothing else.
+TURBO_STEPS = 8
+
+
 @dataclass(frozen=True)
 class FieldError:
     """A single field-level validation failure; ``field`` names the config field."""
@@ -176,6 +189,10 @@ class GenerationConfig:
     quant: Quant = Quant.FP16
     offload: OffloadMode = OffloadMode.RESIDENT
     attention_backend: AttentionBackend = AttentionBackend.AUTO
+    #: Sampling/weights recipe ("base" | "turbo"); turbo pins steps to 8,
+    #: refuses true-CFG and Q8 (validated in __post_init__ and the adapter
+    #: policy), and swaps the DiT+scheduler for the Turbo profile.
+    recipe: Recipe = Recipe.BASE
     vae_tiled_decode: bool = False
     output_format: OutputFormat = OutputFormat.JPG
     #: Native transparency core flag: when True the positive prompt sent to the
@@ -202,6 +219,7 @@ class GenerationConfig:
         "offload": OffloadMode,
         "attention_backend": AttentionBackend,
         "output_format": OutputFormat,
+        "recipe": Recipe,
     }
 
     def __post_init__(self) -> None:
@@ -315,6 +333,26 @@ class GenerationConfig:
                     f"jpg, got {self.output_format.value!r}",
                 )
             )
+        if self.recipe is Recipe.TURBO:
+            # Every turbo rule is a refusal, never a silent rewrite: the
+            # saved sigmas ignore num_inference_steps, upstream evaluated only
+            # CFG 1, and no Q8 Turbo artifact exists yet (turbo + references
+            # stays allowed but is recorded as unmeasured by the adapter).
+            if self.steps != TURBO_STEPS:
+                errors.append(FieldError(
+                    "steps",
+                    f"recipe 'turbo' owns the shipped eight-step sigma "
+                    f"schedule: steps must be exactly {TURBO_STEPS}, got {self.steps!r}"))
+            if self.cfg_active:
+                errors.append(FieldError(
+                    "true_cfg_scale",
+                    "recipe 'turbo' is upstream-evaluated at CFG 1.0 with no "
+                    "negative prompt; a true-CFG request is refused until measured"))
+            if self.quant is Quant.Q8:
+                errors.append(FieldError(
+                    "quant",
+                    "recipe 'turbo' has no reviewed Q8 artifact yet; "
+                    "use quant 'fp16'"))
         if not isinstance(self.references, (tuple, list)):
             errors.append(
                 FieldError("references", f"must be a list of content ids, got {self.references!r}")

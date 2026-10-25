@@ -35,6 +35,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from qwen_engine._jsonsafe import strict_json_loads
 from qwen_engine.adapters.supplied_qwen21 import SuppliedQwen21Adapter
 from qwen_engine.config import (
     AttentionBackend,
@@ -43,11 +44,14 @@ from qwen_engine.config import (
     GenerationConfig,
     OffloadMode,
     Quant,
+    Recipe,
+    TURBO_STEPS,
 )
 from qwen_engine.encoder import EmbeddingCache
 from qwen_engine.encoder_client import ProductionEncoder
 from qwen_engine.errors import EngineError, HardwareAbsentError
-from qwen_engine.local_bundle import LocalReferenceBundle, resolve_local_bundle
+from qwen_engine.local_bundle import (LocalReferenceBundle, resolve_local_bundle,
+                                      TURBO_REFERENCE_PROFILE)
 from qwen_engine.manifest import load_manifest
 from qwen_engine.runtime_identity import observe_generation_runtime
 from qwen_engine.performance import stage, attach_cuda, current
@@ -63,6 +67,92 @@ ENCODER_HEADROOM_BYTES = 4 * 1024**3
 
 #: Bounded encoder worker lifetime; a full 17.5 GB CPU load is slow.
 ENCODER_TIMEOUT_S = 3600.0
+
+#: The eight sigmas the Turbo transformer was evaluated with (turbo-plan
+#: §3.1). ``FlowMatchEulerDiscreteScheduler.__call__`` IGNORES
+#: ``num_inference_steps`` when the pipeline config carries these, which is
+#: why the recipe owns the step count. Copy-pasted deliberately — the value
+#: is the reviewed artifact constant; tests re-derive it from the bundle
+#: file's sha256 so a drift can never pass silently.
+TURBO_SAMPLE_SIGMAS = (1.0, 0.978453, 0.95418, 0.926626, 0.89508,
+                       0.845148, 0.704534, 0.414568)
+
+#: The Turbo ``scheduler_config.json`` content (its diffusers ``_``-prefixed
+#: metadata keys excluded), as shipped in the bundle. Against the base file
+#: the diff is exactly two fields: ``shift_terminal`` 0.02 -> null and
+#: ``use_dynamic_shifting`` true -> false. Guarded constant: a test ties it
+#: content-for-content to the sha256-pinned bundle file listed in
+#: models/turbo/manifest.json, and every turbo load re-checks the on-disk
+#: file (:func:`_assert_turbo_scheduler`).
+TURBO_SCHEDULER_CONFIG = {
+    "base_image_seq_len": 256,
+    "base_shift": 0.5,
+    "invert_sigmas": False,
+    "max_image_seq_len": 8192,
+    "max_shift": 0.9,
+    "num_train_timesteps": 1000,
+    "shift": 1.0,
+    "shift_terminal": None,
+    "stochastic_sampling": False,
+    "time_shift_type": "exponential",
+    "use_beta_sigmas": False,
+    "use_dynamic_shifting": False,
+    "use_exponential_sigmas": False,
+    "use_karras_sigmas": False,
+}
+
+
+def turbo_bundle_paths(manifest_path: str | Path) -> tuple[Path, Path]:
+    """Return ``(turbo manifest path, turbo asset root)`` for a run whose BASE
+    manifest lives at ``manifest_path``.
+
+    Layout convention (models/turbo/manifest.json beside models/assets/):
+    both sit under ``<base manifest dir>/turbo/``. Pure path derivation — no
+    filesystem access; resolution/fail-closed verification happens via
+    ``resolve_local_bundle`` with :data:`TURBO_REFERENCE_PROFILE`.
+    """
+    root = Path(manifest_path).parent / "turbo"
+    return root / "manifest.json", root / "assets"
+
+
+def _assert_turbo_scheduler(scheduler_dir: str | Path) -> None:
+    """The Turbo weights are only evaluated on the shipped Turbo schedule.
+
+    The bundle's ``scheduler_config.json`` (minus diffusers' ``_``-prefixed
+    metadata keys) must equal :data:`TURBO_SCHEDULER_CONFIG` exactly — the
+    shipped file's two Turbo properties, ``shift_terminal`` null and
+    ``use_dynamic_shifting`` false, versus the base file's 0.02/true. The
+    FILE is checked, never the loaded scheduler object: ``from_pretrained``
+    blends class defaults into ``scheduler.config``, so an inherited base
+    config could otherwise masquerade as a Turbo one (§3.2).
+    """
+    path = Path(scheduler_dir) / "scheduler_config.json"
+    try:
+        document = strict_json_loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise EngineError(
+            f"the turbo scheduler config is unreadable: "
+            f"{type(exc).__name__}: {exc}") from None
+    if not isinstance(document, dict):
+        raise EngineError("the turbo scheduler config is not a JSON object")
+    observed = {key: value for key, value in document.items()
+                if not key.startswith("_")}
+    if observed != TURBO_SCHEDULER_CONFIG:
+        common = set(observed) & set(TURBO_SCHEDULER_CONFIG)
+        changed = sorted(key for key in common
+                         if observed[key] != TURBO_SCHEDULER_CONFIG[key])
+        missing = sorted(set(TURBO_SCHEDULER_CONFIG) - set(observed))
+        unexpected = sorted(set(observed) - set(TURBO_SCHEDULER_CONFIG))
+        detail = []
+        if changed:
+            detail.append("changed: " + ", ".join(changed))
+        if missing:
+            detail.append("missing: " + ", ".join(missing))
+        if unexpected:
+            detail.append("unexpected: " + ", ".join(unexpected))
+        raise EngineError("the turbo scheduler config disagrees with the "
+                          "reviewed Turbo schedule (" + "; ".join(detail) + ")")
+
 
 #: The reviewed execution device is the first CUDA logical device. The
 #: hardware gate below still verifies its identity before anything is loaded.
@@ -230,6 +320,22 @@ def _validate_policy(config: GenerationConfig) -> None:
     if config.quant is Quant.Q8:
         from qwen_engine.adapters.q8_loader import validate_q8_environment
         validate_q8_environment()
+    if config.recipe is Recipe.TURBO:
+        # Mirror of the config gate (§5.2), so a hand-built or replayed
+        # config still dies before any weight read: the sigmas make steps
+        # inert, upstream evaluated only CFG 1 with no negative prompt, and
+        # no Q8 Turbo artifact exists.
+        if config.steps != TURBO_STEPS:
+            errors.append(FieldError(
+                "steps", f"recipe 'turbo' owns the shipped {TURBO_STEPS}-step "
+                         "sigma schedule; steps must match it exactly"))
+        if config.cfg_active:
+            errors.append(FieldError(
+                "true_cfg_scale", "recipe 'turbo' is measured only at CFG 1.0 "
+                                  "with no negative prompt"))
+        if config.quant is Quant.Q8:
+            errors.append(FieldError(
+                "quant", "recipe 'turbo' has no reviewed Q8 artifact yet"))
     if config.offload is not OffloadMode.RESIDENT:
         errors.append(FieldError(
             "offload", "the resident loader supports offload=resident only; "
@@ -315,11 +421,28 @@ class Qwen21DiffusersAdapter:
         _validate_policy(config)
         manifest = load_manifest(config.manifest_path)
         bundle = resolve_local_bundle(manifest, config.models_dir)
+        turbo = config.recipe is Recipe.TURBO
+        turbo_bundle = None
+        if turbo:
+            # A separate manifest/root (§3.3), never an implicit "whatever
+            # sits next to the base files". The BASE bundle still carries
+            # encoder/processor/vae identity and the embedding-cache
+            # namespace: the Turbo tree ships none of those (decision: the
+            # base encoder is used exactly).
+            turbo_manifest_path, turbo_root = turbo_bundle_paths(config.manifest_path)
+            turbo_bundle = resolve_local_bundle(
+                load_manifest(turbo_manifest_path), turbo_root,
+                profile=TURBO_REFERENCE_PROFILE)
         q8_artifact = None
         if config.quant is Quant.Q8:
             from qwen_engine.q8_artifact import resolve_q8_artifact
             q8_artifact = resolve_q8_artifact(config.q8_manifest_path)
         bundle_assets = bundle.to_assets()
+        expected_assets = dict(bundle_assets)
+        if turbo_bundle is not None:
+            # Turbo overrides the dit/scheduler/pipeline roles with its own
+            # artifacts; text_encoder/vae/processor stay base.
+            expected_assets.update(turbo_bundle.to_assets())
         # The CLI resolver reports paths in the caller's lexical form (e.g. a
         # relative --models-dir); the bundle publishes canonical absolutes.
         # Compare resolved identities, then attach the canonical set.
@@ -327,7 +450,7 @@ class Qwen21DiffusersAdapter:
             role: tuple(Path(path).resolve() for path in paths)
             for role, paths in dict(assets).items()
         }
-        if supplied_assets != bundle_assets:
+        if supplied_assets != expected_assets:
             raise ConfigError(FieldError(
                 "assets", "verified asset paths disagree with the pinned local bundle"))
 
@@ -348,7 +471,8 @@ class Qwen21DiffusersAdapter:
         if current() is not None:
             current().metadata.update(vae_tile=TILED_DECODE_TILE if config.vae_tiled_decode else None,
                                       vae_stride=TILED_DECODE_STRIDE if config.vae_tiled_decode else None,
-                                      vae_precision="fp32" if _fp32_decode(config) else "fp16")
+                                      vae_precision="fp32" if _fp32_decode(config) else "fp16",
+                                      recipe=config.recipe.value)
         device = torch.device("cuda", LOGICAL_DEVICE_INDEX)
 
         try:
@@ -358,8 +482,8 @@ class Qwen21DiffusersAdapter:
             with stage("transformer_loading", cuda=True):
                 if q8_artifact is None:
                     transformer = transformer_cls.from_pretrained(
-                        bundle.component_dirs["dit"], torch_dtype=torch.float16,
-                        local_files_only=True)
+                        (turbo_bundle if turbo else bundle).component_dirs["dit"],
+                        torch_dtype=torch.float16, local_files_only=True)
                     transformer.to(device=device, dtype=torch.float16).eval()
                 else:
                     from qwen_engine.adapters.q8_loader import load_q8_transformer
@@ -370,16 +494,20 @@ class Qwen21DiffusersAdapter:
                     local_files_only=True)
                 vae.to(device=device, dtype=torch.float16).eval()
             scheduler = scheduler_cls.from_pretrained(
-                bundle.component_dirs["scheduler"], local_files_only=True)
+                (turbo_bundle if turbo else bundle).component_dirs["scheduler"],
+                local_files_only=True)
             processor = processor_cls.from_pretrained(
                 bundle.component_dirs["processor"], local_files_only=True)
         except Exception as exc:
             raise EngineError(
                 f"local component load refused: {type(exc).__name__}: {exc}") from exc
 
+        if turbo:
+            _assert_turbo_scheduler(turbo_bundle.component_dirs["scheduler"])
+        pipeline_kwargs = ({}, {"sample_sigmas": list(TURBO_SAMPLE_SIGMAS)})[turbo]
         pipeline = pipeline_cls(
             scheduler=scheduler, vae=vae, text_encoder=None,
-            processor=processor, transformer=transformer)
+            processor=processor, transformer=transformer, **pipeline_kwargs)
 
         runtime = observe_generation_runtime()
         if not runtime.matches_cuda_device(
@@ -393,6 +521,14 @@ class Qwen21DiffusersAdapter:
                 artifact_identity = artifact_set_identity(artifact_identity, q8_artifact.identity_sha256)
             current().metadata.update(runtime_identity_sha256=runtime.sha256,
                                       artifact_set_sha256=artifact_identity)
+            if turbo:
+                current().metadata["turbo_artifact_set_sha256"] = turbo_bundle.fingerprints.bundle
+                if tuple(getattr(config, "references", ())):
+                    # Base-encoder conditioning combined with Turbo
+                    # denoising has never been evaluated; the run is
+                    # recorded as unmeasured, never silently assumed
+                    # (§3.3).
+                    current().metadata["turbo_reference_run_unmeasured"] = True
 
         cache_root = Path(config.cache_dir)
         scratch = cache_root / "encoder-scratch"

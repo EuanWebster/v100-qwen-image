@@ -20,6 +20,7 @@ import json
 import sys
 import traceback
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ from qwen_engine.adapters.base import (
     OFFLOAD_CHOICES,
     QUANT_CHOICES,
 )
-from qwen_engine.config import ConfigError, FieldError, GenerationConfig
+from qwen_engine.config import ConfigError, FieldError, GenerationConfig, Recipe
 from qwen_engine.core import generate, plan, require_run_config
 from qwen_engine.errors import (
     EngineError,
@@ -61,6 +62,7 @@ _OVERRIDES = {
     "manifest": "manifest_path",
     "q8_manifest": "q8_manifest_path",
     "output_format": "output_format",
+    "recipe": "recipe",
 }
 MAX_CONFIG_BYTES = 1 << 20
 
@@ -126,6 +128,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "--output-format jpg is refused. --no-transparent "
                         "overrides a config-file true and keeps the format")
     p.add_argument("--quant", choices=QUANT_CHOICES)
+    p.add_argument("--recipe", choices=("base", "turbo"), default=None,
+                   help="weights/sampling recipe: 'turbo' is the Turbo "
+                        "transformer + base encoder/VAE with the shipped "
+                        "eight-step sigma schedule (steps must be 8, CFG 1, "
+                        "fp16 only); default 'base'")
     p.add_argument("--offload", choices=OFFLOAD_CHOICES)
     p.add_argument("--attention-backend", dest="attention_backend",
                    choices=ATTENTION_BACKEND_CHOICES)
@@ -279,6 +286,28 @@ def _verify_assets(config: GenerationConfig):
             f"{len(report.errors)} model artifact(s) unresolved; nothing "
             f"downloaded (fetching is a separate operator action)"
         )
+    if config.recipe is Recipe.TURBO:
+        # Turbo's fail-closed path (turbo-plan §3.3): its own manifest and
+        # root, resolved exactly like the base assets, then role-merged on
+        # top — dit/scheduler/pipeline come from the Turbo tree while
+        # text_encoder/vae/processor stay base. A missing turbo manifest is
+        # a refusal, never an implicit fallback to the base weights.
+        from qwen_engine.adapters.qwen21_diffusers import turbo_bundle_paths
+        turbo_manifest_path, turbo_root = turbo_bundle_paths(config.manifest_path)
+        try:
+            turbo_manifest = load_manifest(turbo_manifest_path)
+        except ManifestError as exc:
+            raise ManifestError(
+                f"recipe 'turbo' needs the separate turbo manifest: {exc}") from None
+        turbo_report = resolve_manifest(turbo_manifest, turbo_root)
+        if not turbo_report.ok:
+            for err in turbo_report.errors:
+                print(f"turbo asset error: {err}", file=sys.stderr)
+            raise ManifestError(
+                f"{len(turbo_report.errors)} turbo artifact(s) unresolved; "
+                f"nothing downloaded (fetching is a separate operator action)")
+        report = replace(report, resolved={**report.resolved,
+                                           **turbo_report.resolved})
     return report
 
 

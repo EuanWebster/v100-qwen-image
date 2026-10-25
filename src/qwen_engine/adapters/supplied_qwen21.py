@@ -12,7 +12,8 @@ import uuid
 from pathlib import Path
 
 from qwen_engine import reference_store
-from qwen_engine.config import AttentionBackend, ConfigError, GenerationConfig, OffloadMode, Quant
+from qwen_engine.config import (AttentionBackend, ConfigError, GenerationConfig,
+                                OffloadMode, Quant, Recipe, TURBO_STEPS)
 from qwen_engine.encoder_client import ProductionEncoding
 from qwen_engine.encoder import EncoderCancelledError
 from qwen_engine.encoder_identity import project_encoder_seed, validate_completed_seed
@@ -213,6 +214,7 @@ class SuppliedQwen21Adapter:
             "use_kv_cache": bool(self.use_kv_cache),
             "embedding_cache_hit": getattr(self._encoder, "last_cache_hit", None),
             "references": len(tuple(getattr(self._config, "references", ()))),
+            "recipe": self._config.recipe.value,
         }
 
     def reference_images(self, config):
@@ -347,7 +349,10 @@ class SuppliedQwen21Adapter:
         if current() is not None:
             current().metadata["seed"] = self.actual_seed
 
+        steps_observed: list[int] = []
+
         def callback(pipe, index, timestep, tensors):
+            steps_observed.append(index)
             self._check("encoded", config)
             self._finite(tensors["latents"], (1, config.latent_tokens, 64), self._dtype)
             if self._progress_callback is not None:
@@ -365,6 +370,15 @@ class SuppliedQwen21Adapter:
                 mask_hook()
         self._check("encoded", config)
         self._finite(result.images, (1, config.latent_tokens, 64), self._dtype)
+        if config.recipe is Recipe.TURBO and len(steps_observed) != TURBO_STEPS:
+            # The saved sigmas make num_inference_steps inert inside the
+            # pipeline; without this witness a tampered/truncated schedule
+            # would run a different number of denoising steps than the
+            # recipe claims (turbo-plan §3.1).
+            raise EngineError(
+                f"the turbo recipe must consume exactly the {TURBO_STEPS} "
+                f"shipped sigmas; the sampler reported "
+                f"{len(steps_observed)} step callbacks")
         self._state = "denoised"
         return result.images
 

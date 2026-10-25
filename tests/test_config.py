@@ -14,6 +14,7 @@ from qwen_engine.config import (
     GenerationConfig,
     OffloadMode,
     Quant,
+    Recipe,
 )
 
 HEAVY_MODULES = ("torch", "diffusers", "transformers")
@@ -304,3 +305,50 @@ def test_injected_parser_failures_wrap_as_config_errors(monkeypatch, boom):
 def test_ambiguous_nonfinite_or_wrong_type_config_json_is_typed(doc):
     with pytest.raises(ConfigError, match="invalid JSON"):
         GenerationConfig.from_json(doc)
+
+
+# --- recipe gate (docs/turbo-plan.md §4.3/§5.2) --------------------------------
+
+
+def test_recipe_defaults_to_base_and_round_trips():
+    assert GenerationConfig().recipe is Recipe.BASE
+    doc = GenerationConfig(recipe="turbo", steps=8).to_dict()
+    assert doc["recipe"] == "turbo"
+    assert GenerationConfig.from_dict(doc).recipe is Recipe.TURBO
+
+
+@pytest.mark.parametrize("overrides,field", [
+    ({"steps": 40}, "steps"),
+    ({"steps": 7}, "steps"),
+    ({"steps": 8, "negative_prompt": "blurry", "true_cfg_scale": 2.0},
+     "true_cfg_scale"),
+    ({"steps": 8, "quant": Quant.Q8, "q8_manifest_path": "q8.json"}, "quant"),
+])
+def test_turbo_refuses_unmeasured_combinations_by_field(overrides, field):
+    with pytest.raises(ConfigError) as exc:
+        GenerationConfig(recipe="turbo", **overrides)
+    assert _err_fields(exc) == {field}
+
+
+def test_turbo_error_names_the_owned_sigma_schedule():
+    with pytest.raises(ConfigError) as exc:
+        GenerationConfig(recipe="turbo", steps=40)
+    assert "eight-step" in str(exc.value.errors[0])
+
+
+def test_turbo_keeps_a_negative_prompt_inert_at_cfg_one():
+    # Same base semantics: with the scale at 1.0 the negative prompt is not
+    # active, so the recipe does not refuse it.
+    config = GenerationConfig(recipe="turbo", steps=8, negative_prompt="blurry")
+    assert not config.cfg_active
+
+
+def test_base_recipe_keeps_the_full_step_range():
+    assert GenerationConfig(steps=40).steps == 40
+    assert GenerationConfig(recipe="base", steps=8).steps == 8
+
+
+def test_unknown_recipe_is_a_field_error_on_recipe():
+    with pytest.raises(ConfigError) as exc:
+        GenerationConfig(recipe="mid")
+    assert _err_fields(exc) == {"recipe"}

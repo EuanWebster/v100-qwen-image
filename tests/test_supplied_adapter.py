@@ -264,6 +264,7 @@ def test_calibration_facts_measure_the_processed_conditioning(setup):
         "use_kv_cache": True,
         "embedding_cache_hit": True,
         "references": 0,
+        "recipe": "base",
     }
     active = replace(setup.config, negative_prompt="blurry", true_cfg_scale=2.0)
     supplied._config = active
@@ -705,3 +706,136 @@ class _E2EPipe:
                            prompt_embeds_mask=kwargs["prompt_embeds_mask"],
                            image_pad_mask=None)
         return SimpleNamespace(images=FakeTensor("F16", (1, 256, 64), values=[0.5] * 256))
+
+
+class _StepCountingPipe(_E2EPipe):
+    """``__call__`` fires ``callback_on_step_end`` exactly ``fires`` times —
+    a sampler whose realised schedule may or may not match the recipe."""
+    fires = 3
+
+    def __call__(self, prompt, image, height, width, **kwargs):
+        self.call = dict(prompt=prompt, image=image, height=height, width=width, **kwargs)
+        callback = kwargs["callback_on_step_end"]
+        for index in range(self.fires):
+            callback(self, index, 1000.0,
+                     {"latents": FakeTensor("F16", (1, 256, 64), values=[0.5] * 256)})
+        return SimpleNamespace(images=FakeTensor("F16", (1, 256, 64), values=[0.5] * 256))
+
+
+def _text_payload_for(request):
+    """Text-only payload: the image-pad mask is all-False (§2.1 invariant)."""
+    tensors = {}
+    for side in ("positive", "negative") if request.kwargs["cfg_active"] else ("positive",):
+        embeds, attention, image_mask = triple(shape=(1, 4, 16), code="F16")
+        tensors[f"{side}.embeds"] = embeds
+        tensors[f"{side}.attention_mask"] = attention
+        tensors[f"{side}.image_pad_mask"] = image_mask
+    descriptors = [{"name": name, "dtype": tensor.code, "shape": list(tensor.shape),
+                    "bytes": len(tensor.raw)} for name, tensor in sorted(tensors.items())]
+    canonical = lambda doc: json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    metadata = {"schema": ep.TENSOR_PAYLOAD_SCHEMA, "codec": ep.SAFETENSORS_CODEC,
+                "cache_key": cache_key(request), "dtype": request.dtype,
+                "cfg_active": request.kwargs["cfg_active"],
+                "request": request.key_document(), "tensors": descriptors}
+    st_metadata = {"codec": ep.SAFETENSORS_CODEC, "cache_key": cache_key(request),
+                   "dtype": request.dtype,
+                   "cfg_active": "true" if request.kwargs["cfg_active"] else "false",
+                   "request_identity": canonical(request.key_document()),
+                   "tensor_descriptors": canonical(descriptors)}
+    return EncodedPayload(metadata=metadata,
+                          blobs=(Blob("tensors", st_bytes(tensors, st_metadata)),))
+
+
+def _step_witness(tmp_path, monkeypatch, *, fires, recipe, steps):
+    """Loaded, encoded supplied adapter over a pipe firing ``fires`` step
+    callbacks; returns (adapter, config, progress records)."""
+    from PIL import Image as PILImage
+
+    class _Generator:
+        def __init__(self, device=None):
+            self.value = None
+        def seed(self):
+            return 7
+        def manual_seed(self, value):
+            self.value = value
+
+    class _Torch(FakeTorch):
+        float16 = "torch.float16"
+        float32 = "torch.float32"
+        Generator = _Generator
+        @staticmethod
+        def isfinite(tensor):
+            return tensor.isfinite()
+
+    class _Pipe(_StepCountingPipe):
+        pass
+    _Pipe.fires = fires
+
+    install_ml(monkeypatch)
+    monkeypatch.setattr(FakeTensor, "to",
+                        lambda self, device=None, dtype=None: self, raising=False)
+    monkeypatch.setattr(module, "_libraries",
+                        lambda: (_Torch(), PILImage, (_Pipe, _E2ETransformer, _E2EVAE, _E2EScheduler)))
+
+    manifest = load_manifest(ROOT / "models/manifest.json")
+    bundle = LocalReferenceBundle(profile=LOCAL_REFERENCE_PROFILE, root=tmp_path,
+        root_resolved=tmp_path, repo=manifest.artifacts[0].repo,
+        revision=manifest.artifacts[0].revision,
+        assets={r: tuple(tmp_path / n for n in names) for r, names in LOCAL_REFERENCE_LAYOUT.items()},
+        component_dirs={r: tmp_path / n for r, n in ROLE_DIRECTORIES.items()},
+        fingerprints=reference_bundle_fingerprints(manifest))
+
+    def encode_provider(cfg, *, encoder_dtype, cancel_event, image_files):
+        assert not image_files  # text-only witness run
+        seed = project_encoder_seed(cfg, manifest, encoder_dtype=encoder_dtype)
+        completed = replace(seed, implementation_identity=make_identity(
+            worker_implementation_revision="synthetic-steps-child",
+            encoder_artifact_set_sha256=reference_bundle_fingerprints(manifest).encoder))
+        return ProductionEncoding(completed, _text_payload_for(completed))
+
+    config = GenerationConfig(output_dir=tmp_path, height=256, width=256,
+                              recipe=recipe, steps=steps)
+    supplied = module.SuppliedQwen21Adapter(
+        pipeline=_Pipe(), encoder=SimpleNamespace(encode=encode_provider),
+        manifest=manifest, bundle=bundle, encoder_dtype="fp16")
+    progress: list[tuple[int, int]] = []
+    supplied.set_progress_callback(lambda done, total: progress.append((done, total)))
+    supplied.load(config, bundle.to_assets())
+    branches = supplied.encode(config)
+    return supplied, config, branches, progress
+
+
+@needs_references
+def test_turbo_denoise_refuses_a_truncated_step_schedule(tmp_path, monkeypatch):
+    """The saved sigmas make num_inference_steps inert inside the pipeline,
+    so the adapter must witness EIGHT callbacks itself: seven (tampered or
+    truncated schedule) is a refusal before publication."""
+    supplied, config, branches, _ = _step_witness(
+        tmp_path, monkeypatch, fires=7, recipe="turbo", steps=8)
+    with pytest.raises(EngineError, match="8 shipped sigmas"):
+        supplied.denoise(config, branches)
+    assert supplied._state == "encoded"  # never published as denoised
+    supplied.close()
+
+
+@needs_references
+def test_turbo_denoise_accepts_the_eight_callback_schedule(tmp_path, monkeypatch):
+    supplied, config, branches, progress = _step_witness(
+        tmp_path, monkeypatch, fires=8, recipe="turbo", steps=8)
+    latents = supplied.denoise(config, branches)
+    assert tuple(latents.shape) == (1, config.latent_tokens, 64)
+    assert supplied._state == "denoised"
+    assert progress == [(index + 1, 8) for index in range(8)]
+    supplied.close()
+
+
+@needs_references
+def test_base_recipe_denoise_is_not_step_pinned(tmp_path, monkeypatch):
+    """Base keeps its own contract: the pipeline builds its schedule from
+    ``steps``; the turbo witness must not pin base callback counts."""
+    supplied, config, branches, _ = _step_witness(
+        tmp_path, monkeypatch, fires=3, recipe="base", steps=40)
+    latents = supplied.denoise(config, branches)
+    assert supplied._state == "denoised"
+    assert tuple(latents.shape) == (1, config.latent_tokens, 64)
+    supplied.close()

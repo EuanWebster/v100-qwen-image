@@ -756,3 +756,94 @@ def test_cli_config_replacement_during_read_is_typed_and_no_adapter(tmp_path, ca
     monkeypatch.setattr(os, "read", read)
     assert run_cli(tmp_path, ["--config", path, "--run"]) == 2
     assert "changed during read" in capsys.readouterr().err
+
+
+# --- recipe flag + turbo asset resolution (docs/turbo-plan.md §4.3/§5.2) --------
+
+
+def test_recipe_flag_echoes_into_the_plan(tmp_path, capsys):
+    assert run_cli(tmp_path, ["--dry-run", "--recipe", "turbo", "--steps", "8"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["config"]["recipe"] == "turbo" and doc["config"]["steps"] == 8
+
+
+def test_recipe_defaults_to_base_in_the_plan(tmp_path, capsys):
+    assert run_cli(tmp_path, ["--dry-run"]) == 0
+    assert json.loads(capsys.readouterr().out)["config"]["recipe"] == "base"
+
+
+def test_cli_refuses_turbo_step_mismatch_before_any_asset_work(tmp_path, capsys):
+    assert run_cli(tmp_path, ["--dry-run", "--recipe", "turbo", "--steps", "40"]) == 2
+    assert "eight-step" in capsys.readouterr().err
+
+
+def _asset_tree(root: Path, roles, repo: str,
+                manifest: Path | None = None) -> Path:
+    """A minimal resolvable manifest + one small file per role."""
+    import hashlib
+
+    artifacts = []
+    for role in roles:
+        content = f"{repo}:{role}".encode()
+        path = root / role / "model.bin"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        artifacts.append({"role": role, "repo": repo, "revision": REV,
+                          "filename": f"{role}/model.bin",
+                          "sha256": hashlib.sha256(content).hexdigest(),
+                          "bytes": len(content)})
+    manifest = manifest if manifest is not None else root / "manifest.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"schema_version": mf.MANIFEST_SCHEMA_VERSION,
+                                    "artifacts": artifacts}))
+    return manifest
+
+
+def test_verify_assets_merges_turbo_roles_without_touching_base_encoder(tmp_path):
+    base_manifest = _asset_tree(tmp_path / "models",
+                                ["text_encoder", "dit", "vae", "scheduler", "processor"], REPO)
+    _asset_tree(tmp_path / "models" / "turbo" / "assets",
+                ["dit", "scheduler", "pipeline"], "Qwen/Qwen-Image-2.1-Turbo",
+                manifest=tmp_path / "models" / "turbo" / "manifest.json")
+    turbo = GenerationConfig(manifest_path=str(base_manifest),
+                             models_dir=str(tmp_path / "models"),
+                             recipe="turbo", steps=8)
+    report = cli._verify_assets(turbo)
+    assert report.resolved["dit"] == (
+        tmp_path / "models" / "turbo" / "assets" / "dit" / "model.bin",)
+    assert report.resolved["text_encoder"] == (
+        tmp_path / "models" / "text_encoder" / "model.bin",)
+    # the same tree under the base recipe never sees the turbo directory
+    base = cli._verify_assets(GenerationConfig(manifest_path=str(base_manifest),
+                                               models_dir=str(tmp_path / "models")))
+    assert base.resolved["dit"] == (tmp_path / "models" / "dit" / "model.bin",)
+
+
+def test_verify_assets_refuses_turbo_without_its_manifest_or_artifacts(tmp_path):
+    from qwen_engine.manifest import ManifestError
+
+    base_manifest = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    _asset_tree(tmp_path / "models" / "turbo" / "assets", ["dit"],
+                "Qwen/Qwen-Image-2.1-Turbo",
+                manifest=tmp_path / "models" / "turbo" / "manifest.json")
+    turbo = GenerationConfig(manifest_path=str(base_manifest),
+                             models_dir=str(tmp_path / "models"),
+                             recipe="turbo", steps=8)
+    (tmp_path / "models" / "turbo" / "manifest.json").unlink()
+    with pytest.raises(ManifestError, match="turbo manifest"):
+        cli._verify_assets(turbo)
+
+
+def test_verify_assets_refuses_hash_drifted_turbo_artifact(tmp_path):
+    from qwen_engine.manifest import ManifestError
+
+    base_manifest = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    _asset_tree(tmp_path / "models" / "turbo" / "assets", ["dit"],
+                "Qwen/Qwen-Image-2.1-Turbo",
+                manifest=tmp_path / "models" / "turbo" / "manifest.json")
+    (tmp_path / "models" / "turbo" / "assets" / "dit" / "model.bin").write_bytes(b"swallowed")
+    turbo = GenerationConfig(manifest_path=str(base_manifest),
+                             models_dir=str(tmp_path / "models"),
+                             recipe="turbo", steps=8)
+    with pytest.raises(ManifestError, match="turbo artifact"):
+        cli._verify_assets(turbo)
