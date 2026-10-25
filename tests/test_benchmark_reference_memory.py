@@ -342,7 +342,8 @@ def test_process_cells_attempts_every_cell_and_records_crashes(tmp_path):
     def spawn(command, log_path):
         seen_commands.append(command)
         log_path.write_text("")
-        index = command[-1].split("cell-")[1].split(".")[0]
+        spec = command[command.index("--cell-spec") + 1]
+        index = spec.split("cell-")[1].split(".")[0]
         if index == "0":
             module._write_json_exclusive(out / "cell-0.json", {
                 "index": 0, "references": 0, "kv_cache": True,
@@ -355,8 +356,11 @@ def test_process_cells_attempts_every_cell_and_records_crashes(tmp_path):
     assert [c["status"] for c in cells] == ["failed", "crashed"]
     assert cells[0]["error_type"] == "OutOfMemoryError"
     assert cells[1]["error_type"] == "exit_code_9"
+    # cell mode REFUSES to run without --run (see test_cell_mode_requires_run):
+    # the parent must forward it, or every cell exits 1 at that gate.
     assert all(cmd[0] == sys.executable and cmd[1] == "-B" and cmd[2] ==
-               str(SCRIPT.resolve()) and cmd[3] == "--cell-spec"
+               str(SCRIPT.resolve()) and cmd[3] == "--cell-spec" and
+               cmd[cmd.index("--cell-spec") + 2] == "--run"
                for cmd in seen_commands)
     assert (out / "cell-0.spec.json").is_file()
 

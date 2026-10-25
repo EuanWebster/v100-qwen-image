@@ -202,7 +202,7 @@ def test_local_loader_uses_fixed_paths_cpu_and_no_remote_code(inputs, monkeypatc
 def test_encoder_diagnostic_knob_defaults_reproduce_the_pinned_child(monkeypatch):
     monkeypatch.delenv(ew.THREADS_ENV, raising=False)
     monkeypatch.delenv(ew.ATTN_ENV, raising=False)
-    assert ew._requested_threads() == 1
+    assert ew._requested_threads() == min(16, os.cpu_count() or 1)
     assert ew._requested_attn() == "eager"
 
 

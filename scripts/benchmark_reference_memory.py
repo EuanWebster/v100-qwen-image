@@ -461,8 +461,10 @@ def process_cells(output_dir: Path, plan, store_dir: str, config_path: Path, *,
                 "perf_path": str(output_dir / f"cell-{cell['index']}.perf.json"),
                 "cell_path": str(cell_path)}
         _write_json_exclusive(spec_path, spec)
+        # Cell mode REQUIRES --run (see main()); the parent must forward it
+        # or every cell dies at that gate (batch5: all cells exit 1).
         code = spawn([sys.executable, "-B", str(Path(__file__).resolve()),
-                      "--cell-spec", str(spec_path)],
+                      "--cell-spec", str(spec_path), "--run"],
                      output_dir / f"cell-{cell['index']}.log")
         if cell_path.exists():
             record = json.loads(cell_path.read_text())

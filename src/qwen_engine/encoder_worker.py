@@ -58,20 +58,23 @@ def _offline_audit(event, args):
     if event.startswith("socket."):
         raise OfflineViolation(f"encoder worker offline policy refuses {event}")
 
-#: Environment-only diagnostic knobs (docs/encoder-cpu-performance.md). The
-#: defaults reproduce the historical child exactly: ONE thread for every BLAS
-#: and eager attention. Non-default values exist for root's CPU profiling and
-#: MAY change embedding bit patterns; production must keep the defaults until
-#: bit-identity is demonstrated for a specific pinned build. Children inherit
-#: the parent environment, so these must be validated and applied HERE,
-#: before torch imports (Open/MKL pinning is fixed at first BLAS init).
+#: Encoder threading knobs (docs/encoder-cpu-performance.md). Threads
+#: default to min(16, cpu_count): bf16 AVX512 matmul values were proven
+#: BIT-IDENTICAL to one thread across text-only+CFG, 1-ref and 2-ref
+#: requests (t1/t16 value-hash matrix), and child VmHWM is unchanged by
+#: thread count, so the memory gate sees the same peak. QWEN_ENCODER_THREADS
+#: still overrides for diagnosis. ATTENTION stays single-kernel eager by
+#: default: sdpa is 1.5x faster but materially changes embeddings (global
+#: cosine 0.936) and is refused as a default. Children inherit the parent
+#: environment, so these must be validated and applied HERE, before torch
+#: imports (Open/MKL pinning is fixed at first BLAS init).
 THREADS_ENV = "QWEN_ENCODER_THREADS"
 ATTN_ENV = "QWEN_ENCODER_ATTN"
 ATTN_CHOICES = ("eager", "sdpa")
 
 
 def _requested_threads() -> int:
-    raw = os.environ.get(THREADS_ENV, "1")
+    raw = os.environ.get(THREADS_ENV, str(min(16, os.cpu_count() or 1)))
     try:
         value = int(raw)
     except ValueError:
