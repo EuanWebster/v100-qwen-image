@@ -91,6 +91,15 @@ def test_missing_manifest_refuses_before_any_ml_import(tmp_path):
     assert not set(HEAVY) & set(sys.modules)
 
 
+def test_single_step_base_schedule_refuses_before_assets_or_model_loading(tmp_path):
+    adapter = cli._make_adapter()
+    with pytest.raises(ConfigError) as caught:
+        adapter.load(_config(tmp_path, steps=1), {})
+    assert "steps" in caught.value.fields
+    assert "non-finite" in str(caught.value)
+    assert not set(HEAVY) & set(sys.modules)
+
+
 def test_q8_requires_explicit_sidecar_before_assets_or_ml(tmp_path):
     with pytest.raises(ConfigError) as caught:
         cli._make_adapter().load(_config(tmp_path, quant="q8"), {})

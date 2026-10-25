@@ -195,6 +195,10 @@ def _validate_policy(config: GenerationConfig) -> None:
     if not isinstance(config, GenerationConfig):
         raise ConfigError(FieldError("config", "a GenerationConfig is required"))
     errors: list[FieldError] = []
+    if config.steps == 1:
+        errors.append(FieldError(
+            "steps", "the pinned base schedule produces non-finite values with one step; "
+                     "use at least two steps"))
     if config.quant not in (Quant.FP16, Quant.Q8):
         errors.append(FieldError(
             "quant", "the resident loader supports fp16 or reviewed Q8_0 only"))
