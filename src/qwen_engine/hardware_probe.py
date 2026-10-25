@@ -72,7 +72,7 @@ def _nvml_snapshot(uuid):
         return result
 
     call("nvmlInit_v2")
-    primary = None
+    failed = False
     try:
         handle = ctypes.c_void_p()
         call("nvmlDeviceGetHandleByUUID", uuid.encode("ascii"), ctypes.byref(handle))
@@ -92,14 +92,14 @@ def _nvml_snapshot(uuid):
                 or memory.used > memory.total or memory.free + memory.used != memory.total):
             raise HardwareProbeError("incoherent_or_unreviewed_gpu_memory")
         return version, int(memory.total), int(memory.free), int(memory.used)
-    except BaseException as exc:
-        primary = exc
+    except BaseException:
+        failed = True
         raise
     finally:
         try:
             call("nvmlShutdown")
         except Exception:
-            if primary is None:
+            if not failed:
                 raise
             # Do not hide the primary failure/interrupt. Fresh worker exit
             # releases process state; no successful snapshot is returned.

@@ -509,3 +509,98 @@ def test_encode_request_forwards_the_attestation_to_the_preflight(inputs, monkey
                            0, attested_unbounded_host=attested)
     assert calls["attested_unbounded_host"] is attested
 
+
+
+# ---------------------------------------------------------------------------
+# reference image bytes: bounded, hash-bound reads (request v3)
+# ---------------------------------------------------------------------------
+
+
+def test_read_reference_blobs_verifies_content_against_request_hashes(
+        inputs, monkeypatch, tmp_path):
+    import hashlib
+    from dataclasses import replace
+    blob = b"a real png would be longer, these bytes only need to hash"
+    req = replace(inputs.req, images=(hashlib.sha256(blob).hexdigest(),))
+    path = tmp_path / "reference.bin"
+    path.write_bytes(blob)
+    assert ew._read_reference_blobs(req, (str(path),)) == [blob]
+
+    path.write_bytes(b"swapped after submission")
+    with pytest.raises(ew.EncoderRequestError, match="does not match its request"):
+        ew._read_reference_blobs(req, (str(path),))
+
+
+def test_read_reference_blobs_pairing_and_bounds(inputs, monkeypatch, tmp_path):
+    import hashlib
+    from dataclasses import replace
+    blob = b"x" * 64
+    req = replace(inputs.req, images=(hashlib.sha256(blob).hexdigest(),))
+    path = tmp_path / "reference.bin"
+    path.write_bytes(blob)
+    with pytest.raises(ew.EncoderRequestError, match="exactly one path per image"):
+        ew._read_reference_blobs(req, ())
+    with pytest.raises(ew.EncoderRequestError, match="exactly one path per image"):
+        ew._read_reference_blobs(req, (str(path), str(path)))
+    with pytest.raises(ew.EncoderRequestError, match="text-only request"):
+        ew._read_reference_blobs(inputs.req, (str(path),))
+    monkeypatch.setattr(ew, "MAX_REFERENCE_BYTES", 32)
+    with pytest.raises(ew.EncoderRequestError, match="bounded regular file"):
+        ew._read_reference_blobs(req, (str(path),))
+
+
+def test_encode_request_orders_references_before_assets_and_loader(
+        inputs, monkeypatch, tmp_path):
+    import hashlib
+    from dataclasses import replace
+    blob = b"png bytes"
+    req = replace(inputs.req, images=(hashlib.sha256(blob).hexdigest(),))
+    path = tmp_path / "reference.bin"
+    path.write_bytes(blob)
+    events = []
+    monkeypatch.setattr(ew, "require_encoder_memory_fit",
+                        lambda *a, **k: events.append("memory"))
+    monkeypatch.setattr(ew, "validate_worker_request_identity",
+                        lambda *a: events.append("identity"))
+    monkeypatch.setattr(ew, "_read_reference_blobs",
+                        lambda request, paths: events.append("read") or list(paths))
+    monkeypatch.setattr(ew, "reference_images_from_blobs",
+                        lambda request, blobs:
+                        events.append("resize") or ["resized"] * len(blobs))
+    monkeypatch.setattr(ew, "verify_encoder_assets",
+                        lambda *a, **k: (events.append("assets")
+                                         or assets(inputs)))
+    monkeypatch.setattr(ew, "_load_local_components",
+                        lambda *a: events.append("loader") or (object(), object()))
+    monkeypatch.setattr(
+        ew, "encode_with_supplied_model",
+        lambda model, processor, request, reference_images=None:
+        events.append("encoder") or reference_images)
+    result = ew._encode_request(req, inputs.manifest, inputs.root, 0,
+                                (str(path),))
+    assert events == ["memory", "identity", "read", "resize", "assets",
+                      "loader", "encoder"]
+    assert result == ["resized"]
+
+
+def test_text_only_encode_request_never_touches_the_reference_path(
+        inputs, monkeypatch):
+    monkeypatch.setattr(ew, "require_encoder_memory_fit", lambda *a, **k: None)
+    monkeypatch.setattr(ew, "validate_worker_request_identity", lambda *a: None)
+    monkeypatch.setattr(ew, "_read_reference_blobs",
+                        lambda *a: pytest.fail("bytes read for text-only request"))
+    monkeypatch.setattr(ew, "reference_images_from_blobs",
+                        lambda *a: pytest.fail("decode for text-only request"))
+    monkeypatch.setattr(ew, "verify_encoder_assets",
+                        lambda *a, **k: assets(inputs))
+    monkeypatch.setattr(ew, "_load_local_components", lambda *a: (object(), object()))
+    seen = {}
+
+    def encode(model, processor, request, reference_images=None):
+        seen["refs"] = reference_images
+        return "result"
+
+    monkeypatch.setattr(ew, "encode_with_supplied_model", encode)
+    assert ew._encode_request(inputs.req, inputs.manifest, inputs.root,
+                              0) == "result"
+    assert seen["refs"] is None

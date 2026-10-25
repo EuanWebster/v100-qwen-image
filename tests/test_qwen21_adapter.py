@@ -456,3 +456,225 @@ def test_mlp_chunking_is_idempotent_and_refuses_an_unknown_layout():
     with pytest.raises(EngineError, match="chunk"):
         qd._apply_mlp_chunking(fake_torch, SimpleNamespace(transformer_blocks=[
             SimpleNamespace()]), 2048)
+
+
+# -- reference-image orchestration (edit support, part B) ---------------------
+
+
+def _reference_capable() -> bool:
+    try:
+        GenerationConfig(references=("a" * 64,), references_dir="/store")
+        return True
+    except Exception:
+        return False
+
+
+needs_references = pytest.mark.skipif(
+    not _reference_capable(), reason="config references patch not applied yet")
+
+
+def _reference_config(tmp_path, **overrides):
+    values = dict(references=("a" * 64,), references_dir=str(tmp_path / "store"))
+    values.update(overrides)
+    return _config(tmp_path, **values)
+
+
+def test_reference_token_total_counts_one_token_per_32px_square():
+    from qwen_engine.adapters import qwen21_diffusers as qd
+    assert qd._reference_token_total([]) == 0
+    assert qd._reference_token_total([(1024, 1024)]) == 1024
+    assert qd._reference_token_total([(32, 32), (64, 32)]) == 3
+
+
+@needs_references
+def test_reference_policy_refuses_before_any_ml(tmp_path):
+    from qwen_engine.adapters import qwen21_diffusers as qd
+    assert qd.REFERENCE_MAX == 10
+    cases = [
+        (dict(references=tuple(f"{i:064x}" for i in range(11))), "references"),
+        (dict(references=("A" * 64,), references_dir=str(tmp_path)), "references"),
+        (dict(references=("a" * 64,), references_dir=None), "references_dir"),
+    ]
+    for changes, field in cases:
+        with pytest.raises(ConfigError) as excinfo:
+            qd._validate_policy(_reference_config(tmp_path, **changes))
+        assert field in excinfo.value.fields
+    # A within-cap, hex-clean, paired run is not refused by the reference gate.
+    try:
+        qd._validate_policy(_reference_config(tmp_path))
+    except ConfigError as exc:
+        assert "references" not in exc.fields and "references_dir" not in exc.fields
+
+
+def test_joint_chunking_is_decided_after_encode_once(monkeypatch):
+    from types import SimpleNamespace
+    from qwen_engine.adapters import qwen21_diffusers as qd
+    adapter = cli._make_adapter()
+    with pytest.raises(EngineError):
+        adapter._apply_joint_chunking()  # denoise before encode must not guess
+    applied = []
+    monkeypatch.setattr(qd, "_apply_mlp_chunking",
+                        lambda torch, transformer, tokens: applied.append(tokens) or 60)
+    adapter._torch, adapter._pipeline = object(), SimpleNamespace(transformer=object())
+    adapter._joint_tokens = qd.MLP_CHUNK_ABOVE_TOKENS
+    adapter._apply_joint_chunking()
+    assert applied == []  # exactly at the threshold is not above it
+    adapter._joint_tokens = qd.MLP_CHUNK_ABOVE_TOKENS + 1
+    adapter._apply_joint_chunking()
+    assert applied == [qd.MLP_CHUNK_TOKENS]
+    assert adapter._mlp_chunk_tokens == qd.MLP_CHUNK_TOKENS
+    assert adapter._mlp_chunked_blocks == 60
+    applied.clear()
+    adapter._apply_joint_chunking()  # already chunked: never re-wrapped
+    assert applied == []
+
+
+class _PrepareLatentsPipe:
+    def __init__(self, boom=False):
+        self.vae = None
+        self.transformer = object()
+        self.calls = []
+        self.boom = boom
+
+    def prepare_latents(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.boom:
+            raise RuntimeError("pinned prepare_latents failed")
+        return "latents"
+
+
+def _residency_adapter(pipe):
+    adapter = cli._make_adapter()
+    adapter._pipeline = pipe
+    adapter._order = order = []
+    adapter._restore_vae = lambda **kwargs: order.append(("restore", kwargs))
+    adapter._release_vae = lambda: order.append("release")
+    return adapter, order
+
+
+def test_reference_latents_hook_is_per_call_and_idempotent_to_remove():
+    pipe = _PrepareLatentsPipe()
+    adapter, order = _residency_adapter(pipe)
+    adapter._install_reference_latents_hook()
+    assert "prepare_latents" in vars(pipe)
+    assert pipe.prepare_latents(x=1) == "latents"
+    assert pipe.calls == [{"x": 1}]
+    # VAE resident ONLY for the encode: restored (fp16 policy flag) and released
+    # again before anything else in the call can allocate.
+    assert order == [("restore", {"reference": True}), "release"]
+    adapter._remove_reference_latents_hook()
+    assert "prepare_latents" not in vars(pipe)
+    assert pipe.prepare_latents(x=2) == "latents"  # pinned method restored verbatim
+    adapter._remove_reference_latents_hook()       # idempotent
+
+
+def test_reference_latents_hook_releases_vae_after_a_failure():
+    pipe = _PrepareLatentsPipe(boom=True)
+    adapter, order = _residency_adapter(pipe)
+    adapter._install_reference_latents_hook()
+    with pytest.raises(RuntimeError, match="pinned"):
+        pipe.prepare_latents()
+    assert order == [("restore", {"reference": True}), "release"]
+    adapter._remove_reference_latents_hook()
+
+
+def test_reference_latents_hook_refuses_double_install_and_missing_method():
+    from types import SimpleNamespace
+    adapter = cli._make_adapter()
+    adapter._pipeline = SimpleNamespace()  # no prepare_latents at all
+    with pytest.raises(EngineError):
+        adapter._install_reference_latents_hook()
+    pipe = _PrepareLatentsPipe()
+    pipe.prepare_latents = lambda **kwargs: None  # stale override in instance vars
+    adapter._pipeline = pipe
+    with pytest.raises(EngineError):
+        adapter._install_reference_latents_hook()
+
+
+@needs_references
+def test_reference_denoise_wraps_inner_call_and_always_removes(monkeypatch, tmp_path):
+    class Inner:
+        def __init__(self, pipe, order):
+            self.pipe, self.order = pipe, order
+
+        def denoise(self, config, conditioning):
+            self.order.append("override" if "prepare_latents" in vars(self.pipe) else "bare")
+            if conditioning == "boom":
+                raise EngineError("inner refusal")
+            return ["latents"]
+
+    pipe = _PrepareLatentsPipe()
+    order = []
+    adapter = cli._make_adapter()
+    adapter._pipeline = pipe
+    adapter._inner = Inner(pipe, order)
+    adapter._joint_tokens = 100
+    monkeypatch.setattr(adapter, "_apply_joint_chunking", lambda: order.append("chunk"))
+    monkeypatch.setattr(adapter, "_release_vae", lambda: None)
+    monkeypatch.setattr(adapter, "_release_denoiser", lambda: None)
+    config = _reference_config(tmp_path)
+    assert adapter.denoise(config, "cond") == ["latents"]
+    assert order == ["chunk", "override"]
+    assert "prepare_latents" not in vars(pipe) and adapter._reference_latents_hook is None
+    with pytest.raises(EngineError, match="inner"):
+        adapter.denoise(config, "boom")
+    assert order[-1] == "override"
+    assert "prepare_latents" not in vars(pipe)  # finally removed even on failure
+
+
+@needs_references
+def test_encode_derives_joint_tokens_and_facts_merge_them(tmp_path):
+    class Inner:
+        def encode(self, config):
+            return "encoding"
+
+        def calibration_facts(self):
+            return {"prompt_tokens": 25, "negative_prompt_tokens": None,
+                    "cfg_active": False, "encoder_dtype": "fp16",
+                    "execution_dtype": "fp16", "use_kv_cache": True,
+                    "embedding_cache_hit": True, "references": 2}
+
+    adapter = cli._make_adapter()
+    adapter._inner = Inner()
+    adapter._joint_reference_tokens = lambda config: 2048
+    config = _reference_config(tmp_path, references=("a" * 64, "b" * 64))
+    assert adapter.encode(config) == "encoding"
+    assert adapter._joint_tokens == 25 + 2048 + config.latent_tokens
+    assert adapter.calibration_facts()["joint_tokens"] == adapter._joint_tokens
+    adapter._joint_tokens = None
+    assert "joint_tokens" not in adapter.calibration_facts()
+
+
+@needs_references
+def test_t2i_denoise_path_never_touches_reference_hooks(tmp_path, monkeypatch):
+    class Inner:
+        def denoise(self, config, conditioning):
+            assert "prepare_latents" not in vars(pipe)
+            return ["latents"]
+
+    pipe = _PrepareLatentsPipe()
+    adapter = cli._make_adapter()
+    adapter._pipeline = pipe
+    adapter._inner = Inner()
+    monkeypatch.setattr(adapter, "_release_vae", lambda: None)
+    monkeypatch.setattr(adapter, "_release_denoiser", lambda: None)
+    assert adapter.denoise(_config(tmp_path), None) == ["latents"]
+    assert pipe.calls == []
+
+
+def test_reference_vae_restore_stays_fp16_untiled_even_for_tiled_decode():
+    from types import SimpleNamespace
+    order = []
+    adapter = cli._make_adapter()
+    pipe = SimpleNamespace(vae=None)
+    adapter._pipeline = pipe
+    adapter._vae_cls = _FakeVaeClass(order)
+    adapter._vae_dir = "/models/vae"
+    adapter._torch = SimpleNamespace(float16="fp16", float32="fp32",
+                                     device=lambda *a: ("cuda", a[1]))
+    adapter._tiled_decode = True
+    adapter._restore_vae(reference=True)
+    path, kwargs = adapter._vae_cls.calls[0]
+    assert kwargs == {"torch_dtype": "fp16", "local_files_only": True}
+    assert pipe.vae.tiling is False
+    assert pipe.vae.moved == {"device": ("cuda", 0), "dtype": "fp16"}

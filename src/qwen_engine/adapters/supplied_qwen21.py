@@ -11,6 +11,7 @@ import threading
 import uuid
 from pathlib import Path
 
+from qwen_engine import reference_store
 from qwen_engine.config import AttentionBackend, ConfigError, GenerationConfig, OffloadMode, Quant
 from qwen_engine.encoder_client import ProductionEncoding
 from qwen_engine.encoder import EncoderCancelledError
@@ -25,6 +26,11 @@ from qwen_engine.manifest import ModelManifest
 from qwen_engine.performance import stage, current
 
 MAX_PNG_BYTES = 256 * 1024 * 1024
+
+#: Exact pinned ``QwenImage21Pipeline.encode_prompt`` parameter list (bound).
+#: The reference mask hook refuses on ANY drift instead of guessing.
+_ENCODE_PROMPT_PARAMETERS = ("prompt", "image", "device", "num_images_per_prompt",
+                             "prompt_embeds", "prompt_embeds_mask", "image_pad_mask")
 
 
 def _libraries():
@@ -82,6 +88,7 @@ class SuppliedQwen21Adapter:
         self._conditioning = None
         self.actual_seed = None
         self._progress_callback = None
+        self._reference_pils = None
 
     def set_progress_callback(self, callback):
         if self._state != "new" or (callback is not None and not callable(callback)):
@@ -149,8 +156,21 @@ class SuppliedQwen21Adapter:
 
     def encode(self, config):
         self._check("loaded", config)
+        # config.references are the ordered identity binding; the encoder
+        # child re-hashes every path it reads against them. Paths come from
+        # the same reference store the loader below reads (no filesystem
+        # probe here: path_for is syntax-only, like the worker IPC side).
+        image_files: tuple[str, ...] = ()
+        if config.references:
+            if config.references_dir is None:
+                raise EngineError("reference conditioning requires the "
+                                  "reference store directory (references_dir)")
+            image_files = tuple(str(reference_store.path_for(config.references_dir, reference_id))
+                                for reference_id in config.references)
         try:
-            encoding = self._encoder.encode(config, encoder_dtype=self.encoder_dtype, cancel_event=self._event)
+            encoding = self._encoder.encode(config, encoder_dtype=self.encoder_dtype,
+                                            cancel_event=self._event,
+                                            image_files=image_files)
         except EncoderCancelledError:
             # A provider's cancellation acknowledgement is only valid when
             # THIS job requested it; never relabel unrelated provider failures.
@@ -192,7 +212,95 @@ class SuppliedQwen21Adapter:
             "execution_dtype": self.execution_dtype,
             "use_kv_cache": bool(self.use_kv_cache),
             "embedding_cache_hit": getattr(self._encoder, "last_cache_hit", None),
+            "references": len(tuple(getattr(self._config, "references", ()))),
         }
+
+    def reference_images(self, config):
+        """Hash-verified reference PILs in config order, loaded once per attachment.
+
+        Bytes come through ``reference_store.read_blob`` (bounded read +
+        sha256 == id recheck), so a blob replaced mid-run fails closed before
+        any decode. Decoding is capped: the declared side lengths are checked
+        against the store side bound first, then the pixels are loaded (PIL's
+        own decompression-bomb guard is the pixel-count backstop). The list is
+        handed to the pipeline as ``image=`` verbatim: the pinned pipeline
+        performs its own resize for both the VL and the VAE path (design §1.1).
+        """
+        self._check("encoded", config)
+        if self._reference_pils is None:
+            self._reference_pils = self._load_reference_images(config)
+        return self._reference_pils
+
+    def _load_reference_images(self, config):
+        references = tuple(getattr(config, "references", ()))
+        directory = getattr(config, "references_dir", None)
+        if not references or directory is None:
+            raise EngineError("reference loading requested without ids or the store directory")
+        images = []
+        for position, reference_id in enumerate(references, start=1):
+            raw = reference_store.read_blob(directory, reference_id)
+            try:
+                image = self._image.open(io.BytesIO(raw))
+                width, height = image.size
+                if (not 1 <= width <= reference_store.MAX_REFERENCE_DIM
+                        or not 1 <= height <= reference_store.MAX_REFERENCE_DIM):
+                    raise EngineError(
+                        f"reference {position} decodes to {width}x{height}; each side "
+                        f"must not exceed {reference_store.MAX_REFERENCE_DIM} pixels")
+                image.load()
+            except EngineError:
+                raise
+            except Exception:
+                raise EngineError(
+                    f"reference {position} cannot be decoded as an image") from None
+            images.append(image)
+        return images
+
+    def _install_image_pad_mask_hook(self, pairs):
+        """Install a per-call instance override of the pinned ``encode_prompt``.
+
+        ``__call__`` never forwards ``image_pad_mask`` and refuses cached
+        embeds that cover condition images without one, while the pinned
+        ``encode_prompt`` itself accepts it (design §1.6 amendment). The
+        override matches the positive/negative embedding tensors by identity —
+        the box holds strong references so ids cannot be recycled mid-call —
+        injects the cached mask for the matching branch and delegates
+        unchanged to the original bound method. The returned closure removes
+        the override and empties the box, and the caller's ``finally`` runs it
+        on every path, so nothing pins frames or tensors into later memory
+        measurement. Signature drift or a stale override is a refusal, never
+        a guess.
+        """
+        import inspect
+
+        pipe = self._pipeline
+        if "encode_prompt" in vars(pipe):
+            raise EngineError("an encode_prompt override is already installed")
+        original = pipe.encode_prompt
+        if tuple(inspect.signature(original).parameters) != _ENCODE_PROMPT_PARAMETERS:
+            raise EngineError("pinned pipeline encode_prompt signature has changed; "
+                              "cached reference masks cannot be injected blindly")
+        box = {}
+        for embeds, mask in pairs:
+            if mask is None:
+                raise EngineError("reference conditioning is missing its cached image_pad_mask")
+            box[id(embeds)] = (embeds, mask.to(self._device))
+
+        def encode_prompt(*args, **kwargs):
+            embeds = kwargs.get("prompt_embeds")
+            if embeds is not None and kwargs.get("image_pad_mask") is None:
+                entry = box.get(id(embeds))
+                if entry is not None and entry[0] is embeds:
+                    kwargs["image_pad_mask"] = entry[1]
+            return original(*args, **kwargs)
+
+        pipe.encode_prompt = encode_prompt
+
+        def remove():
+            if "encode_prompt" in vars(pipe):
+                del pipe.encode_prompt
+            box.clear()
+        return remove
 
     def _finite(self, tensor, shape, dtype):
         torch = self._torch
@@ -225,6 +333,14 @@ class SuppliedQwen21Adapter:
             kwargs[prefix + "prompt_embeds"] = embeds
             kwargs[prefix + "prompt_embeds_mask"] = (
                 None if branch.attention_mask is None else branch.attention_mask.to(self._device))
+        references = tuple(getattr(config, "references", ()))
+        images = self.reference_images(config) if references else None
+        mask_hook = None
+        if images is not None:
+            mask_hook = self._install_image_pad_mask_hook(
+                [(kwargs["prompt_embeds"], conditioning.positive.image_pad_mask)]
+                + ([] if conditioning.negative is None else
+                   [(kwargs["negative_prompt_embeds"], conditioning.negative.image_pad_mask)]))
         generator = torch.Generator(device=self._device)
         self.actual_seed = generator.seed() if config.seed is None else config.seed
         generator.manual_seed(self.actual_seed)
@@ -238,11 +354,15 @@ class SuppliedQwen21Adapter:
                 self._progress_callback(index + 1, config.steps)
             return {}
 
-        with torch.inference_mode():
-            result = self._pipeline(prompt=None, image=None, height=config.height, width=config.width,
-                num_inference_steps=config.steps, true_cfg_scale=config.true_cfg_scale if config.cfg_active else 1,
-                num_images_per_prompt=1, generator=generator, output_type="latent",
-                use_kv_cache=self.use_kv_cache, callback_on_step_end=callback, **kwargs)
+        try:
+            with torch.inference_mode():
+                result = self._pipeline(prompt=None, image=images, height=config.height, width=config.width,
+                    num_inference_steps=config.steps, true_cfg_scale=config.true_cfg_scale if config.cfg_active else 1,
+                    num_images_per_prompt=1, generator=generator, output_type="latent",
+                    use_kv_cache=self.use_kv_cache, callback_on_step_end=callback, **kwargs)
+        finally:
+            if mask_hook is not None:
+                mask_hook()
         self._check("encoded", config)
         self._finite(result.images, (1, config.latent_tokens, 64), self._dtype)
         self._state = "denoised"
@@ -295,4 +415,5 @@ class SuppliedQwen21Adapter:
         self._encoding_request = self._event = None
         self._progress_callback = None
         self._conditioning = None
+        self._reference_pils = None
         self._state = "closed"

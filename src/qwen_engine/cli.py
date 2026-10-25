@@ -31,7 +31,7 @@ from qwen_engine.adapters.base import (
     OFFLOAD_CHOICES,
     QUANT_CHOICES,
 )
-from qwen_engine.config import ConfigError, GenerationConfig
+from qwen_engine.config import ConfigError, FieldError, GenerationConfig
 from qwen_engine.core import generate, plan, require_run_config
 from qwen_engine.errors import (
     EngineError,
@@ -140,7 +140,61 @@ def build_parser() -> argparse.ArgumentParser:
                    help="model manifest path override (default: unset -> run refuses)")
     p.add_argument("--q8-manifest", type=Path, default=None,
                    help="explicit verified Q8 GGUF sidecar manifest (required with --quant q8)")
+    p.add_argument("--reference", dest="references", action="append", default=None,
+                   metavar="PATH",
+                   help="reference image file (repeatable, ordered, at most 10): the "
+                        "bytes are copied verbatim into the reference store and the "
+                        "run carries only content ids")
+    p.add_argument("--references-dir", dest="references_dir", type=Path, default=None,
+                   help="reference store directory (default: <cache_dir>/references)")
     return p
+
+
+def _ingest_references(paths: list[Any], references_dir: Any,
+                       data: dict[str, Any]) -> None:
+    """Store CLI reference files as content blobs and point the config at ids.
+
+    Files are copied verbatim (no re-encode: identity must cover the bytes the
+    user chose); the config keeps ids + store directory only, so job envelopes
+    never carry server paths. Validation stays in the store: magic sniff,
+    decode caps, size caps, store fullness — every refusal is an exit-2
+    config error, never a traceback."""
+    from qwen_engine import reference_store
+    if references_dir is None:
+        cache_dir = data.get("cache_dir")
+        if cache_dir is None:
+            raise ConfigError(FieldError(
+                "references_dir",
+                "--reference requires --references-dir (or a cache_dir; the "
+                "store defaults to <cache_dir>/references)"))
+        references_dir = Path(str(cache_dir)) / "references"
+    store_dir = Path(str(references_dir))
+    try:
+        store_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ConfigError(FieldError(
+            "references_dir", f"store directory is not usable: {store_dir}: "
+                              f"{exc.strerror or exc}")) from exc
+    ids = []
+    for position, raw_path in enumerate(paths, start=1):
+        path = Path(str(raw_path))
+        try:
+            blob = read_bounded_file(path, reference_store.MAX_REFERENCE_BYTES)
+        except OSError as exc:
+            raise ConfigError(FieldError(
+                "references", f"reference {position} is not a readable file: "
+                              f"{path}: {exc.strerror or exc}")) from exc
+        except (ValueError, RuntimeError) as exc:
+            raise ConfigError(FieldError(
+                "references", f"reference {position} exceeds the store byte cap: "
+                              f"{path}: {exc}")) from exc
+        try:
+            ids.append(reference_store.put_bytes(store_dir, blob))
+        except EngineError as exc:
+            raise ConfigError(FieldError(
+                "references", f"reference {position} refused: {exc}")) from exc
+    data["references"] = ids
+    data["references_dir"] = str(store_dir)
 
 
 def _load_config(args: argparse.Namespace) -> GenerationConfig:
@@ -190,6 +244,11 @@ def _load_config(args: argparse.Namespace) -> GenerationConfig:
             current = str(data.get("output_format", "jpg")).lower()
             if not explicit_format and current not in ("png", "webp"):
                 data["output_format"] = "png"
+    reference_paths = list(getattr(args, "references", None) or [])
+    if reference_paths:
+        _ingest_references(reference_paths, getattr(args, "references_dir", None), data)
+    elif getattr(args, "references_dir", None) is not None:
+        data["references_dir"] = str(args.references_dir)
     return GenerationConfig.from_dict(data)
 
 
@@ -335,8 +394,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger = _logger_for(config)
         if args.dry_run:
             status = manifest_status(config.manifest_path, config.models_dir)
-            print(json.dumps(plan(config, manifest=status),
-                             sort_keys=True, indent=2))
+            document = plan(config, manifest=status)
+            if config.references:
+                # Echo ids, sizes and order (design §2.2); blobs are never
+                # resolved — sizes come from the freshly ingested input files,
+                # and a config-file-only run reports null sizes.
+                paths = list(args.references or [])
+                echoed = []
+                for ordinal, reference_id in enumerate(config.references, start=1):
+                    entry: dict[str, Any] = {"ordinal": ordinal, "id": reference_id}
+                    entry["bytes"] = None
+                    if ordinal <= len(paths):
+                        try:
+                            entry["bytes"] = Path(str(paths[ordinal - 1])).stat().st_size
+                        except OSError as exc:
+                            raise ConfigError(FieldError(
+                                "references", f"reference {ordinal} vanished: {exc}")) from exc
+                    echoed.append(entry)
+                document["references"] = echoed
+            print(json.dumps(document, sort_keys=True, indent=2))
             return int(ExitCode.OK)
         if not args.run:
             parser.print_help()

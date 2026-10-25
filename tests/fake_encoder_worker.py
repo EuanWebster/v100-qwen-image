@@ -28,15 +28,17 @@ Driven entirely by underscore-prefixed keys in the request ``kwargs``:
   ``max_response_bytes`` cap at the byte-exact boundary. The document is
   deterministic apart from the 32-hex ``request_id`` (fixed length), so
   repeated runs of the same request produce same-LENGTH responses.
+* ``_echo_wire``: true — echo the request document's ``images``/
+  ``image_files`` lists into the response metadata (v3 wiring check)
 * ``_counter_file``: path — append one line per *encode* (double-encode detector)
 * ``_pid_file``: path — record the worker pid (kill-path verification)
 
 An otherwise plain request answers ``ok`` with a deterministic blob derived
 from the prompt, so cache round-trips are byte-reproducible.
 
-Request schema v2 may carry an ``implementation_identity`` block; the fake
-ignores it entirely (it is a *generic* worker — only a production worker
-requires an implementation identity).
+Request schema v3 may carry ``images`` (content hashes) and the wire-only
+``image_files`` list; the fake otherwise ignores both entirely (it is a
+*generic* worker — only production workers interpret conditioning).
 """
 from __future__ import annotations
 
@@ -112,6 +114,9 @@ def main() -> int:
             "prompt_chars": len(prompt),
             "source": "fake-worker",
         }
+        if kwargs.get("_echo_wire"):
+            metadata["images"] = req.get("images", [])
+            metadata["image_files"] = req.get("image_files")
         if kwargs.get("_nan_metadata"):
             metadata["nan_field"] = float("nan")  # sloppy worker: NaN literal
         doc.update({

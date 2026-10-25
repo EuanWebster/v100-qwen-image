@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from enum import StrEnum
@@ -38,6 +39,13 @@ SEED_MIN, SEED_MAX = 0, 2**64 - 1
 CFG_SCALE_MIN = 1.0
 DEFAULT_STEPS = 40
 
+#: Plan §4: at most ten reference images per run (V100 token budget; the
+#: measured matrix may lower this, nothing raises it without new evidence).
+REF_MAX = 10
+
+#: Canonical reference content id: sha256 hex digest, lowercase.
+REFERENCE_ID_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
 # --- transparency wrapper (core) ---------------------------------------------
 #: Versioned identity of the exact wrapper text below. Future metadata/audit
 #: records should cite this constant so a later wrapper revision can never be
@@ -55,7 +63,7 @@ TRANSPARENCY_PROMPT_SUFFIX = (
 
 #: Fields that must name an existing *directory* when they exist on disk.
 _DIR_FIELDS = ("output_dir", "cache_dir", "log_dir", "benchmarks_dir",
-               "models_dir")
+               "models_dir", "references_dir")
 #: Fields that must name an existing *file* when they exist on disk.
 _FILE_FIELDS = ("manifest_path", "q8_manifest_path")
 
@@ -183,6 +191,11 @@ class GenerationConfig:
     models_dir: str | None = None
     manifest_path: str | None = None
     q8_manifest_path: str | None = None
+    #: Ordered reference-image content ids (design §2.1): each a sha256 hex
+    #: digest of a blob in ``references_dir``. Duplicates are legal — the same
+    #: image may fill two ``<imageN>`` slots. Empty means text-to-image.
+    references: tuple[str, ...] = ()
+    references_dir: str | None = None
 
     _ENUM_FIELDS: ClassVar[dict[str, type[StrEnum]]] = {
         "quant": Quant,
@@ -302,6 +315,31 @@ class GenerationConfig:
                     f"jpg, got {self.output_format.value!r}",
                 )
             )
+        if not isinstance(self.references, (tuple, list)):
+            errors.append(
+                FieldError("references", f"must be a list of content ids, got {self.references!r}")
+            )
+        else:
+            references = tuple(self.references)
+            object.__setattr__(self, "references", references)
+            if len(references) > REF_MAX:
+                errors.append(
+                    FieldError("references",
+                               f"at most {REF_MAX} reference ids are allowed, "
+                               f"got {len(references)}")
+                )
+            if not all(isinstance(value, str) and REFERENCE_ID_RE.fullmatch(value)
+                       for value in references):
+                errors.append(
+                    FieldError("references",
+                               "every entry must be a 64-character lowercase hex "
+                               "content id of a stored reference")
+                )
+            if references and self.references_dir is None:
+                errors.append(
+                    FieldError("references_dir",
+                               "reference ids require the store directory")
+                )
 
         if errors:
             raise ConfigError(errors)

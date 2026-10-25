@@ -15,6 +15,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from collections.abc import Sequence
+
 from qwen_engine._jsonsafe import plain_json
 from qwen_engine.config import GenerationConfig
 from qwen_engine.encoder import (
@@ -38,9 +40,10 @@ def _absolute_path(value, field):
     return Path(os.path.abspath(raw))
 
 
-def _request_budget(request, rid):
+def _request_budget(request, rid, image_files=None):
     # Match generic runner's current wire serialization, including newline.
-    raw = (json.dumps(request.to_request_dict(rid), sort_keys=True,
+    raw = (json.dumps(request.to_request_dict(rid, image_files=image_files),
+                      sort_keys=True,
                       ensure_ascii=True) + "\n").encode("utf-8")
     if len(raw) > MAX_REQUEST_BYTES:
         raise EncoderRequestError("production encoder request exceeds the worker input byte cap")
@@ -130,13 +133,28 @@ class ProductionEncoder:
                                      timeout_s=timeout_s, performance_supported=True, **common)
 
     def encode(self, config: GenerationConfig, *, encoder_dtype: str,
-               cancel_event: threading.Event | None = None) -> ProductionEncoding:
+               cancel_event: threading.Event | None = None,
+               image_files: Sequence[str] = ()) -> ProductionEncoding:
+        """Encode the config; ``image_files`` are wire-only paths of the
+        reference images whose ordered content hashes ``seed.images`` must
+        already carry (one absolute path per hash, same order)."""
         if cancel_event is not None and not isinstance(cancel_event, threading.Event):
             raise EncoderRequestError("cancel_event must be a threading.Event or None")
+        if isinstance(image_files, (str, bytes)) or not isinstance(image_files, Sequence):
+            raise EncoderRequestError("image_files must be a sequence of path strings")
+        image_files = tuple(image_files)
         manifest = load_manifest(self.manifest_path)
         seed = project_encoder_seed(config, manifest, encoder_dtype=encoder_dtype)
         rid = uuid.uuid4().hex
-        _request_budget(seed, rid)
+        if image_files and not seed.images:
+            raise EncoderRequestError(
+                "image files supplied but the seed request carries no image "
+                "hashes (config references missing?)")
+        if seed.images and not image_files:
+            raise EncoderRequestError(
+                "the seed request carries image hashes; ordered wire "
+                "image_files are required (one path per hash)")
+        _request_budget(seed, rid, image_files)
         projected = self._projector.run(seed, request_id=rid, cancel_event=cancel_event)
         request = _completed_request(projected, seed, rid, manifest)
         self._loader._event("production_encoder_identity", cache_key=cache_key(request),
@@ -145,7 +163,9 @@ class ProductionEncoder:
         if self.cache is None:
             # No cache configured behaves as a miss: the child encoder runs.
             self.last_cache_hit = False
-            return ProductionEncoding(request, self._loader.run(request, request_id=rid, cancel_event=cancel_event))
+            return ProductionEncoding(request, self._loader.run(
+                request, request_id=rid, cancel_event=cancel_event,
+                image_files=image_files))
         key = cache_key(request)
         with self.cache.lock_for(key):
             payload = self.cache.get(key)
@@ -154,7 +174,9 @@ class ProductionEncoder:
                 self.last_cache_hit = True
                 return ProductionEncoding(request, payload)
             self._loader._event("encoder_cache_miss", cache_key=key)
-            result = ProductionEncoding(request, self._loader.run(request, request_id=rid, cancel_event=cancel_event))
+            result = ProductionEncoding(request, self._loader.run(
+                request, request_id=rid, cancel_event=cancel_event,
+                image_files=image_files))
             self.cache.put(key, result.payload)
             self.last_cache_hit = False
             return result

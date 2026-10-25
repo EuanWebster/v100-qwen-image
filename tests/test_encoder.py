@@ -51,6 +51,7 @@ from qwen_engine.encoder import (
     _EntryCorrupt,
     cache_key,
     embedding_cache_for,
+    request_image_files,
 )
 
 HEAVY_MODULES = ("torch", "diffusers", "transformers")
@@ -109,7 +110,7 @@ def assert_scratch_clean(tmp_path) -> None:
 
 
 def test_schema_tags_are_versioned():
-    assert REQUEST_SCHEMA == "qwen_engine.encoder_request.v2"
+    assert REQUEST_SCHEMA == "qwen_engine.encoder_request.v3"
     assert RESULT_SCHEMA == "qwen_engine.encoder_result.v1"
     assert CACHE_KEY_SCHEMA == "qwen_engine.embed_cache_key.v3"
     assert ENTRY_SCHEMA == "qwen_engine.embed_entry.v1"
@@ -123,6 +124,75 @@ def test_request_roundtrip_is_lossless():
     parsed, rid = EncoderRequest.from_request_dict(doc)
     assert rid == "rid-1"
     assert parsed.key_document() == req.key_document()
+
+
+def test_request_v3_image_files_are_wire_only():
+    req = make_request(images=(SHA_A, SHA_B))
+    doc = req.to_request_dict("rid", image_files=["/store/a.img", "/store/b.img"])
+    assert doc["schema"] == REQUEST_SCHEMA
+    assert doc["image_files"] == ["/store/a.img", "/store/b.img"]
+    parsed, rid = EncoderRequest.from_request_dict(doc)
+    assert rid == "rid"
+    assert "image_files" not in parsed.key_document()
+    assert parsed.key_document() == req.key_document()
+    assert cache_key(parsed) == cache_key(req)  # identity stays hash-based
+    assert request_image_files(doc) == ("/store/a.img", "/store/b.img")
+
+
+def test_text_only_request_document_stays_byte_identical():
+    req = make_request()
+    plain = req.to_request_dict("rid")
+    assert "image_files" not in plain
+    assert req.to_request_dict("rid", image_files=None) == plain
+    assert req.to_request_dict("rid", image_files=()) == plain
+    assert request_image_files(plain) == ()
+
+
+def test_t2i_cache_key_survives_the_v3_wire_upgrade():
+    # Frozen golden value computed from the pre-upgrade (schema v2) encoder
+    # module: the key document of text-only conditioning is byte-identical
+    # across the v2 -> v3 transport bump, so existing cache entries keep
+    # hitting. Any change to this value is a cache-wipe regression.
+    req = make_request(negative_prompt="ugly, blurry", kwargs={"cfg_active": True})
+    assert cache_key(req) == ("ee4c3686e973d8b7fa01fbff8472a414b821de5c90dca984"
+                              "ebeb1202cb3eac68")
+
+
+@pytest.mark.parametrize("files", [
+    "/store/a.img",
+    ["/store/a.img"],
+    ["/store/a.img", "relative/b.img"],
+    ["/store/a.img", "  "],
+    ["/store/a.img", "/store/b\0.img"],
+])
+def test_malformed_image_files_are_typed(files):
+    req = make_request(images=(SHA_A, SHA_B))
+    with pytest.raises(EncoderRequestError, match="image_files"):
+        req.to_request_dict("rid", image_files=files)
+
+
+def test_image_files_without_images_is_refused():
+    req = make_request()
+    with pytest.raises(EncoderRequestError, match="image_files"):
+        req.to_request_dict("rid", image_files=["/store/a.img"])
+    doc = make_request().to_request_dict("rid")
+    doc["image_files"] = ["/store/a.img"]
+    with pytest.raises(EncoderRequestError, match="image_files"):
+        EncoderRequest.from_request_dict(doc)
+
+
+def test_from_request_dict_validates_image_files_shape():
+    doc = make_request(images=(SHA_A,)).to_request_dict("rid")
+    doc["image_files"] = ["relative/a.img"]
+    with pytest.raises(EncoderRequestError, match="image_files"):
+        EncoderRequest.from_request_dict(doc)
+    doc = make_request(images=(SHA_A,)).to_request_dict("rid")
+    doc["image_files"] = "/store/a.img"
+    with pytest.raises(EncoderRequestError, match="image_files"):
+        EncoderRequest.from_request_dict(doc)
+    assert request_image_files(
+        make_request(images=(SHA_A,)).to_request_dict(
+            "rid", image_files=["/store/a.img"])) == ("/store/a.img",)
 
 
 @pytest.mark.parametrize(
@@ -2280,3 +2350,22 @@ def test_mixed_mapping_keys_are_typed_encoder_request_errors(part):
         action = lambda: EncoderRequest.from_request_dict(data)
     with pytest.raises(EncoderRequestError, match="unknown"):
         action()
+
+
+def test_worker_run_wires_image_files_into_the_child_document(tmp_path):
+    # End-to-end v3 subprocess: EncoderWorker.run(..., image_files=...)
+    # serializes the ordered paths into the wire document next to the
+    # images hashes, and a generic worker consumes the document verbatim.
+    req = make_request(images=(SHA_A,),
+                       kwargs={"_echo_wire": True})
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    worker = EncoderWorker(
+        command=["{python}", str(FAKE_WORKER), "--request", "{request}",
+                 "--response", "{response}"],
+        timeout_s=15.0, scratch_dir=scratch)
+    payload = worker.run(req, request_id="v3-img-1",
+                         image_files=["/store/a.img"])
+    assert payload.metadata["images"] == (SHA_A,)
+    assert payload.metadata["image_files"] == ("/store/a.img",)
+    assert_scratch_clean(tmp_path)

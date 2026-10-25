@@ -86,6 +86,11 @@ MLP_CHUNK_TOKENS = 2048
 TILED_DECODE_TILE = 1024
 TILED_DECODE_STRIDE = 768
 
+#: Ordered reference-image cap accepted by this loader (plan §4: ten, subject
+#: to measured V100 limits). Refused before any manifest read or ML import;
+#: the config layer validates its own identical bound independently.
+REFERENCE_MAX = 10
+
 
 def _chunked_mlp_forward(inner_forward, torch, chunk: int, hidden_states):
     """Evaluate a token-wise MLP in fixed token chunks (exact, not an approximation)."""
@@ -124,6 +129,19 @@ def _apply_mlp_chunking(torch, transformer, chunk: int) -> int:
         raise EngineError(
             f"MLP chunking wrapped {wrapped} of {len(blocks)} transformer blocks")
     return wrapped
+
+
+def _reference_token_total(resized_dimensions) -> int:
+    """Packed denoise-sequence tokens contributed by reference images.
+
+    Each reference is resized to the pinned 1024²-area rule (multiples of 32),
+    the VAE compresses 16x spatially, and ``_pack_latents`` groups 2x2 latent
+    patches: exactly one token per 32x32 pixels. Pure arithmetic so the CPU
+    tests cover it; the GPU path feeds it the pinned
+    ``calculate_dimensions`` results.
+    """
+    return sum((width // 32) * (height // 32)
+               for width, height in resized_dimensions)
 
 
 def _libraries():
@@ -230,6 +248,22 @@ def _validate_policy(config: GenerationConfig) -> None:
             "cache_dir", "the encoder cache/scratch requires an explicit cache_dir; "
                          "add --cache-dir cache (created automatically) "
                          "or set cache_dir in the JSON config"))
+    references = tuple(getattr(config, "references", ()))
+    if references:
+        from qwen_engine import reference_store
+        if len(references) > REFERENCE_MAX:
+            errors.append(FieldError(
+                "references",
+                f"at most {REFERENCE_MAX} reference images are supported, "
+                f"got {len(references)}"))
+        if any(not reference_store.is_reference_id(value) for value in references):
+            errors.append(FieldError(
+                "references", "every entry must be a 64-character lowercase hex "
+                              "content id of a stored reference"))
+        if getattr(config, "references_dir", None) is None:
+            errors.append(FieldError(
+                "references_dir",
+                "reference ids require the store directory (references_dir)"))
     if errors:
         raise ConfigError(errors)
 
@@ -258,6 +292,8 @@ class Qwen21DiffusersAdapter:
         self._tiled_decode = False
         self._fp32_decode = False
         self._mlp_chunk_tokens = 0
+        self._joint_tokens = None
+        self._reference_latents_hook = None
         self._mlp_chunked_blocks = 0
         self._trust_unbounded_host = trust_unbounded_host
         self._state = "new"
@@ -404,24 +440,110 @@ class Qwen21DiffusersAdapter:
 
     def encode(self, config: GenerationConfig):
         result = self._attached().encode(config)
+        facts = self._attached().calibration_facts()
+        references = tuple(getattr(config, "references", ()))
+        if references:
+            # Prompt-free joint-sequence facts (design §4): S_prompt + the
+            # packed reference tokens + target tokens. This is the value the
+            # MLP chunk decision re-evaluates and the measurement matrix
+            # records; it changes nothing for text-to-image runs.
+            self._joint_tokens = (facts["prompt_tokens"]
+                                  + self._joint_reference_tokens(config)
+                                  + config.latent_tokens)
         if current() is not None:
-            facts = self._attached().calibration_facts()
-            for key in ("embedding_cache_hit", "prompt_tokens", "negative_prompt_tokens"):
+            for key in ("embedding_cache_hit", "prompt_tokens",
+                        "negative_prompt_tokens", "references"):
                 current().metadata[key] = facts[key]
+            if references:
+                current().metadata["joint_tokens"] = self._joint_tokens
         return result
 
     def calibration_facts(self):
-        """Delegate the exact conditioning facts to the attached adapter."""
-        return self._attached().calibration_facts()
+        """Delegate the exact conditioning facts to the attached adapter;
+        add the measured joint token count once references were encoded."""
+        facts = self._attached().calibration_facts()
+        if self._joint_tokens is not None:
+            facts = {**facts, "joint_tokens": self._joint_tokens}
+        return facts
 
     def denoise(self, config: GenerationConfig, conditioning):
+        references = bool(getattr(config, "references", ()))
         with stage("initial_vae_cleanup", cuda=True):
             self._release_vae()
+        if references:
+            self._apply_joint_chunking()
         with stage("denoising", cuda=True):
-            latents = self._attached().denoise(config, conditioning)
+            if references:
+                self._install_reference_latents_hook()
+            try:
+                latents = self._attached().denoise(config, conditioning)
+            finally:
+                if references:
+                    self._remove_reference_latents_hook()
         with stage("transformer_cleanup", cuda=True):
             self._release_denoiser()
         return latents
+
+    def _joint_reference_tokens(self, config: GenerationConfig) -> int:
+        """Tokens the references add to the denoise sequence, measured off the
+        hash-verified decoded sizes through the pinned resize rule (lazy
+        diffusers import: this only runs on an actual reference run)."""
+        from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_dimensions
+        dimensions = [
+            tuple(int(value) for value in calculate_dimensions(
+                1024 * 1024, image.size[0] / image.size[1])[:2])
+            for image in self._attached().reference_images(config)]
+        return _reference_token_total(dimensions)
+
+    def _apply_joint_chunking(self) -> None:
+        """Reference runs decide MLP chunking on the JOINT sequence (design §4
+        correctness gap): the load-time target-only decision cannot know
+        S_prompt or the reference tokens. Re-evaluated after encode, before the
+        first step; an already-chunked transformer (large target) is kept.
+        Chunking is token-wise exact, so the decision changes peak memory and
+        kernel count, never the result."""
+        if self._joint_tokens is None:
+            raise EngineError("reference generation must be encoded before denoise")
+        if self._joint_tokens > MLP_CHUNK_ABOVE_TOKENS and not self._mlp_chunk_tokens:
+            self._mlp_chunked_blocks = _apply_mlp_chunking(
+                self._torch, self._pipeline.transformer, MLP_CHUNK_TOKENS)
+            self._mlp_chunk_tokens = MLP_CHUNK_TOKENS
+
+    def _install_reference_latents_hook(self) -> None:
+        """Keep the VAE resident for exactly the reference VAE encode.
+
+        With references, upstream's ``prepare_latents`` calls the VAE encoder
+        inside ``__call__`` before the loop; the measured transformer+VAE
+        residency (~14.8 GiB, see :meth:`_release_denoiser`) leaves no denoise
+        headroom on the 16 GiB card. This per-call instance override restores
+        the VAE (fp16, untiled), runs the pinned ``prepare_latents`` under a
+        prompt-free wall-time stage, and releases the VAE again in its own
+        ``finally`` — so the sampling loop runs transformer-only exactly like
+        text-to-image. Removed by :meth:`_remove_reference_latents_hook` in
+        the caller's ``finally``; nothing survives into memory measurement.
+        """
+        pipeline = self._pipeline
+        if pipeline is None or not callable(getattr(pipeline, "prepare_latents", None)):
+            raise EngineError("reference generation requires the pinned prepare_latents")
+        if "prepare_latents" in vars(pipeline):
+            raise EngineError("a prepare_latents override is already installed")
+        original = pipeline.prepare_latents
+
+        def prepare_latents(*args, **kwargs):
+            self._restore_vae(reference=True)
+            try:
+                with stage("reference_vae_encode"):
+                    return original(*args, **kwargs)
+            finally:
+                self._release_vae()
+
+        pipeline.prepare_latents = prepare_latents
+        self._reference_latents_hook = pipeline
+
+    def _remove_reference_latents_hook(self) -> None:
+        pipeline, self._reference_latents_hook = self._reference_latents_hook, None
+        if pipeline is not None and "prepare_latents" in vars(pipeline):
+            del pipeline.prepare_latents
 
     def decode(self, latents):
         with stage("vae_loading", cuda=True):
@@ -444,7 +566,7 @@ class Qwen21DiffusersAdapter:
         pipeline.vae = None
         gc.collect()
 
-    def _restore_vae(self) -> None:
+    def _restore_vae(self, *, reference: bool = False) -> None:
         pipeline = self._pipeline
         if pipeline is None or self._vae_cls is None or self._vae_dir is None:
             return
@@ -461,13 +583,15 @@ class Qwen21DiffusersAdapter:
         # Transparent output also decodes in fp32: at 1024² the fp16 decode of
         # RGBA latents was non-finite for all three measured prompts, while the
         # same run with fp32 decode produced a finite image with a real alpha
-        # channel.
-        dtype = torch.float32 if self._fp32_decode else torch.float16
+        # channel. A reference encode is fed the fp16 execution tensors and
+        # never uses the fp32 decode policy or decode tiling.
+        dtype = torch.float16 if reference else (
+            torch.float32 if self._fp32_decode else torch.float16)
         vae = self._vae_cls.from_pretrained(
             self._vae_dir, torch_dtype=dtype, local_files_only=True)
         vae.to(device=torch.device("cuda", LOGICAL_DEVICE_INDEX),
                dtype=dtype).eval()
-        if self._tiled_decode:
+        if self._tiled_decode and not reference:
             vae.enable_tiling(
                 tile_sample_min_height=TILED_DECODE_TILE,
                 tile_sample_min_width=TILED_DECODE_TILE,
@@ -519,5 +643,7 @@ class Qwen21DiffusersAdapter:
         self._bundle = None
         self._state = "closed"
         self._progress_callback = None
+        self._joint_tokens = None
+        self._reference_latents_hook = None
         if inner is not None:
             inner.close()

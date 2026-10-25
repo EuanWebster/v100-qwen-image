@@ -246,7 +246,7 @@ class GenerationProcessExecutor:
         if not self._lease.acquire(blocking=False):
             raise GenerationProcessError("executor_busy")
         scratch = proc = None
-        primary = None
+        failed = False
         completed = False
         try:
             if (self._closing.is_set() or self._active is not None
@@ -275,8 +275,8 @@ class GenerationProcessExecutor:
             result = self._await(proc, response, context)
             completed = True  # clean worker publication; controller still verifies artifact
             return result
-        except BaseException as exc:
-            primary = exc
+        except BaseException:
+            failed = True
             raise
         finally:
             try:
@@ -287,7 +287,7 @@ class GenerationProcessExecutor:
                 self._closing.set()
                 if self.last_cleanup_error is None:
                     self.last_cleanup_error = "worker_cleanup_pending"
-                if primary is None and not completed:
+                if not failed and not completed:
                     raise
                 # Preserve primary failures/interrupts and a coherent clean
                 # worker result. The controller still freshly verifies files.
