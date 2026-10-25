@@ -12,6 +12,13 @@ broader quality/shape validation and production memory preflight remain pending.
 Upstream evidence and two local Qwen planning reviews:
 [feature review](docs/upstream-feature-roadmap-2026-10-24.md).
 
+**Next-build review, 2026-10-25:** [feature inventory and delivery order](docs/next-features-plan-2026-10-25.md).
+This is a planning-only checkpoint requested before further implementation:
+memory/2K decoding foundation, transparency, official Turbo, single-reference
+editing, multiple references and rewriting; model reuse is a performance
+companion. The ratio catalog and option explanations are already delivered;
+Q4 stays removed. No new feature build starts as part of this review.
+
 The original executable plan was revised 2026-10-07, with senior-review fixes on
 `f6325d0`. It superseded the original draft (committed as `df59ce7`) and
 incorporates every correction and confirmed requirement in `HANDOFF.md` (committed as
@@ -558,10 +565,12 @@ latency thresholds. Model downloads remain an explicit operator action.
   no silent changes, stale responses, malformed-output application or hidden
   external fallback. Cancellation/timeout keeps the original draft intact.
 
-**Suggested sequence:** Q8 feasibility + M5.3 integration; complete aspect catalog
-and RGBA audit; official Turbo; single-reference then multiple-reference editing;
-rewriter feasibility can proceed independently, with editing rewriting following
-reference support. Base quality mode remains usable throughout. Persistent job
+**Suggested sequence (updated 2026-10-25):** M5.3 integration and decode headroom;
+complete the native RGBA workflow; official Turbo; single-reference then
+multiple-reference editing; prompt rewriting. The aspect catalog is delivered.
+Rewriter/model-reuse feasibility can proceed independently, with editing
+rewriting following reference support. See the next-build review linked above.
+Base quality mode remains usable throughout. Persistent job
 history is a recommended companion task before repeated deployment restarts;
 it is not claimed implemented by this feature-plan update.
 
