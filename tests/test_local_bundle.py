@@ -1203,10 +1203,17 @@ def test_direct_construction_enforces_profile_scalars():
 def test_fingerprints_reject_non_digest_strings():
     lb.ArtifactSetFingerprints(bundle="a" * 64, encoder="b" * 64)
     for bad in ("", "a" * 63, "a" * 65, "z" * 64, "AB" * 32, None):
+        # The whole-set digest is never optional, not even as None.
         with pytest.raises(lb.BundleLayoutError, match="hex digest"):
             lb.ArtifactSetFingerprints(bundle=bad, encoder="b" * 64)
+        if bad is None:
+            break
         with pytest.raises(lb.BundleLayoutError, match="hex digest"):
             lb.ArtifactSetFingerprints(bundle="a" * 64, encoder=bad)
+    # ``encoder`` is Optional, but only ``None`` is exempt (Turbo carries no
+    # encoder files): the whole-set digest is NEVER optional.
+    assert lb.ArtifactSetFingerprints(bundle="a" * 64,
+                                      encoder=None).encoder is None
 
 
 def test_artifact_set_fingerprint_rejects_non_artifacts_and_duplicates():
@@ -1228,3 +1235,309 @@ def test_artifact_set_fingerprint_rejects_non_artifacts_and_duplicates():
     # the SAME as once — also a duplicate identity, also refused.
     with pytest.raises(lb.BundleLayoutError, match="duplicate"):
         lb.artifact_set_fingerprint([good, good])
+
+
+# ---------------------------------------------------------------------------
+# The Turbo transformer-only profile (second reviewed table, one validator)
+# ---------------------------------------------------------------------------
+
+TURBO_REPO = "Qwen/Qwen-Image-2.1-Turbo"
+TURBO_REVISION = "fc13ba1986fcb905854dc8de2f52eee395f49b5b"
+TURBO_MANIFEST_PATH = ROOT / "models" / "turbo" / "manifest.json"
+
+#: Spelled independently of the module table (drift in either direction fails).
+TURBO_EXPECTED_FILES = frozenset({
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "transformer/config.json",
+    "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+    "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+    "transformer/diffusion_pytorch_model.safetensors.index.json",
+})
+TURBO_EXPECTED_ROLE_COUNTS = {"pipeline": 1, "scheduler": 1, "dit": 4}
+
+#: Anchored whole-set digest of the COMMITTED Turbo DiT manifest (same
+#: algorithm as COMMITTED_BUNDLE_FINGERPRINT, over the 6 transformer files).
+COMMITTED_TURBO_BUNDLE_FINGERPRINT = (
+    "04953de982345c0af6a80defc44dd2494b2cd4e08bc93481b31f6f36384c7ce0")
+#: Anchored identity digest (repo+revision+filename+bytes+sha256), same
+#: payload shape as test_m2_manifest.IDENTITY_DIGEST.
+COMMITTED_TURBO_IDENTITY_DIGEST = (
+    "cc825a1e51e73bebddc63c62d2934f20e92ea1478bd18cc461167297783e0462")
+#: Upstream metadata byte totals: 13.25 GiB of weights + 31,717 B of configs.
+TURBO_TOTAL_BYTES = 14_230_316_125
+TURBO_WEIGHT_BYTES = 14_230_284_408
+
+
+def build_tiny_turbo_tree(root: Path, *, repo: str = TURBO_REPO,
+                          revision: str = TURBO_REVISION) -> ModelManifest:
+    """Tiny fake Turbo-tree files (same content convention as the base
+    builder) plus a schema-v1 manifest describing exactly those bytes."""
+    artifacts = []
+    for role, filenames in lb.TURBO_LAYOUT.items():
+        for filename in filenames:
+            path = root / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = f"tiny-fake::{filename}".encode("utf-8")
+            path.write_bytes(content)
+            artifacts.append(ModelArtifact(
+                role=role, repo=repo, revision=revision, filename=filename,
+                sha256=hashlib.sha256(content).hexdigest(),
+                bytes=len(content)))
+    return ModelManifest(schema_version=1, artifacts=tuple(artifacts))
+
+
+def _turbo_artifact(filename: str, role: str,
+                    *, repo: str = TURBO_REPO,
+                    revision: str = TURBO_REVISION) -> ModelArtifact:
+    return ModelArtifact(role=role, repo=repo, revision=revision,
+                         filename=filename, sha256="ab" * 32, bytes=1)
+
+
+def test_turbo_profile_table_is_the_committed_transformer_set():
+    spec = lb.get_profile(lb.TURBO_REFERENCE_PROFILE)
+    assert spec is lb.TURBO_PROFILE
+    flat = [fn for fns in spec.layout.values() for fn in fns]
+    assert len(flat) == 6 and set(flat) == TURBO_EXPECTED_FILES
+    assert {r: len(f) for r, f in spec.layout.items()} == \
+        TURBO_EXPECTED_ROLE_COUNTS
+    assert dict(spec.role_directories) == {"pipeline": ".",
+                                          "scheduler": "scheduler",
+                                          "dit": "transformer"}
+    for fns in spec.layout.values():
+        assert list(fns) == sorted(fns)
+    # The whole point of the profile: NO encoder/VAE files are fetched, so
+    # no encoder digest can be derived from it.
+    assert spec.encoder_roles == ()
+    assert not {"processor", "text_encoder", "vae"} & set(spec.layout)
+    # Honest labelling is part of the contract, not decoration.
+    assert spec.label == lb.TURBO_ASSET_LABEL == "Turbo transformer + base encoder/VAE"
+    assert (spec.repo, spec.revision) == (TURBO_REPO, TURBO_REVISION)
+    assert spec.file_count == 6
+
+
+def test_profile_tables_are_immutable_and_registry_is_closed():
+    with pytest.raises(TypeError):
+        lb.TURBO_LAYOUT["vae"] = ("vae/config.json",)  # type: ignore[index]
+    with pytest.raises(TypeError):
+        lb.TURBO_ROLE_DIRECTORIES["vae"] = "vae"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        lb.PROFILES["gguf"] = lb.BASE_PROFILE  # type: ignore[index]
+    assert set(lb.PROFILES) == {"full-reference", "turbo-transformer"}
+
+
+def test_registry_unknown_and_hand_built_profiles_refused():
+    for bad in ("gguf-ladder", "", "Turbo-transformer", None):
+        with pytest.raises(lb.BundleLayoutError, match="unknown bundle profile"):
+            lb.get_profile(bad)  # type: ignore[arg-type]
+    # A structurally valid table that is not in the registry is NOT usable:
+    # no runtime path exists from "name I made up" to "loads something".
+    hand_built = lb.BundleProfile(
+        name="made-up", label="made up", repo=TURBO_REPO,
+        revision=TURBO_REVISION, layout=lb.TURBO_LAYOUT,
+        role_directories=lb.TURBO_ROLE_DIRECTORIES, encoder_roles=())
+    with pytest.raises(lb.BundleLayoutError, match="hand-built profile table"):
+        lb.get_profile(hand_built)
+    # Registry members pass both spellings (name or the table itself).
+    assert lb.get_profile(lb.TURBO_PROFILE) is lb.TURBO_PROFILE
+
+
+def test_bundle_profile_rejects_incoherent_tables():
+    with pytest.raises(lb.BundleLayoutError, match="layout/role_directories"):
+        lb.BundleProfile(name="x", label="x", repo=TURBO_REPO,
+                         revision=TURBO_REVISION, layout=lb.TURBO_LAYOUT,
+                         role_directories={"pipeline": "."}, encoder_roles=())
+    with pytest.raises(lb.BundleLayoutError, match="sorted order"):
+        lb.BundleProfile(name="x", label="x", repo=TURBO_REPO,
+                         revision=TURBO_REVISION,
+                         layout={"dit": ("z.json", "a.json")},
+                         role_directories={"dit": "."}, encoder_roles=())
+    with pytest.raises(lb.BundleLayoutError, match="not in the layout"):
+        lb.BundleProfile(name="x", label="x", repo=TURBO_REPO,
+                         revision=TURBO_REVISION, layout=lb.TURBO_LAYOUT,
+                         role_directories=lb.TURBO_ROLE_DIRECTORIES,
+                         encoder_roles=("text_encoder",))
+
+
+def test_committed_turbo_manifest_matches_the_turbo_profile():
+    manifest = load_manifest(TURBO_MANIFEST_PATH)
+    assert lb.validate_turbo_layout(manifest) == (TURBO_REPO, TURBO_REVISION)
+    assert lb.validate_layout(manifest, lb.TURBO_PROFILE) == (TURBO_REPO,
+                                                             TURBO_REVISION)
+    fps = lb.reference_bundle_fingerprints(manifest,
+                                           lb.TURBO_REFERENCE_PROFILE)
+    assert fps.bundle == COMMITTED_TURBO_BUNDLE_FINGERPRINT
+    assert fps.encoder is None
+    assert "encoder_artifact_set_sha256" not in fps.to_dict()
+    payload = {
+        "repo": TURBO_REPO,
+        "revision": TURBO_REVISION,
+        "artifacts": {a.filename: [a.bytes, a.sha256]
+                      for a in manifest.artifacts},
+    }
+    canon = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    assert hashlib.sha256(canon.encode("utf-8")).hexdigest() == (
+        COMMITTED_TURBO_IDENTITY_DIGEST)
+    names = [a.filename for a in manifest.artifacts]
+    assert names == sorted(names)
+    assert sum(a.bytes for a in manifest.artifacts) == TURBO_TOTAL_BYTES
+    assert sum(a.bytes for a in manifest.artifacts
+               if a.filename.endswith(".safetensors")) == TURBO_WEIGHT_BYTES
+    assert all(a.repo == TURBO_REPO and a.revision == TURBO_REVISION
+               for a in manifest.artifacts)
+
+
+def test_committed_turbo_manifest_is_refused_by_the_base_profile():
+    """Cross-profile confusion is the failure mode this table exists for:
+    a Turbo manifest must never validate as the base bundle (and the base
+    manifest must never validate as Turbo)."""
+    turbo = load_manifest(TURBO_MANIFEST_PATH)
+    base = load_manifest(MANIFEST_PATH)
+    # The Turbo DiT filenames are a SUBSET of the base names, so the base
+    # profile reports them as the 18 files it is missing (and never as a
+    # smaller-but-valid bundle).
+    with pytest.raises(lb.BundleLayoutError, match="missing from manifest"):
+        lb.validate_local_reference_layout(turbo)
+    # The base manifest in a Turbo root is an EXTRA-file refusal (encoder,
+    # VAE and the base scheduler/config set are not Turbo assets).
+    with pytest.raises(lb.BundleLayoutError, match="unexpected files"):
+        lb.validate_turbo_layout(base)
+    with pytest.raises(lb.BundleLayoutError, match="missing from manifest"):
+        lb.reference_bundle_fingerprints(turbo)  # default profile = base
+
+
+def test_turbo_profile_refuses_other_repo_and_revision():
+    def one(**kwargs) -> ModelManifest:
+        return ModelManifest(schema_version=1,
+                             artifacts=(_turbo_artifact("model_index.json",
+                                                        "pipeline", **kwargs),))
+
+    with pytest.raises(lb.BundleLayoutError, match="is pinned to repo"):
+        lb.validate_turbo_layout(one(repo="Qwen/base"))
+    # The base repo at the Turbo revision is still a different identity.
+    with pytest.raises(lb.BundleLayoutError, match="is pinned to repo"):
+        lb.validate_turbo_layout(one(repo=lb.FULL_REFERENCE_REPO))
+    with pytest.raises(lb.BundleLayoutError, match="is pinned to revision"):
+        lb.validate_turbo_layout(one(revision="f" * 40))
+    # Mixed revisions inside one Turbo manifest are refused too.
+    mixed = ModelManifest(schema_version=1, artifacts=(
+        _turbo_artifact("model_index.json", "pipeline"),
+        _turbo_artifact("scheduler/scheduler_config.json", "scheduler",
+                        revision="f" * 40)))
+    with pytest.raises(lb.BundleLayoutError, match="ONE revision"):
+        lb.validate_turbo_layout(mixed)
+
+
+def test_turbo_profile_refuses_missing_extra_and_misroled_files():
+    complete = [_turbo_artifact(fn, role)
+                for role, fns in lb.TURBO_LAYOUT.items() for fn in fns]
+    lb.validate_turbo_layout(ModelManifest(schema_version=1,
+                                           artifacts=tuple(complete)))
+    # A base-profile file (encoder/VAE) is an EXTRA here: Turbo fetches none.
+    extra = complete + [_turbo_artifact("vae/config.json", "vae")]
+    with pytest.raises(lb.BundleLayoutError,
+                       match=r"unexpected files for the turbo-transformer"):
+        lb.validate_turbo_layout(ModelManifest(schema_version=1,
+                                              artifacts=tuple(extra)))
+    missing = complete[:-1]
+    with pytest.raises(lb.BundleLayoutError, match="missing from manifest"):
+        lb.validate_turbo_layout(ModelManifest(schema_version=1,
+                                              artifacts=tuple(missing)))
+    misroled = [_turbo_artifact(fn, "pipeline" if role == "dit" else role)
+                for role, fns in lb.TURBO_LAYOUT.items() for fn in fns]
+    with pytest.raises(lb.BundleLayoutError, match="role mismatch"):
+        lb.validate_turbo_layout(ModelManifest(schema_version=1,
+                                              artifacts=tuple(misroled)))
+
+
+def test_turbo_projection_and_closed_tree(tmp_path):
+    root = tmp_path / "turbo-assets"
+    manifest = build_tiny_turbo_tree(root)
+    bundle = lb.resolve_local_bundle(manifest, root,
+                                     profile=lb.TURBO_REFERENCE_PROFILE)
+    assert bundle.profile == lb.TURBO_REFERENCE_PROFILE
+    assert (bundle.repo, bundle.revision) == (TURBO_REPO, TURBO_REVISION)
+    assert set(bundle.assets) == {"pipeline", "scheduler", "dit"}
+    assert bundle.fingerprints.encoder is None
+    assert set(bundle.component_dirs) == {"pipeline", "scheduler", "dit"}
+    assert bundle.component_dirs["pipeline"] == root.resolve()
+    assert bundle.component_dirs["dit"] == root.resolve() / "transformer"
+    # The tiny Turbo tree is closed for the Turbo profile.
+    checked = bundle.preflight_closed_tree()
+    assert set(checked) == set(TURBO_EXPECTED_FILES) | {"scheduler",
+                                                       "transformer"}
+    assert checked == lb.preflight_closed_tree(
+        root, profile=lb.TURBO_REFERENCE_PROFILE)
+    # ... and is NOT closed for the base profile: the DiT names are shared
+    # but the 18 encoder/VAE files (and their directories) are absent.
+    with pytest.raises(lb.BundleTreeError, match="missing from the closed"):
+        lb.preflight_closed_tree(root)
+
+
+def test_turbo_closed_tree_refuses_reused_encoder_files(tmp_path):
+    """The Turbo asset root must hold the Turbo DiT tree ONLY: dropping the
+    base encoder/VAE files there (a plausible "just reuse them" shortcut)
+    is refused before any ML import."""
+    root = tmp_path / "turbo-assets"
+    build_tiny_turbo_tree(root)
+    reused = root / "text_encoder" / "config.json"
+    reused.parent.mkdir(parents=True)
+    reused.write_bytes(b"reused encoder config")
+    with pytest.raises(lb.BundleTreeError,
+                       match=r"NOT part of the closed turbo-transformer"):
+        lb.preflight_closed_tree(root, profile=lb.TURBO_REFERENCE_PROFILE)
+
+
+def test_base_defaults_are_unchanged_by_the_profile_parameterisation(tmp_path):
+    """Every pre-existing entry point keeps the base profile when the
+    argument is omitted — the Turbo table never becomes a silent default."""
+    root = tmp_path / "assets"
+    manifest = build_tiny_tree(root)
+    assert lb.validate_layout(manifest) == lb.validate_local_reference_layout(
+        manifest) == (REPO, REVISION)
+    assert lb.reference_bundle_fingerprints(manifest).encoder is not None
+    assert lb.preflight_closed_tree(root) == lb.preflight_closed_tree(
+        root, profile=lb.LOCAL_REFERENCE_PROFILE)
+    default_bundle = lb.resolve_local_bundle(manifest, root)
+    assert default_bundle.profile == lb.LOCAL_REFERENCE_PROFILE
+    # And the base default NEVER validates the Turbo manifest.
+    with pytest.raises(lb.BundleLayoutError):
+        lb.resolve_local_bundle(load_manifest(TURBO_MANIFEST_PATH), root)
+
+
+def test_direct_construction_accepts_the_turbo_identity():
+    common = dict(root=Path("/abs/root"), root_resolved=Path("/abs/root"))
+    turbo = lb.LocalReferenceBundle(
+        profile=lb.TURBO_REFERENCE_PROFILE, repo=TURBO_REPO,
+        revision=TURBO_REVISION,
+        assets={"dit": (Path("/abs/root/transformer/config.json"),)},
+        component_dirs={"dit": Path("/abs/root/transformer")},
+        fingerprints=lb.ArtifactSetFingerprints(bundle="a" * 64, encoder=None),
+        **common)
+    assert turbo.profile == lb.TURBO_REFERENCE_PROFILE
+    # Turbo has no encoder files, so an encoder digest on a Turbo bundle is a
+    # contradiction (it would key a cache on weights the profile lacks).
+    with pytest.raises(lb.BundleLayoutError, match="no encoder files"):
+        lb.LocalReferenceBundle(
+            profile=lb.TURBO_REFERENCE_PROFILE, repo=TURBO_REPO,
+            revision=TURBO_REVISION, assets={}, component_dirs={},
+            fingerprints=lb.ArtifactSetFingerprints(bundle="a" * 64,
+                                                    encoder="b" * 64),
+            **common)
+    # The base profile still requires its encoder digest.
+    with pytest.raises(lb.BundleLayoutError, match="encoder digest is required"):
+        lb.LocalReferenceBundle(
+            profile=lb.LOCAL_REFERENCE_PROFILE, repo=lb.FULL_REFERENCE_REPO,
+            revision=lb.FULL_REFERENCE_REVISION, assets={},
+            component_dirs={},
+            fingerprints=lb.ArtifactSetFingerprints(bundle="a" * 64,
+                                                    encoder=None),
+            **common)
+    # Turbo repo/revision are still policed per profile.
+    with pytest.raises(lb.BundleLayoutError, match="repo"):
+        lb.LocalReferenceBundle(
+            profile=lb.TURBO_REFERENCE_PROFILE, repo=REPO,
+            revision=TURBO_REVISION, assets={}, component_dirs={},
+            fingerprints=lb.ArtifactSetFingerprints(bundle="a" * 64,
+                                                    encoder=None),
+            **common)

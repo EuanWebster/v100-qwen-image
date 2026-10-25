@@ -44,7 +44,8 @@ part of the document may therefore be trusted for.
 ## 1. Upstream inventory: what a Turbo install actually contains
 
 The repo publishes 15 runtime-relevant files across 6 roles (plus LICENSE, README,
-`.gitattributes`, 14 preview PNGs in `assets/`).
+`.gitattributes`, 14 preview PNGs in `assets/`). We install **6 of them** (the DiT
+side: root index, scheduler config, transformer config/shards/index) — see §4.1.
 
 | Role | Files | Bytes | vs installed base |
 |---|---:|---:|---|
@@ -234,40 +235,111 @@ locally)*.
 
 ## 4. Identity and pinning design
 
-### 4.1 New reviewed profile, not a relaxed check
+### 4.1 New reviewed profile, not a relaxed check — **implemented (transformer-only)**
 
-`local_bundle.py` deliberately refuses to become a generic loader
-(`:93,227-280,451-455,470-473` — "a new profile is new reviewed code, not a string
-here"). Add a **second** profile, reviewed as new code:
+`local_bundle.py` deliberately refuses to become a generic loader ("a new profile
+is new reviewed code, not a string here"). The decision taken is **root decision
+(a)**: fetch the Turbo **transformer only** and reuse the installed base text
+encoder, VAE and processor. The profile is therefore not "Turbo" but *"Turbo
+transformer + base encoder/VAE"*, and it says so in its own label.
+
+The profile table now lives **inside `local_bundle.py`** — one validator, two
+reviewed tables — instead of a second module (decision (c)):
 
 ```text
-TURBO_REFERENCE_PROFILE = "turbo-reference"
-TURBO_REFERENCE_REPO      = "Qwen/Qwen-Image-2.1-Turbo"
-TURBO_REFERENCE_REVISION  = "fc13ba1986fcb905854dc8de2f52eee395f49b5b"
-TURBO_REFERENCE_LAYOUT    = 15 files / 6 roles (processor role has 4 files)
+TURBO_REFERENCE_PROFILE  = "turbo-transformer"
+TURBO_REFERENCE_REPO     = "Qwen/Qwen-Image-2.1-Turbo"
+TURBO_REFERENCE_REVISION = "fc13ba1986fcb905854dc8de2f52eee395f49b5b"
+TURBO_ASSET_LABEL        = "Turbo transformer + base encoder/VAE"
+TURBO_LAYOUT             = 6 files / 3 roles
 ```
 
-with its own `TURBO_ROLE_DIRECTORIES` (identical directory names: `processor`,
-`scheduler`, `text_encoder`, `transformer`, `vae`, root). Requirements:
+| Role | Directory | Files |
+|---|---|---:|
+| `pipeline` | `.` | 1 — `model_index.json` (carries `sample_sigmas`, §4.4) |
+| `scheduler` | `scheduler/` | 1 — `scheduler_config.json` (§3.2) |
+| `dit` | `transformer/` | 4 — `config.json`, shard 1, shard 2, index |
 
-- `validate_*_layout` becomes profile-parameterised; each profile table is still a
-  frozen literal with its own `LAYOUT_FILE_COUNT` guard.
-- `LocalReferenceBundle.profile/repo/revision` invariants validate against the
-  selected profile, never "whatever the manifest says".
-- `preflight_closed_tree` uses the selected profile's entry set (Turbo legitimately
-  has no `processor/vocab.json`, `merges.txt`, `added_tokens.json`,
-  `special_tokens_map.json`, `preprocessor_config.json`,
-  `video_preprocessor_config.json`, and no 4-shard encoder).
-- `VerifiedEncoderAssets` must accept the Turbo encoder file set (3 files) and the
-  Turbo repo/revision — a new pinned branch, again not a loosened check.
+Mechanics, all in `src/qwen_engine/local_bundle.py`:
 
-### 4.2 Separate manifest, separate root
+- `BundleProfile` (frozen dataclass) = name, honest label, repo, revision, layout,
+  role directories, encoder roles; `__post_init__` refuses a table whose roles and
+  directories disagree, whose filenames are unsorted, or whose `encoder_roles`
+  name a role it does not contain.
+- `PROFILES` is a `MappingProxyType` of exactly
+  `{"full-reference", "turbo-transformer"}`; `get_profile(name)` raises
+  `BundleLayoutError` for anything else **and for a hand-built table not in the
+  registry** — no fallback chain, no "try the other one".
+- `validate_layout(manifest, profile=...)` is the single validator;
+  `validate_local_reference_layout` / `validate_turbo_layout` are thin fixed-profile
+  spellings so the default can never drift. Error text is per-profile.
+- `LOCAL_REFERENCE_LAYOUT`, `ROLE_DIRECTORIES`, `ENCODER_ROLES`,
+  `LAYOUT_FILE_COUNT`, `FULL_REFERENCE_*` remain the base aliases — every existing
+  caller and both committed fingerprint anchors (`test_local_bundle.
+  COMMITTED_BUNDLE_FINGERPRINT`, `test_m2_manifest.IDENTITY_DIGEST`) are unchanged.
+  `ARTIFACT_SET_FINGERPRINT_VERSION` is still `qwen-image.artifact-set.v1`.
+- `ArtifactSetFingerprints.encoder` is now `str | None`. A profile with no encoder
+  files returns `None` and `to_dict()` omits the key: the Turbo manifest cannot
+  produce an encoder digest, and **the encoder cache key must keep coming from the
+  base bundle** (that is the whole meaning of the honest label). `LocalReferenceBundle`
+  enforces the pairing in both directions — base without an encoder digest and
+  Turbo with one are both refused.
+- `LocalReferenceBundle`, `resolve_local_bundle`, `project_resolution_report` and
+  `preflight_closed_tree` all take `profile=` (default: base) and validate the
+  bundle's repo/revision against *that* profile; `bundle.preflight_closed_tree()`
+  uses the bundle's own profile.
+- `preflight_closed_tree(root, profile=...)` uses the selected entry set, so the
+  Turbo asset root is closed at six files plus `scheduler/` and `transformer/`.
+  Dropping the base `text_encoder/`, `vae/` or `processor/` files into
+  `models/turbo/assets/` (the obvious "just reuse them here" shortcut) is refused
+  before any ML import.
 
-`models/turbo/manifest.json` (schema v1, 15 artifacts, repo+revision as above) and
-`models/turbo/assets/` — never mixed into `models/assets/` (the closed-tree
-preflight would legitimately reject it, and the base fingerprint is used by
-cache/calibration identities). `tools/fetch_models.py` already takes
-`--manifest`/`--models-dir`, so fetching is operator-explicit with no code change.
+`VerifiedEncoderAssets` (`encoder_assets.py`) is **unchanged**: the Turbo path never
+loads encoder files from the Turbo repo, so no Turbo branch is needed there.
+
+### 4.2 Separate manifest, separate root — **implemented**
+
+`models/turbo/manifest.json` (schema v1, **6 artifacts**, repo `Qwen/Qwen-Image-2.1-Turbo`
+@ `fc13ba19…`) sits beside `models/assets/` and never mixes into it: the base
+closed-tree preflight would reject it, and the base artifact-set fingerprint keys
+the encoder cache and calibration identities. `models/turbo/assets/` is the Turbo
+root; the base root is untouched by the Turbo fetch.
+
+All identities are Hub metadata at the pinned revision (**no weight bytes were
+downloaded to produce this manifest**); the 4 small files were fetched and hashed
+locally, the 2 shards take their sha256 from the LFS pointer metadata:
+
+| File | Bytes | sha256 |
+|---|---:|---|
+| `model_index.json` | 578 | `97e2febe…390cf20` |
+| `scheduler/scheduler_config.json` | 486 | `16c948c7…b7eb4bb` |
+| `transformer/config.json` | 370 | `2c567038…eb58ce3` |
+| `transformer/diffusion_pytorch_model-00001-of-00002.safetensors` | 9,968,332,504 | `6cccd922…7431cc0` |
+| `transformer/diffusion_pytorch_model-00002-of-00002.safetensors` | 4,261,951,904 | `69f53ebb…82eab5` |
+| `transformer/diffusion_pytorch_model.safetensors.index.json` | 30,283 | `17987f66…5af803a` |
+
+Totals: **14,230,316,125 B = 13.25 GiB** (14,230,284,408 B of weights).
+Committed anchors: whole-set fingerprint `04953de9…84c7ce0`, identity digest
+`cc825a1e…783e0462` (asserted in `tests/test_local_bundle.py`).
+
+Exact operator command — plan first (offline, no writes, no sockets), then fetch:
+
+```bash
+# 1. plan: what is missing, how many bytes, no network and no writes
+python tools/fetch_models.py \
+    --manifest models/turbo/manifest.json \
+    --models-dir /home/euan/Sandbox/v100-qwen-image/models/turbo/assets
+
+# 2. fetch (13.25 GiB, resumable via *.partial, size+sha256 verified per file)
+python tools/fetch_models.py \
+    --manifest models/turbo/manifest.json \
+    --models-dir /home/euan/Sandbox/v100-qwen-image/models/turbo/assets \
+    --fetch
+```
+
+After the fetch settles, the root must pass
+`preflight_closed_tree(<that dir>, profile="turbo-transformer")`; an in-flight
+`*.partial` is refused by design.
 
 ### 4.3 One recipe field on `GenerationConfig`
 
@@ -466,15 +538,20 @@ redistribution requires the agreement plus a Notice file; derivatives must not b
 presented primarily as "Qwen". Turbo adds no new grant and no new restriction
 beyond the base terms; the Unsloth GGUF derivative is labelled `license: other`
 with `license_name: qwen-research` pointing at that same file. `LICENSE`,
-`README.md` and `.gitattributes` (25,410 B) are in the Turbo repo but outside the
-15-file runtime set — keep them in the fetched tree and do not fold Turbo weights
-into `models/assets/`.
+`README.md` and `.gitattributes` (25,410 B) are in the Turbo repo but outside both
+the 15-file upstream runtime set and our 6-file manifest — we fetch neither, and
+Turbo weights never go into `models/assets/`. The licence text travels with the
+weights on the Hub; our own distribution (if any) must carry the agreement plus a
+Notice file per the terms.
 
 ## 9. Implementation split (disjoint ownership)
 
-1. **Profile/asset layer** — profile-parameterised `local_bundle`, Turbo profile +
-   layout + role dirs, `VerifiedEncoderAssets` Turbo branch, `models/turbo/manifest.json`,
-   `models/turbo/q8_manifest.json`, fetch check docs. No GPU.
+1. **Profile/asset layer** — *done for the transformer-only decision (a)*:
+   profile-parameterised `local_bundle` (registry, `BundleProfile`, six-file Turbo
+   layout, `turbo-transformer` role dirs, closed-tree per profile) and
+   `models/turbo/manifest.json`. Still open here: `models/turbo/q8_manifest.json`
+   (deferred by decision (d)) and a `VerifiedEncoderAssets` Turbo branch — which
+   decision (a) makes **unnecessary**, since Turbo reuses the base encoder. No GPU.
 2. **Config/CLI/web contract** — `recipe` field, policy refusals, `EDITABLE_FIELDS`,
    `app.js` validation + locked steps, export round-trip, docs.
 3. **Adapter/sampling** — `sample_sigmas` plumbing, scheduler-config assertion,
@@ -499,19 +576,23 @@ into `models/assets/`.
 
 ## 11. Open questions for root
 
-1. Do we require the **Turbo encoder** file at all, given payload equality but
-   unproven numerical equality? (Recommended: yes for a "Turbo" label; the pairing
-   caveat in §7 otherwise.)
-2. Is CFG > 1 under Turbo a supported experiment or a refusal? (Recommended:
-   refusal until measured.)
-3. Turbo profile naming: new module (`turbo_bundle.py`) vs a profile table inside
-   `local_bundle.py`? The latter keeps one validator but grows the "new profile is
-   new reviewed code" surface.
-4. Do we ship the Turbo DiT alone as a "Turbo-DiT on base companions" install
-   variant in the UI, or only whole-bundle?
-5. Should the Q8 ladder (Q4_K_M etc.) be offered? Upstream LPIPS says Q8_0 is
-   already 0.036 away from bf16 Turbo; our review scope currently admits only
-   reviewed Q8_0.
+**Answered by root (this round):**
+
+1. *Turbo encoder?* **No** — decision (a): fetch the Turbo transformer only and
+   reuse the base text encoder/VAE/processor. Consequence: every user-facing label
+   says "Turbo transformer + base encoder/VAE" (`TURBO_ASSET_LABEL`), never "Turbo",
+   and the encoder cache key continues to come from the base bundle.
+2. *CFG > 1 under Turbo?* **Refused until measured** (decision (b)); the refusal
+   belongs to the policy layer (§5.2), not to this asset layer.
+3. *Profile module vs table?* **A profile table inside `local_bundle.py`** — one
+   validator, two reviewed tables (decision (c)), implemented in §4.1.
+4. *Q8 ladder?* **Q8_0 only** for any quantised Turbo; Q4 stays removed
+   (decision (d)). No Q8 Turbo manifest is written yet.
+
+**Still open:**
+
+5. Do we ship the Turbo DiT-alone install as an explicit "Turbo-DiT on base
+   companions" variant in the UI, or keep it CLI/manifest-only until measurement?
 
 ## 12. Evidence and disclosure
 
