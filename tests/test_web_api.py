@@ -149,6 +149,62 @@ def test_export_import_roundtrips_transparent_background():
     assert [f["field"] for f in refused.payload["fields"]] == ["output_format"]
 
 
+def test_plan_echoes_recipe_and_refuses_broken_turbo_combinations():
+    # Default is the reference recipe and it is echoed as such.
+    assert plan_payload(plan_bytes({"prompt": "x"}))["config"]["recipe"] == "base"
+    turbo = plan_payload(plan_bytes({"prompt": "x", "recipe": "turbo",
+                                     "steps": 8, "quant": "fp16"}))
+    assert turbo["config"]["recipe"] == "turbo"
+    assert turbo["config"]["steps"] == 8
+    # cfg_active must stay false for turbo: CFG 1.0 with no negative prompt.
+    assert turbo["cfg_active"] is False
+
+    # Every turbo rule is a typed refusal on the field it describes, never a
+    # silent rewrite of steps/cfg/quant.
+    bad_steps = plan_payload(plan_bytes({"prompt": "x", "recipe": "turbo"}))
+    error_shape(bad_steps)
+    assert bad_steps["code"] == "invalid_config"
+    assert [f["field"] for f in bad_steps["fields"]] == ["steps"]
+
+    bad_cfg = plan_payload(plan_bytes({"prompt": "x", "recipe": "turbo", "steps": 8,
+                                       "negative_prompt": "blurry",
+                                       "true_cfg_scale": 4.0}))
+    assert bad_cfg["code"] == "invalid_config"
+    assert [f["field"] for f in bad_cfg["fields"]] == ["true_cfg_scale"]
+
+    bad_quant = plan_payload(plan_bytes({"prompt": "x", "recipe": "turbo",
+                                         "steps": 8, "quant": "q8"}))
+    assert bad_quant["code"] == "invalid_config"
+    assert [f["field"] for f in bad_quant["fields"]] == ["quant"]
+
+    # Unknown recipe value: typed, on its own field.
+    unknown = plan_payload(plan_bytes({"prompt": "x", "recipe": "turbo2"}))
+    assert unknown["code"] == "invalid_config"
+    assert [f["field"] for f in unknown["fields"]] == ["recipe"]
+
+
+def test_export_import_roundtrips_recipe():
+    rt = runtime()
+    exported = api.export_response(rt, plan_bytes({"prompt": "a jar",
+                                                   "recipe": "turbo", "steps": 8}))
+    assert exported.status == 200
+    data = json.loads(exported.body)
+    assert data["recipe"] == "turbo"
+    assert data["steps"] == 8
+    imported = api.import_response(rt, exported.body)
+    assert imported.status == 200, imported.payload
+    assert imported.payload["config"]["recipe"] == "turbo"
+    assert imported.payload["config"]["steps"] == 8
+    # A legacy export predating the key imports as the reference recipe.
+    legacy = api.import_response(rt, b'{"prompt": "old"}')
+    assert legacy.status == 200
+    assert legacy.payload["config"]["recipe"] == "base"
+    # A legacy file that cannot satisfy the turbo gates is refused, not fixed.
+    refused = api.import_response(rt, b'{"prompt": "old", "recipe": "turbo"}')
+    assert refused.status == 422
+    assert [f["field"] for f in refused.payload["fields"]] == ["steps"]
+
+
 def test_plan_never_leaks_server_runtime_paths(tmp_path):
     rt = runtime(output_dir=str(tmp_path / "out"), cache_dir=str(tmp_path / "cache"))
     text = json.dumps(api.plan_response(rt, plan_bytes({"prompt": "x"})).payload)

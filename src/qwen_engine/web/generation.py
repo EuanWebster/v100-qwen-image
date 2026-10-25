@@ -147,8 +147,13 @@ class WebGeneration:
             _validate_policy(config)
         except ConfigError as exc:
             # Path values never cross the wire. Editable policy errors are safe.
+            # The recipe gate is an editable policy rule too (turbo owns the
+            # step count and refuses true-CFG / Q8), so those fields must be
+            # named rather than dropped into an empty field list.
+            editable_policy = ("quant", "offload", "attention_backend",
+                               "steps", "true_cfg_scale", "recipe")
             fields = tuple((e.field, e.message) for e in exc.errors
-                           if e.field in ("quant", "offload", "attention_backend"))
+                           if e.field in editable_policy)
             raise ApiError(422, "unsupported_generation_config",
                            "this configuration is not supported by the current adapter", fields) from None
         if config.latent_tokens > 4096 and not config.vae_tiled_decode:

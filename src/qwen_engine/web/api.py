@@ -71,7 +71,7 @@ _REFERENCE_CONTENT_TYPES = {"png": "image/png", "jpeg": "image/jpeg",
 #: Runtime paths (output/cache/log/benchmarks/models/manifest) are
 #: server-controlled and must never arrive from browser JSON.
 EDITABLE_FIELDS = frozenset({
-    "prompt", "negative_prompt", "width", "height", "steps",
+    "prompt", "negative_prompt", "width", "height", "steps", "recipe",
     "true_cfg_scale", "seed", "quant", "offload", "attention_backend",
     "vae_tiled_decode", "output_format", "transparent_background",
     "references",
@@ -88,11 +88,10 @@ RUNTIME_PATH_FIELDS = ("output_dir", "cache_dir", "log_dir",
 #: neither editable, a runtime path, nor listed here — so a new config field
 #: still cannot slip past this contract unnoticed.
 #:
-#: ``recipe`` — engine/CLI landed in the Turbo milestone; the browser-side
-#: recipe (EDITABLE_KEYS, locked steps under Turbo, export round-trip) is the
-#: separate web follow-up in docs/turbo-plan.md §6. Sending it before the UI
-#: validates it would let a stale page select a recipe it cannot represent.
-DEFERRED_WIRE_FIELDS = frozenset({"recipe"})
+#: EMPTY today: ``recipe`` was the last deferral and became editable with the
+#: Turbo web surface (docs/turbo-plan.md §6). The set and its guard stay in
+#: place as the place a future field must announce itself in.
+DEFERRED_WIRE_FIELDS = frozenset()
 
 #: Seed wire grammar: ASCII decimal digits only, at most 20 characters
 #: (the full uint64 range stays an exact string; range is validated later

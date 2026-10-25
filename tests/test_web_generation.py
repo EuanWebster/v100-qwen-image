@@ -267,6 +267,44 @@ def test_bad_submissions_create_no_job_or_output(runtime, values, code):
         assert service.close()
 
 
+@pytest.mark.parametrize('values,field', [
+    ({'recipe': 'turbo'}, 'steps'),
+    ({'recipe': 'turbo', 'steps': 8, 'negative_prompt': 'blurry',
+      'true_cfg_scale': 4.0}, 'true_cfg_scale'),
+    ({'recipe': 'turbo', 'steps': 8, 'quant': 'q8'}, 'quant'),
+])
+def test_turbo_submissions_refuse_the_gated_combination_on_its_own_field(
+        runtime, values, field):
+    service = WebGeneration(runtime, executor=save)
+    try:
+        with pytest.raises(api.ApiError) as caught:
+            service.submit(envelope(**values))
+        # GenerationConfig itself enforces the Turbo gates, so the refusal
+        # arrives from config validation (invalid_config) before the adapter
+        # policy stage is reached.
+        assert caught.value.code == 'invalid_config'
+        # The field must be NAMED so the UI can point at the control; a job
+        # is never enqueued for a combination the adapter will refuse.
+        assert [f for f, _ in caught.value.field_errors] == [field]
+        assert not service.controller.snapshots()
+        assert not list(Path(runtime.output_dir).iterdir())
+    finally:
+        assert service.close()
+
+
+def test_turbo_submission_is_accepted_with_the_gated_defaults(runtime):
+    service = WebGeneration(runtime, executor=save)
+    try:
+        response = service.submit(envelope(recipe='turbo', steps=8))
+        assert response.status == 202
+        config = service.controller.snapshots()[0].config
+        assert (config.recipe.value, config.steps, config.quant.value) == ('turbo', 8, 'fp16')
+        # The public job document carries the recipe so History can label it.
+        assert response.payload['config']['recipe'] == 'turbo'
+    finally:
+        assert service.close()
+
+
 @pytest.mark.parametrize('method,suffix,kind', [
     ('GET', '', 'job'), ('GET', '/image', 'image'),
     ('POST', '/cancel', 'cancel'), ('POST', '/forget', 'forget'),

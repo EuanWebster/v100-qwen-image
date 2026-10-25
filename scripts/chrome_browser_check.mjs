@@ -190,11 +190,12 @@ async function main() {
   // Full GenerationConfig surface the UI owns: the four W3/W4 fields
   // (output_format, transparent_background, references) were previously
   // missing from this list, which is why the check reported a stale
-  // snapshot mismatch rather than a real regression.
+  // snapshot mismatch rather than a real regression. `recipe` joined the
+  // same list with the Turbo recipe (D4).
   const wantKeys = ['attention_backend', 'height', 'kind', 'negative_prompt',
-                    'offload', 'output_format', 'prompt', 'quant', 'references',
-                    'seed', 'steps', 'transparent_background', 'true_cfg_scale',
-                    'vae_tiled_decode', 'width'].join(',');
+                    'offload', 'output_format', 'prompt', 'quant', 'recipe',
+                    'references', 'seed', 'steps', 'transparent_background',
+                    'true_cfg_scale', 'vae_tiled_decode', 'width'].join(',');
   check('snapshot keys mirror GenerationConfig fields + kind (snake_case, no aliases)',
         snapInfo.keys === wantKeys, snapInfo.keys);
   check('snapshot seed is a decimal STRING',
@@ -217,8 +218,8 @@ async function main() {
   check('empty draft envelope carries references: [] in order',
         JSON.parse(emptyEnv).refs.length === 0 &&
         JSON.parse(emptyEnv).ids.length === 0, emptyEnv);
-  check('envelope config carries all 14 editable keys',
-        JSON.parse(emptyEnv).keys.length === 14, emptyEnv);
+  check('envelope config carries all 15 editable keys',
+        JSON.parse(emptyEnv).keys.length === 15, emptyEnv);
   check('Add reference is disabled while disconnected (writes need status)',
         await evaluate('document.getElementById("add-reference").disabled') === true);
   check('reference empty-state is visible with no references',
@@ -313,6 +314,81 @@ async function main() {
   check('the visible count follows the hard cap',
         up.countLabel === '1 of 10 references', up.countLabel);
 
+
+  /* ---- 5d. recipe (Quality / Turbo): the UI LOCKS what config.py refuses --
+   * Turbo is refused by the server unless steps==8, CFG is inactive and
+   * quant is fp16, so the form must never offer that combination: it locks
+   * the three controls and says why, and it restores the user's own values
+   * when Quality is chosen again. ---- */
+  const recipeState = () => evaluate(`(function () {
+    var b = window.QwenStudio.buildEnvelope();
+    var g = function (id) { return document.getElementById(id); };
+    return {
+      radio: (document.querySelector('input[name="recipe"]:checked') || {}).value,
+      current: window.QwenStudio.currentRecipe(),
+      steps: g('steps').value, cfg: g('cfg').value, quant: g('quant').value,
+      locks: [g('steps').disabled, g('cfg').disabled, g('negative').disabled,
+              g('quant').disabled].join(','),
+      note: g('recipe-note').hidden ? '' : g('recipe-note').textContent,
+      noteRole: g('recipe-note').getAttribute('role'),
+      envRecipe: b.ok ? b.envelope.config.recipe : 'invalid',
+      envSteps: b.ok ? b.envelope.config.steps : null,
+      help: !!g('recipe-help')
+    };
+  })()`);
+  const base0 = await recipeState();
+  check('Quality is the default recipe and nothing is locked',
+        base0.radio === 'base' && base0.current === 'base' &&
+        base0.locks === 'false,false,false,false' && base0.note === '',
+        JSON.stringify(base0));
+  check('the default envelope carries recipe "base"',
+        base0.envRecipe === 'base' && base0.envSteps === Number(base0.steps),
+        JSON.stringify(base0));
+  check('the recipe note is a polite live region (locked state is announced)',
+        base0.noteRole === 'status' && base0.help, JSON.stringify(base0));
+  check('Turbo step count mirrors config.TURBO_STEPS (8)',
+        await evaluate('window.QwenStudio.TURBO_STEPS') === 8);
+  // The user's own sampling values, entered in Quality mode.
+  await evaluate(`(function () {
+    var g = function (id) { return document.getElementById(id); };
+    g('prompt').value = 'a brass diving helmet';
+    g('prompt').dispatchEvent(new Event('input'));
+    g('steps').value = '40'; g('steps').dispatchEvent(new Event('input'));
+    g('cfg').value = '4.0'; g('cfg').dispatchEvent(new Event('input'));
+    g('quant').value = 'q8'; g('quant').dispatchEvent(new Event('change'));
+    g('negative').value = 'blurry';
+    g('negative').dispatchEvent(new Event('input'));
+  })()`);
+  await evaluate(`document.getElementById('recipe-turbo').click()`);
+  const turbo = await recipeState();
+  check('selecting Turbo pins steps to 8, guidance to 1.0 and quant to fp16',
+        turbo.radio === 'turbo' && turbo.steps === '8' && turbo.cfg === '1.0' &&
+        turbo.quant === 'fp16', JSON.stringify(turbo));
+  check('Turbo locks steps, guidance, the negative prompt and quant',
+        turbo.locks === 'true,true,true,true', turbo.locks);
+  check('Turbo explains the lock instead of silently changing values',
+        /fixed at 8/.test(turbo.note) && /locked/.test(turbo.note), turbo.note);
+  check('the Turbo envelope sends the values the server accepts',
+        turbo.envRecipe === 'turbo' && turbo.envSteps === 8, JSON.stringify(turbo));
+  await evaluate(`document.getElementById('recipe-base').click()`);
+  const back = await recipeState();
+  check('switching back to Quality restores the user values and unlocks them',
+        back.radio === 'base' && back.steps === '40' && back.cfg === '4.0' &&
+        back.quant === 'q8' && back.locks === 'false,false,false,false' &&
+        back.note === '', JSON.stringify(back));
+  check('restored draft sends recipe "base" again with the user step count',
+        back.envRecipe === 'base' && back.envSteps === 40, JSON.stringify(back));
+  // One radio group, one checked member: a second group would let both
+  // recipes be "selected" at once.
+  const radios = await evaluate(`(function () {
+    var all = Array.prototype.slice.call(document.querySelectorAll('input[name="recipe"]'));
+    return { values: all.map(function (r) { return r.value; }).join(','),
+             checked: all.filter(function (r) { return r.checked; }).length,
+             type: all.every(function (r) { return r.type === 'radio'; }) };
+  })()`);
+  check('one radio group offers exactly base and turbo, one checked',
+        radios.values === 'base,turbo' && radios.checked === 1 && radios.type,
+        JSON.stringify(radios));
 
   /* ---- 6. presets and manual dimension matching ----
    * The preset table gained 2K tiers since these assertions were written,
@@ -608,6 +684,17 @@ async function main() {
     }
     await window.QwenStudio.addReferenceFiles(files);
     window.fetch = realFetch;
+    // loading="lazy" means a card scrolled out of the viewport never
+    // REQUESTS its thumbnail — so it can never fail either. Scroll each
+    // card into view (twice, so a card pushed out before its request
+    // started still gets one), or the check silently depends on how tall
+    // the form above the list happens to be (adding the recipe fieldset
+    // moved Image 1 out of view and left it unmarked).
+    for (var pass = 0; pass < 2; pass++) {
+      var live = Array.prototype.slice.call(
+        document.querySelectorAll('#reference-list > li'));
+      for (var k = 0; k < live.length; k++) live[k].scrollIntoView({ block: 'center' });
+    }
     await new Promise(function (r) { setTimeout(r, 500); });
     seen.disconnect();
     var cards = Array.prototype.slice.call(

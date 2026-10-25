@@ -45,6 +45,12 @@ def test_raw_export_carries_transparency_and_legacy_raw_file_defaults_false():
     assert [f['field'] for f in refused.payload['fields']] == ['output_format']
 
 
+def test_legacy_export_without_recipe_imports_as_the_reference_recipe():
+    response = api.import_response(api.WebRuntime(), b'{"prompt":"legacy file"}')
+    assert response.status == 200
+    assert response.payload['config']['recipe'] == 'base'
+
+
 @pytest.mark.parametrize('data', [
     b'{"prompt":"a","seed":1,"seed":2}', b'{"prompt":"a","seed":true}',
     b'{"prompt":"a","seed":1.5}', b'{"prompt":"a","seed":18446744073709551616}',

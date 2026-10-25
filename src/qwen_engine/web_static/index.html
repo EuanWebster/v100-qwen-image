@@ -129,11 +129,38 @@
               Presets do not guarantee memory fit on your card.</p>
           </fieldset>
 
+          <fieldset class="field recipe-field" id="recipe-field">
+            <legend>Recipe</legend>
+            <div class="radio-row" role="radiogroup"
+                 aria-describedby="recipe-help recipe-note">
+              <div class="radio-field">
+                <input id="recipe-base" name="recipe" type="radio" value="base"
+                       checked aria-describedby="recipe-help recipe-note">
+                <label for="recipe-base">Quality</label>
+              </div>
+              <div class="radio-field">
+                <input id="recipe-turbo" name="recipe" type="radio" value="turbo"
+                       aria-describedby="recipe-help recipe-note">
+                <label for="recipe-turbo">Turbo</label>
+              </div>
+            </div>
+            <p id="recipe-help" class="help">Quality uses the reference model at
+              the step count you choose — the slowest, most faithful option.
+              Turbo uses the Turbo image model (with the same text encoder and
+              decoder as Quality) and always runs its fixed 8 sampling steps:
+              drawing is about five times faster, but loading the model and
+              reading your prompt dominate a whole run, so the total is often
+              only slightly shorter. Turbo has no negative prompt and no
+              guidance (CFG 1.0), and runs in FP16 only.</p>
+            <p id="recipe-note" class="help recipe-note" role="status"></p>
+            <p class="error" id="recipe-error" aria-live="polite"></p>
+          </fieldset>
+
           <div class="field">
             <label for="steps">Steps</label>
             <input id="steps" name="steps" type="number" min="1" max="1000"
                    step="1" value="40" inputmode="numeric"
-                   aria-describedby="steps-error">
+                   aria-describedby="steps-error recipe-note">
             <p class="error" id="steps-error" aria-live="polite"></p>
           </div>
 
@@ -216,11 +243,12 @@
             <div class="field-row">
               <div class="field">
                 <label for="quant">Quantization</label>
-                <select id="quant" name="quant" aria-describedby="quant-help">
+                <select id="quant" name="quant" aria-describedby="quant-help quant-error">
                   <option value="fp16" selected title="Uses more graphics-card memory to keep the model's original detail. Best starting point for maximum image quality when it fits.">fp16</option>
                   <option value="q8" title="Compresses the model to use less graphics-card memory. Small image differences are possible. Looked similar to FP16 in our tests, but sampling was slightly slower. Experimental.">q8 — experimental</option>
                 </select>
                 <p id="quant-help" class="help" aria-live="polite">Uses more graphics-card memory to keep the model's original detail. Best starting point for maximum image quality when it fits.</p>
+                <p class="error" id="quant-error" aria-live="polite"></p>
               </div>
               <div class="field">
                 <label for="offload">Layer offload</label>
@@ -326,6 +354,7 @@
             <div><dt>Seed (decimal string)</dt><dd id="plan-seed">—</dd></div>
             <div><dt>Dimensions</dt><dd id="plan-dims">—</dd></div>
             <div><dt>Steps</dt><dd id="plan-steps">—</dd></div>
+            <div><dt>Recipe</dt><dd id="plan-recipe">—</dd></div>
             <div><dt>CFG</dt><dd id="plan-cfg">—</dd></div>
             <div><dt>Latent tokens</dt><dd id="plan-tokens">—</dd></div>
             <div><dt>Quant / offload / attention</dt><dd id="plan-quant">—</dd></div>

@@ -128,15 +128,22 @@
   // Output formats — the exact OutputFormat enum values of config.py.
   var OUTPUT_FORMATS = ['jpg', 'png', 'webp'];
 
-  // The 14 browser-editable GenerationConfig fields, in wire order (the
+  // The 15 browser-editable GenerationConfig fields, in wire order (the
   // server's EDITABLE_FIELDS, web/api.py). Plan and job echoes must carry
   // EXACTLY this set: the explicit legacy branches in parsePlan/parseJob
   // fill in the keys OLDER servers never sent, and anything else (an unknown
   // key, an alias) is a schema rejection — never "any key count".
   var EDITABLE_KEYS = ['prompt', 'negative_prompt', 'width', 'height', 'steps',
-                       'true_cfg_scale', 'seed', 'quant', 'offload',
+                       'recipe', 'true_cfg_scale', 'seed', 'quant', 'offload',
                        'attention_backend', 'vae_tiled_decode', 'output_format',
                        'transparent_background', 'references'];
+
+  // Recipe enum values (config.py Recipe) and the step count Turbo owns
+  // (config.py TURBO_STEPS). A test pins both against the Python values:
+  // Turbo's shipped sigmas make num_inference_steps inert, so the recipe
+  // owns the step count and the control is LOCKED at exactly this number.
+  var RECIPES = ['base', 'turbo'];
+  var TURBO_STEPS = 8;
 
   // Formats that can carry an alpha channel (config.py ALPHA_OUTPUT_FORMATS).
   // JPEG cannot store transparency, so a transparent background REQUIRES one
@@ -360,6 +367,9 @@
       errors.prompt = 'Prompt must not be empty — enter the text you want ' +
                       'used exactly as typed.';
     }
+    // Under Turbo these controls are locked (applyRecipeMode) at values the
+    // server accepts, so the ordinary checks stay as the honest mirror: a
+    // restored OUT-OF-RANGE value from before Turbo still surfaces its error.
     var steps = numberField('steps', true);
     if (steps.error) { errors.steps = steps.error; }
     else if (steps.value < 1 || steps.value > 1000) {
@@ -426,6 +436,12 @@
     setText('cfg-error', errors.cfg || '');
     setText('dims-error', errors.dims || '');
     setText('format-error', errors.format || '');
+    // Server-side policy refusals for these four fields are rendered inline
+    // by applyServerFieldErrors; any draft edit clears them (they described
+    // the configuration that was sent, not the current one).
+    setText('quant-error', '');
+    setText('recipe-error', '');
+    setAriaInvalid('quant', false);
     syncTransparency();
     // The prompt error only appears once the user has edited the prompt or
     // attempted to submit — never as a first-load alert.
@@ -439,6 +455,37 @@
     // The dimension error message is shared, so it marks BOTH controls.
     setAriaInvalid('width', !!errors.dims);
     setAriaInvalid('height', !!errors.dims);
+  }
+
+  // Server refusals that describe THIS recipe combination are mapped onto the
+  // controls the user can act on, so "the server said no" becomes "this
+  // control is wrong, and here is why". Every other field stays in the
+  // bounded api-message text (renderApiError). Returns the number applied.
+  var SERVER_FIELD_SLOTS = {
+    steps: 'steps-error',
+    true_cfg_scale: 'cfg-error',
+    quant: 'quant-error',
+    recipe: 'recipe-error'
+  };
+  var SERVER_FIELD_CONTROLS = {
+    steps: 'steps', true_cfg_scale: 'cfg', quant: 'quant', recipe: 'recipe-field'
+  };
+
+  function applyServerFieldErrors(payload) {
+    if (!payload || !Array.isArray(payload.fields)) return 0;
+    var applied = 0;
+    for (var i = 0; i < payload.fields.length; i++) {
+      var f = payload.fields[i];
+      if (!f || typeof f.field !== 'string' ||
+          !Object.prototype.hasOwnProperty.call(SERVER_FIELD_SLOTS, f.field) ||
+          typeof f.message !== 'string') continue;
+      var slot = SERVER_FIELD_SLOTS[f.field];
+      setText(slot, f.message.slice(0, 200));
+      var control = $(SERVER_FIELD_CONTROLS[f.field]);
+      if (control) control.setAttribute('aria-invalid', 'true');
+      applied++;
+    }
+    return applied;
   }
 
   // Set only by the jpg -> png auto-switch, so the explanation survives the
@@ -488,6 +535,64 @@
     syncPlanStaleness();
   }
 
+  /* ---------------- Recipe (base / Turbo) ----------------
+   * The server's config.py gates Turbo on three things: exactly
+   * TURBO_STEPS sampling steps, no true-CFG (no negative prompt AND no
+   * scale above 1.0), and FP16 weights. The UI therefore LOCKS those
+   * controls while Turbo is selected and says why — it never silently
+   * submits a combination the server would refuse. Nothing the user typed
+   * is deleted: only a locked, restored-on-switch-back value is replaced,
+   * and the negative prompt TEXT is kept (it is legal at scale 1.0).
+   */
+
+  // Values captured when Turbo is entered, restored when Quality is chosen
+  // again. null means "not in a locked Turbo draft".
+  var recipeSaved = null;
+
+  function currentRecipe() {
+    var el = document.querySelector('input[name="recipe"]:checked');
+    return el && RECIPES.indexOf(el.value) !== -1 ? el.value : 'base';
+  }
+
+  function setRecipeControl(value) {
+    var el = document.getElementById('recipe-' + value);
+    if (el) el.checked = true;
+  }
+
+  // Brings the form in line with the selected recipe: locks the controls the
+  // server will not accept under Turbo, and restores the user's own values
+  // when switching back. Safe to call repeatedly.
+  //
+  // `keepValues` marks an EXTERNALLY supplied Turbo draft (an imported plan):
+  // its steps/guidance/quant already are the recipe's own values, so there is
+  // nothing of the user's to capture — capturing them would later "restore"
+  // numbers the user never chose while in Quality.
+  function applyRecipeMode(keepValues) {
+    var turbo = currentRecipe() === 'turbo';
+    var steps = $('steps'), cfg = $('cfg'), quant = $('quant'), negative = $('negative');
+    if (turbo && recipeSaved === null && !keepValues) {
+      recipeSaved = { steps: steps.value, cfg: cfg.value, quant: quant.value };
+      steps.value = String(TURBO_STEPS);
+      cfg.value = '1.0';
+      quant.value = 'fp16';
+    } else if (!turbo && recipeSaved !== null) {
+      steps.value = recipeSaved.steps;
+      cfg.value = recipeSaved.cfg;
+      quant.value = recipeSaved.quant;
+      recipeSaved = null;
+    }
+    steps.disabled = turbo;
+    cfg.disabled = turbo;
+    negative.disabled = turbo;
+    quant.disabled = turbo;
+    setText('recipe-note', turbo
+      ? 'Turbo is selected: steps are fixed at ' + TURBO_STEPS + ', guidance ' +
+        'is fixed at 1.0 (Turbo has no negative prompt), and quantization ' +
+        'is FP16. These controls are locked until you switch back to Quality.'
+      : '');
+    $('recipe-note').hidden = !turbo;
+  }
+
   /* ---------------- UI wire snapshot and request envelope ----------------
    * formSnapshot() is the UI wire format (kind marks it; seed is a STRING).
    * buildEnvelope() turns the CURRENT draft into the exact server envelope:
@@ -503,6 +608,7 @@
       width: Number($('width').value),
       height: Number($('height').value),
       steps: Number($('steps').value),
+      recipe: currentRecipe(),                 // base | turbo (exact config.py values)
       seed: seedWireString($('seed').value),   // decimal STRING or null (UI-only)
       true_cfg_scale: Number($('cfg').value),
       quant: $('quant').value,                 // fp16 | q8 (exact config.py values)
@@ -535,6 +641,7 @@
           width: snap.width,
           height: snap.height,
           steps: snap.steps,
+          recipe: snap.recipe,
           true_cfg_scale: snap.true_cfg_scale,
           seed: snap.seed,                     // decimal STRING or null — never a Number
           quant: snap.quant,
@@ -1299,6 +1406,7 @@
       }
       if (!r.res.ok) {
         renderApiError(r.res, r.json === undefined ? null : r.json);
+        applyServerFieldErrors(r.json);
         setText('api-message', $('api-message').textContent +
           ' No planning result received; your draft is unchanged; nothing ' +
           'was generated.');
@@ -1375,6 +1483,10 @@
     setText('plan-seed', plan.config.seed === null ? 'null (random at run time)' : plan.config.seed);
     setText('plan-dims', plan.config.width + ' × ' + plan.config.height);
     setText('plan-steps', String(plan.config.steps));
+    setText('plan-recipe', plan.config.recipe === 'turbo'
+      ? 'Turbo — Turbo image model with the same text encoder and decoder ' +
+        'as Quality, fixed ' + TURBO_STEPS + ' sampling steps'
+      : 'Quality — reference model at ' + plan.config.steps + ' steps');
     setText('plan-cfg', plan.cfg_active === true ? 'active (scale ' + plan.config.true_cfg_scale + ')'
                                                  : 'inactive (scale ' + plan.config.true_cfg_scale + ')');
     setText('plan-tokens', String(plan.latent_tokens));
@@ -1413,8 +1525,20 @@
     quant: ['fp16', 'q8'],
     offload: ['resident', 'streamed', 'offload'],
     attention_backend: ['auto', 'sdpa', 'efficient', 'eager'],
-    output_format: OUTPUT_FORMATS
+    output_format: OUTPUT_FORMATS,
+    recipe: RECIPES
   };
+
+  // The recipe gates config.py enforces, mirrored so an echo that could not
+  // have come from a validated config is refused rather than rendered:
+  // Turbo owns exactly TURBO_STEPS steps, runs at CFG 1.0 (no usable
+  // negative prompt), and has no reviewed Q8 artifact.
+  function recipeConsistent(c) {
+    if (PLAN_ENUMS.recipe.indexOf(c.recipe) === -1) return false;
+    if (c.recipe !== 'turbo') return true;
+    return c.steps === TURBO_STEPS && c.quant === 'fp16' &&
+           !(pyStrip(c.negative_prompt).length > 0 && c.true_cfg_scale > 1);
+  }
 
   // The WHOLE public plan response is validated before anything renders:
   // exact editable keys, string lengths ALIGNED with the server's 64 KiB
@@ -1439,19 +1563,29 @@
       return Object.prototype.hasOwnProperty.call(c, key);
     };
     // Backward compatibility is EXPLICIT, never "any key count": an older
-    // server that predates references sent 13 keys, the one before
-    // transparency 12, the one before output_format 11. Each branch fills
-    // in exactly what that server actually did; 10 keys, 15 keys or any
-    // unknown key is a schema rejection.
-    var legacyNoReferences = have.length === 13 && !hasKey('references');
+    // server that predates the recipe sent 14 keys, the one before
+    // references 13, the one before transparency 12, the one before
+    // output_format 11. Each branch fills in exactly what that server
+    // actually did — a pre-recipe server could only run the reference
+    // model, so recipe is "base"; 10 keys, 16 keys or any unknown key is a
+    // schema rejection, never a guess.
+    var legacyNoRecipe = have.length === 14 && !hasKey('recipe');
+    var legacyNoReferences = have.length === 13 &&
+      !hasKey('references') && !hasKey('recipe');
     var legacyNoTransparency = have.length === 12 &&
-      !hasKey('references') && !hasKey('transparent_background');
+      !hasKey('references') && !hasKey('recipe') &&
+      !hasKey('transparent_background');
     var legacyNoFormat = have.length === 11 &&
-      !hasKey('references') && !hasKey('transparent_background') &&
+      !hasKey('references') && !hasKey('recipe') &&
+      !hasKey('transparent_background') &&
       !hasKey('output_format');
-    if (!(have.length === want.length || legacyNoReferences ||
-          legacyNoTransparency || legacyNoFormat)) return null;
+    var legacyAny = legacyNoRecipe || legacyNoReferences ||
+                    legacyNoTransparency || legacyNoFormat;
+    if (!(have.length === want.length || legacyAny)) return null;
     var i;
+    // Reference ids: the content-addressed digests the server validates
+    // against (config.py REF_MAX = 10) with one filled-in-per-era rule.
+    if (legacyAny) c.recipe = 'base';
     if (legacyNoFormat) c.output_format = 'png';
     if (legacyNoFormat || legacyNoTransparency) c.transparent_background = false;
     if (legacyNoFormat || legacyNoTransparency || legacyNoReferences) c.references = [];
@@ -1505,6 +1639,8 @@
     // AND a scale strictly above 1.0.
     var cfgActive = pyStrip(c.negative_prompt).length > 0 && c.true_cfg_scale > 1;
     if (raw.cfg_active !== cfgActive) return null;
+    // Recipe contract: enum value plus the exact Turbo gates (config.py).
+    if (!recipeConsistent(c)) return null;
     // latent_tokens must equal the /16 compression of the echoed
     // dimensions (config.py C6); multiples-of-32 make this division exact.
     if (raw.latent_tokens !== (c.width / 16) * (c.height / 16)) return null;
@@ -1711,6 +1847,10 @@
     $('negative').value = c.negative_prompt;
     $('width').value = String(c.width);
     $('height').value = String(c.height);
+    // The recipe is applied FIRST (and its lock re-derived LAST) so the
+    // imported steps/cfg/quant land as the file's values instead of being
+    // overwritten by a leftover Turbo lock or restored from a stale capture.
+    recipeSaved = null;
     $('steps').value = String(c.steps);
     $('cfg').value = String(c.true_cfg_scale);
     // Seed stays a decimal STRING end to end — never a Number.
@@ -1725,6 +1865,8 @@
     // stale switch explanation must not survive it either.
     transparencySwitchNote = '';
     $('transparent').checked = c.transparent_background;
+    setRecipeControl(c.recipe);
+    applyRecipeMode(true);   // values came from the file: never capture them
     // Round-trip: the imported ids become the draft's reference list in the
     // file's order. The export carries ids only, so the display metadata
     // (dimensions/alpha/bytes) is UNKNOWN until the thumbnails load — shown
@@ -2319,25 +2461,31 @@
         typeof job.cancel_requested !== 'boolean') return null;
     var c = job.config;
     if (!c || typeof c !== 'object') return null;
-    // Current servers echo all 14 editable fields. Three older shapes are
+    // Current servers echo all 15 editable fields. FOUR older shapes are
     // accepted ONLY via explicit backward-compat branches and default the
-    // missing keys to what those servers actually did: 13 keys without
-    // references (no conditioning images), 12 keys without
+    // missing keys to what those servers actually did: 14 keys without
+    // recipe (always the reference model, so "base"), 13 keys without
+    // references either (no conditioning images), 12 keys without
     // transparent_background either (never transparent), and 11 keys
     // without output_format either (saved PNG). Anything else (10 keys,
-    // 15 keys, extra runtime fields) is a schema rejection, never a guess.
+    // 16 keys, extra runtime fields) is a schema rejection, never a guess.
     var ckeys = Object.keys(c);
     var hasKey = function (key) {
       return Object.prototype.hasOwnProperty.call(c, key);
     };
-    var legacyNoFormat = ckeys.length === 11 && !hasKey('output_format') &&
-      !hasKey('transparent_background') && !hasKey('references');
+    var legacyNoRecipe = ckeys.length === 14 && !hasKey('recipe');
+    var legacyNoReferences = ckeys.length === 13 && !hasKey('references') &&
+      !hasKey('recipe');
     var legacyNoTransparency = ckeys.length === 12 &&
       !hasKey('transparent_background') && hasKey('output_format') &&
-      !hasKey('references');
-    var legacyNoReferences = ckeys.length === 13 && !hasKey('references');
-    if (!(ckeys.length === 14 || legacyNoFormat || legacyNoTransparency ||
-          legacyNoReferences)) return null;
+      !hasKey('references') && !hasKey('recipe');
+    var legacyNoFormat = ckeys.length === 11 && !hasKey('output_format') &&
+      !hasKey('transparent_background') && !hasKey('references') &&
+      !hasKey('recipe');
+    var legacyAny = legacyNoRecipe || legacyNoReferences ||
+                    legacyNoTransparency || legacyNoFormat;
+    if (!(ckeys.length === 15 || legacyAny)) return null;
+    if (legacyAny) c.recipe = 'base';
     if (legacyNoFormat) c.output_format = 'png';
     if (legacyNoFormat || legacyNoTransparency) c.transparent_background = false;
     if (legacyNoFormat || legacyNoTransparency || legacyNoReferences) c.references = [];
@@ -2363,6 +2511,9 @@
     // cannot have come from a validated server config.
     if (c.transparent_background &&
         ALPHA_FORMATS.indexOf(c.output_format) === -1) return null;
+    // Same recipe contract as parsePlan: a job config the server would have
+    // refused is a broken echo, not something to display or resubmit.
+    if (!recipeConsistent(c)) return null;
     if (['width', 'height'].some(function (key) {
       return !Number.isInteger(c[key]) || c[key] < 64 || c[key] > 4096 || c[key] % 32 !== 0;
     })) return null;
@@ -2487,7 +2638,10 @@
         card.appendChild(image);
       }
       var label = document.createElement('p');
-      label.textContent = job.state + ' · seed ' + job.config.seed + ' · ' + job.config.prompt.slice(0, 160);
+      label.textContent = job.state +
+        (job.config.recipe === 'turbo' ? ' · Turbo' : '') +
+        ' · seed ' + job.config.seed + ' · ' +
+        job.config.prompt.slice(0, 160);
       card.appendChild(label);
       var view = document.createElement('button');
       view.type = 'button';
@@ -2607,6 +2761,8 @@
       if (!job) {
         if (r.res && !r.res.ok && r.json && r.json.schema === ERROR_SCHEMA) {
           renderApiError(r.res, r.json);
+          // Recipe-combination refusals land on the controls they describe.
+          applyServerFieldErrors(r.json);
           // The server names the ORDINAL, not the id: mirror it in the live
           // status line so the user knows which thumbnail to re-upload.
           if (r.json.code === 'reference_unavailable') {
@@ -2821,10 +2977,23 @@
     // from the change-only group above.
     $('transparent').addEventListener('change', onTransparencyChange);
 
+    // Recipe: every radio in the group shares one handler, so the lock state
+    // is derived from whichever control the user (or an import) selected.
+    Array.prototype.forEach.call(
+      document.querySelectorAll('input[name="recipe"]'),
+      function (radio) {
+        radio.addEventListener('change', function () {
+          applyRecipeMode();
+          renderValidation(validateForm().errors);
+          syncPlanStaleness();
+        });
+      });
+
     window.addEventListener('hashchange', routeOnHashchange);
     initTheme();   // persisted theme applied before first paint of content
     initialRoute();
     syncPresetButtons();
+    applyRecipeMode();   // lock state matches the checked recipe on load
     renderValidation(validateForm().errors);
 
     var generate = $('generate-btn');
@@ -2875,6 +3044,12 @@
     renderReferences: renderReferences,
     MAX_REFERENCES: MAX_REFERENCES,
     EDITABLE_KEYS: EDITABLE_KEYS,
+    // Recipe surface: the real-Chrome check drives the lock behaviour and
+    // reads what the draft would submit without a server.
+    RECIPES: RECIPES,
+    TURBO_STEPS: TURBO_STEPS,
+    currentRecipe: currentRecipe,
+    applyRecipeMode: applyRecipeMode,
     // TEST-ONLY: opens the write gate without a live server so the offline
     // checks can drive the upload path (production only ever opens it from a
     // RECOGNIZED status document).

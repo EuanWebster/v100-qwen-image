@@ -850,6 +850,103 @@ def test_parse_job_accepts_13_keys_and_keeps_legacy_shapes_honest():
     assert "typeof c.transparent_background !== 'boolean'" in body
 
 
+def test_recipe_field_mirrors_the_config_gates():
+    html = _read("index.html")
+    js = _read("app.js")
+    css = _read("app.css")
+    from qwen_engine.config import Recipe, TURBO_STEPS
+
+    # The UI's Turbo step count and recipe names are the SAME values the
+    # server validates against.
+    assert f"var TURBO_STEPS = {TURBO_STEPS};" in js
+    m = re.search(r"var RECIPES = \[([^\]]*)\];", js)
+    assert m, "RECIPES not found"
+    assert re.findall(r"'([a-z]+)'", m.group(1)) == [r.value for r in Recipe]
+    # One radio group, both values, Quality checked by default.
+    assert re.search(r'<fieldset[^>]*id="recipe-field"[^>]*>', html)
+    for value in ("base", "turbo"):
+        assert f'id="recipe-{value}" name="recipe" type="radio" value="{value}"' in html
+    assert re.search(r'id="recipe-base"[^>]*checked', html, re.S)
+    assert 'id="recipe-help"' in html and 'id="recipe-note"' in html
+    assert 'id="recipe-error"' in html
+    # The note is a live region and is referenced by the locked controls so
+    # the reason for the lock reaches assistive tech.
+    note = re.search(r'<p id="recipe-note"[^>]*>', html).group(0)
+    assert 'role="status"' in note
+    for control in ("steps", "recipe-base", "recipe-turbo"):
+        tag = re.search(rf'<input id="{control}"[^>]*', html, re.S)
+        assert tag and "recipe-note" in tag.group(0), f"#{control} must describe the recipe note"
+    assert re.search(r'<input id="steps"[^>]*aria-describedby="steps-error recipe-note"',
+                     html, re.S)
+    # Plan panel echoes the recipe.
+    assert 'id="plan-recipe"' in html
+    # Locks are STYLED (visible-but-inert), never just hidden.
+    assert ".radio-row" in css and ".radio-field" in css
+    assert "input:disabled" in css and "select:disabled" in css
+
+
+def test_apply_recipe_mode_locks_and_restores_the_gated_controls():
+    js = _read("app.js")
+    body = _js_function(js, "applyRecipeMode")
+    # Turbo pins exactly what config.py refuses to see otherwise.
+    assert "steps.value = String(TURBO_STEPS);" in body
+    assert "cfg.value = '1.0';" in body
+    assert "quant.value = 'fp16';" in body
+    # All four gated controls are locked, and the reason is written down.
+    for control in ("steps", "cfg", "negative", "quant"):
+        assert f"{control}.disabled = turbo;" in body, f"{control} must be locked under Turbo"
+    assert "recipe-note" in body and "hidden = !turbo" in body
+    # Leaving Turbo restores the user's own values instead of keeping pins.
+    assert "recipeSaved" in body and "steps.value = recipeSaved.steps;" in body
+    assert "cfg.value = recipeSaved.cfg;" in body
+    assert "quant.value = recipeSaved.quant;" in body
+    # An imported plan supplies the recipe's own values: no capture.
+    assert "keepValues" in body
+    m = re.search(r"function applyImportedPlan\(plan\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "applyImportedPlan not found"
+    imported = m.group(1)
+    assert "applyRecipeMode(true)" in imported
+    # Order matters: the recipe is applied after the file's values so the
+    # locks match the file, not a leftover draft.
+    assert imported.index("setRecipeControl(c.recipe)") > imported.index("c.quant")
+    assert "recipeSaved = null;" in imported
+
+
+def test_recipe_contract_is_mirrored_by_parse_plan_and_parse_job():
+    js = _read("app.js")
+    body = _js_function(js, "recipeConsistent")
+    assert "PLAN_ENUMS.recipe.indexOf(c.recipe) === -1" in body
+    assert "c.steps === TURBO_STEPS" in body
+    assert "c.quant === 'fp16'" in body
+    assert "true_cfg_scale > 1" in body
+    # Both parsers refuse an echo the server could not have produced.
+    assert "recipeConsistent(c)" in _js_function(js, "parsePlan")
+    assert "recipeConsistent(c)" in _js_function(js, "parseJob")
+    # The history label distinguishes the two recipes.
+    assert "job.config.recipe === 'turbo' ? ' · Turbo' : ''" in js
+    # Server refusals are mapped onto the recipe's own fields.
+    assert "recipe: 'recipe-error'" in js and "recipe: 'recipe-field'" in js
+    for fn in ("runPlan", "submitGeneration"):
+        assert "applyServerFieldErrors(" in _js_function(js, fn), \
+            f"{fn} must render per-field server refusals"
+
+
+def test_recipe_radios_are_wired_and_locked_on_load():
+    js = _read("app.js")
+    assert 'document.querySelectorAll(\'input[name="recipe"]\')' in js
+    # The group handler re-derives the locks, re-renders errors and stales
+    # any visible plan result — the same contract as every other field.
+    m = re.search(r"input\[name=\"recipe\"\]'\),([\s\S]*?)\}\);\n", js)
+    assert m and "applyRecipeMode();" in m.group(1)
+    assert "renderValidation(validateForm().errors);" in m.group(1)
+    assert "syncPlanStaleness();" in m.group(1)
+    # Locks exist on first paint, not only after the first change event.
+    assert "applyRecipeMode();   // lock state matches" in js
+    # The envelope carries the recipe value (not a derived boolean).
+    assert "recipe: currentRecipe()," in js
+    assert "recipe: snap.recipe," in js
+
+
 def test_import_applies_transparent_background_without_auto_switch():
     js = _read("app.js")
     m = re.search(r"function applyImportedPlan\(plan\)\s*\{([\s\S]*?)\n  \}", js)
@@ -931,11 +1028,13 @@ def test_w4_editable_keys_match_the_server_set_exactly():
     m = re.search(r"var EDITABLE_KEYS = \[([\s\S]*?)\];", js)
     assert m, "EDITABLE_KEYS not found"
     keys = re.findall(r"'([a-z_]+)'", m.group(1))
-    assert len(keys) == len(set(keys)) == 14, keys
+    assert len(keys) == len(set(keys)) == 15, keys
     assert set(keys) == set(EDITABLE_FIELDS), (
         f"EDITABLE_KEYS diverge from api.EDITABLE_FIELDS: "
         f"{set(keys) ^ set(EDITABLE_FIELDS)}")
     assert keys[-1] == "references", "references is the newest (last) wire field"
+    assert keys.index("recipe") == keys.index("steps") + 1, \
+        "recipe sits with the sampling fields, right after steps"
 
 
 def test_w4_reference_fieldset_markup_is_labelled_and_announced():
@@ -1032,11 +1131,16 @@ def test_w4_parse_reference_response_is_a_closed_shape():
 def test_w4_parse_plan_and_job_keep_explicit_legacy_branches():
     js = _read("app.js")
     plan = _js_function(js, "parsePlan")
-    # Current shape first, then the three explicitly-gated older shapes.
+    # Current shape first, then the four explicitly-gated older shapes (the
+    # recipe era, then references, transparency and output_format).
     assert "var want = EDITABLE_KEYS;" in plan
     assert "have.length === want.length" in plan
-    for n in (13, 12, 11):
+    for n in (14, 13, 12, 11):
         assert f"have.length === {n}" in plan, f"parsePlan misses the {n}-key branch"
+    # Every legacy branch is gated on the recipe key too, so a 14-key echo
+    # that HAS recipe (i.e. some other key missing) is a rejection.
+    assert "!hasKey('recipe')" in plan
+    assert "c.recipe = 'base';" in plan
     assert "c.references = [];" in plan
     assert "Object.keys(c).length !== want.length" in plan
     assert "Array.isArray(c.references)" in plan and \
@@ -1044,8 +1148,10 @@ def test_w4_parse_plan_and_job_keep_explicit_legacy_branches():
     assert "REFERENCE_ID_RE.test(c.references[i])" in plan
 
     job = _js_function(js, "parseJob")
-    for n in (14, 13, 12, 11):
+    for n in (15, 14, 13, 12, 11):
         assert f"ckeys.length === {n}" in job, f"parseJob misses the {n}-key branch"
+    assert "!hasKey('recipe')" in job
+    assert "c.recipe = 'base';" in job
     assert "c.references = [];" in job
     assert "REFERENCE_ID_RE.test(c.references[r])" in job
     # An over-cap list is refused, never truncated.
