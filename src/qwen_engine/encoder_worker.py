@@ -58,6 +58,36 @@ def _offline_audit(event, args):
     if event.startswith("socket."):
         raise OfflineViolation(f"encoder worker offline policy refuses {event}")
 
+#: Environment-only diagnostic knobs (docs/encoder-cpu-performance.md). The
+#: defaults reproduce the historical child exactly: ONE thread for every BLAS
+#: and eager attention. Non-default values exist for root's CPU profiling and
+#: MAY change embedding bit patterns; production must keep the defaults until
+#: bit-identity is demonstrated for a specific pinned build. Children inherit
+#: the parent environment, so these must be validated and applied HERE,
+#: before torch imports (Open/MKL pinning is fixed at first BLAS init).
+THREADS_ENV = "QWEN_ENCODER_THREADS"
+ATTN_ENV = "QWEN_ENCODER_ATTN"
+ATTN_CHOICES = ("eager", "sdpa")
+
+
+def _requested_threads() -> int:
+    raw = os.environ.get(THREADS_ENV, "1")
+    try:
+        value = int(raw)
+    except ValueError:
+        raise EncoderSetupError(f"{THREADS_ENV} must be an integer in 1..64") from None
+    if not 1 <= value <= 64:
+        raise EncoderSetupError(f"{THREADS_ENV} must be an integer in 1..64")
+    return value
+
+
+def _requested_attn() -> str:
+    value = os.environ.get(ATTN_ENV, "eager")
+    if value not in ATTN_CHOICES:
+        raise EncoderSetupError(
+            f"{ATTN_ENV} must be one of {'/'.join(ATTN_CHOICES)}")
+    return value
+
 
 def install_offline_guard() -> None:
     """Irreversible child-only socket guard, installed before lazy ML imports."""
@@ -66,11 +96,12 @@ def install_offline_guard() -> None:
         return
     if any(m in sys.modules for m in ("torch", "diffusers", "transformers")):
         raise EncoderSetupError("offline guard must be installed in a fresh child before ML imports")
+    threads = str(_requested_threads())
     os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
                       HF_DATASETS_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1",
                       TOKENIZERS_PARALLELISM="false", PYTHONDONTWRITEBYTECODE="1",
-                      OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
-                      NUMEXPR_NUM_THREADS="1")
+                      OMP_NUM_THREADS=threads, MKL_NUM_THREADS=threads,
+                      OPENBLAS_NUM_THREADS=threads, NUMEXPR_NUM_THREADS=threads)
     sys.dont_write_bytecode = True
     sys.addaudithook(_offline_audit)
     _OFFLINE_INSTALLED = True
@@ -234,7 +265,7 @@ def validate_shard_index(assets: VerifiedEncoderAssets) -> None:
 def _load_classes():
     try:
         torch = importlib.import_module("torch")
-        torch.set_num_threads(1)
+        torch.set_num_threads(_requested_threads())
         torch.set_num_interop_threads(1)
         transformers = importlib.import_module("transformers")
         return torch, transformers.Qwen3VLProcessor, transformers.Qwen3VLForConditionalGeneration
@@ -253,7 +284,7 @@ def _load_local_components(assets: VerifiedEncoderAssets, dtype: str):
             model = model_class.from_pretrained(str(assets.component_dirs["text_encoder"]),
                 **common, dtype=want, device_map={"": "cpu"}, use_safetensors=True,
                 weights_only=True, low_cpu_mem_usage=True,
-                attn_implementation="eager", use_kernels=False, allow_all_kernels=False)
+                attn_implementation=_requested_attn(), use_kernels=False, allow_all_kernels=False)
             # Qwen has a nested text config; setting only the outer config
             # need not disable the language model's autoregressive KV cache.
             model.config.get_text_config().use_cache = False

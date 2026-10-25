@@ -199,6 +199,59 @@ def test_local_loader_uses_fixed_paths_cpu_and_no_remote_code(inputs, monkeypatc
     assert text_config.use_cache is False
 
 
+def test_encoder_diagnostic_knob_defaults_reproduce_the_pinned_child(monkeypatch):
+    monkeypatch.delenv(ew.THREADS_ENV, raising=False)
+    monkeypatch.delenv(ew.ATTN_ENV, raising=False)
+    assert ew._requested_threads() == 1
+    assert ew._requested_attn() == "eager"
+
+
+@pytest.mark.parametrize("raw", ["0", "65", "-3", "x", "4.5", ""])
+def test_thread_knob_refuses_malformed_values(monkeypatch, raw):
+    monkeypatch.setenv(ew.THREADS_ENV, raw)
+    with pytest.raises(EncoderSetupError, match="QWEN_ENCODER_THREADS"):
+        ew._requested_threads()
+
+
+@pytest.mark.parametrize("raw", ["flash_attention_2", "sdpa,1", "EAGER", ""])
+def test_attn_knob_refuses_unpinned_choices(monkeypatch, raw):
+    monkeypatch.setenv(ew.ATTN_ENV, raw)
+    with pytest.raises(EncoderSetupError, match="QWEN_ENCODER_ATTN"):
+        ew._requested_attn()
+
+
+def test_attn_and_thread_knobs_reach_the_pinned_loader(inputs, monkeypatch):
+    monkeypatch.setenv(ew.ATTN_ENV, "sdpa")
+    calls = []
+    torch = FakeTorch()
+    torch.float16, torch.bfloat16, torch.float32 = "F16", "BF16", "F32"
+    text_config = SimpleNamespace(use_cache=True)
+    model = SimpleNamespace(eval=lambda: calls.append("eval"),
+                            config=SimpleNamespace(use_cache=True, get_text_config=lambda: text_config))
+    monkeypatch.setattr(ew, "_load_classes", lambda: (
+        torch, SimpleNamespace(from_pretrained=lambda *a, **k: "processor"),
+        SimpleNamespace(from_pretrained=lambda path, **k: calls.append(("model", k)) or model)))
+    ew._load_local_components(assets(inputs), "fp16")
+    opts = next(call[1] for call in calls if call[0] == "model")
+    assert opts["attn_implementation"] == "sdpa"
+
+
+def test_guard_applies_thread_knob_before_torch_import(monkeypatch):
+    captured: dict = {}
+    monkeypatch.setattr(ew.os.environ, "update", lambda **kw: captured.update(kw))
+    monkeypatch.setattr(ew.sys, "addaudithook", lambda hook: None)
+    monkeypatch.setattr(ew, "_requested_threads", lambda: 8)
+    monkeypatch.setattr(ew, "_OFFLINE_INSTALLED", False)
+    try:
+        ew.install_offline_guard()
+    finally:
+        monkeypatch.setattr(ew, "_OFFLINE_INSTALLED", False)
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                 "NUMEXPR_NUM_THREADS"):
+        assert captured[name] == "8"
+    assert captured["HF_HUB_OFFLINE"] == "1" and captured["TRANSFORMERS_OFFLINE"] == "1"
+
+
 def test_worker_orders_memory_identity_assets_index_loader_encoder(inputs, monkeypatch):
     verified = assets(inputs)
     events = []
