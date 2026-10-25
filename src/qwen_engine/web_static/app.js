@@ -47,11 +47,24 @@
   var API_EXPORT = '/api/v1/config/export';
   var API_IMPORT = '/api/v1/config/import';
   var API_JOBS = '/api/v1/jobs';
+  var API_REFERENCES = '/api/v1/references';
   var PLAN_REQUEST_SCHEMA = 'qwen_engine.web_plan_request.v1';
   var STATUS_SCHEMA = 'qwen_engine.web_status.v1';
   var PLAN_SCHEMA = 'qwen_engine.web_plan.v1';
   var ERROR_SCHEMA = 'qwen_engine.web_error.v1';
+  var REFERENCE_SCHEMA = 'qwen_engine.web_reference.v1';
   var UI_HEADER = 'X-Qwen-UI';
+
+  // Reference images (design §5). The caps MIRROR the server contract
+  // (config.py REF_MAX = 10, reference_store.MAX_REFERENCE_BYTES = 32 MiB,
+  // MAX_REFERENCE_DIM = 4096) so the page refuses locally with the same
+  // reason the server would give — the server stays authoritative and its
+  // typed error is surfaced verbatim when it refuses anyway.
+  var MAX_REFERENCES = 10;
+  var MAX_REFERENCE_BYTES = 32 * 1024 * 1024;
+  var MAX_REFERENCE_DIM = 4096;
+  var REFERENCE_ID_RE = /^[0-9a-f]{64}$/;
+  var REFERENCE_ACCEPT = 'image/png,image/jpeg,image/webp';
 
   // Closed gate contract: each gate has exactly one truthful state and one
   // stable code (qwen_engine.web/api.py). An arbitrary bounded string is a
@@ -92,6 +105,16 @@
 
   // Output formats — the exact OutputFormat enum values of config.py.
   var OUTPUT_FORMATS = ['jpg', 'png', 'webp'];
+
+  // The 14 browser-editable GenerationConfig fields, in wire order (the
+  // server's EDITABLE_FIELDS, web/api.py). Plan and job echoes must carry
+  // EXACTLY this set: the explicit legacy branches in parsePlan/parseJob
+  // fill in the keys OLDER servers never sent, and anything else (an unknown
+  // key, an alias) is a schema rejection — never "any key count".
+  var EDITABLE_KEYS = ['prompt', 'negative_prompt', 'width', 'height', 'steps',
+                       'true_cfg_scale', 'seed', 'quant', 'offload',
+                       'attention_backend', 'vae_tiled_decode', 'output_format',
+                       'transparent_background', 'references'];
 
   // Formats that can carry an alpha channel (config.py ALPHA_OUTPUT_FORMATS).
   // JPEG cannot store transparency, so a transparent background REQUIRES one
@@ -465,7 +488,11 @@
       attention_backend: $('attention').value, // auto | sdpa | efficient | eager
       vae_tiled_decode: $('vae-tiling').checked,
       output_format: $('output-format').value, // jpg | png | webp (exact config.py enum)
-      transparent_background: $('transparent').checked
+      transparent_background: $('transparent').checked,
+      // Reference ids in LIST order — the displayed order IS the
+      // conditioning order ("image 1" in the prompt). Ids only: the bytes
+      // live in the server store, keyed by these hashes.
+      references: referenceIds()
     };
   }
 
@@ -493,7 +520,8 @@
           attention_backend: snap.attention_backend,
           vae_tiled_decode: snap.vae_tiled_decode,
           output_format: snap.output_format,
-          transparent_background: snap.transparent_background
+          transparent_background: snap.transparent_background,
+          references: snap.references
         }
       }
     };
@@ -639,6 +667,7 @@
     $('btn-export').disabled = !available;
     $('btn-import').disabled = !available;
     if (!available) generationConnected = false;
+    updateReferenceControls();   // uploads are writes: status-gated too
     updateGenerate();
   }
 
@@ -1004,6 +1033,13 @@
         ? 'on — prompts the model for a transparent background; saved as ' +
           plan.config.output_format + ', which can keep it (not guaranteed)'
         : 'off — saved as ' + plan.config.output_format);
+    setText('plan-references', plan.config.references.length === 0
+      ? 'none — the prompt is used on its own'
+      : plan.config.references.length + ' image' +
+        (plan.config.references.length === 1 ? '' : 's') +
+        ' (image 1' + (plan.config.references.length > 1
+          ? '…image ' + plan.config.references.length : '') +
+        ') — cited by number in the prompt');
     setText('plan-manifest',
       plan.manifest.ready === false && plan.manifest.verification === 'not_performed'
         ? 'metadata only — verification not performed, fit not evaluated, not ready'
@@ -1044,14 +1080,40 @@
     if (!Number.isInteger(raw.latent_tokens) || raw.latent_tokens < 0) return null;
     var c = raw.config;
     if (!c || typeof c !== 'object') return null;
-    var want = ['prompt', 'negative_prompt', 'width', 'height', 'steps',
-                'true_cfg_scale', 'seed', 'quant', 'offload',
-                'attention_backend', 'vae_tiled_decode', 'output_format',
-                'transparent_background'];
+    var want = EDITABLE_KEYS;
     var have = Object.keys(c);
-    if (have.length !== want.length) return null;   // no extra runtime fields
-    for (var i = 0; i < want.length; i++) {
-      if (!Object.prototype.hasOwnProperty.call(c, want[i])) return null;
+    var hasKey = function (key) {
+      return Object.prototype.hasOwnProperty.call(c, key);
+    };
+    // Backward compatibility is EXPLICIT, never "any key count": an older
+    // server that predates references sent 13 keys, the one before
+    // transparency 12, the one before output_format 11. Each branch fills
+    // in exactly what that server actually did; 10 keys, 15 keys or any
+    // unknown key is a schema rejection.
+    var legacyNoReferences = have.length === 13 && !hasKey('references');
+    var legacyNoTransparency = have.length === 12 &&
+      !hasKey('references') && !hasKey('transparent_background');
+    var legacyNoFormat = have.length === 11 &&
+      !hasKey('references') && !hasKey('transparent_background') &&
+      !hasKey('output_format');
+    if (!(have.length === want.length || legacyNoReferences ||
+          legacyNoTransparency || legacyNoFormat)) return null;
+    var i;
+    if (legacyNoFormat) c.output_format = 'png';
+    if (legacyNoFormat || legacyNoTransparency) c.transparent_background = false;
+    if (legacyNoFormat || legacyNoTransparency || legacyNoReferences) c.references = [];
+    for (i = 0; i < want.length; i++) {
+      if (!hasKey(want[i])) return null;
+    }
+    if (Object.keys(c).length !== want.length) return null;  // no extra runtime fields
+    // Reference ids: the content-addressed digests the server validates
+    // against (config.py REF_MAX = 10; duplicates are LEGAL — the same
+    // image may be cited twice). Any non-hex id or an over-cap list is a
+    // broken echo.
+    if (!Array.isArray(c.references) || c.references.length > MAX_REFERENCES) return null;
+    for (i = 0; i < c.references.length; i++) {
+      if (typeof c.references[i] !== 'string' ||
+          !REFERENCE_ID_RE.test(c.references[i])) return null;
     }
     if (typeof c.prompt !== 'string' || c.prompt.length > MAX_CONFIG_STRING_CHARS) return null;
     // EXACTLY shared GenerationConfig (config.py: `not self.prompt.strip()`):
@@ -1280,32 +1342,11 @@
    * failure the draft stays exactly as typed and nothing is generated.
    */
 
+  // One bounded read path for every local file (config import and reference
+  // uploads): the SAME size/staleness checks, so neither flow can grow a
+  // second, subtly different reading convention.
   function readFileLimited(file) {
-    return new Promise(function (resolve, reject) {
-      if (!file || typeof file.size !== 'number' ||
-          file.size > MAX_IMPORT_FILE_BYTES) {
-        reject(new Error('too_large'));
-        return;
-      }
-      var reader = new FileReader();
-      reader.onerror = function () { reject(new Error('unreadable')); };
-      reader.onload = function () {
-        var bytes = reader.result;
-        if (!(bytes instanceof ArrayBuffer) ||
-            bytes.byteLength > MAX_IMPORT_FILE_BYTES) {
-          reject(new Error('too_large'));
-          return;
-        }
-        // Re-read the live file size: a file changed on disk between
-        // selection and read must not slip past the bound.
-        if (typeof file.size === 'number' && file.size > MAX_IMPORT_FILE_BYTES) {
-          reject(new Error('too_large'));
-          return;
-        }
-        resolve(new Uint8Array(bytes));
-      };
-      reader.readAsArrayBuffer(file);
-    });
+    return readFileBytes(file, MAX_IMPORT_FILE_BYTES);
   }
 
   function applyImportedPlan(plan) {
@@ -1328,6 +1369,19 @@
     // stale switch explanation must not survive it either.
     transparencySwitchNote = '';
     $('transparent').checked = c.transparent_background;
+    // Round-trip: the imported ids become the draft's reference list in the
+    // file's order. The export carries ids only, so the display metadata
+    // (dimensions/alpha/bytes) is UNKNOWN until the thumbnails load — shown
+    // honestly as "stored on the server" rather than invented numbers.
+    references = c.references.map(function (id) {
+      return { id: id, width: null, height: null, has_alpha: null, bytes: null };
+    });
+    renderReferences();
+    setReferenceStatus(c.references.length
+      ? 'Imported ' + c.references.length + ' reference image' +
+        (c.references.length === 1 ? '' : 's') + ' in the file\'s order. ' +
+        'Their thumbnails appear if the server still holds them.'
+      : '');
   }
 
   function importConfigFile(file) {
@@ -1434,6 +1488,365 @@
                              'or generated.');
       return false;
     });
+  }
+
+  /* ---------------- Reference images ----------------
+   * Design §5 / §2.4. Uploads carry the RAW file bytes to
+   * POST /api/v1/references with Content-Type: application/octet-stream —
+   * never base64 inside JSON: the JSON routes cap bodies at 64 KiB while one
+   * reference may be 32 MiB. The browser only ever holds ids plus display
+   * metadata; the bytes and the store live on the server. The displayed
+   * order IS the conditioning order, so the list is renumbered and the
+   * envelope rebuilt in the same turn as any change.
+   */
+
+  var references = [];            // [{id, width, height, has_alpha, bytes}]
+  var uploadingReference = false;
+
+  function referenceIds() {
+    return references.map(function (ref) { return ref.id; });
+  }
+
+  function setReferenceStatus(text) { setText('reference-status', text); }
+
+  function formatReferenceBytes(n) {
+    if (typeof n !== 'number' || !isFinite(n) || n < 0) return 'unknown size';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KiB';
+    return (n / (1024 * 1024)).toFixed(1) + ' MiB';
+  }
+
+  // Add is offered only when a RECOGNIZED status has been seen (uploads are
+  // writes), no upload is in flight and the hard cap is not reached. The
+  // disabled state is a courtesy: the handler refuses on the same terms.
+  function updateReferenceControls() {
+    var full = references.length >= MAX_REFERENCES;
+    $('add-reference').disabled = !apiConnected || uploadingReference || full;
+    setText('reference-limit', String(MAX_REFERENCES));
+    setText('reference-count', references.length === 0
+      ? 'No references'
+      : references.length + ' of ' + MAX_REFERENCES + ' references');
+    $('reference-empty').hidden = references.length > 0;
+  }
+
+  function referenceButton(id, action) {
+    return $('reference-list').querySelector(
+      '[data-reference-id="' + id + '"] button[data-action="' + action + '"]');
+  }
+
+  // Focus restore after a re-render. The wanted button may be disabled (an
+  // "up" that reached the top) or gone (a removed card), so fall back to the
+  // nearest ENABLED control rather than dropping focus to <body>.
+  function focusReferenceButton(id, action, index) {
+    var want = referenceButton(id, action);
+    if (!want || want.disabled) {
+      // The acted-on card may be gone (remove): keep focus in the list.
+      var cards = $('reference-list').children;
+      var nearby = cards[index < cards.length ? index : cards.length - 1];
+      want = null;
+      if (nearby) {
+        var buttons = nearby.querySelectorAll('button');
+        for (var i = 0; i < buttons.length && !want; i++) {
+          if (!buttons[i].disabled) want = buttons[i];
+        }
+      }
+    }
+    // No card left with an enabled action: the Add button is the next step.
+    if (!want || want.disabled) want = $('add-reference');
+    if (want) want.focus();
+  }
+
+  // One card. It is its OWN function for a reason: `var` is function-scoped,
+  // so building every card inside renderReferences' loop left all the error
+  // handlers sharing the LAST iteration's item/img/meta — a failed thumbnail
+  // would mark the wrong card (and, with the loop variable, the wrong
+  // ordinal). One call per card gives each handler its own bindings.
+  function referenceCard(ref, index) {
+    var item = document.createElement('li');
+    item.className = 'reference-card';
+    item.dataset.referenceId = ref.id;   // validated 64-hex: safe selector
+    var ordinal = document.createElement('span');
+    ordinal.className = 'reference-ordinal';
+    ordinal.textContent = 'Image ' + (index + 1);
+    var img = document.createElement('img');
+    img.alt = 'Reference image ' + (index + 1);
+    img.loading = 'lazy';
+    // Server-owned thumbnail of stored bytes; the id is a checked hash, so
+    // the URL is built from a validated value only (never a raw string).
+    img.src = API_REFERENCES + '/' + ref.id + '/thumb';
+    var meta = document.createElement('span');
+    meta.className = 'reference-meta';
+    var facts = [];
+    if (Number.isInteger(ref.width) && Number.isInteger(ref.height)) {
+      facts.push(ref.width + '×' + ref.height);
+    }
+    if (typeof ref.bytes === 'number') facts.push(formatReferenceBytes(ref.bytes));
+    if (ref.has_alpha === true) facts.push('alpha');
+    meta.textContent = facts.length ? facts.join(' · ') : 'stored on the server';
+    // A pruned id (an imported plan naming bytes the server no longer holds)
+    // would otherwise render a silent broken-image icon. The card stays in
+    // place — the envelope must keep showing the order the user will submit
+    // — but the missing thumbnail is stated.
+    img.addEventListener('error', function () {
+      // The list is rebuilt on every change, so a discarded card's later
+      // error must not narrate for the CURRENT list.
+      if (!item.isConnected) return;
+      // The ordinal comes from the LIVE DOM position, not a captured value,
+      // so the message always matches the numbering on screen.
+      var pos = Array.prototype.indexOf.call(item.parentNode.children, item);
+      if (pos === -1) return;
+      // A failed thumbnail request does NOT prove the bytes are gone (the
+      // server may be restarting, or the page opened from file://), so the
+      // copy says what was observed. Only a submit-time 422 claims pruning.
+      item.classList.add('reference-missing');
+      meta.textContent = 'thumbnail unavailable — the preview could not be ' +
+                         'loaded';
+      setReferenceStatus('The preview for reference image ' + (pos + 1) +
+        ' could not be loaded. The image may be missing from the server ' +
+        'store — remove it or upload it again before submitting.');
+    });
+    var actions = document.createElement('span');
+    actions.className = 'reference-actions';
+    var buttons = [['up', 'Up', 'Move reference image ' + (index + 1) + ' up'],
+                   ['down', 'Down', 'Move reference image ' + (index + 1) + ' down'],
+                   ['remove', 'Remove', 'Remove reference image ' + (index + 1)]];
+    for (var b = 0; b < buttons.length; b++) {
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.action = buttons[b][0];
+      button.textContent = buttons[b][1];
+      button.setAttribute('aria-label', buttons[b][2]);
+      // Keyboard-only reordering: no drag, and the ends are honestly
+      // unavailable instead of silently doing nothing.
+      if (buttons[b][0] === 'up') button.disabled = index === 0;
+      if (buttons[b][0] === 'down') button.disabled = index === references.length - 1;
+      if (buttons[b][0] === 'remove') button.disabled = uploadingReference;
+      actions.appendChild(button);
+    }
+    item.appendChild(ordinal);
+    item.appendChild(img);
+    item.appendChild(meta);
+    item.appendChild(actions);
+    return item;
+  }
+
+  // Numbering is derived from position on EVERY render — never stored — so a
+  // remove or reorder renumbers immediately and the envelope cannot carry an
+  // order the list does not show.
+  function renderReferences() {
+    var list = $('reference-list');
+    while (list.firstChild) list.removeChild(list.firstChild);
+    for (var i = 0; i < references.length; i++) {
+      list.appendChild(referenceCard(references[i], i));
+    }
+    updateReferenceControls();
+  }
+
+  // Closed shape: exactly the six documented fields, id a lowercase sha256
+  // hex digest, dimensions and byte count inside the server's own caps.
+  function parseReferenceResponse(raw) {
+    if (!raw || typeof raw !== 'object' || raw.schema !== REFERENCE_SCHEMA) return null;
+    if (typeof raw.id !== 'string' || !REFERENCE_ID_RE.test(raw.id)) return null;
+    if (!Number.isInteger(raw.width) || raw.width < 1 || raw.width > MAX_REFERENCE_DIM) return null;
+    if (!Number.isInteger(raw.height) || raw.height < 1 || raw.height > MAX_REFERENCE_DIM) return null;
+    if (typeof raw.has_alpha !== 'boolean') return null;
+    if (!Number.isInteger(raw.bytes) || raw.bytes < 1 || raw.bytes > MAX_REFERENCE_BYTES) return null;
+    if (Object.keys(raw).length !== 6) return null;
+    return { id: raw.id, width: raw.width, height: raw.height,
+             has_alpha: raw.has_alpha, bytes: raw.bytes };
+  }
+
+  function readFileBytes(file, cap) {
+    return new Promise(function (resolve, reject) {
+      if (!file || typeof file.size !== 'number' || file.size > cap) {
+        reject(new Error('too_large'));
+        return;
+      }
+      var reader = new FileReader();
+      reader.onerror = function () { reject(new Error('unreadable')); };
+      reader.onload = function () {
+        var bytes = reader.result;
+        if (!(bytes instanceof ArrayBuffer) || bytes.byteLength > cap) {
+          reject(new Error('too_large'));
+          return;
+        }
+        // Re-read the live file size: a file changed on disk between
+        // selection and read must not slip past the bound.
+        if (typeof file.size === 'number' && file.size > cap) {
+          reject(new Error('too_large'));
+          return;
+        }
+        resolve(new Uint8Array(bytes));
+      };
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  // One reference upload. Resolves true only when the server returned a
+  // schema-valid reference document; every refusal is stated in the
+  // aria-live status line with the server's own typed code, never silently
+  // dropped. The server is authoritative: local checks only mirror its caps.
+  function uploadReference(file) {
+    return readFileBytes(file, MAX_REFERENCE_BYTES).then(function (bytes) {
+      return apiRequest(API_REFERENCES, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream', 'X-Qwen-UI': '1' },
+        body: bytes   // raw bytes, verbatim — never base64, never JSON
+      }, 'json').then(function (r) {
+        if (r.network) {
+          setApiAvailable(false);
+          renderChip('Not connected',
+            r.timedOut ? 'Not connected — the request timed out'
+                       : 'Not connected — request failed');
+          setReferenceStatus('Upload failed: the local server is not ' +
+                             'reachable (or it timed out). The image was not ' +
+                             'added and your draft is otherwise unchanged.');
+          return false;
+        }
+        if (r.bodyError) {
+          // An unusable body (including one over the response cap) is a
+          // broken server contract, exactly like a rejected plan.
+          setApiAvailable(false);
+          renderChip('Status rejected',
+            'Status rejected — server contract broken');
+          setReferenceStatus('Upload response was unusable (' +
+            (r.bodyError === 'too_large' ? 'over the fixed response cap'
+              : r.bodyError === 'unsupported' ? 'unreadable bounded body'
+                                              : 'not decodable JSON') +
+            ') — a schema rejection, not a disconnect. The image was not ' +
+            'added.');
+          return false;
+        }
+        if (!r.res.ok) {
+          var payload = r.json && r.json.schema === ERROR_SCHEMA ? r.json : null;
+          var code = payload && typeof payload.code === 'string' &&
+                     /^[a-z0-9_]{1,64}$/.test(payload.code)
+            ? payload.code : 'HTTP ' + r.res.status;
+          var detail = payload && typeof payload.message === 'string'
+            ? payload.message.slice(0, 200) : '';
+          setReferenceStatus('Upload refused — ' + code +
+            (detail ? ': ' + detail : '') + '. The image was not added.');
+          return false;
+        }
+        var ref = parseReferenceResponse(r.json);
+        if (!ref) {
+          setApiAvailable(false);
+          renderChip('Status rejected',
+            'Status rejected — server contract broken');
+          setReferenceStatus('The upload response did not match the ' +
+                             'expected reference schema — nothing was added.');
+          return false;
+        }
+        // The store is content-addressed: the same bytes are the same id.
+        var existing = referenceIds().indexOf(ref.id);
+        if (existing !== -1) {
+          setReferenceStatus('That image is already reference image ' +
+                             (existing + 1) + ' — it was not added twice.');
+          return true;
+        }
+        references.push(ref);
+        renderReferences();
+        syncPlanStaleness();   // the draft now conditions on more images
+        setReferenceStatus('Added reference image ' + references.length +
+          ' (' + ref.width + '×' + ref.height +
+          (ref.has_alpha ? ', transparency kept' : '') +
+          '). Refer to it as image ' + references.length + ' in your prompt.');
+        return true;
+      });
+    }).catch(function (err) {
+      var why = (err && err.message === 'too_large')
+        ? 'the file exceeds the ' + formatReferenceBytes(MAX_REFERENCE_BYTES) +
+          ' upload limit'
+        : 'the file could not be read';
+      setReferenceStatus('Upload refused: ' + why +
+                         '. The image was not added.');
+      return false;
+    });
+  }
+
+  // Sequential uploads: one request in flight at a time (each is up to
+  // 32 MiB), room for the remainder of the hard cap is computed BEFORE any
+  // bytes are sent, and the cap is a hard stop with a stated reason.
+  function addReferenceFiles(fileList) {
+    var files = Array.prototype.slice.call(fileList || []);
+    if (!files.length) return Promise.resolve(0);
+    if (!apiConnected) {
+      setReferenceStatus('Uploads need a recognized server status — use ' +
+                         '"Check configuration" first. Nothing was uploaded.');
+      return Promise.resolve(0);
+    }
+    if (uploadingReference) return Promise.resolve(0);
+    var room = MAX_REFERENCES - references.length;
+    if (room <= 0) {
+      setReferenceStatus('At most ' + MAX_REFERENCES + ' reference images are ' +
+                         'allowed. Remove an image before adding another — ' +
+                         'nothing was uploaded.');
+      return Promise.resolve(0);
+    }
+    var accepted = files.slice(0, room);
+    var refused = files.length - accepted.length;
+    uploadingReference = true;
+    updateReferenceControls();
+    var added = 0;
+    var index = 0;
+    function step() {
+      if (index >= accepted.length) return Promise.resolve(added);
+      var file = accepted[index];
+      setReferenceStatus('Uploading ' + (file && file.name ? file.name : 'image') +
+        ' — ' + (index + 1) + ' of ' + accepted.length + ' queued…');
+      return uploadReference(file).then(function (ok) {
+        if (ok) added++;
+        index++;
+        return step();
+      });
+    }
+    // The batch end RE-RENDERS the cards, not just the toolbar: each render
+    // during the batch saw uploadingReference === true, so the Remove
+    // buttons were built disabled and would stay that way.
+    return step().then(function (count) {
+      uploadingReference = false;
+      renderReferences();
+      if (refused > 0) {
+        setReferenceStatus('At most ' + MAX_REFERENCES + ' reference images are ' +
+          'allowed — ' + refused + ' more file' + (refused === 1 ? ' was' : 's were') +
+          ' not uploaded. Nothing was silently dropped.');
+      } else if (count === 0 && references.length === 0) {
+        setReferenceStatus('No reference images were added.');
+      }
+      return count;
+    }, function () {
+      uploadingReference = false;
+      renderReferences();   // same reason: re-enable the per-card actions
+      setReferenceStatus('The upload stopped unexpectedly; nothing further ' +
+                         'was added. Check the server and try again.');
+      return added;
+    });
+  }
+
+  function removeReference(index) {
+    if (!(index >= 0 && index < references.length)) return;
+    references.splice(index, 1);
+    renderReferences();
+    syncPlanStaleness();
+    setReferenceStatus('Removed reference image ' + (index + 1) + '. ' +
+      (references.length
+        ? 'The remaining images were renumbered — check that your prompt ' +
+          'still names the right image numbers.'
+        : 'No references remain; the prompt is used on its own.'));
+  }
+
+  function moveReference(index, delta) {
+    var target = index + delta;
+    if (index < 0 || index >= references.length ||
+        target < 0 || target >= references.length) return;
+    var moved = references[index];
+    references[index] = references[target];
+    references[target] = moved;
+    renderReferences();
+    syncPlanStaleness();
+    setReferenceStatus('Reference image ' + (index + 1) + ' is now image ' +
+      (target + 1) + '. The prompt refers to images by number, so check your ' +
+      'wording.');
   }
 
   /* ---------------- Presets & preview ---------------- */
@@ -1550,22 +1963,35 @@
         typeof job.cancel_requested !== 'boolean') return null;
     var c = job.config;
     if (!c || typeof c !== 'object') return null;
-    // Current servers echo all 13 editable fields. Two older shapes are
+    // Current servers echo all 14 editable fields. Three older shapes are
     // accepted ONLY via explicit backward-compat branches and default the
-    // missing key to what those servers actually did: 12 keys without
-    // transparent_background (never transparent), and 11 keys without
-    // output_format either (saved PNG). Anything else (10 keys, 14 keys,
-    // extra runtime fields) is a schema rejection, never a guess.
+    // missing keys to what those servers actually did: 13 keys without
+    // references (no conditioning images), 12 keys without
+    // transparent_background either (never transparent), and 11 keys
+    // without output_format either (saved PNG). Anything else (10 keys,
+    // 15 keys, extra runtime fields) is a schema rejection, never a guess.
     var ckeys = Object.keys(c);
     var hasKey = function (key) {
       return Object.prototype.hasOwnProperty.call(c, key);
     };
-    var legacyNoFormat = ckeys.length === 11 && !hasKey('output_format');
+    var legacyNoFormat = ckeys.length === 11 && !hasKey('output_format') &&
+      !hasKey('transparent_background') && !hasKey('references');
     var legacyNoTransparency = ckeys.length === 12 &&
-      !hasKey('transparent_background') && hasKey('output_format');
-    if (!(ckeys.length === 13 || legacyNoFormat || legacyNoTransparency)) return null;
+      !hasKey('transparent_background') && hasKey('output_format') &&
+      !hasKey('references');
+    var legacyNoReferences = ckeys.length === 13 && !hasKey('references');
+    if (!(ckeys.length === 14 || legacyNoFormat || legacyNoTransparency ||
+          legacyNoReferences)) return null;
     if (legacyNoFormat) c.output_format = 'png';
     if (legacyNoFormat || legacyNoTransparency) c.transparent_background = false;
+    if (legacyNoFormat || legacyNoTransparency || legacyNoReferences) c.references = [];
+    // Same id contract as parsePlan: an ordered list of at most REF_MAX
+    // content digests, in conditioning order.
+    if (!Array.isArray(c.references) || c.references.length > MAX_REFERENCES) return null;
+    for (var r = 0; r < c.references.length; r++) {
+      if (typeof c.references[r] !== 'string' ||
+          !REFERENCE_ID_RE.test(c.references[r])) return null;
+    }
     if (typeof c.prompt !== 'string' ||
         !pyStrip(c.prompt) || c.prompt.length > MAX_CONFIG_STRING_CHARS ||
         typeof c.negative_prompt !== 'string' || c.negative_prompt.length > MAX_CONFIG_STRING_CHARS ||
@@ -1788,6 +2214,16 @@
     });
   }
 
+  // The server's message is untrusted text: extract at most the ordinal
+  // ("reference 3 is not available…") and fall back to a neutral phrase.
+  function referenceNumberFromError(message) {
+    if (typeof message === 'string') {
+      var m = /^reference (\d{1,2}) is not available/.exec(message);
+      if (m && Number(m[1]) >= 1 && Number(m[1]) <= MAX_REFERENCES) return m[1];
+    }
+    return 'listed in the plan';
+  }
+
   function submitGeneration(config) {
     if (submittingJob) return;
     if (!config) {
@@ -1815,6 +2251,14 @@
       if (!job) {
         if (r.res && !r.res.ok && r.json && r.json.schema === ERROR_SCHEMA) {
           renderApiError(r.res, r.json);
+          // The server names the ORDINAL, not the id: mirror it in the live
+          // status line so the user knows which thumbnail to re-upload.
+          if (r.json.code === 'reference_unavailable') {
+            setReferenceStatus('The server no longer holds reference image ' +
+              'number ' + referenceNumberFromError(r.json.message) +
+              ' — it was probably pruned. Remove it or upload it again. ' +
+              'Nothing was submitted.');
+          }
           jobFailure('Submission refused. See the configuration message.');
         } else {
           jobFailure('Submission response was lost or rejected. Check History before retrying; the job may have been accepted.');
@@ -1898,6 +2342,45 @@
       input.value = '';   // reset FIRST: the same file can be re-picked
       if (file) importConfigFile(file);
     });
+
+    // Reference images: the visible Add button opens the hidden multi-file
+    // input, and the input resets BEFORE the uploads start so picking the
+    // same file again still fires 'change'. Uploads are sequential and
+    // capacity-checked inside addReferenceFiles.
+    $('add-reference').addEventListener('click', function () {
+      if ($('add-reference').disabled) return;
+      $('reference-file').click();
+    });
+    $('reference-file').addEventListener('change', function (ev) {
+      var input = ev.currentTarget;
+      var files = input.files ? Array.prototype.slice.call(input.files) : [];
+      input.value = '';   // reset FIRST: re-picking the same file must work
+      addReferenceFiles(files);
+    });
+    // One delegated handler for the per-card buttons: the list is rebuilt on
+    // every render, so per-button listeners would need re-attaching.
+    $('reference-list').addEventListener('click', function (ev) {
+      var button = ev.target && ev.target.closest
+        ? ev.target.closest('button[data-action]') : null;
+      if (!button || button.disabled) return;
+      var card = button.closest('.reference-card');
+      if (!card) return;
+      var index = Array.prototype.indexOf.call($('reference-list').children, card);
+      var action = button.dataset.action;
+      if (action === 'remove') {
+        removeReference(index);
+        focusReferenceButton(card.dataset.referenceId, 'remove', index);
+      } else if (action === 'up' || action === 'down') {
+        var delta = action === 'up' ? -1 : 1;
+        moveReference(index, delta);
+        // Focus follows the MOVED card to its new position, so repeated
+        // presses keep moving the same image instead of the neighbour.
+        focusReferenceButton(card.dataset.referenceId, action, index + delta);
+      }
+    });
+    // Drag is never the ONLY way: it is not offered at all, so keyboard and
+    // pointer users get the same buttons.
+    renderReferences();
     $('view-result').addEventListener('click', function () {
       $('preview-frame').scrollIntoView({behavior: 'smooth', block: 'center'});
     });
@@ -1994,7 +2477,7 @@
   // that shortens the whole-operation timeout so a stalled response BODY
   // can be observed quickly — production code never calls it.
   window.QwenStudio = {
-    version: 'w3-jobs',
+    version: 'w4-refs',
     formSnapshot: formSnapshot,
     buildEnvelope: buildEnvelope,
     validateForm: validateForm,
@@ -2008,6 +2491,22 @@
     applyTheme: applyTheme,
     readStoredTheme: readStoredTheme,
     jobDownloadName: jobDownloadName,
+    // Reference surface: the checks (and a curious operator) can assert the
+    // upload path, the ordering contract and the hard cap without a server.
+    referenceIds: referenceIds,
+    addReferenceFiles: addReferenceFiles,
+    removeReference: removeReference,
+    moveReference: moveReference,
+    parseReferenceResponse: parseReferenceResponse,
+    renderReferences: renderReferences,
+    MAX_REFERENCES: MAX_REFERENCES,
+    EDITABLE_KEYS: EDITABLE_KEYS,
+    // TEST-ONLY: opens the write gate without a live server so the offline
+    // checks can drive the upload path (production only ever opens it from a
+    // RECOGNIZED status document).
+    setApiAvailableForChecks: function (available) {
+      if (typeof available === 'boolean') setApiAvailable(available);
+    },
     setFetchTimeoutForChecks: function (ms) {
       if (Number.isInteger(ms) && ms > 0 && ms <= 60000) FETCH_TIMEOUT_MS = ms;
     }

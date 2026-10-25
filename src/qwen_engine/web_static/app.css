@@ -361,7 +361,45 @@ details.advanced > .help { margin-top: 10px; }
   background: repeating-conic-gradient(#eee9df 0% 25%, #f7f3eb 0% 50%) 0 0 / 16px 16px;
 }
 
-/* ---------- Transparent background ---------- */
+/* ---------- Reference images ---------- */
+
+.reference-field { border-top: 1px solid var(--border); padding-top: 10px; }
+.reference-field .help { margin-top: 6px; }
+.reference-toolbar { display: flex; align-items: center; gap: 10px;
+  flex-wrap: wrap; margin: 8px 0 4px; }
+.reference-count { font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.reference-list { list-style: none; margin: 6px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 6px; }
+/* No --warning token exists in any theme: the missing-image state borrows
+   --error, which is defined in all three. */
+.reference-card.reference-missing { border-color: var(--error);
+  border-style: dashed; }
+/* flex-wrap, NOT a fixed 4-column grid: the ordinal + thumbnail + metadata
+   + three action buttons do not fit side by side on a 320px layout, and a
+   rigid grid forces a wider layout viewport (real horizontal overflow).
+   The action row wraps to its own line instead. */
+.reference-card { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 6px; border: 1px solid var(--border); border-radius: 8px; }
+.reference-ordinal { font-size: 12px; font-weight: 650; color: var(--text-muted);
+  font-variant-numeric: tabular-nums; flex: 0 0 auto; min-width: 52px; }
+.reference-card img { display: block; width: 56px; height: 56px; object-fit: contain;
+  border-radius: 4px; border: 1px solid var(--border);
+  /* Checkerboard UNDER the thumbnail (same treatment as history cards): a
+     transparent reference must read as transparent, not as a flat block.
+     Preview only — the stored bytes are never altered. */
+  background:
+    repeating-conic-gradient(#1a1c20 0% 25%, #1f2226 0% 50%) 0 0 / 12px 12px; }
+:root[data-theme="paper"] .reference-card img {
+  background: repeating-conic-gradient(#eee9df 0% 25%, #f7f3eb 0% 50%) 0 0 / 12px 12px;
+}
+.reference-meta { font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums; flex: 1 1 8ch; min-width: 0; }
+.reference-actions { display: flex; gap: 4px; flex: 0 0 auto; margin-left: auto; }
+.reference-actions button { font-size: 11.5px; padding: 3px 7px; }
+.reference-status { font-size: 12.5px; margin: 8px 0 0; min-height: 1.2em;
+  color: var(--text-muted); overflow-wrap: anywhere; }
+
+/* ---------- Transparency ---------- */
 
 .transparency-field { border-top: 1px solid var(--border); padding-top: 10px; }
 .transparency-field .help { margin-top: 6px; }

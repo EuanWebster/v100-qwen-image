@@ -158,10 +158,11 @@ def test_form_snapshot_uses_exact_config_enums_and_keys():
     config_fields = {f.name for f in dataclasses.fields(GenerationConfig)}
     assert keys - {"kind"} <= config_fields, \
         f"snapshot keys outside GenerationConfig fields: {keys - config_fields}"
-    assert keys - {"kind"} == config_fields - {
-        "output_dir", "cache_dir", "log_dir", "benchmarks_dir",
-        "models_dir", "manifest_path", "q8_manifest_path",
-    }, "snapshot must carry every non-path GenerationConfig field, no aliases"
+    # Path fields belong to the SERVER's runtime; use the API's own closed
+    # set instead of a literal list so a new path field cannot silently pass.
+    from qwen_engine.web.api import RUNTIME_PATH_FIELDS
+    assert keys - {"kind"} == config_fields - set(RUNTIME_PATH_FIELDS), \
+        "snapshot must carry every non-path GenerationConfig field, no aliases"
 
     # Selects expose EXACTLY the config.py enum values — no invented options,
     # no aliases, compared against the real Python enums.
@@ -872,3 +873,357 @@ def test_alpha_results_are_previewed_on_a_checkerboard_only():
     assert "canvas" not in js and "toBlob" not in js
     # The transparency row has its own visible styles.
     assert ".transparency-field" in css and ".effective-prompt-text" in css
+
+
+# ---------------------------------------------------------------------------
+# W4 — reference images (design §2.4 / §5)
+#
+# The upload route takes RAW file bytes; the JSON routes cap bodies at
+# 64 KiB while one reference may be 32 MiB, so base64-in-JSON is not an
+# option and the tests refuse it outright. Conditioning order is the
+# DISPLAYED order, so the envelope must carry the ids in list order.
+# ---------------------------------------------------------------------------
+
+
+def _js_function(js: str, signature: str) -> str:
+    """Body of a top-level ``function <signature>(...) { ... }`` in app.js.
+
+    The file is 2-space indented and every top-level function closes on a
+    line that is exactly ``  }``; the regex is anchored there so a nested
+    block can never end the match early.
+    """
+    m = re.search(rf"function {re.escape(signature)}\([\s\S]*?\n  \}}", js)
+    assert m, f"{signature} not found in app.js"
+    return m.group(0)
+
+
+def test_w4_constants_mirror_the_python_caps_and_schema():
+    from qwen_engine import reference_store
+    from qwen_engine.config import REF_MAX
+    from qwen_engine.web import api
+
+    js = _read("app.js")
+    assert f"var MAX_REFERENCES = {REF_MAX};" in js
+    assert f"var MAX_REFERENCE_BYTES = {reference_store.MAX_REFERENCE_BYTES};" in js or \
+        f"32 * 1024 * 1024" in js
+    assert f"var MAX_REFERENCE_DIM = {reference_store.MAX_REFERENCE_DIM};" in js
+    assert f"var REFERENCE_SCHEMA = '{api.WEB_REFERENCE_SCHEMA}';" in js
+    # The upload route is the server's own path, relative (same-origin only).
+    assert "var API_REFERENCES = '/api/v1/references';" in js
+    # The id is a content digest the server also validates: lowercase only.
+    assert r"[0-9a-f]{64}" in js
+    assert "REFERENCE_ACCEPT = 'image/png,image/jpeg,image/webp'" in js
+
+
+def test_w4_editable_keys_match_the_server_set_exactly():
+    from qwen_engine.web.api import EDITABLE_FIELDS
+
+    js = _read("app.js")
+    m = re.search(r"var EDITABLE_KEYS = \[([\s\S]*?)\];", js)
+    assert m, "EDITABLE_KEYS not found"
+    keys = re.findall(r"'([a-z_]+)'", m.group(1))
+    assert len(keys) == len(set(keys)) == 14, keys
+    assert set(keys) == set(EDITABLE_FIELDS), (
+        f"EDITABLE_KEYS diverge from api.EDITABLE_FIELDS: "
+        f"{set(keys) ^ set(EDITABLE_FIELDS)}")
+    assert keys[-1] == "references", "references is the newest (last) wire field"
+
+
+def test_w4_reference_fieldset_markup_is_labelled_and_announced():
+    html = _read("index.html")
+    m = re.search(r'<fieldset[^>]*id="reference-field"[^>]*>([\s\S]*?)</fieldset>', html)
+    assert m, "reference fieldset missing"
+    block = m.group(0)
+    assert "<legend>Reference images</legend>" in block
+    # Plain-language help states the numbering contract and that size comes
+    # from the preset, not the images.
+    assert "image 1, image 2" in block
+    assert "Output size comes from the preset" in block
+    # File input: accepted types mirror the server's formats, multi-select,
+    # hidden (the visible button opens it) — never a drag-only affordance.
+    assert 'accept="image/png,image/jpeg,image/webp"' in block
+    assert " multiple" in block and "hidden" in block
+    for control in ("add-reference", "reference-file", "reference-list",
+                    "reference-count", "reference-empty", "reference-status",
+                    "reference-limit"):
+        assert f'id="{control}"' in block, f"missing #{control}"
+    assert 'aria-describedby="reference-help reference-status"' in block
+    assert 'role="status"' in block and 'aria-live="polite"' in block
+    assert 'aria-label="Reference images, in prompt order"' in block
+    # The disabled Add button is never the only guard, and there is no
+    # draggable attribute anywhere: reordering is button-only.
+    assert "draggable" not in block
+
+
+def test_w4_upload_sends_raw_bytes_never_base64_or_json():
+    js = _read("app.js")
+    body = _js_function(js, "uploadReference")
+    assert "Content-Type': 'application/octet-stream'" in body
+    assert "'X-Qwen-UI': '1'" in body
+    assert "body: bytes" in body
+    # The file is read as an ArrayBuffer and wrapped in a Uint8Array; the
+    # page never base64-encodes it and never JSON-wraps the bytes.
+    reader = _js_function(js, "readFileBytes")
+    assert "readAsArrayBuffer" in reader
+    assert "new Uint8Array(bytes)" in reader
+    assert "JSON.stringify" not in body
+    # No base64 path exists at all: no encoder, no data-URL reader.
+    for forbidden in ("btoa(", "atob(", "readAsDataURL", "toDataURL", "FileReaderSync"):
+        assert forbidden not in js, f"app.js must not use {forbidden}"
+    # The upload is gated on a recognized status: writes need one.
+    add = _js_function(js, "addReferenceFiles")
+    assert "if (!apiConnected)" in add
+    # Config import reuses the same bounded read path — one convention.
+    limited = _js_function(js, "readFileLimited")
+    assert "readFileBytes(file, MAX_IMPORT_FILE_BYTES)" in limited
+
+
+def test_w4_upload_refusals_are_typed_and_bounded():
+    js = _read("app.js")
+    body = _js_function(js, "uploadReference")
+    # Status codes reach the user as the server's own closed code pattern,
+    # truncated, never a raw message of unbounded length.
+    assert r"/^[a-z0-9_]{1,64}$/" in body
+    assert "payload.message.slice(0, 200)" in body
+    assert "setReferenceStatus(" in body
+    # A schema-invalid 201 is a contract rejection: availability is dropped,
+    # never rendered as a successful upload.
+    assert "parseReferenceResponse(r.json)" in body
+    assert "setApiAvailable(false)" in body
+    # Content addressing: the same bytes are the same id, added once.
+    assert "referenceIds().indexOf(ref.id)" in body
+
+
+def test_w4_hard_cap_is_a_stated_stop_not_a_silent_drop():
+    js = _read("app.js")
+    add = _js_function(js, "addReferenceFiles")
+    assert "MAX_REFERENCES - references.length" in add
+    assert "files.slice(0, room)" in add
+    assert "were not uploaded" in add or "not uploaded" in add
+    # Room is computed BEFORE any bytes are sent: no over-cap upload can
+    # even start.
+    assert add.index("var room = MAX_REFERENCES - references.length") < \
+        add.index("return step()")
+    controls = _js_function(js, "updateReferenceControls")
+    assert "references.length >= MAX_REFERENCES" in controls
+    assert "$('add-reference').disabled" in controls
+
+
+def test_w4_parse_reference_response_is_a_closed_shape():
+    js = _read("app.js")
+    body = _js_function(js, "parseReferenceResponse")
+    assert body.count("return null") >= 6
+    assert "Object.keys(raw).length !== 6" in body
+    for field in ("width", "height", "has_alpha", "bytes"):
+        assert field in body
+    for cap in ("MAX_REFERENCE_DIM", "MAX_REFERENCE_BYTES"):
+        assert cap in body, f"{cap} not enforced on the response"
+
+
+def test_w4_parse_plan_and_job_keep_explicit_legacy_branches():
+    js = _read("app.js")
+    plan = _js_function(js, "parsePlan")
+    # Current shape first, then the three explicitly-gated older shapes.
+    assert "var want = EDITABLE_KEYS;" in plan
+    assert "have.length === want.length" in plan
+    for n in (13, 12, 11):
+        assert f"have.length === {n}" in plan, f"parsePlan misses the {n}-key branch"
+    assert "c.references = [];" in plan
+    assert "Object.keys(c).length !== want.length" in plan
+    assert "Array.isArray(c.references)" in plan and \
+        "c.references.length > MAX_REFERENCES" in plan
+    assert "REFERENCE_ID_RE.test(c.references[i])" in plan
+
+    job = _js_function(js, "parseJob")
+    for n in (14, 13, 12, 11):
+        assert f"ckeys.length === {n}" in job, f"parseJob misses the {n}-key branch"
+    assert "c.references = [];" in job
+    assert "REFERENCE_ID_RE.test(c.references[r])" in job
+    # An over-cap list is refused, never truncated.
+    assert "c.references.length > MAX_REFERENCES" in job
+
+
+def test_w4_reference_ids_are_validated_but_duplicates_are_legal():
+    js = _read("app.js")
+    plan = _js_function(js, "parsePlan")
+    assert "typeof c.references[i] !== 'string'" in plan
+    # config.py allows repeating an id (the same image cited twice), so the
+    # parser must not de-duplicate or unique-filter the list.
+    assert "new Set(" not in plan
+    assert ".filter(" not in plan.split("c.references")[0]
+
+
+def test_w4_import_round_trips_reference_ids_in_file_order():
+    js = _read("app.js")
+    body = _js_function(js, "applyImportedPlan")
+    assert "references = c.references.map(" in body
+    # Order is the FILE's order, and the display metadata is honestly
+    # unknown (the export carries ids only).
+    assert "id: id, width: null, height: null, has_alpha: null, bytes: null" in body
+    assert "renderReferences()" in body
+
+
+def test_w4_plan_panel_shows_the_reference_count():
+    html = _read("index.html")
+    assert 'id="plan-references"' in html
+    js = _read("app.js")
+    body = _js_function(js, "planRenderFields")
+    assert "setText('plan-references'" in body
+    assert "plan.config.references.length" in body
+
+
+def test_w4_envelope_and_render_agree_on_order():
+    js = _read("app.js")
+    snapshot = _js_function(js, "formSnapshot")
+    assert "references: referenceIds()" in snapshot
+    envelope = re.search(r"buildEnvelope\(\)[\s\S]*?transparent_background: snap\."
+                         r"transparent_background,\s*\n\s*references: snap\.references",
+                         js)
+    assert envelope, "buildEnvelope must forward snap.references verbatim"
+    # The list is renumbered from POSITION on every render — never stored —
+    # so a remove/reorder cannot leave a stale ordinal.
+    render = _js_function(js, "renderReferences")
+    assert "referenceCard(references[i], i)" in render, \
+        "renderReferences must number cards from their list position"
+    assert "'Image ' + (index + 1)" in _js_function(js, "referenceCard")
+    assert "renderReferences();" in _js_function(js, "moveReference")
+    assert "renderReferences();" in _js_function(js, "removeReference")
+    # Every reorder/remove also bumps the draft revision via staleness.
+    for fn in ("moveReference", "removeReference"):
+        assert "syncPlanStaleness()" in _js_function(js, fn), f"{fn} must stale plans"
+
+
+def test_w4_reorder_buttons_are_keyboard_accessible_and_end_aware():
+    js = _read("app.js")
+    render = _js_function(js, "referenceCard")
+    assert "button.type = 'button'" in render
+    assert "setAttribute('aria-label', buttons[b][2])" in render
+    assert "'Move reference image ' + (index + 1) + ' up'" in render
+    # The ends are honestly unavailable, not silent no-ops.
+    assert "button.disabled = index === 0" in render
+    assert "button.disabled = index === references.length - 1" in render
+    # Focus survives the re-render (the list is rebuilt every time).
+    assert "want.focus()" in _js_function(js, "focusReferenceButton")
+
+
+def test_w4_submit_surfaces_reference_unavailable():
+    js = _read("app.js")
+    submit = _js_function(js, "submitGeneration")
+    assert "r.json.code === 'reference_unavailable'" in submit
+    assert "referenceNumberFromError(" in submit
+    helper = _js_function(js, "referenceNumberFromError")
+    # Only the ORDINAL is extracted from server text, and only when it
+    # matches the documented message; anything else falls back safely.
+    assert r"/^reference (\d{1,2}) is not available/" in helper
+    assert "MAX_REFERENCES" in helper
+
+
+def test_w4_reference_thumbnails_use_the_checkerboard_background():
+    css = _read("app.css")
+    rule = re.search(r"\.reference-card img \{([^}]*)\}", css)
+    assert rule and "repeating-conic-gradient" in rule.group(1), \
+        "alpha reference thumbnails need a checkerboard behind them"
+    assert re.search(r':root\[data-theme="paper"\] \.reference-card img \{([^}]*)\}',
+                     css) and "repeating-conic-gradient" in \
+        re.search(r':root\[data-theme="paper"\] \.reference-card img \{([^}]*)\}',
+                  css).group(1)
+    for selector in (".reference-field", ".reference-list", ".reference-actions",
+                     ".reference-status", ".reference-ordinal", ".reference-meta"):
+        assert selector in css, f"missing {selector} styles"
+
+
+def test_w4_reference_cards_wrap_instead_of_forcing_a_wider_viewport():
+    """A 4-column grid over ordinal+thumb+meta+3 buttons overflowed 320px.
+
+    The browser check measures the symptom (innerWidth widening past the
+    emulated 320px); this pins the layout choice that prevents it.
+    """
+    css = _read("app.css")
+    card = re.search(r"\.reference-card \{([^}]*)\}", css)
+    assert card, "missing .reference-card rule"
+    assert "display: flex" in card.group(1) and "flex-wrap: wrap" in card.group(1), \
+        "reference cards must wrap; a rigid grid widens the layout viewport"
+    assert "grid-template-columns" not in card.group(1)
+    meta = re.search(r"\.reference-meta \{([^}]*)\}", css)
+    assert meta and "min-width: 0" in meta.group(1), \
+        "the metadata cell must be allowed to shrink for overflow-wrap to apply"
+    actions = re.search(r"\.reference-actions \{([^}]*)\}", css)
+    assert actions and "flex: 0 0 auto" in actions.group(1), \
+        "action buttons keep their hit size and wrap as a unit"
+
+
+def test_w4_batch_end_rerenders_so_remove_is_enabled_again():
+    """Cards are rendered while uploadingReference is true.
+
+    Only refreshing the toolbar at the batch end left every Remove button
+    permanently disabled (found by screenshot, now pinned two ways).
+    """
+    js = _read("app.js")
+    add = _js_function(js, "addReferenceFiles")
+    assert add.count("renderReferences();") == 2, \
+        "both the success and failure paths must re-render the card list"
+    assert "button.disabled = uploadingReference" in _js_function(
+        js, "referenceCard")
+
+
+def test_w4_a_pruned_reference_states_the_thumbnail_is_gone():
+    """A 422 names the ordinal; the card must not stay a silent broken icon.
+
+    The card keeps its LIST POSITION (the envelope must show the order the
+    user would submit), so the absence is stated on the card and in the
+    aria-live status line instead.
+    """
+    render = _js_function(_read("app.js"), "referenceCard")
+    assert "img.addEventListener('error'" in render
+    assert "reference-missing" in render
+    assert "thumbnail unavailable" in render
+    assert "setReferenceStatus(" in render
+    # `var i` is function-scoped: an error handler that reads the loop
+    # variable narrates one past the end of the list. The ordinal must be
+    # read from the live DOM position instead.
+    # The handler BODY only: the buttons loop later in renderReferences uses
+    # `i` correctly (synchronously, before any re-render).
+    start = render.index("img.addEventListener('error'")
+    handler = render[start:render.index("});", start)]
+    assert "pos + 1" in handler
+    # Parent-relative, so the card needs no closure over the render list.
+    assert "indexOf.call(item.parentNode.children, item)" in handler
+    assert "(i + 1)" not in handler
+    assert "isConnected" in handler, "discarded cards must not narrate"
+    css = _read("app.css")
+    assert ".reference-card.reference-missing" in css
+    rule = re.search(r"\.reference-card\.reference-missing \{([^}]*)\}", css)
+    # Every theme defines --error; no theme defines a --warning token.
+    assert "--error" in rule.group(1)
+    for token in ("--bg:", "--text:", "--border:", "--accent:", "--error:"):
+        assert css.count(token) >= 3, f"{token} must be defined in all 3 themes"
+
+
+def test_w4_each_card_gets_its_own_closure_scope():
+    """`var` is function-scoped: building cards inside one loop function
+    left every error handler bound to the LAST card's item/img/meta.
+
+    Each card is now built by its own function call, so the handler's
+    bindings are per-card. A report of the wrong ordinal/card traced
+    directly to this.
+    """
+    js = _read("app.js")
+    render = _js_function(js, "renderReferences")
+    card = _js_function(js, "referenceCard")
+    # The DOM nodes are created inside referenceCard, never the render loop.
+    for creation in ("document.createElement('li')", "document.createElement('img')"):
+        assert creation in card, f"referenceCard must create {creation}"
+        assert creation not in render, \
+            f"{creation} in renderReferences re-creates the shared-scope bug"
+    # The handler must not read the render loop's variable at all.
+    assert "img.addEventListener('error'" in card
+    assert "list.children" not in card
+
+
+def test_w4_reference_surface_is_exposed_for_the_browser_checks():
+    js = _read("app.js")
+    surface = js[js.index("window.QwenStudio = {"):]
+    assert "version: 'w4-refs'" in surface
+    for name in ("referenceIds", "addReferenceFiles", "removeReference",
+                 "moveReference", "parseReferenceResponse", "MAX_REFERENCES"):
+        assert f"{name}: {name}" in surface, f"QwenStudio must expose {name}"

@@ -69,6 +69,30 @@
           </div>
 
           <div class="settings-scroll" tabindex="0" role="region" aria-label="Generation settings">
+          <fieldset class="field reference-field" id="reference-field">
+            <legend>Reference images</legend>
+            <p id="reference-help" class="help">Optional. Add up to
+              <span id="reference-limit">10</span> images (PNG, JPEG or WebP) and
+              refer to them as image 1, image 2 … in your prompt, in the order
+              shown here. Output size comes from the preset, not from the
+              images. Transparent PNG or WebP references keep their
+              transparency, but the model composites them over white when
+              reading them.</p>
+            <div class="reference-toolbar">
+              <button type="button" id="add-reference" class="btn-secondary"
+                      aria-describedby="reference-help reference-status">Add reference</button>
+              <input id="reference-file" type="file" hidden
+                     accept="image/png,image/jpeg,image/webp" multiple>
+              <span id="reference-count" class="reference-count">No references</span>
+            </div>
+            <ol id="reference-list" class="reference-list"
+                aria-label="Reference images, in prompt order"></ol>
+            <p id="reference-empty" class="help">No reference images added —
+              the prompt is used on its own.</p>
+            <p id="reference-status" class="reference-status" role="status"
+               aria-live="polite"></p>
+          </fieldset>
+
           <fieldset class="field preset-field">
             <legend>Aspect preset</legend>
             <div id="presets-1k" class="preset-row" role="group" aria-label="1K resolution presets"></div>
@@ -280,6 +304,7 @@
             <div><dt>Latent tokens</dt><dd id="plan-tokens">—</dd></div>
             <div><dt>Quant / offload / attention</dt><dd id="plan-quant">—</dd></div>
             <div><dt>Transparent background</dt><dd id="plan-transparency">—</dd></div>
+            <div><dt>References</dt><dd id="plan-references">—</dd></div>
             <div><dt>Manifest</dt><dd id="plan-manifest">—</dd></div>
             <div><dt>Hardware</dt><dd id="plan-hardware">—</dd></div>
             <div><dt>Calibration</dt><dd id="plan-calibration">—</dd></div>
