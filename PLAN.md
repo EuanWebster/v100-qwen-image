@@ -5,9 +5,11 @@ the LTX-2.5 ROCm build (engine / front-end split, subprocess encoder, VRAM calib
 
 Status: **roadmap extended 2026-10-24 at Euan's request** with single/multi-reference
 editing, native transparent generation, official 8-step Turbo, all upstream aspect
-presets and optional prompt rewriting (M6.2/M8/W4). These are **planned**, not newly
-implemented by this revision. Q8 + measured memory preflight remain the next GPU
-work. Upstream evidence and two local Qwen planning reviews:
+presets and optional prompt rewriting (M6.2/M8/W4). **Updated 2026-10-25:** the
+complete aspect catalog is implemented; the other new modes remain planned.
+Experimental Q8 loading works and a matched full-recipe 1K comparison passed;
+broader quality/shape validation and production memory preflight remain pending.
+Upstream evidence and two local Qwen planning reviews:
 [feature review](docs/upstream-feature-roadmap-2026-10-24.md).
 
 The original executable plan was revised 2026-10-07, with senior-review fixes on
@@ -374,10 +376,15 @@ unexpected (logged with context, traceback only into the log sink).
   resident **Q8** and other higher-quality quants compared against it (numerical
   comparison on equivalent execution paths + human eval on the genre set). Q4 only as a
   capacity fallback with the quality delta documented (C3).
-  Q8 is the next GPU feature: first prove a V100-compatible weight-only loading /
-  dequantization path in an isolated review environment, pin verified artifacts,
-  then compare fixed prompts/seeds at 1K and 2K for quality, time and peak memory.
-  Keep the working FP16 path available; Q8 is not implemented or a speed guarantee.
+  Experimental Q8 weight-only loading/dequantization and pinned artifact checks
+  are implemented (`fde631f`). Matched 1K40 seed42 testing on 2026-10-25 saved
+  memory (9678.5 vs 15612.5 MiB peak) with visually similar cube output, but was
+  slightly slower during denoising (44.84 vs 42.14s). Continue full-recipe 2K and
+  genre quality comparisons; keep FP16 default. Evidence and limitations:
+  [aspect/Q8 continuation](docs/handoffs/2026-10-25-aspects-q8.md).
+  Q8 2048²/40/tiled also completed on 2026-10-25, but fp32 tiled decoding peaked
+  at15946.5MiB and emitted an allocator-retry warning. Treat this as a narrow
+  successful trial, not comfortable fit or calibration of the other six shapes.
 - **5.2** Streaming block offload mode where it preserves quality or is needed for
   capacity; cost it against the measured link (M3.4). Equivalence test: streamed vs
   resident at fixed seed, max abs diff within fp16 tolerance — this is an *equivalent
