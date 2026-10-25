@@ -43,7 +43,18 @@
       <aside class="controls" aria-label="Generation controls">
         <form id="create-form" novalidate>
 
-          <div class="actions job-actions sticky-actions">
+          <div class="prompt-panel sticky-actions" role="group" aria-label="Prompt and generation">
+            <div class="field prompt-field">
+              <label for="prompt">Prompt</label>
+              <textarea id="prompt" name="prompt" rows="4"
+                placeholder="Describe the image you want to generate…"
+                aria-describedby="prompt-help prompt-error"></textarea>
+              <p id="prompt-help" class="help">Your words are used exactly as typed.
+                Nothing is generated or auto-filled for you.</p>
+              <p class="error" id="prompt-error" aria-live="polite"></p>
+            </div>
+
+          <div class="actions job-actions">
             <button type="submit" id="generate-btn" class="btn-primary" disabled>
               Generate</button>
             <p class="disabled-reason" id="generate-reason" role="status"></p>
@@ -55,15 +66,6 @@
             <button type="button" id="view-result" class="btn-secondary" hidden>View completed image</button>
             <button type="button" id="cancel-job" class="btn-secondary" disabled>Cancel selected job</button>
           </div>
-
-          <div class="field">
-            <label for="prompt">Prompt</label>
-            <textarea id="prompt" name="prompt" rows="4"
-              placeholder="Describe the image you want to generate…"
-              aria-describedby="prompt-help prompt-error"></textarea>
-            <p id="prompt-help" class="help">Your words are used exactly as typed.
-              Nothing is generated or auto-filled for you.</p>
-            <p class="error" id="prompt-error" aria-live="polite"></p>
           </div>
 
           <fieldset class="field preset-field">
