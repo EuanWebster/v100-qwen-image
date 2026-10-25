@@ -33,6 +33,18 @@ Root run command (lineage owner wraps the owned script process):
     python -B scripts/check_generation_recovery.py --config CFG.json \
     --output-dir NEW_DIR --run [--attest-unbounded-host]
 
+Each cancellation scenario now measures the production queue boundary in
+place: after the AFTER snapshot (retention with no diagnostic GC yet), it
+calls the very same release production uses for FAILED/CANCELLED jobs --
+qwen_engine.jobs.release_cyclic_references, the JobController default
+boundary collector -- snapshots again (after_boundary), and only then runs
+the diagnostic's own explicit gc.collect pass. after -> after_boundary is
+what the production release frees on the GPU; after_boundary -> after_gc is
+residue a second pass would still find. The follow-up (success) scenario
+runs neither, exactly as the production queue never collects for a
+success. These are additive report fields (boundary_ms, after_boundary,
+retry_delta_boundary); the v1 report schema stays compatible.
+
 Observation only: no acceptance, fit or quality claims. See
 docs/generation-recovery-check.md.
 """
@@ -52,6 +64,7 @@ from qwen_engine.bench import host_rss_bytes
 from qwen_engine.config import GenerationConfig
 from qwen_engine.decode_bench import allocator_retry_delta
 from qwen_engine.errors import EngineError
+from qwen_engine.jobs import release_cyclic_references
 
 REPORT_SCHEMA = "qwen_engine.generation_recovery.v1"
 MAX_REPORT_BYTES = 256 * 1024
@@ -301,7 +314,8 @@ def _cancelled_outcome(entry, cancel_phase) -> str:
 
 
 def _run_scenario(config, out_dir, name, cancel_phase, *, assets, adapter_factory,
-                  probe, timer_factory, logger, image_opener, gc_collect):
+                  probe, timer_factory, logger, image_opener, gc_collect,
+                  boundary_release):
     from qwen_engine.core import generate
     from qwen_engine.encoder import EncoderCancelledError
     from qwen_engine.errors import GenerationCancelled
@@ -371,8 +385,18 @@ def _run_scenario(config, out_dir, name, cancel_phase, *, assets, adapter_factor
     # touched — that would be intervention.
 
     after = probe.snapshot()
-    collected = gc_ms = None
+    collected = gc_ms = boundary_ms = None
+    after_boundary = None
     if not followup:
+        # The production queue boundary first: JobController's default
+        # FAILED/CANCELLED collector, invoked exactly where production
+        # invokes it (primary fully handled, nothing retained here).
+        # The following diagnostic pass then only sees what the production
+        # release itself could not reclaim.
+        start = time.monotonic()
+        boundary_release()
+        boundary_ms = round((time.monotonic() - start) * 1000, 1)
+        after_boundary = probe.snapshot()
         start = time.monotonic()
         collected = int(gc_collect())
         gc_ms = round((time.monotonic() - start) * 1000, 1)
@@ -396,13 +420,16 @@ def _run_scenario(config, out_dir, name, cancel_phase, *, assets, adapter_factor
                               and fired_at <= inner_returned) if cancel_phase == "decode" else None,
         children_after=children_after,
         published_files=published_files,
-        gc_collected=collected, gc_ms=gc_ms,
+        gc_collected=collected, gc_ms=gc_ms, boundary_ms=boundary_ms,
         retry_delta_after=probe.retry_delta(before["num_alloc_retries"],
                                            after["num_alloc_retries"]),
-        retry_delta_gc=(probe.retry_delta(after["num_alloc_retries"],
+        retry_delta_boundary=(probe.retry_delta(after["num_alloc_retries"],
+                                                after_boundary["num_alloc_retries"])
+                              if after_boundary is not None else None),
+        retry_delta_gc=(probe.retry_delta(after_boundary["num_alloc_retries"],
                                           after_gc["num_alloc_retries"])
                         if after_gc is not None else None),
-        before=before, after=after, after_gc=after_gc,
+        before=before, after=after, after_boundary=after_boundary, after_gc=after_gc,
         outcome=None, stop=None)
 
     if followup:
@@ -442,7 +469,8 @@ def _chain_has(exc, cls) -> bool:
 
 
 def run_scenarios(config, out_dir, *, assets, adapter_factory, probe, timer_factory,
-                  logger=None, image_opener=None, gc_collect=gc.collect):
+                  logger=None, image_opener=None, gc_collect=gc.collect,
+                  boundary_release=release_cyclic_references):
     """Shared production/test seam: serial scenarios with injected
     adapter/probe/timer collaborators. Writes the bounded prompt-free report
     FIRST, then raises RecoveryRefusal when a stop condition fired."""
@@ -461,7 +489,8 @@ def run_scenarios(config, out_dir, *, assets, adapter_factory, probe, timer_fact
         entry = _run_scenario(config, out_dir, name, cancel_phase, assets=assets,
                               adapter_factory=adapter_factory, probe=probe,
                               timer_factory=timer_factory, logger=logger,
-                              image_opener=image_opener, gc_collect=gc_collect)
+                              image_opener=image_opener, gc_collect=gc_collect,
+                              boundary_release=boundary_release)
         report["scenarios"].append(entry)
         if entry["stop"] is not None:
             report["stop"] = entry["stop"]
@@ -514,7 +543,8 @@ def main(argv=None) -> int:
                                   followup_steps=config.steps, seed=config.seed,
                                   width=config.width, height=config.height,
                                   quant=config.quant.value,
-                                  lineage_wrap="scripts/process_lineage_owner.py"),
+                                  lineage_wrap="scripts/process_lineage_owner.py",
+                                  boundary_release="qwen_engine.jobs.release_cyclic_references"),
                              sort_keys=True))
             return 0
         from qwen_engine.cli import _make_adapter, _verify_assets

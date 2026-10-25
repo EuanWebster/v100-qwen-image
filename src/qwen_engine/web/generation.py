@@ -31,7 +31,7 @@ JOBS_SCHEMA = "qwen_engine.web_jobs.v1"
 
 class WebGeneration:
     def __init__(self, runtime: WebRuntime, *, trust_unbounded_host=False, executor=None,
-                 performance=False):
+                 performance=False, memory_release=None):
         if _blockers(runtime):
             raise ValueError("generation runtime is incomplete or disabled")
         self.runtime = runtime
@@ -42,7 +42,7 @@ class WebGeneration:
         self._lock = threading.Lock()
         self._metrics = {}
         self._executor = executor or self._execute
-        self.controller = JobController(runtime.output_dir, self._run)
+        self.controller = JobController(runtime.output_dir, self._run, memory_release=memory_release)
 
     def _execute(self, context):
         # Identical asset verification, adapter and host policy to --run.
@@ -124,6 +124,10 @@ class WebGeneration:
             "config": editable_config_dict(record.config),
             "elapsed_ms": elapsed, "phase_ms": phases,
             "error_code": record.error_code,
+            # Prompt-free boundary release cost for terminal failed/cancelled
+            # jobs (None for successes and never-executed cancellations); it
+            # is recorded just after the terminal state becomes visible.
+            "collect_ms": self.controller.collect_ms(record.job_id),
             "progress": {"completed_steps": completed, "total_steps": record.config.steps},
             "image_url": (f"/api/v1/jobs/{record.job_id}/image" if record.artifact else None),
             "image_filename": record.artifact.filename if record.artifact else None,

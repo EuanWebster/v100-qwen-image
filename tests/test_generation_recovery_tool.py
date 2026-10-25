@@ -187,7 +187,7 @@ class FakeProbe:
 
 
 def run(tmp_path, modes=None, state=None, children=[], stage="worker",
-        resolution=[1024, 1024], timer_clean=True):
+        resolution=[1024, 1024], timer_clean=True, at_boundary=None):
     module = tool()
     TOKENS.clear()
     log, adapters, timers = [], [], []
@@ -211,24 +211,34 @@ def run(tmp_path, modes=None, state=None, children=[], stage="worker",
         return timer
 
     def gc_collect():
-        # A REAL gc pass: the cancellation exception (and its owner token)
-        # stay reachable only through cycles (e.g. core's own primary-frame
-        # cycle) unless the diagnostic itself still holds them — so if any
-        # token survives this collect, the diagnostic retained the primary.
+        # A REAL diagnostic pass: with the production queue path cycle-free
+        # the cancellation exception (and its owner token) is already dead
+        # by refcounting when this runs — if any token survived here, the
+        # diagnostic itself would still be holding the primary.
         log.append("gc")
         return gc.collect()
+
+    def boundary_release():
+        # The production queue-boundary seam (JobController's default
+        # collector stand-in). Live tokens recorded HERE would prove
+        # production still keeps cancelled frames alive until collection;
+        # the fixed refcount path must leave none.
+        log.append("boundary")
+        if at_boundary is not None:
+            at_boundary.append(sum(1 for ref in TOKENS if ref() is not None))
 
     report = module.run_scenarios(
         GenerationConfig(prompt="private prompt", seed=7, steps=40), tmp_path,
         assets={}, adapter_factory=adapter_factory,
         probe=FakeProbe(log, children=children, stage=stage),
         timer_factory=timer_factory, gc_collect=gc_collect,
-        image_opener=lambda path: resolution)
+        image_opener=lambda path: resolution, boundary_release=boundary_release)
     return module, report, log, adapters, timers
 
 
 def test_full_sequence_orders_cancels_then_recovers(tmp_path):
-    _, report, log, adapters, timers = run(tmp_path)
+    alive_at_boundary = []
+    _, report, log, adapters, timers = run(tmp_path, at_boundary=alive_at_boundary)
     assert report["stop"] is None and len(report["scenarios"]) == 4
     assert [phase for phase, _ in adapters] == ["encode", "sampling", "decode", "none"]
     by_phase = {entry["cancel_phase"]: entry for entry in report["scenarios"]}
@@ -248,22 +258,31 @@ def test_full_sequence_orders_cancels_then_recovers(tmp_path):
         assert entry["before"]["allocated_bytes"] is not None
         assert entry["after_gc"]["children"] == []
         assert entry["retry_delta_after"] == 1
+        assert entry["boundary_ms"] is not None and entry["boundary_ms"] >= 0
+        assert entry["after_boundary"] is not None
+        assert entry["retry_delta_boundary"] == 1
     for phase in ("encode", "decode"):
         assert by_phase[phase]["timer_fired"] and by_phase[phase]["timer_terminated"]
     assert by_phase["sampling"]["timer_fired"] is None
     followup = report["scenarios"][3]
     assert followup["outcome"] == "succeeded" and followup["published_files"] == 1
     assert followup["output_resolution"] == [1024, 1024]
+    assert followup["boundary_ms"] is None and followup["after_boundary"] is None
+    # the production queue never collects a success and the diagnostic
+    # mirrors that rule exactly (three boundary calls, not four)
     assert report["cancelled_steps"] == 4 and report["followup_steps"] == 40
     assert [adapter.calls[-1] for _, adapter in adapters] == ["close"] * 4
     assert [phase for phase, adapter in adapters if "save" in adapter.calls] == ["none"]
     assert adapters[0][1].steps_seen == [4] and adapters[3][1].steps_seen == [40]
-    # the diagnostic never holds the primary through measurement: every
-    # cancellation token is freed by the diagnostic's own gc pass
+    # the production boundary sees zero live tokens: refcounting (not any
+    # collector) already freed the cancelled jobs' frames — pre-fix, core's
+    # primary-frame cycle kept every one alive until the first gc pass
+    assert alive_at_boundary == [0, 0, 0]
     assert all(ref() is None for ref in TOKENS)
-    assert log.index("snapshot1") < log.index("gc") < log.index("snapshot3")
-    assert log.count("gc") == 3 and sum(
-        1 for line in log if line.startswith("snapshot")) == 11
+    assert log.index("snapshot1") < log.index("boundary") < log.index("snapshot3")
+    assert log.index("snapshot3") < log.index("gc") < log.index("snapshot4")
+    assert log.count("gc") == 3 and log.count("boundary") == 3 and sum(
+        1 for line in log if line.startswith("snapshot")) == 14
     assert len(timers) == 2 and all(t.stopped and t.stop() for t in timers)
 
 
@@ -429,6 +448,7 @@ def test_plan_only_never_runs_or_echoes_prompt(tmp_path, capsys):
     doc = json.loads(captured.out)
     assert doc["run"] is False and doc["cancelled_steps"] == 4
     assert doc["followup_steps"] == 40 and doc["seed"] == 0
+    assert doc["boundary_release"] == "qwen_engine.jobs.release_cyclic_references"
     assert "private" not in captured.out + captured.err
     assert not out.exists() and not (tmp_path / "recovery-report.json").exists()
     for heavy in ("torch", "diffusers", "transformers"):

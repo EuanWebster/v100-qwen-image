@@ -136,7 +136,13 @@ def generate(
             raise GenerationCancelled("generation cancelled before verified save")
         return logger.phase(name)
 
-    primary = None
+    # Boolean, never the exception object: storing it in a frame local while
+    # it is being re-raised forms a reference cycle (exception -> traceback ->
+    # this frame -> local -> exception) that only cyclic GC can break, so a
+    # cancelled run's whole adapter frame chain (and its CUDA tensors) would
+    # survive until some later gc.collect().  The raised exception itself is
+    # never inspected here, only its presence.
+    failed = False
     saved = False
     try:
         binder = getattr(adapter, "set_cancel_event", None)
@@ -154,8 +160,8 @@ def generate(
             output = adapter.save(image, config)
             output_path = _validate_output(output, config)
             saved = True
-    except BaseException as exc:
-        primary = exc
+    except BaseException:
+        failed = True
         raise
     finally:
         # Drop intermediates before releasing model references. Production
@@ -167,7 +173,7 @@ def generate(
                 with stage("adapter_cleanup", cuda=True):
                     closer()
         except Exception:
-            if primary is None and not saved:
+            if not failed and not saved:
                 raise
             # Preserve the primary failure (including interrupts), and a
             # verified saved result. Cleanup failure is diagnostic only there.

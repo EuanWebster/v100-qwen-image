@@ -73,20 +73,32 @@ event.
 ## Observation methodology
 
 The primary exception is converted to observations (type name,
-acknowledged bool, `EncoderCancelledError` context-chain bool) inside the
-handler, and the diagnostic retains NO reference to it: after the try
-statement exits, the traceback is released, so the AFTER snapshot and the
-one explicit diagnostic `gc.collect()` measure production retention (cycles
-core/adapter leave naturally), not the diagnostic holding its own traceback.
-Frames are not otherwise cleared — that would be intervention. The gc's
-collected count and wall cost are recorded; the cost is measured, never
-assumed free. Snapshots carry CUDA allocated/reserved (current +
-process-lifetime peaks), `num_alloc_retries` with actual before→after and
-after→gc deltas via the existing `allocator_retry_delta`, current RSS,
-lifetime peak RSS and `/proc` direct children. CUDA is read only when
-`torch.cuda.is_initialized()` is already true, with one boundary
-`synchronize` per snapshot (after-job observation only; no in-loop sync, no
-context creation, no `empty_cache`). CUDA fields are honest nulls until then.
+acknowledged bool, `EncoderCancelledError` context-chain bool) inside
+the handler, and the
+diagnostic retains NO reference to it: after the try statement exits the
+traceback is released, so the AFTER snapshot measures live production
+retention with NO collection yet performed. Since the production
+queue-boundary fix, `core.generate` stores no exception object, so our
+own exception-free frames die by refcounting alone; whatever the AFTER
+snapshot still shows is third-party cycles or adapter-held references.
+The diagnostic then calls the very same release the production queue
+runs for a FAILED/CANCELLED job — `qwen_engine.jobs.release_cyclic_references`,
+`JobController`'s default boundary collector — records `boundary_ms` and
+the `after_boundary` snapshot, and only THEN performs its own explicit
+`gc.collect()` pass (count, cost, `after_gc` snapshot) to measure what a
+second pass could still find. The follow-up (success) scenario runs
+neither, exactly as the production queue never collects a success.
+Frames are not otherwise cleared — that would be intervention. Snapshots
+carry CUDA allocated/reserved (current + process-lifetime peaks),
+`num_alloc_retries` with actual before→after, after→boundary and
+boundary→gc deltas via the existing `allocator_retry_delta`, current
+RSS, lifetime peak RSS and `/proc` direct children. CUDA is read only
+when `torch.cuda.is_initialized()` is already true, with one boundary
+`synchronize` per snapshot (after-job observation only; no in-loop sync,
+no context creation, no `empty_cache`). CUDA fields are honest nulls
+until then. The new `boundary_ms`, `after_boundary` and
+`retry_delta_boundary` report fields are additive; the v1 schema
+stays compatible.
 
 ## Stop conditions and report
 
@@ -104,19 +116,22 @@ lists and fixed evidence tokens — never config, paths or prompts.
 ## CPU tests
 
 `tests/test_generation_recovery_tool.py` drives the same
-`run_scenarios(...)` seam with injected fake adapters/probes/timers/gc (no
-ML, no GPU) plus direct stub-driven unit tests of the watchdog poll loop and
-the VAE hook install/remove contract. They cover: sequencing and cancel
-ordering, mid-body vs boundary timer semantics, per-scenario timer cancel +
-join + termination reporting, snapshot ordering around the measurement, and
-refcount-release proof: each cancellation carries a weakref'd fixture
-"tensor owner" token that may legitimately survive BEFORE the diagnostic GC
-(core's own primary-frame cycle is the measured phenomenon), must be gone
-AFTER the real `gc.collect()` the fixture performs, and would survive it if
-the diagnostic still held the exception; conservative encoder labels (worker
-label only with argv AND chain evidence), hook override removal on success
-and failure paths, all stop
-reasons including children/timer refusals, follow-up resolution strictness,
-report prompt-freedom and no-clobber, and the plan-only no-import/no-write
-gate. Fixture passes are not GPU evidence; only a root `--run` report counts
-as observation.
+`run_scenarios(...)` seam with injected fake adapters/probes/timers/gc
+and a fake boundary collector (no ML, no GPU) plus direct stub-driven
+unit tests of the watchdog poll loop and the VAE hook install/remove
+contract. They cover: sequencing and cancel ordering, mid-body vs
+boundary timer semantics, per-scenario timer cancel + join +
+termination reporting, snapshot ordering around the
+before→after→boundary→gc measurement, and refcount-release proof: each
+cancellation carries a weakref'd fixture "tensor owner" token that the
+fake boundary collector must find ALREADY DEAD when production's release
+seam runs (with the fixed queue path refcounting frees the frames before
+any collection; pre-fix, core's primary-frame cycle kept them alive),
+and that must stay gone through the real `gc.collect()` the fixture
+performs; the follow-up scenario proves no boundary call on success;
+they also cover conservative encoder labels (worker label only with
+argv AND chain evidence), hook override removal on success and failure
+paths, all stop reasons including children/timer refusals, follow-up
+resolution strictness, report prompt-freedom and no-clobber, and the
+plan-only no-import/no-write gate. Fixture passes are not GPU evidence;
+only a root `--run` report counts as observation.

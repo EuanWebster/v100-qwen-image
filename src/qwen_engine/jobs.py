@@ -6,9 +6,14 @@ is cooperative: running jobs stay CANCELLING until the executor returns. A
 finite close reports whether the worker actually stopped; it cannot kill a
 Python thread. Production execution must additionally own/reap its child and
 release model resources before returning. No images/directories are deleted.
+A terminal FAILED/CANCELLED job additionally gets one deterministic
+boundary reference release (injectable ``release_cyclic_references``) after
+its state is recorded; successful jobs and queued-only cancellations never
+run it.
 """
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import math
@@ -129,6 +134,20 @@ def _request(config):
     return config
 
 
+def release_cyclic_references() -> None:
+    """Default queue-boundary reference release: one cyclic GC pass.
+
+    The controller calls it only after a failed/cancelled job's exception
+    has been fully handled and its terminal state recorded, so this
+    package's own exception-free frames are already freed by refcounting;
+    this pass additionally frees reference cycles left inside third-party
+    pipeline code before the next job loads models. It never touches
+    device allocators (no ``empty_cache``): production adapters own
+    device teardown.
+    """
+    gc.collect()
+
+
 class JobController:
     """Bounded queue/history with explicitly owned per-job artifact directories.
 
@@ -140,21 +159,26 @@ class JobController:
     """
 
     def __init__(self, root: str | Path, executor: Callable[[JobContext], GenerationResult], *,
-                 max_pending: int = 4, max_records: int = 32):
+                 max_pending: int = 4, max_records: int = 32,
+                 memory_release: Callable[[], object] | None = None):
         if not callable(executor):
             raise JobError("explicit executor required")
         if (type(max_pending) is not int or not 1 <= max_pending <= 32
                 or type(max_records) is not int or not max_pending <= max_records <= 128):
             raise JobError("invalid queue/history limits")
+        if memory_release is not None and not callable(memory_release):
+            raise JobError("memory release collector must be callable or None")
         self.root = Path(root).resolve(strict=True)
         self._root_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK)
         info = os.fstat(self._root_fd)
         self._root_identity = (info.st_dev, info.st_ino)
         self._executor = executor
+        self._memory_release = release_cyclic_references if memory_release is None else memory_release
         self._max_pending, self._max_records = max_pending, max_records
         self._condition = threading.Condition()
         self._records: dict[str, JobSnapshot] = {}
         self._cancels: dict[str, threading.Event] = {}
+        self._collect_ms: dict[str, float] = {}
         self._directories: dict[str, tuple[int, int]] = {}
         self._pending: deque[str] = deque()
         self._closing = False
@@ -281,6 +305,7 @@ class JobController:
                 raise JobError("cannot forget live job")
             del self._records[job_id]  # never delete partials or completed artifacts
             del self._directories[job_id]
+            self._collect_ms.pop(job_id, None)  # evicted with the metadata
 
     def wait(self, job_id: str, *, timeout_s: float = 5) -> JobSnapshot:
         deadline = time.monotonic() + _timeout(timeout_s)
@@ -291,6 +316,13 @@ class JobController:
                     break
                 self._condition.wait(remaining)
             return self._record(job_id)
+
+    def collect_ms(self, job_id: str) -> float | None:
+        """Wall cost of the queue-boundary reference release recorded for a
+        terminal CANCELLED/FAILED job, or None when no collector ran (a
+        success, or a cancellation that never entered the executor)."""
+        with self._condition:
+            return self._collect_ms.get(job_id)
 
     def close(self, *, timeout_s: float = 5) -> bool:
         timeout_s = _timeout(timeout_s)
@@ -398,6 +430,25 @@ class JobController:
                     del self._cancels[job_id]
                     self._active = None
                     self._condition.notify_all()
+                # Deterministic queue-boundary memory release, only for
+                # FAILED/CANCELLED jobs: the executor exception has now been
+                # fully handled (this is outside every except scope, so this
+                # thread retains no traceback) and the terminal state is
+                # recorded. Nothing in this package stores a raised
+                # exception any more, so refcounting has already freed our
+                # frames; this one cyclic collection additionally frees
+                # cycles left inside third-party pipeline code before the
+                # next job loads models. Successes retain nothing here and
+                # never pay; queued cancellations never entered the
+                # executor. The collect timing is prompt-free bookkeeping.
+                if state in (JobState.CANCELLED, JobState.FAILED):
+                    started = time.monotonic()
+                    try:
+                        self._memory_release()
+                    except Exception:
+                        pass  # the state is final; never kill the worker
+                    with self._condition:
+                        self._collect_ms[job_id] = (time.monotonic() - started) * 1000.0
         finally:
             # Unexpected BaseException/thread death must not strand live jobs.
             # Preserve the original thread exception; expose only fixed codes.

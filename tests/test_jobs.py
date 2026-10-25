@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import os
 import threading
+import sys
+import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
@@ -435,3 +437,91 @@ def test_request_snapshot_owns_builtin_values_not_mutable_subclasses(harness):
     assert type(submitted.config.prompt) is str and type(submitted.config.steps) is int
     assert submitted.config.prompt == original.prompt and submitted.config.steps == original.steps
     assert controller.wait(submitted.job_id).state == jobs.JobState.SUCCEEDED
+
+
+def test_boundary_collector_fires_once_after_state_for_failed_and_cancelled_only(harness):
+    controller_ref = {}
+    releases = []
+    collected = threading.Event()
+
+    def collect():
+        controller = controller_ref["controller"]
+        releases.append({
+            "states": tuple((r.state, r.error_code) for r in controller.snapshots()),
+            "handling_exception": sys.exc_info()[1] is not None,
+            "thread": threading.current_thread().name,
+        })
+        collected.set()
+
+    entered, release = threading.Event(), threading.Event()
+    block_entered, block_release = threading.Event(), threading.Event()
+    harness.releases.extend([release, block_release])
+
+    def execute(context):
+        if context.config.prompt == "fail":
+            raise RuntimeError("fixture executor failure")
+        if context.config.prompt == "cancel":
+            entered.set()
+            assert release.wait(3)
+            context.check_cancelled()
+        if context.config.prompt == "block":
+            block_entered.set()
+            assert block_release.wait(3)
+        return saved(context)
+
+    def recorded(controller, job_id):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            value = controller.collect_ms(job_id)
+            if value is not None:
+                return value
+            time.sleep(0.005)
+        raise AssertionError("boundary release duration was never recorded")
+
+    controller = harness.create(execute, memory_release=collect)
+    controller_ref["controller"] = controller
+
+    failed = controller.submit(GenerationConfig(prompt="fail"))
+    assert controller.wait(failed.job_id).error_code == "execution_failed"
+    assert collected.wait(3) and len(releases) == 1
+    assert recorded(controller, failed.job_id) >= 0.0
+    # the terminal state and its fixed error code are already recorded when
+    # the collector runs, and the worker thread holds no exception being
+    # handled: the release is outside every except scope, after bookkeeping
+    assert releases[0]["states"] == ((jobs.JobState.FAILED, "execution_failed"),)
+    assert releases[0]["handling_exception"] is False
+    assert releases[0]["thread"] == "qwen-owned-job-worker"
+    collected.clear()
+
+    cancelled = controller.submit(GenerationConfig(prompt="cancel"))
+    assert entered.wait(2)
+    assert controller.cancel(cancelled.job_id).state == jobs.JobState.CANCELLING
+    release.set()
+    assert controller.wait(cancelled.job_id).state == jobs.JobState.CANCELLED
+    assert collected.wait(3) and len(releases) == 2
+    assert recorded(controller, cancelled.job_id) >= 0.0
+    assert releases[1]["states"] == ((jobs.JobState.FAILED, "execution_failed"),
+                                     (jobs.JobState.CANCELLED, None))
+    collected.clear()
+
+    # keep the worker busy so the queued cancellation can never race into
+    # execution; successes and never-executed queued cancellations never pay
+    blocker = controller.submit(GenerationConfig(prompt="block"))
+    assert block_entered.wait(2)
+    queued = controller.submit(GenerationConfig(prompt="later"))
+    assert controller.cancel(queued.job_id).state == jobs.JobState.CANCELLED
+    good = controller.submit(GenerationConfig())
+    block_release.set()
+    assert controller.wait(blocker.job_id).state == jobs.JobState.SUCCEEDED
+    assert controller.wait(good.job_id).state == jobs.JobState.SUCCEEDED
+    assert len(releases) == 2
+    assert controller.collect_ms(good.job_id) is None
+    assert controller.collect_ms(queued.job_id) is None
+    controller.forget(failed.job_id)
+    assert controller.collect_ms(failed.job_id) is None
+
+
+@pytest.mark.parametrize("bad", [True, 1, "", [], object()])
+def test_non_callable_memory_release_refuses_before_worker_or_io(tmp_path, bad):
+    with pytest.raises(jobs.JobError, match="memory release collector"):
+        jobs.JobController(tmp_path / "absent", saved, memory_release=bad)

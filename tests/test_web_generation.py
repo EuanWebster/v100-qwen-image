@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import base64
+import gc
 import json
 import threading
+import time
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +14,7 @@ import pytest
 
 from qwen_engine import cli
 from qwen_engine.core import GenerationResult
+from qwen_engine.errors import GenerationCancelled
 from qwen_engine.jobs import JobState
 from qwen_engine.web import api, server
 from qwen_engine.web.generation import WebGeneration
@@ -275,3 +279,129 @@ def test_exact_job_routes_and_method_policy(method, suffix, kind):
     assert caught.value.status == 405
     with pytest.raises(api.ApiError):
         server.resolve_route(method, '/api/v1/jobs/' + job_id + suffix + '?path=/etc/passwd')
+
+
+class TensorOwner:
+    """Weakref-able stand-in for an object owning CUDA tensors."""
+
+
+@pytest.mark.parametrize('kind', ['cancelled', 'failed'])
+def test_terminal_web_jobs_release_executor_frames_without_gc(runtime, monkeypatch, kind):
+    refs = []
+
+    class Adapter:
+        def set_progress_callback(self, callback):
+            self.progress = callback
+
+        def set_cancel_event(self, event):
+            self.event = event
+
+        def load(self, config, assets):
+            pass
+
+        def encode(self, config):
+            return 'conditioning'
+
+        def denoise(self, config, conditioning):
+            owner = TensorOwner()
+            refs.append(weakref.ref(owner))
+            if kind == 'cancelled':
+                self.event.set()
+                raise GenerationCancelled('fixture mid-denoise cancellation')
+            raise RuntimeError('/private/adapter/failure secret detail')
+
+        def decode(self, latents):
+            raise AssertionError('unreachable')
+
+        def save(self, image, config):
+            raise AssertionError('unreachable')
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli, '_verify_assets',
+                        lambda config: SimpleNamespace(resolved={'weights': ()}))
+    monkeypatch.setattr(cli, '_make_adapter', lambda **kw: Adapter())
+    service = WebGeneration(runtime, trust_unbounded_host=True,
+                            memory_release=lambda: None)
+    try:
+        gc.collect()
+        gc.disable()
+        job_id = service.submit(envelope()).payload['job_id']
+        done = service.controller.wait(job_id)
+        # the real serial worker already finished handling the exception, so
+        # refcounting alone (cyclic GC off for the whole window) must have
+        # freed the failing adapter frame and its tensor owner
+        assert refs and all(ref() is None for ref in refs)
+    finally:
+        gc.enable()
+    try:
+        doc = service.job_response(job_id).payload
+        if kind == 'cancelled':
+            assert done.state == JobState.CANCELLED and doc['error_code'] is None
+        else:
+            assert done.state == JobState.FAILED and doc['error_code'] == 'execution_failed'
+            assert 'secret detail' not in json.dumps(doc)
+    finally:
+        assert service.close()
+
+
+def test_job_documents_expose_boundary_release_cost_only_for_non_success(runtime):
+    calls = []
+    collected = threading.Event()
+    started, release = threading.Event(), threading.Event()
+
+    def collect():
+        calls.append(1)
+        collected.set()
+
+    def execute(context):
+        if context.config.prompt == 'boom':
+            raise RuntimeError('fixture web fault')
+        if context.config.prompt == 'cancel':
+            started.set()
+            assert release.wait(5)
+            context.check_cancelled()
+        return save(context)
+
+    def recorded(job_id):
+        # the collect duration is recorded just after the terminal state
+        # becomes visible; bounded wait, the serial worker writes it directly
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            value = service.controller.collect_ms(job_id)
+            if value is not None:
+                return value
+            time.sleep(0.005)
+        raise AssertionError('boundary release duration was never recorded')
+
+    service = WebGeneration(runtime, executor=execute, memory_release=collect)
+    try:
+        failed = service.submit(envelope(prompt='boom')).payload['job_id']
+        assert service.controller.wait(failed).state == JobState.FAILED
+        assert collected.wait(5) and len(calls) == 1
+        value = recorded(failed)
+        doc = service.job_response(failed).payload
+        assert doc['collect_ms'] == value and doc['error_code'] == 'execution_failed'
+        collected.clear()
+
+        cancelled = service.submit(envelope(prompt='cancel')).payload['job_id']
+        assert started.wait(5)
+        assert service.job_response(cancelled, action='cancel').payload['state'] == 'cancelling'
+        release.set()
+        assert service.controller.wait(cancelled).state == JobState.CANCELLED
+        assert collected.wait(5) and len(calls) == 2
+        value = recorded(cancelled)
+        doc = service.job_response(cancelled).payload
+        assert doc['collect_ms'] == value and doc['error_code'] is None
+        assert doc['image_url'] is None
+        collected.clear()
+
+        good = service.submit(envelope(prompt='ok')).payload['job_id']
+        assert service.controller.wait(good).state == JobState.SUCCEEDED
+        doc = service.job_response(good).payload
+        assert doc['collect_ms'] is None and doc['image_url'] is not None
+        assert len(calls) == 2
+    finally:
+        release.set()
+        assert service.close()
