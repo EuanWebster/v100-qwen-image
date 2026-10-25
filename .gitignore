@@ -18,6 +18,7 @@ dist/
 # too large for git; the committed models/manifest.json pins their identities.
 models/assets/
 models/q8/
+models/q4/
 
 # Engine runtime artifacts (all config-relocatable; must never land in the repo)
 output/

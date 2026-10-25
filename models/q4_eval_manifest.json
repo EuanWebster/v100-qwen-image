@@ -1,0 +1,10 @@
+{
+  "schema": "qwen_engine.q4_artifact.v1",
+  "repo": "unsloth/Qwen-Image-2.1-GGUF",
+  "revision": "2c31ccd392b367a6637841a143813320a02dff55",
+  "filename": "q4/qwen-image-2.1-Q4_K_M.gguf",
+  "sha256": "631d532e7ca71e8d90a87c71d3699761a812039d22e3370e87498d87754660fe",
+  "bytes": 4199565024,
+  "source_model_revision": "d26bb61231c349cf6b7896fa83353113880e1ba3",
+  "quant_format": "gguf-q4_k_m"
+}
