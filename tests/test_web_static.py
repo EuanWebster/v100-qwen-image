@@ -1921,3 +1921,36 @@ def test_brand_assets_are_the_agreed_files_and_stay_inert():
         assert b"<script" not in blob and b"<image" not in blob
         assert b"xlink:href" not in blob and b"<style" not in blob
         assert blob.count(b"http") == blob.count(b"http://www.w3.org/2000/svg")
+
+
+def test_preview_keeps_the_shown_images_shape_and_labels_the_next_size():
+    # Job polling re-renders the selected job, so a frame that followed the
+    # draft would flip to a new preset and straight back. While a finished
+    # image is shown the frame keeps the image's shape; the draft's size shows
+    # as a "Next image" label instead.
+    html = _read("index.html")
+    frame = re.search(r'<div class="preview-frame" id="preview-frame"[\s\S]*?\n        </div>', html)
+    assert frame and 'id="preview-next-size"' in frame.group(0)
+    assert re.search(r'<p class="preview-next-size" id="preview-next-size" hidden>', html)
+
+    js = _read("app.js")
+    shape = _js_function(js, "syncPreviewShape")
+    assert "if (!shownImageSize) {" in shape
+    assert "setPreviewAspect(width, height);" in shape
+    assert "setPreviewAspect(shownImageSize.width, shownImageSize.height);" in shape
+    assert "'Next image: ' + sizeLabel(width, height)" in shape
+    assert "width !== shownImageSize.width || height !== shownImageSize.height" in shape
+    # Every draft-size change goes through syncPreviewShape, never straight
+    # to setPreviewAspect.
+    assert "syncPreviewShape();" in _js_function(js, "applyPreset")
+    assert "setPreviewAspect(preset" not in js
+    assert "setPreviewAspect(plan.config" not in js
+    assert js.count("setPreviewAspect(") == 3, "only syncPreviewShape and the definition"
+    # The selected job sets or clears the shown size, then re-syncs.
+    job = _js_function(js, "renderSelectedJob")
+    assert "shownImageSize = { width: job.config.width, height: job.config.height };" in job
+    assert "shownImageSize = null;" in job
+    assert job.index("shownImageSize = null;") < job.rindex("syncPreviewShape();")
+    label = _js_function(js, "sizeLabel")
+    assert "PRESETS[name].ratio" in label
+    assert ".preview-next-size {" in _read("app.css")
