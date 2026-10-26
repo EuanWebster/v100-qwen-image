@@ -1,8 +1,11 @@
 """CPU tests for scripts/web_e2e_smoke.py against an in-process fake of the
-REAL wire contract (routes, X-Qwen-UI gate, exact content types, schema/config
-envelope, fifteen-field editability). The fake speaks real HTTP/1.1 bytes over
-an AF_UNIX socketpair driven by the stdlib BaseHTTPRequestHandler — no
-listening sockets exist anywhere (the guarded runner denies network-socket
+REAL wire contract: the fake validates every POST body through the server's
+own web/api.parse_request_json + build_config (plus generation.py's submit
+gates), so it speaks the exact grammar — decimal-STRING seed, editable-field
+whitelist, typed config validation — and can never accept what the real
+server refuses.  The fake speaks real HTTP/1.1 bytes over an AF_UNIX
+socketpair driven by the stdlib BaseHTTPRequestHandler — no listening
+sockets exist anywhere (the guarded runner denies network-socket
 construction), and no GPU, models or network leave the process."""
 from __future__ import annotations
 
@@ -19,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from qwen_engine.web import api as web_api
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "web_e2e_smoke.py"
 
@@ -26,11 +31,6 @@ _spec = importlib.util.spec_from_file_location("web_e2e_smoke", SCRIPT)
 smoke = importlib.util.module_from_spec(_spec)
 assert _spec.loader is not None
 _spec.loader.exec_module(smoke)
-
-EDITABLE = {"prompt", "negative_prompt", "width", "height", "steps", "recipe",
-            "true_cfg_scale", "seed", "quant", "offload", "attention_backend",
-            "vae_tiled_decode", "output_format", "transparent_background",
-            "references"}
 
 
 def _png(width=2, height=2, mode="RGBA"):
@@ -53,8 +53,17 @@ class _State:
         self.counter = 0
         self.hangs = False
         self.fails = False
+        self.uploaded_ids: set[str] = set()
         self.references_expected = {smoke.PROMPTS["edit-1ref"]: 1,
                                     smoke.PROMPTS["edit-2ref"]: 2}
+        # Server-controlled paths exactly as startup injects them (the fake
+        # never opens them; they only complete the merged config).
+        self.runtime = web_api.WebRuntime(
+            output_dir="/srv/qwen/out", cache_dir="/srv/qwen/cache",
+            log_dir="/srv/qwen/log", benchmarks_dir="/srv/qwen/bench",
+            models_dir="/srv/qwen/models",
+            manifest_path="/srv/qwen/manifest.json",
+            references_dir="/srv/qwen/references", generation_enabled=True)
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -137,41 +146,64 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         if upload:
             reference_id = hashlib.sha256(body).hexdigest()
+            self.server.uploaded_ids.add(reference_id)
             self._send(201, json.dumps({"schema": "qwen_engine.web_reference.v1",
                                         "id": reference_id, "width": 2,
                                         "height": 2, "has_alpha": True,
                                         "bytes": len(body)}).encode())
             return
+        # THE real wire grammar: the same strict parser and envelope/config
+        # validator web/server.py runs (web/generation.py submit), so the
+        # fake can never accept what the real server refuses — decimal-
+        # STRING seed included.
         try:
-            envelope = json.loads(body)
-        except json.JSONDecodeError:
-            self._error(400, "invalid_envelope")
-            return
-        if (set(envelope) != {"schema", "config"}
-                or envelope["schema"] != smoke.WIRE_SCHEMA
-                or not isinstance(envelope["config"], dict)
-                or not set(envelope["config"]) <= EDITABLE):
-            self._error(400, "invalid_envelope")
+            config = web_api.build_config(self.server.runtime,
+                                          web_api.parse_request_json(body))
+        except web_api.ApiError as exc:
+            self._send(exc.status, json.dumps(exc.to_payload()).encode())
             return
         if self.path == "/api/v1/plan":
             self._send(200, json.dumps({"schema": "qwen_engine.web_plan.v1",
-                                        "config": envelope["config"]}).encode())
+                                        "config": web_api.editable_config_dict(
+                                            config)}).encode())
             return
         if self.path == "/api/v1/jobs":
-            config = envelope["config"]
-            expected_refs = self.server.references_expected.get(
-                config.get("prompt"), 0)
-            if len(config.get("references", [])) != expected_refs:
+            if (config.references
+                    and not set(config.references) <= self.server.uploaded_ids):
+                # the real submit reads a hash-verified blob per id first
+                self._error(422, "reference_unavailable")
+                return
+            expected_refs = self.server.references_expected.get(config.prompt, 0)
+            if len(config.references) != expected_refs:
                 # the fixture knows the smoke prompts: edits must carry
                 # exactly 1 / 2 uploaded ids, non-edits none
                 self._error(422, "invalid_config")
                 return
+            from qwen_engine.adapters.qwen21_diffusers import _validate_policy
+            from qwen_engine.config import ConfigError
+            try:
+                _validate_policy(config)
+            except ConfigError as exc:
+                editable_policy = ("quant", "offload", "attention_backend",
+                                   "steps", "true_cfg_scale", "recipe")
+                self._send(422, json.dumps({
+                    "schema": "qwen_engine.web_error.v1",
+                    "code": "unsupported_generation_config",
+                    "message": "this configuration is not supported by the "
+                               "current adapter",
+                    "fields": [{"field": e.field, "message": e.message}
+                               for e in exc.errors
+                               if e.field in editable_policy]}).encode())
+                return
+            if config.latent_tokens > 4096 and not config.vae_tiled_decode:
+                self._error(422, "tiled_decode_required")
+                return
             self.server.counter += 1
             job_id = f"{self.server.counter:032x}"
-            transparent = bool(config.get("transparent_background"))
             self.server.jobs[job_id] = {"polls": 0, "error_code": None}
             self.server.images[job_id] = (self.server.rgba_png
-                                          if transparent else self.server.rgb_png)
+                                          if config.transparent_background
+                                          else self.server.rgb_png)
             self._send(202, json.dumps({"schema": "qwen_engine.web_job.v1",
                                         "job_id": job_id, "state": "queued",
                                         "error_code": None}).encode())
@@ -297,7 +329,39 @@ def test_transparent_without_alpha_channel_fails_verification(fake_state):
 def test_missing_reference_ids_are_refused_by_the_wire(fake_state):
     """The fixture enforces references exactly like the real submit path;
     an edit config without ids must NOT be accepted (envelope guard)."""
-    status, _ = _PipeClient(fake_state).request_json(
-        "POST", "/api/v1/jobs",
-        body=smoke.envelope({"prompt": smoke.PROMPTS["edit-1ref"], "seed": 42}))
+    body = smoke.envelope({"prompt": smoke.PROMPTS["edit-1ref"], "seed": "42"})
+    status, _ = _PipeClient(fake_state).request_json("POST", "/api/v1/jobs",
+                                                     body=body)
     assert status == 422
+
+
+def test_numeric_seed_is_refused_by_the_real_wire_grammar(fake_state):
+    """THE regression: seed is a decimal STRING on the wire (web/api.py
+    _SEED_WIRE_RE); a JSON number is a 400 invalid_seed, never accepted."""
+    status, payload = _PipeClient(fake_state).request_json(
+        "POST", "/api/v1/jobs",
+        body=smoke.envelope({"prompt": smoke.PROMPTS["t2i-turbo"],
+                             "recipe": "turbo", "steps": smoke.TURBO_STEPS,
+                             "seed": 42}))
+    assert status == 400 and payload["code"] == "invalid_seed"
+
+
+def test_transparent_without_alpha_format_is_refused(fake_state):
+    """The second script-vs-grammar gap: transparent_background with the
+    default (jpg) output_format is a 422 field error on the real submit."""
+    status, payload = _PipeClient(fake_state).request_json(
+        "POST", "/api/v1/jobs",
+        body=smoke.envelope({"prompt": "a probe", "seed": "1",
+                             "transparent_background": True}))
+    assert status == 422 and payload["code"] == "invalid_config"
+    assert any(f["field"] == "output_format" for f in payload["fields"])
+
+
+def test_runtime_path_field_on_the_wire_is_refused(fake_state):
+    """output_dir is server-controlled: the real build_config answers
+    400 unknown_config_field — refused, never silently stripped."""
+    status, payload = _PipeClient(fake_state).request_json(
+        "POST", "/api/v1/jobs",
+        body=smoke.envelope({"prompt": "a probe", "seed": "42",
+                             "output_dir": "/tmp/pwn"}))
+    assert status == 400 and payload["code"] == "unknown_config_field"

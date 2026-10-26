@@ -119,12 +119,15 @@ class ApiClient:
 
 
 def job_config(kind: str, reference_ids: list[str]) -> dict:
-    config: dict = {"prompt": PROMPTS[kind], "seed": 42,
+    config: dict = {"prompt": PROMPTS[kind], "seed": "42",
                     "width": 1024, "height": 1024}
     if kind == "t2i-turbo":
         config.update(recipe="turbo", steps=TURBO_STEPS)
     elif kind == "transparent":
-        config.update(recipe="base", transparent_background=True)
+        # output_format="png" is mandatory: the real server refuses alpha
+        # output it cannot store, and the default format is jpg.
+        config.update(recipe="base", transparent_background=True,
+                      output_format="png")
     elif kind == "edit-1ref":
         config.update(recipe="base", width=1024, height=960,
                       references=list(reference_ids[:1]))
