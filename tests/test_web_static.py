@@ -1538,21 +1538,25 @@ def test_w5_rewrite_ui_is_a_suggestion_flow_not_an_automatic_edit():
 
 
 def test_use_as_reference_button_exists_on_both_surfaces_and_is_labelled():
-    """One click, two places: the finished-image panel and each History card."""
+    """One click, two places: the reference panel and each History card."""
     html = _read("index.html")
+    # The finished-image panel no longer carries it: the shortcut lives with
+    # the other reference controls, so it is only offered in edit mode.
     actions = re.search(r'<div class="result-actions"[^>]*>([\s\S]*?)</div>', html)
     assert actions, "result-actions group missing"
-    actions = actions.group(0)
-    button = re.search(r'<button[^>]*id="action-reference"[^>]*>([\s\S]*?)</button>',
-                       actions)
-    assert button, "the finished-image panel needs #action-reference"
+    assert "reference" not in actions.group(0).lower()
+    toolbar = re.search(r'<div class="reference-toolbar">([\s\S]*?)</div>', html)
+    assert toolbar, "reference toolbar missing"
+    toolbar = toolbar.group(0)
+    button = re.search(r'<button[^>]*id="use-last-image"[^>]*>([\s\S]*?)</button>',
+                       toolbar)
+    assert button, "the reference panel needs #use-last-image"
     tag, label = button.group(0), button.group(1)
-    assert label.strip() == "Use as reference", "the label names the action"
+    assert label.strip() == "Use last image as reference", "the label names the action"
     assert 'type="button"' in tag, "never a submit button inside the form"
-    # It starts disabled with the reason in the title, exactly like its
-    # Download/Open/Generate-again siblings — no result, no shortcut.
+    # It starts disabled with the reason in the title — no result, no shortcut.
     assert "disabled" in tag and 'title="No result yet"' in tag
-    assert actions.index('id="action-download"') < actions.index('id="action-reference"')
+    assert toolbar.index('id="add-reference"') < toolbar.index('id="use-last-image"')
 
     js = _read("app.js")
     history = _js_function(js, "renderHistory")
@@ -1640,8 +1644,8 @@ def test_use_as_reference_respects_the_cap_and_the_finished_image_rule():
     # predicate, so they cannot disagree about what is addable.
     control = _js_function(js, "updateUseAsReferenceControl")
     assert "useAsReferenceBlock(jobCache[selectedJob])" in control
-    assert "$('action-reference').disabled = reason !== '';" in control
-    assert "$('action-reference').title = reason" in control
+    assert "$('use-last-image').disabled = reason !== '';" in control
+    assert "$('use-last-image').title = reason" in control
     history = _js_function(js, "renderHistory")
     assert "var blocked = useAsReferenceBlock(job);" in history
     assert "reuse.disabled = blocked !== '';" in history

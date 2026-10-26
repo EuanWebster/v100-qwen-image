@@ -2995,9 +2995,11 @@
 
   function updateUseAsReferenceControl() {
     var reason = useAsReferenceBlock(jobCache[selectedJob]);
-    $('action-reference').disabled = reason !== '';
-    $('action-reference').title = reason || 'Add this image as reference image ' +
-      (references.length + 1) + ' of ' + MAX_REFERENCES;
+    // "Last image" is the one in the preview: the newest result unless an
+    // older one was opened from History.
+    $('use-last-image').disabled = reason !== '';
+    $('use-last-image').title = reason || 'Add the image shown in the preview ' +
+      'as reference image ' + (references.length + 1) + ' of ' + MAX_REFERENCES;
   }
 
   // Bytes plus a display name for the upload path, which reads file.size and
@@ -3198,7 +3200,7 @@
     });
     // Same refusal discipline as its siblings: the disabled state is a
     // courtesy, the function re-checks the block and states the reason.
-    $('action-reference').addEventListener('click', function () {
+    $('use-last-image').addEventListener('click', function () {
       useJobImageAsReference(selectedJob);
     });
     $('preview-image').addEventListener('error', function () {

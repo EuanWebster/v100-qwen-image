@@ -224,10 +224,11 @@ How to use it:
    above 4096 latent tokens (e.g. 1088×1088) also tick **VAE tiling** — the
    server refuses an untiled config that large. Unticking the box keeps your
    references in the list but stops using them; tick it again to bring them back.
-   To edit an image you just generated, press **Use as reference** on the
-   finished image (or on its History entry) instead of downloading it and
-   adding it back: it uploads that image as the next *image N* and ticks the
-   box for you.
+   To edit an image you just generated, press **Use last image as reference**
+   next to **Add reference** instead of downloading it and adding it back: it
+   adds the image shown in the preview as the next *image N*. Each History
+   entry also has a **Use as reference** button, which adds that entry's image
+   and ticks the box for you.
 2. **CLI:** `--reference PATH` (repeatable, ordered, at most 10) plus
    `--references-dir DIR` (default `<cache_dir>/references`). The bytes are
    copied verbatim into a content-addressed store; the run carries only ids.
