@@ -557,13 +557,14 @@ def test_w2_request_bound_whole_operation_including_body():
     body = m.group(1)
     assert "new AbortController()" in body and "controller.abort()" in body
     assert "requestOpts.signal = controller.signal" in body
-    assert "readBodyLimited(res)" in body, "body consumption must run inside the timer scope"
+    assert "readBodyLimited(res, cap)" in body, \
+        "body consumption must run inside the timer scope"
     assert "settle(" in body and "clearTimeout(timer); return value;" in body
     assert ".finally(function () { clearTimeout(timer); })" not in js, \
         "clearing on the fetch promise alone leaves the body untimed"
     assert "timedOut = true" in body, "a timeout must be distinguishable"
     # no unbounded bodies: a fixed cap, streaming-read and cancelled
-    m = re.search(r"function readBodyLimited\(res\)\s*\{([\s\S]*?)\n  \}", js)
+    m = re.search(r"function readBodyLimited\(res, cap\)\s*\{([\s\S]*?)\n  \}", js)
     assert m, "readBodyLimited not found"
     body = m.group(1)
     assert "MAX_RESPONSE_BYTES" in body and "reader.cancel()" in body, \
@@ -673,7 +674,7 @@ def test_status_requests_are_sequenced_never_land_late():
 
 def test_body_without_readable_stream_fails_closed_not_unbounded():
     js = _read("app.js")
-    m = re.search(r"function readBodyLimited\(res\)\s*\{([\s\S]*?)\n  \}", js)
+    m = re.search(r"function readBodyLimited\(res, cap\)\s*\{([\s\S]*?)\n  \}", js)
     assert m, "readBodyLimited not found"
     body = m.group(1)
     assert "UNSUPPORTED_BODY" in body
@@ -1426,7 +1427,8 @@ def test_test_surface_is_exposed_for_the_browser_checks():
                  "moveReference", "parseReferenceResponse", "MAX_REFERENCES",
                  "parseRewriteBlock", "parseRewriteAnswer", "setRewriterState",
                  "presetForRatio", "requestRewrite", "applyProposal",
-                 "keepOriginal", "rewriteState"):
+                 "keepOriginal", "rewriteState",
+                 "useJobImageAsReference", "useAsReferenceBlock"):
         assert f"{name}: {name}" in surface, f"QwenStudio must expose {name}"
 
 
@@ -1530,3 +1532,192 @@ def test_w5_rewrite_ui_is_a_suggestion_flow_not_an_automatic_edit():
         body = _js_function(js, fn)
         assert "innerHTML" not in body, f"{fn} must not assign innerHTML"
         assert "insertAdjacentHTML" not in body, f"{fn} must not insert HTML"
+
+
+# ------------------------------------------------ use as reference (W6)
+
+
+def test_use_as_reference_button_exists_on_both_surfaces_and_is_labelled():
+    """One click, two places: the finished-image panel and each History card."""
+    html = _read("index.html")
+    actions = re.search(r'<div class="result-actions"[^>]*>([\s\S]*?)</div>', html)
+    assert actions, "result-actions group missing"
+    actions = actions.group(0)
+    button = re.search(r'<button[^>]*id="action-reference"[^>]*>([\s\S]*?)</button>',
+                       actions)
+    assert button, "the finished-image panel needs #action-reference"
+    tag, label = button.group(0), button.group(1)
+    assert label.strip() == "Use as reference", "the label names the action"
+    assert 'type="button"' in tag, "never a submit button inside the form"
+    # It starts disabled with the reason in the title, exactly like its
+    # Download/Open/Generate-again siblings — no result, no shortcut.
+    assert "disabled" in tag and 'title="No result yet"' in tag
+    assert actions.index('id="action-download"') < actions.index('id="action-reference"')
+
+    js = _read("app.js")
+    history = _js_function(js, "renderHistory")
+    assert "reuse.textContent = 'Use as reference'" in history
+    # Only entries that HAVE an image get it: image_url is non-null exactly for
+    # a succeeded job (parseJob pins that equality), so the same test gates it.
+    gated = "if (job.state === 'succeeded') {\n        var reuse" in history
+    assert gated, "the History shortcut must be gated on a finished image"
+    # Focus is never stolen by a button: the click routes to Create, where the
+    # reference list and its status line live.
+    assert "location.hash = '#create';" in history
+    assert history.index("useJobImageAsReference(id)") > history.index("var reuse")
+
+
+def test_use_as_reference_reads_the_job_image_endpoint_and_reuses_the_upload():
+    """No new route and no new trust: GET the job image, POST it back."""
+    js = _read("app.js")
+    body = _js_function(js, "useJobImageAsReference")
+    # The bytes come from the job's own image URL — the same value Download
+    # and the preview use, and the one parseJob pins to /api/v1/jobs/<id>/image.
+    assert "apiRequest(job.image_url" in body
+    assert "'raw'" in body, "the response bytes must be taken verbatim"
+    assert "maxBytes: MAX_JOB_IMAGE_BYTES" in body, \
+        "a large PNG must not be refused by the JSON response cap"
+    assert "addReferenceFiles([" in body, \
+        "the upload must go through the existing reference path (caps, dedupe)"
+    assert "API_REFERENCES" not in body, \
+        "the upload route is reached via addReferenceFiles, never hand-built"
+    assert "JSON.stringify" not in body and "btoa(" not in body
+    # No new endpoint: the closed set of routes the page knows is unchanged
+    # (this feature is a GET of an existing route plus an existing POST).
+    assert sorted(set(re.findall(r"var (API_[A-Z_]+) = ", js))) == \
+        ["API_EXPORT", "API_IMPORT", "API_JOBS", "API_PLAN", "API_REFERENCES",
+         "API_REWRITE", "API_STATUS"]
+    # Every failure mode is narrated on the reference status line, never an
+    # alert(): network, unusable body, typed HTTP error, empty body.
+    assert "alert(" not in body
+    for reason in ("setReferenceStatus('Could not load the saved image",
+                   "if (r.bodyError)", "renderChip('Status rejected'",
+                   "apiErrorPayloadFromBytes(r.bytes)",
+                   "r.bytes instanceof Uint8Array"):
+        assert reason in body, f"missing failure path: {reason}"
+    assert re.search(r"/\^\[a-z0-9_\]\{1,64\}\$/", body), \
+        "only a code-shaped server code is quoted back"
+    # The typed 404 (image_unavailable) must be distinguishable from a
+    # disconnect: bodyError drops availability as a REJECTED contract.
+    rejected = body[body.index("if (r.bodyError)"):body.index("if (!r.res.ok)")]
+    assert "setApiAvailable(false)" in rejected and "not a disconnect" in rejected
+
+
+def test_use_as_reference_ticks_edit_mode_before_the_request():
+    js = _read("app.js")
+    body = _js_function(js, "useJobImageAsReference")
+    assert "$('edit-mode').checked = true;" in body
+    assert "applyEditMode();" in body
+    # Order is the point: reveal the list (and its live status line) BEFORE
+    # anything is fetched, so progress and every refusal are visible.
+    assert body.index("$('edit-mode').checked = true;") < \
+        body.index("applyEditMode();") < body.index("apiRequest(job.image_url")
+    # The status line is written before the request too: silence would look
+    # like a dead button on a slow disk.
+    assert body.index("setReferenceStatus('Loading the saved image") < \
+        body.index("apiRequest(job.image_url")
+
+
+def test_use_as_reference_respects_the_cap_and_the_finished_image_rule():
+    js = _read("app.js")
+    block = _js_function(js, "useAsReferenceBlock")
+    assert "references.length >= MAX_REFERENCES" in block, \
+        "a full list must refuse, not drop the image silently"
+    assert "MAX_REFERENCES + ' reference images are allowed" in block
+    assert "job.state !== 'succeeded' || !job.image_url" in block, \
+        "a job with no image has nothing to add"
+    assert "if (uploadingReference)" in block
+    assert block.rstrip().endswith("return '';\n  }") or "return '';" in block, \
+        "'' means available"
+
+    # The refusal is stated, not merely hidden behind a disabled button.
+    use = _js_function(js, "useJobImageAsReference")
+    assert "setReferenceStatus(block + '. Nothing was added.');" in use
+    assert use.index("var block = useAsReferenceBlock(job)") < \
+        use.index("if (block) {") < use.index("$('edit-mode').checked = true;")
+
+    # Both surfaces derive their disabled state (and its title) from the same
+    # predicate, so they cannot disagree about what is addable.
+    control = _js_function(js, "updateUseAsReferenceControl")
+    assert "useAsReferenceBlock(jobCache[selectedJob])" in control
+    assert "$('action-reference').disabled = reason !== '';" in control
+    assert "$('action-reference').title = reason" in control
+    history = _js_function(js, "renderHistory")
+    assert "var blocked = useAsReferenceBlock(job);" in history
+    assert "reuse.disabled = blocked !== '';" in history
+    assert "reuse.title = blocked" in history
+    # A reference added or removed re-derives the panel button, so the cap
+    # cannot leave a live-looking button behind.
+    controls = _js_function(js, "updateReferenceControls")
+    assert "updateUseAsReferenceControl();" in controls
+    assert "updateUseAsReferenceControl();" in _js_function(js, "renderSelectedJob")
+
+
+def test_use_as_reference_writes_no_setting_but_the_edit_mode_box():
+    js = _read("app.js")
+    use = _js_function(js, "useJobImageAsReference")
+    assert "$('prompt')" not in use and "$('prompt')" not in \
+        _js_function(js, "useAsReferenceBlock")
+    for control in ("seed", "width", "height", "steps", "cfg", "negative",
+                    "output-format", "transparent", "vae-tiling", "recipe"):
+        assert f"$('{control}')" not in use, f"must not touch #{control}"
+    assert "submitGeneration" not in use, "adding a reference never generates"
+    # The ONLY control this feature writes is the edit-mode checkbox.
+    assert [line.strip() for line in use.splitlines() if ".checked = " in line] == \
+        ["$('edit-mode').checked = true;"]
+    # The History shortcut leaves the selected job (and therefore the preview,
+    # the timings and the other result buttons) exactly as it was.
+    history = _js_function(js, "renderHistory")
+    reuse_handler = history[history.index("reuse.addEventListener"):]
+    reuse_handler = reuse_handler[:reuse_handler.index("card.appendChild(reuse)")]
+    assert "renderSelectedJob" not in reuse_handler
+
+
+def test_finished_image_response_gets_its_own_bounded_cap():
+    from qwen_engine import reference_store
+
+    js = _read("app.js")
+    assert f"var MAX_JOB_IMAGE_BYTES = {reference_store.MAX_REFERENCE_BYTES};" in js \
+        or "var MAX_JOB_IMAGE_BYTES = MAX_REFERENCE_BYTES;" in js, \
+        "the image cap is the store's own upload limit"
+    api = _js_function(js, "apiRequest")
+    assert "opts.maxBytes <= MAX_JOB_IMAGE_BYTES" in api, \
+        "a caller may raise the cap only up to the one legitimate size"
+    assert "opts.maxBytes : MAX_RESPONSE_BYTES" in api or \
+        "? opts.maxBytes : MAX_RESPONSE_BYTES;" in api
+    assert "k !== 'maxBytes'" in api, "the knob must not leak into fetch options"
+    reader = _js_function(js, "readBodyLimited")
+    assert "if (typeof cap !== 'number' || !(cap > 0) || cap > MAX_JOB_IMAGE_BYTES)" in reader
+    assert "cap = MAX_RESPONSE_BYTES;" in reader, \
+        "a missing or absurd cap fails closed to the default"
+    assert "if (total > cap) {" in reader and "reader.cancel()" in reader
+    # Exactly one caller raises it: every other route keeps 256 KiB.
+    assert js.count("maxBytes:") == 1, "the cap override has one caller"
+    assert "maxBytes: MAX_JOB_IMAGE_BYTES" in _js_function(js, "useJobImageAsReference")
+
+
+def test_every_output_format_the_engine_writes_is_accepted_as_a_reference():
+    """The shortcut must not strand a jpg or webp result on re-upload."""
+    from qwen_engine import image_output, reference_store
+    from qwen_engine.config import OutputFormat
+
+    js = _read("app.js")
+    table = re.search(r"var IMAGE_CONTENT_TYPES = \{([\s\S]*?)\};", js)
+    assert table, "no format -> content-type table for the re-uploaded bytes"
+    types = dict(re.findall(r"(\w+):\s*'([^']+)'", table.group(1)))
+    assert set(types) == {fmt.value for fmt in OutputFormat}, \
+        "every format the server can produce must be covered"
+
+    # What the encoder actually writes, and what the store sniffs, agree —
+    # checked on the magic the store reads, not on an extension.
+    source = (Path(image_output.__file__).read_text(encoding="utf-8"))
+    saved = set(re.findall(r'image\.save\(buffer, format="(\w+)"', source))
+    assert saved == {"JPEG", "PNG", "WEBP"}, f"unexpected encoder formats: {saved}"
+    magic = {"JPEG": b"\xff\xd8\xff\xe0\x00\x10JFIF",
+             "PNG": b"\x89PNG\r\n\x1a\n",
+             "WEBP": b"RIFF\x00\x00\x00\x00WEBPVP8 "}
+    accepted = {name: reference_store.sniff_format(raw)
+                for name, raw in magic.items()}
+    assert accepted == {"JPEG": "jpeg", "PNG": "png", "WEBP": "webp"}
+    assert set(types.values()) == {"image/jpeg", "image/png", "image/webp"}
+
