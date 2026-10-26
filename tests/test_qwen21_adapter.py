@@ -824,7 +824,7 @@ def test_close_drops_reference_latents():
 # -- load-phase residency order over the REAL supplied bridge --------------------
 
 
-def _load_env(tmp_path, monkeypatch, references):
+def _load_env(tmp_path, monkeypatch, references, quant=None):
     """One full loader.load over fakes, real bundle/manifest/bridge.
 
     Returns (adapter, order, pipe): ORDER records every component
@@ -940,6 +940,23 @@ def _load_env(tmp_path, monkeypatch, references):
 
     values = dict(manifest_path=str(manifest_path), models_dir=str(root),
                   width=256, height=256)
+    if quant == "q8":
+        from qwen_engine import q8_artifact as qa_mod
+        from qwen_engine.adapters import q8_loader
+        from qwen_engine.config import Quant
+        monkeypatch.setattr(
+            qa_mod, "resolve_q8_artifact",
+            lambda path: SimpleNamespace(identity_sha256="e" * 64))
+        monkeypatch.setattr(q8_loader, "validate_q8_environment", lambda: None)
+        # the GGUF-parameter witness needs real gguf/torch; the placement it
+        # enforces is represented here by the fake transformer's params
+        monkeypatch.setattr(q8_loader, "validate_q8_parameters",
+                            lambda model, device, dtype: None)
+        monkeypatch.setattr(
+            q8_loader, "load_q8_transformer",
+            lambda *args: (order.append("load-q8-transformer"),
+                           _FakeTransformer())[1])
+        values.update(quant=Quant.Q8, q8_manifest_path=str(root / "q8.json"))
     if references:
         store = tmp_path / "store"
         store.mkdir()
@@ -975,4 +992,27 @@ def test_t2i_load_order_and_attachment_are_unchanged(tmp_path, monkeypatch):
     assert pipe.vae is not None                        # resident, as before
     assert adapter._reference_vae_latents is None
     assert adapter._inner._state == "loaded"
+    adapter.close()
+
+
+@needs_references
+@pytest.mark.parametrize("quant,references,expect", [
+    (None, False, ("t2i-on", True)),
+    (None, True, ("reference-fp16-off", False)),
+    ("q8", True, ("q8-on", True)),
+    ("q8", False, ("t2i-on", True)),
+])
+def test_kv_cache_policy_is_automatic_from_references_and_quant(
+        tmp_path, monkeypatch, quant, references, expect):
+    """V100 measured policy: FP16+KV-on OOMs the first denoise step of a
+    reference run; KV-off fits (95 s), Q8+KV-on fits (58 s), Turbo FP16
+    KV-off fits (19 s); T2I keeps KV-on. No user-facing field exists."""
+    from types import SimpleNamespace
+    from qwen_engine.adapters import qwen21_diffusers as qd
+    policy, use_kv = expect
+    stub = SimpleNamespace(metadata={})
+    monkeypatch.setattr(qd, "current", lambda: stub)
+    adapter, _order, _pipe = _load_env(tmp_path, monkeypatch, references, quant=quant)
+    assert adapter._inner.use_kv_cache is use_kv
+    assert stub.metadata["kv_cache_policy"] == policy
     adapter.close()

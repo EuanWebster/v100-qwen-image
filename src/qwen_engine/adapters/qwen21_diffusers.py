@@ -592,6 +592,20 @@ class Qwen21DiffusersAdapter:
             attested_unbounded_host=self._trust_unbounded_host,
         )
 
+        # Automatic KV-cache policy for reference edits (V100, 1K, 1 ref,
+        # 40 steps, measured 2026-10-25): FP16 transformer + KV ON OOMs at
+        # the FIRST denoise step; KV OFF fits (denoise 95 s). Q8 + KV ON
+        # fits (58 s). Turbo is an FP16 transformer and fits KV-off (19 s).
+        # So references keep KV only with Q8. T2I stays KV-ON, unchanged.
+        # NOT measured: 2-reference FP16 KV-off residency — deliberately
+        # left ALLOWED (the batch5 matrix will measure it); nothing here
+        # refuses it. The choice lands in calibration_facts()["use_kv_cache"]
+        # (attached adapter) and in the run metadata below.
+        use_kv_cache = not references or q8_artifact is not None
+        if current() is not None:
+            current().metadata["kv_cache_policy"] = (
+                "t2i-on" if not references else
+                "q8-on" if use_kv_cache else "reference-fp16-off")
         inner = SuppliedQwen21Adapter(
             pipeline=pipeline,
             encoder=encoder,
@@ -599,7 +613,7 @@ class Qwen21DiffusersAdapter:
             bundle=bundle,
             encoder_dtype=ENCODER_DTYPE,
             execution_dtype="fp16",
-            use_kv_cache=True,
+            use_kv_cache=use_kv_cache,
         )
         inner.set_cancel_event(self._event)
         inner.set_progress_callback(self._progress_callback)
