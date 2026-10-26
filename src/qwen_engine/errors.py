@@ -33,3 +33,11 @@ class HardwareAbsentError(EngineError):
 
 class GenerationCancelled(EngineError):
     """Cooperative cancellation acknowledged before a verified save."""
+
+
+class OutOfGpuMemoryError(EngineError):
+    """CUDA device memory exhausted mid-run (an allocation inside the ML
+    stack failed). Typed channel for the web ``out_of_gpu_memory`` code:
+    adapters may raise it directly; :mod:`qwen_engine.jobs` additionally
+    recognises the raw ``torch.OutOfMemoryError`` and CUDA-OOM
+    ``RuntimeError`` texts without importing torch itself."""

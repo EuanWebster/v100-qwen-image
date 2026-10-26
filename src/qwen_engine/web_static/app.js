@@ -2524,7 +2524,8 @@
       var value = job.phase_ms[phase];
       return JOB_PHASES.indexOf(phase) === -1 || typeof value !== 'number' || !isFinite(value) || value < 0;
     })) return null;
-    if ([null, 'execution_failed', 'worker_stopped', 'invalid_cancellation_acknowledgment'].indexOf(job.error_code) === -1) return null;
+    if ([null, 'execution_failed', 'worker_stopped', 'invalid_cancellation_acknowledgment',
+         'out_of_gpu_memory'].indexOf(job.error_code) === -1) return null;
     if (job.image_url !== (job.state === 'succeeded' ? jobUrl(job.job_id) + '/image' : null)) return null;
     // Older servers have no step observations; keep their bar indeterminate.
     if (job.progress !== undefined && (!job.progress ||
@@ -2563,6 +2564,12 @@
     setText('job-status', job.state + (job.phase ? ' · ' + job.phase :
       job.state === 'running' ? ' · verifying model assets' : '') +
       (job.error_code ? ' · ' + job.error_code + ' (see server terminal)' : ''));
+    var failureMessages = {
+      // Plain-language, actionable and prompt-free; unknown codes keep the
+      // generic fixed sentence below (closed list, no server text).
+      out_of_gpu_memory: 'The GPU ran out of memory for this job. Try Q8, ' +
+        'a smaller size, fewer reference images, or Turbo.'
+    };
     var descriptions = {
       queued: 'Queued — waiting for the current generation to finish.',
       running: 'Generating — ' + ({load: 'loading model weights', encode: 'encoding your prompt',
@@ -2570,7 +2577,8 @@
       cancelling: 'Cancellation requested — waiting for the engine to release resources.',
       cancelled: 'Generation cancelled.',
       succeeded: 'Image ready. Use View completed image below.',
-      failed: 'Generation failed — ' + job.error_code + '. See the server terminal for details.'
+      failed: failureMessages[job.error_code] ||
+        ('Generation failed — ' + job.error_code + '. See the server terminal for details.')
     };
     var feedback = descriptions[job.state];
     if (job.elapsed_ms !== null) feedback += ' Elapsed: ' + (job.elapsed_ms / 1000).toFixed(0) + ' s.';

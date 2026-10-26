@@ -247,6 +247,63 @@ def test_executor_failure_sanitized_and_next_job_runs(harness):
     assert controller.wait(second.job_id).state == jobs.JobState.SUCCEEDED
 
 
+
+TorchOutOfMemory = type("OutOfMemoryError", (RuntimeError,), {})
+TorchOutOfMemory.__module__ = "torch"
+
+
+@pytest.mark.parametrize("kind,code", [
+    ("torch-class", "out_of_gpu_memory"),
+    ("torch-subclass-module", "out_of_gpu_memory"),
+    ("runtime-cuda-text", "out_of_gpu_memory"),
+    ("typed-engine", "out_of_gpu_memory"),
+    ("typed-via-cause", "out_of_gpu_memory"),
+    ("plain-runtime-text", "execution_failed"),
+    ("same-name-other-module", "execution_failed"),
+    ("context-only-oom", "execution_failed"),
+    ("unrequested-cancel-unchanged", "invalid_cancellation_acknowledgment"),
+])
+def test_cuda_oom_classifies_typed_without_importing_torch(harness, kind, code):
+    from qwen_engine.errors import GenerationCancelled, OutOfGpuMemoryError
+
+    def execute(context):
+        if kind == "torch-class":
+            raise TorchOutOfMemory("CUDA out of memory. Tried to allocate 2.00 GiB")
+        if kind == "torch-subclass-module":
+            subclass = type("OutOfMemoryError", (TorchOutOfMemory,), {})
+            subclass.__module__ = "torch.cuda"
+            raise subclass("CUDA out of memory")
+        if kind == "runtime-cuda-text":
+            raise RuntimeError("CUDA error: out of memory in cudaMallocAsync")
+        if kind == "typed-engine":
+            raise OutOfGpuMemoryError("adapter-reported device exhaustion")
+        if kind == "typed-via-cause":
+            try:
+                raise TorchOutOfMemory("CUDA out of memory")
+            except TorchOutOfMemory as inner:
+                raise RuntimeError("wrapper text") from inner
+        if kind == "plain-runtime-text":
+            raise RuntimeError("some unrelated cuda kernel fault")
+        if kind == "same-name-other-module":
+            other = type("OutOfMemoryError", (RuntimeError,), {})
+            other.__module__ = "numpy"
+            raise other("host allocation failed")
+        if kind == "context-only-oom":
+            try:
+                raise TorchOutOfMemory("CUDA out of memory")
+            except TorchOutOfMemory:
+                raise ValueError("primary failure with OOM as context only")
+        raise GenerationCancelled("cancelled while an OOM frame was in flight")
+
+    released = []
+    controller = harness.create(execute, memory_release=lambda: released.append(1))
+    record = controller.submit(GenerationConfig())
+    done = controller.wait(record.job_id)
+    assert done.state == jobs.JobState.FAILED and done.error_code == code
+    assert "CUDA" not in repr(done) and "secret" not in repr(done)
+    assert released == [1]  # the bc550be failure-boundary release still runs
+
+
 def test_unrequested_cancellation_is_failure(harness):
     def execute(context):
         raise jobs.JobCancelled()

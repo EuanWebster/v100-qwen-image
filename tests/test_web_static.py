@@ -850,6 +850,28 @@ def test_parse_job_accepts_13_keys_and_keeps_legacy_shapes_honest():
     assert "typeof c.transparent_background !== 'boolean'" in body
 
 
+def test_job_error_code_gate_matches_the_python_public_map():
+    """The UI's closed error_code list and the web layer's PUBLIC_ERROR_CODES
+    map are ONE contract; drift means a real failure silently renders as an
+    invalid job (server codes are fixed literals, prompt-free)."""
+    from qwen_engine.web.generation import PUBLIC_ERROR_CODES
+    js = _read("app.js")
+    m = re.search(r"if \(\[null,([^\]]*?)\]\.indexOf\(job\.error_code\)", js, re.S)
+    assert m, "parseJob error_code gate not found"
+    assert set(re.findall(r"'([a-z_]+)'", m.group(1))) == set(PUBLIC_ERROR_CODES)
+
+
+def test_gpu_oom_failure_message_is_plain_language_and_actionable():
+    js = _read("app.js")
+    m = re.search(r"out_of_gpu_memory: '([^']*)' \+\s*\n?\s*'([^']*)'", js)
+    assert m, "out_of_gpu_memory message not found"
+    assert "".join(m.groups()) == ("The GPU ran out of memory for this job. "
+                                   "Try Q8, a smaller size, fewer reference images, "
+                                   "or Turbo.")
+    # only the closed map may replace the generic sentence; no server text
+    assert "failureMessages[job.error_code] ||" in js
+
+
 def test_recipe_field_mirrors_the_config_gates():
     html = _read("index.html")
     js = _read("app.js")

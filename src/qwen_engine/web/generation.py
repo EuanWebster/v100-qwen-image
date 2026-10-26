@@ -27,6 +27,17 @@ from qwen_engine.web.api import (
 
 JOB_SCHEMA = "qwen_engine.web_job.v1"
 JOBS_SCHEMA = "qwen_engine.web_jobs.v1"
+#: Closed map from executor failure codes to public web error codes (all
+#: fixed, prompt-free literals). ``out_of_gpu_memory`` is a classified CUDA
+#: out-of-memory at the executor boundary instead of the generic
+#: ``execution_failed``; an unknown job-layer code passes through unchanged
+#: (a new engine code must never be silently hidden from the UI).
+PUBLIC_ERROR_CODES = {
+    "execution_failed": "execution_failed",
+    "worker_stopped": "worker_stopped",
+    "invalid_cancellation_acknowledgment": "invalid_cancellation_acknowledgment",
+    "out_of_gpu_memory": "out_of_gpu_memory",
+}
 
 
 class WebGeneration:
@@ -123,7 +134,8 @@ class WebGeneration:
             "cancel_requested": record.cancel_requested,
             "config": editable_config_dict(record.config),
             "elapsed_ms": elapsed, "phase_ms": phases,
-            "error_code": record.error_code,
+            "error_code": (PUBLIC_ERROR_CODES.get(record.error_code, record.error_code)
+                           if record.error_code else None),
             # Prompt-free boundary release cost for terminal failed/cancelled
             # jobs (None for successes and never-executed cancellations); it
             # is recorded just after the terminal state becomes visible.

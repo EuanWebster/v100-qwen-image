@@ -169,7 +169,7 @@ class TensorOwner:
     """Weakref-able stand-in for an object owning CUDA tensors."""
 
 
-@pytest.mark.parametrize("kind", ["cancelled", "failed"])
+@pytest.mark.parametrize("kind", ["cancelled", "failed", "gpu-oom"])
 def test_terminal_job_releases_executor_frames_without_gc(tmp_path, kind):
     # Regression for the cancelled-run 14 GB retention: the adapter fails
     # inside the denoise frame while a tensor owner is still a live local.
@@ -188,6 +188,13 @@ def test_terminal_job_releases_executor_frames_without_gc(tmp_path, kind):
             if kind == "cancelled":
                 self.event.set()
                 raise GenerationCancelled("fixture mid-denoise cancellation")
+            if kind == "gpu-oom":
+                # torch-identity fake: jobs.py classifies CUDA OOM without
+                # importing torch, and the classifier must NOT retain the
+                # traceback (the denoise frame owns the tensor owner here)
+                torch_oom = type("OutOfMemoryError", (RuntimeError,), {})
+                torch_oom.__module__ = "torch"
+                raise torch_oom("fixture mid-denoise CUDA out of memory")
             raise RuntimeError("fixture mid-denoise failure")
 
     adapter = HoldingAdapter()
@@ -206,6 +213,7 @@ def test_terminal_job_releases_executor_frames_without_gc(tmp_path, kind):
     finally:
         gc.enable()
     assert done.state == (JobState.CANCELLED if kind == "cancelled" else JobState.FAILED)
-    assert done.error_code == (None if kind == "cancelled" else "execution_failed")
+    assert done.error_code == {"cancelled": None, "failed": "execution_failed",
+                               "gpu-oom": "out_of_gpu_memory"}[kind]
     assert adapter.calls == ["bind", "load", "encode", "denoise", "close"]
     assert controller.close()

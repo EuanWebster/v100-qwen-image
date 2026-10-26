@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 import threading
 import time
@@ -30,12 +31,43 @@ from pathlib import Path
 
 from qwen_engine.config import GenerationConfig
 from qwen_engine.core import GenerationResult
-from qwen_engine.errors import GenerationCancelled
+from qwen_engine.errors import GenerationCancelled, OutOfGpuMemoryError
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 _PHASES = ("load", "encode", "denoise", "decode", "save")
 _STAT_FIELDS = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
+
+
+#: Stdlib-only CUDA-OOM classifier (torch is NEVER imported here — jobs.py
+#: must stay ML-free). Recognised at the executor boundary: the typed
+#: OutOfGpuMemoryError channel, torch's OutOfMemoryError class by type
+#: identity (exact class name + torch top-level module), and the legacy
+#: plain-RuntimeError CUDA-OOM texts. Only explicit ``__cause__`` chains are
+#: followed: an implicit ``__context__`` may carry an unrelated in-flight
+#: exception (a cancellation raised while an OOM is being handled must stay
+#: a cancellation). Returns a bool only; the exception object and its text
+#: never escape the call, so nothing prompt-bearing or traceback-bearing is
+#: stored — the recorded error_code is one of the fixed literals.
+_CUDA_OOM_TEXT = re.compile(
+    r"CUDA out of memory|CUDA error: out of memory|cudaErrorMemoryAllocation",
+    re.IGNORECASE)
+
+
+def _is_gpu_oom(exc: BaseException | None) -> bool:
+    seen: set[int] = set()
+    while isinstance(exc, BaseException) and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, OutOfGpuMemoryError):
+            return True
+        kind = type(exc)
+        if (kind.__name__ == "OutOfMemoryError"
+                and kind.__module__.partition(".")[0] == "torch"):
+            return True
+        if kind.__name__ == "RuntimeError" and _CUDA_OOM_TEXT.search(str(exc)):
+            return True
+        exc = exc.__cause__
+    return False
 
 
 class JobError(ValueError):
@@ -423,8 +455,13 @@ class JobController:
                         state, error = JobState.FAILED, "invalid_cancellation_acknowledgment"
                     else:
                         state = JobState.CANCELLED
-                except Exception:
-                    state, error = JobState.FAILED, "execution_failed"
+                except Exception as exc:
+                    # Fixed codes only; the classifier returns a bool and the
+                    # exception object dies with this except block (the
+                    # post-block gc boundary below stays traceback-free).
+                    state = JobState.FAILED
+                    error = ("out_of_gpu_memory" if _is_gpu_oom(exc)
+                             else "execution_failed")
                 with self._condition:
                     self._records[job_id] = replace(self._records[job_id], state=state, artifact=artifact, error_code=error)
                     del self._cancels[job_id]

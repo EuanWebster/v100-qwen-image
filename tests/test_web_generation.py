@@ -135,6 +135,36 @@ def test_assets_failure_never_creates_adapter_and_error_is_private(runtime, monk
         assert service.close()
 
 
+@pytest.mark.parametrize("kind", ["torch-identity", "typed-engine"])
+def test_gpu_oom_surfaces_the_typed_public_code(runtime, kind):
+    """End-to-end web contract: a CUDA OOM inside the executor must reach
+    the browser as 'out_of_gpu_memory' (the UI has a plain-language
+    message for it), never as the generic 'execution_failed', and must
+    stay free of exception text."""
+    from qwen_engine.errors import OutOfGpuMemoryError
+    from qwen_engine.web.generation import PUBLIC_ERROR_CODES
+
+    TorchOom = type("OutOfMemoryError", (RuntimeError,), {})
+    TorchOom.__module__ = "torch"
+
+    def execute(context):
+        if kind == "typed-engine":
+            raise OutOfGpuMemoryError("adapter device exhaustion")
+        raise TorchOom("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    service = WebGeneration(runtime, executor=execute)
+    try:
+        doc = service.submit(envelope()).payload
+        service.controller.wait(doc['job_id'])
+        doc = service.job_response(doc['job_id']).payload
+        assert doc['state'] == 'failed' and doc['error_code'] == 'out_of_gpu_memory'
+        assert 'CUDA out of memory' not in json.dumps(doc)
+        assert doc['image_url'] is None
+    finally:
+        assert service.close()
+    assert 'out_of_gpu_memory' in PUBLIC_ERROR_CODES
+
+
 def test_queued_and_running_cancel_keep_the_worker_serial(runtime):
     started, release = threading.Event(), threading.Event()
     active = []
