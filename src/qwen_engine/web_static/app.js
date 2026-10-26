@@ -49,6 +49,11 @@
   var API_JOBS = '/api/v1/jobs';
   var API_REFERENCES = '/api/v1/references';
   var API_REWRITE = '/api/v1/rewrite';
+  // The rewriter choice is a SERVER setting (Settings page): one document in
+  // the server's cache dir, shared by every browser. The page never learns —
+  // and never sends — a filesystem path.
+  var API_REWRITE_SETTINGS = '/api/v1/settings/rewrite';
+  var API_REWRITE_SETTINGS_TEST = API_REWRITE_SETTINGS + '/test';
   var PLAN_REQUEST_SCHEMA = 'qwen_engine.web_plan_request.v1';
   var STATUS_SCHEMA = 'qwen_engine.web_status.v1';
   var PLAN_SCHEMA = 'qwen_engine.web_plan.v1';
@@ -56,6 +61,9 @@
   var REFERENCE_SCHEMA = 'qwen_engine.web_reference.v1';
   var REWRITE_REQUEST_SCHEMA = 'qwen_engine.web_rewrite_request.v1';
   var REWRITE_SCHEMA = 'qwen_engine.web_rewrite.v1';
+  var REWRITE_SETTINGS_SCHEMA = 'qwen_engine.web_rewrite_settings.v1';
+  var REWRITE_TEST_REQUEST_SCHEMA = 'qwen_engine.web_rewrite_test_request.v1';
+  var REWRITE_TEST_SCHEMA = 'qwen_engine.web_rewrite_test.v1';
   var UI_HEADER = 'X-Qwen-UI';
 
   // Reference images (design §5). The caps MIRROR the server contract
@@ -85,13 +93,34 @@
     'manifest_invalid', 'manifest_unreadable'
   ];
 
-  /* Rewrite availability (plan §4.1). CLOSED state/code pairs: the code is the
-     key, the state is the value it must pair with. Rewriting is optional and
-     NEVER a generation gate, so it is deliberately absent from GATE_STATES. */
+  /* Rewrite availability (plan §4.1 plus the two-backend amendment). CLOSED
+     state/code pairs: the code is the key, the state is the value it must pair
+     with. Rewriting is optional and NEVER a generation gate, so it is
+     deliberately absent from GATE_STATES. */
   var REWRITE_STATES = {
     rewrite_available: 'available',
     rewrite_disabled: 'unavailable'
   };
+  // The closed key set of the status block: the four core keys, plus the two
+  // the two-backend server adds. A key outside this list is an unread
+  // contract, not a thing to ignore.
+  var REWRITE_BLOCK_KEYS = ['state', 'code', 'backend', 'reason', 'backends',
+                            'settings'];
+  var REWRITE_BACKEND_ROW_KEYS = ['id', 'label', 'tasks', 'uses_gpu'];
+  var REWRITE_BACKEND_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+  // The Settings document's own closed sets: the state, one choice (the saved
+  // document and the one in force share the shape) and a settings row, which
+  // adds availability plus the reason a choice is greyed out.
+  var REWRITE_SETTINGS_KEYS = ['schema', 'backend', 'saved', 'local', 'backends',
+                               'off', 'persistent', 'note'];
+  // A saved choice carries which backend was picked; the block that describes
+  // the local service does not select anything, so the server sends it without
+  // a backend key. Two documents, two closed key sets.
+  var REWRITE_CHOICE_KEYS = ['backend', 'endpoint', 'model', 'timeout_s'];
+  var REWRITE_LOCAL_KEYS = ['endpoint', 'model', 'timeout_s'];
+  var REWRITE_SETTINGS_ROW_KEYS = ['id', 'label', 'tasks', 'uses_gpu',
+                                   'available', 'reason'];
+  var REWRITE_SETTINGS_BACKENDS = ['pe-llamacpp', 'local-llm', 'off'];
   // Sentinel meaning "present but malformed" — distinct from null
   // ("absent or legitimately unavailable"), so a bad block rejects the
   // whole status document instead of silently hiding a feature.
@@ -867,23 +896,98 @@
 
   /* The rewrite availability, strictly. `undefined` (absent) and the disabled
      pair both mean unavailable; only the exact available pair yields the
-     backend string. Anything else — a fifth key, a missing key, an unknown
-     state/code pair, a non-string backend — is INVALID and rejects the whole
-     status document, exactly like every other closed-set parse here. */
+     backend. The four core keys are ALWAYS present and `backends` / `settings`
+     are the only additive ones, each parsed in full: a fifth unknown key, a
+     missing key, an unknown state/code pair or a non-string backend is INVALID
+     and rejects the whole status document, exactly like every other closed-set
+     parse here. The page therefore never guesses at a contract it has not
+     read. */
   function parseRewriteBlock(block) {
     if (block === undefined) return null;
     if (!block || typeof block !== 'object' || Array.isArray(block)) return INVALID;
-    if (Object.keys(block).length !== 4) return INVALID;
+    var keys = Object.keys(block);
+    if (keys.length < 4) return INVALID;
+    for (var i = 0; i < keys.length; i++) {
+      if (REWRITE_BLOCK_KEYS.indexOf(keys[i]) === -1) return INVALID;
+    }
     if (typeof block.state !== 'string' || typeof block.code !== 'string' ||
         typeof block.reason !== 'string') return INVALID;
     if (block.backend !== null && typeof block.backend !== 'string') return INVALID;
     var pair = REWRITE_STATES[block.code];
     if (!pair || pair !== block.state) return INVALID;
-    if (block.state !== 'available') return null;   // disabled / unavailable
+    var rows = null;
+    if (block.backends !== undefined) {
+      rows = parseRewriteBackends(block.backends);
+      if (rows === INVALID) return INVALID;
+    }
+    var pointer = null;
+    if (block.settings !== undefined) {
+      pointer = parseRewriteSettingsPointer(block.settings);
+      if (pointer === INVALID) return INVALID;
+    }
+    if (block.state !== 'available') {
+      return { backend: null, reason: block.reason, backends: rows,
+               settings: pointer };   // disabled / unavailable
+    }
     if (typeof block.backend !== 'string' || !block.backend) return INVALID;
     if (block.backend.length > 64) return INVALID;
     if (block.reason !== '') return INVALID;        // available carries no reason
-    return { backend: block.backend };
+    if (rows !== null && !containsId(rows, block.backend)) return INVALID;
+    return { backend: block.backend, reason: '', backends: rows,
+             settings: pointer };
+  }
+
+  // The additive `backends` rows: which rewriters exist here and what each can
+  // do. Labels are display text the server owns; a path, address or model name
+  // in one is a contract violation, so it rejects the document.
+  function parseRewriteBackends(rows) {
+    if (!Array.isArray(rows) || !rows.length || rows.length > 4) return INVALID;
+    var out = [];
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return INVALID;
+      var keys = Object.keys(row);
+      if (keys.length !== 4) return INVALID;
+      for (var k = 0; k < keys.length; k++) {
+        if (REWRITE_BACKEND_ROW_KEYS.indexOf(keys[k]) === -1) return INVALID;
+      }
+      if (typeof row.id !== 'string' || !REWRITE_BACKEND_ID_RE.test(row.id)) return INVALID;
+      if (typeof row.label !== 'string' || !row.label || row.label.length > 120) return INVALID;
+      if (/[\/\\]/.test(row.label)) return INVALID;   // a label is never a path
+      if (typeof row.uses_gpu !== 'boolean') return INVALID;
+      if (!Array.isArray(row.tasks) || !row.tasks.length ||
+          row.tasks.length > REWRITE_TASKS.length) return INVALID;
+      for (var t = 0; t < row.tasks.length; t++) {
+        if (REWRITE_TASKS.indexOf(row.tasks[t]) === -1) return INVALID;
+      }
+      if (containsId(out, row.id)) return INVALID;   // one row per backend
+      out.push({ id: row.id, label: row.label, tasks: row.tasks.slice(),
+                 uses_gpu: row.uses_gpu });
+    }
+    return out;
+  }
+
+  // The additive `settings` pointer: the ROUTE the choice is written to, plus
+  // whether a saved document is on disk. A route is a path on THIS origin and
+  // nothing else — never a filesystem location.
+  function parseRewriteSettingsPointer(pointer) {
+    if (!pointer || typeof pointer !== 'object' || Array.isArray(pointer)) return INVALID;
+    var keys = Object.keys(pointer);
+    if (keys.length !== 2) return INVALID;
+    for (var i = 0; i < keys.length; i++) {
+      if (['href', 'saved'].indexOf(keys[i]) === -1) return INVALID;
+    }
+    if (typeof pointer.href !== 'string' ||
+        pointer.href.indexOf(API_REWRITE_SETTINGS) !== 0) return INVALID;
+    if (typeof pointer.saved !== 'boolean') return INVALID;
+    return { href: pointer.href, saved: pointer.saved };
+  }
+
+  function containsId(rows, id) {
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].id === id) return true;
+    }
+    return false;
   }
 
   function statusUnrecognizedText(reason) {
@@ -1046,6 +1150,8 @@
    */
 
   var rewriteBackend = null;      // non-null ONLY when status said available
+  var rewriteBackends = null;     // the status `backends` rows, or null
+  var rewriteSettingsHref = API_REWRITE_SETTINGS;
   var rewriteInFlight = false;
   // Monotonic PROMPT revision: bumped by every change to the prompt TEXT,
   // however it was made (typing, Apply, import). Deliberately NOT the plan
@@ -1075,6 +1181,8 @@
 
   function setRewriterState(rewriter) {
     rewriteBackend = rewriter ? rewriter.backend : null;
+    rewriteBackends = rewriter && rewriter.backends ? rewriter.backends : null;
+    if (rewriter && rewriter.settings) rewriteSettingsHref = rewriter.settings.href;
     var button = $('rewrite-btn');
     if (button) {
       button.hidden = !rewriteBackend;
@@ -1082,7 +1190,28 @@
     }
     var hint = $('rewrite-hint');
     if (hint) hint.hidden = !!rewriteBackend;
+    // Which rewriter is answering is stated, not implied: the two behave
+    // differently (one takes the graphics card, one does not) and the user
+    // just chose between them on the Settings page.
+    var active = $('rewrite-active');
+    if (active) {
+      active.hidden = !rewriteBackend;
+      setText('rewrite-active-text', rewriteBackend
+        ? 'Rewriter in use: ' + rewriteLabel(rewriteBackend) + '.' : '');
+    }
     if (!rewriteBackend) hideProposal();
+  }
+
+  // The friendly name for a backend id, taken from the status rows when the
+  // server sent them. Never a guessed sentence, never an address or a path.
+  function rewriteLabel(backend) {
+    if (rewriteBackends) {
+      for (var i = 0; i < rewriteBackends.length; i++) {
+        if (rewriteBackends[i].id === backend) return rewriteBackends[i].label;
+      }
+    }
+    return backend === 'pe-llamacpp' ? 'Official enhancer (Q8, uses GPU)'
+      : backend === 'local-llm' ? 'Local LLM service' : backend;
   }
 
   function bumpPromptRevision() {
@@ -1101,6 +1230,7 @@
     setText('rewrite-original', '');
     setText('rewrite-suggested', '');
     setText('rewrite-ratio', '');
+    setText('rewrite-source', '');
     var applyRatio = $('rewrite-apply-ratio');
     if (applyRatio) applyRatio.hidden = true;
     setText('rewrite-error', '');
@@ -1247,6 +1377,12 @@
     if (!block) return;
     setText('rewrite-original', answer.original_prompt);
     setText('rewrite-suggested', answer.rewritten_prompt);
+    // Which rewriter answered is stated, not hidden: the two differ in cost
+    // (one takes the graphics card) and in what they can do, and for an edit
+    // draft with the enhancer selected a DIFFERENT one answers than for a t2i
+    // draft — the user is entitled to know which produced this text.
+    setText('rewrite-source', 'Rewritten by ' + rewriteLabel(answer.backend) +
+      ' in ' + answer.elapsed_ms + ' ms.');
     setText('rewrite-error', '');
     var apply = $('rewrite-apply');
     var edit = $('rewrite-edit');
@@ -1364,6 +1500,339 @@
     } catch (err) {
       return null;
     }
+  }
+
+  /* ---------------- Prompt rewriter settings ----------------
+   * The Settings page changes ONE thing that belongs to the server rather
+   * than to this browser: which rewriter answers, and how the local service
+   * is reached. It is stored by the server in its own cache directory and
+   * applies to every browser using it, so NOTHING here is kept in the browser
+   * — no localStorage key, no draft — and no field names a file: the
+   * llama-server binary, its GGUF and the system prompts stay launch flags
+   * the operator owns, and the server refuses any path-shaped key.
+   */
+
+  var rewriteSettings = null;        // the last state the server sent
+  var rewriteSettingsBusy = false;
+  var rewriteTestBusy = false;
+
+  // The settings document, strictly — the same closed shape the server
+  // validates before it sends it. Anything unexpected rejects the document
+  // rather than rendering a partial guess about which rewriter is live.
+  function parseRewriteSettings(payload) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    var keys = Object.keys(payload);
+    for (var i = 0; i < keys.length; i++) {
+      if (REWRITE_SETTINGS_KEYS.indexOf(keys[i]) === -1) return null;
+    }
+    if (payload.schema !== REWRITE_SETTINGS_SCHEMA) return null;
+    if (payload.backend !== null && typeof payload.backend !== 'string') return null;
+    if (typeof payload.persistent !== 'boolean') return null;
+    var saved = parseRewriteChoice(payload.saved);
+    var local = parseRewriteLocal(payload.local);
+    if (saved === null || local === null) return null;
+    var rows = parseRewriteSettingsRows(payload.backends);
+    if (rows === null) return null;
+    var off = payload.off;
+    if (!off || off.id !== 'off' || typeof off.label !== 'string') return null;
+    if (payload.note !== undefined && typeof payload.note !== 'string') return null;
+    return {
+      backend: payload.backend, saved: saved, local: local, backends: rows,
+      off: { id: 'off', label: off.label }, persistent: payload.persistent,
+      note: typeof payload.note === 'string' ? payload.note : ''
+    };
+  }
+
+  // The three local-service values, shared by the saved choice and by the block
+  // that describes the local service: each is null (nothing typed there, so the
+  // launch flags stay in force) or a bounded scalar. The bounds are the server's
+  // own; re-checking them is what makes a hand-edited or corrupted document
+  // render nothing instead of a partial guess.
+  function parseRewriteLocalFields(values) {
+    var out = {};
+    if (values.endpoint !== null) {
+      if (typeof values.endpoint !== 'string' || values.endpoint.length > 512) return null;
+      out.endpoint = values.endpoint;
+    } else { out.endpoint = null; }
+    if (values.model !== null) {
+      if (typeof values.model !== 'string' || values.model.length > 256) return null;
+      out.model = values.model;
+    } else { out.model = null; }
+    if (values.timeout_s !== null) {
+      if (typeof values.timeout_s !== 'number' || !Number.isFinite(values.timeout_s) ||
+          values.timeout_s <= 0 || values.timeout_s > 3600) return null;
+      out.timeout_s = values.timeout_s;
+    } else { out.timeout_s = null; }
+    return out;
+  }
+
+  function hasOnlyKeys(object, keys) {
+    var names = Object.keys(object);
+    for (var i = 0; i < names.length; i++) {
+      if (keys.indexOf(names[i]) === -1) return false;
+    }
+    return true;
+  }
+
+  // One CHOICE document (the saved one): a backend id or null, plus the three
+  // local-service values.
+  function parseRewriteChoice(choice) {
+    if (!choice || typeof choice !== 'object' || Array.isArray(choice)) return null;
+    if (!hasOnlyKeys(choice, REWRITE_CHOICE_KEYS)) return null;
+    var backend = null;
+    if (choice.backend !== null) {
+      if (typeof choice.backend !== 'string' ||
+          REWRITE_SETTINGS_BACKENDS.indexOf(choice.backend) === -1) return null;
+      backend = choice.backend;
+    }
+    var fields = parseRewriteLocalFields(choice);
+    if (fields === null) return null;
+    fields.backend = backend;
+    return fields;
+  }
+
+  // The block that describes the LOCAL service as this server runs it: the same
+  // three values and no backend, because the page does not choose a backend by
+  // editing it.
+  function parseRewriteLocal(local) {
+    if (!local || typeof local !== 'object' || Array.isArray(local)) return null;
+    if (!hasOnlyKeys(local, REWRITE_LOCAL_KEYS)) return null;
+    return parseRewriteLocalFields(local);
+  }
+
+  // The settings form's rows: every backend that exists on this server, with
+  // the reason one of them is greyed out. `available` is what the LAUNCH FLAGS
+  // make possible; no value typed here can change it.
+  function parseRewriteSettingsRows(rows) {
+    if (!Array.isArray(rows) || rows.length !== 2) return null;
+    var out = [];
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+      var keys = Object.keys(row);
+      for (var k = 0; k < keys.length; k++) {
+        if (REWRITE_SETTINGS_ROW_KEYS.indexOf(keys[k]) === -1) return null;
+      }
+      if (typeof row.id !== 'string' || REWRITE_SETTINGS_BACKENDS.indexOf(row.id) === -1) return null;
+      if (typeof row.label !== 'string' || !row.label || /[\/\\]/.test(row.label)) return null;
+      if (typeof row.uses_gpu !== 'boolean' || typeof row.available !== 'boolean') return null;
+      if (typeof row.reason !== 'string') return null;
+      if (!Array.isArray(row.tasks)) return null;
+      for (var t = 0; t < row.tasks.length; t++) {
+        if (REWRITE_TASKS.indexOf(row.tasks[t]) === -1) return null;
+      }
+      out.push({ id: row.id, label: row.label, tasks: row.tasks.slice(),
+                 uses_gpu: row.uses_gpu, available: row.available,
+                 reason: row.reason });
+    }
+    return out;
+  }
+
+  function rewriteRow(id) {
+    if (!rewriteSettings) return null;
+    for (var i = 0; i < rewriteSettings.backends.length; i++) {
+      if (rewriteSettings.backends[i].id === id) return rewriteSettings.backends[i];
+    }
+    return null;
+  }
+
+  function selectedRewriteBackend() {
+    var radios = document.querySelectorAll('input[name="rewrite-backend"]');
+    for (var i = 0; i < radios.length; i++) {
+      if (radios[i].checked) return radios[i].value;
+    }
+    return null;
+  }
+
+  // The POST envelope, built from what is on screen. An empty box is null —
+  // "keep what the server was started with" — never an empty string, which
+  // the server would refuse as a malformed address or name.
+  function rewriteSettingsEnvelope() {
+    var timeoutRaw = pyStrip(String($('rewrite-timeout').value));
+    var timeout = null;
+    if (timeoutRaw !== '') timeout = Number(timeoutRaw);
+    return {
+      schema: REWRITE_SETTINGS_SCHEMA,
+      backend: selectedRewriteBackend(),
+      endpoint: pyStrip(String($('rewrite-endpoint').value)) || null,
+      model: pyStrip(String($('rewrite-model').value)) || null,
+      timeout_s: timeout
+    };
+  }
+
+  function loadRewriteSettings() {
+    setText('rewrite-settings-error', '');
+    return apiRequest(API_REWRITE_SETTINGS,
+      { headers: { 'Accept': 'application/json', 'X-Qwen-UI': '1' } }, 'json')
+      .then(function (r) {
+        if (r.network) {
+          setText('rewrite-settings-error',
+            'The local engine server is unreachable, so the rewriter settings ' +
+            'could not be read.');
+          return null;
+        }
+        var payload = r.json;
+        var state = parseRewriteSettings(payload);
+        if (!state) {
+          // A refusal is information the user asked for; an unreadable
+          // document is not a setting, so nothing is pre-filled from it.
+          var err = r.res && r.res.ok ? null : payload;
+          setText('rewrite-settings-error', err && typeof err.message === 'string'
+            ? err.code + ': ' + err.message.slice(0, 200)
+            : 'The rewriter settings did not match the expected schema, so ' +
+              'nothing on this page was taken from them.');
+          rewriteSettings = null;
+        } else {
+          rewriteSettings = state;
+        }
+        renderRewriteSettings();
+        return state;
+      });
+  }
+
+  function renderRewriteSettings() {
+    var loaded = !!rewriteSettings;
+    var radios = document.querySelectorAll('input[name="rewrite-backend"]');
+    for (var i = 0; i < radios.length; i++) {
+      var radio = radios[i];
+      var row = radio.value === 'off' ? null : rewriteRow(radio.value);
+      // An unavailable backend stays visible with its reason: "Off" and a
+      // greyed-out choice explain themselves, a missing one does not.
+      var available = radio.value === 'off' ? true : !!(row && row.available);
+      radio.disabled = !loaded || (!available && radio.value !== rewriteSettings.backend);
+      radio.checked = loaded && (rewriteSettings.backend || 'off') === radio.value;
+      var reason = $('rewrite-backend-' +
+        (radio.value === 'pe-llamacpp' ? 'pe'
+          : radio.value === 'local-llm' ? 'local' : 'off') + '-reason');
+      if (reason) {
+        setText(reason.id, !loaded ? ''
+          : available ? '' : (row && row.reason ? row.reason
+            : 'this server cannot run that rewriter'));
+      }
+    }
+    var local = loaded ? rewriteSettings.local : { endpoint: null, model: null,
+                                                   timeout_s: null };
+    if (loaded) {
+      $('rewrite-endpoint').value = local.endpoint || '';
+      $('rewrite-model').value = local.model || '';
+      $('rewrite-timeout').value = local.timeout_s === null ? '' : String(local.timeout_s);
+    }
+    // The fields describe the LOCAL service, so they belong to that choice —
+    // but they stay readable when another rewriter is active, because the
+    // edit draft falls back to them and the user needs to see what it says.
+    var isLocal = loaded && selectedRewriteBackend() === 'local-llm';
+    ['rewrite-endpoint', 'rewrite-model', 'rewrite-timeout'].forEach(function (id) {
+      var input = $(id);
+      if (input) input.disabled = !loaded;
+      var box = input ? input.closest('.field') : null;
+      if (box) box.classList.toggle('field-muted', loaded && !isLocal);
+    });
+    var test = $('rewrite-test');
+    if (test) {
+      test.disabled = !loaded || rewriteTestBusy ||
+        !pyStrip(String($('rewrite-endpoint').value));
+    }
+    var save = $('rewrite-save');
+    if (save) save.disabled = !loaded || rewriteSettingsBusy || !selectedRewriteBackend();
+    setText('rewrite-settings-note', loaded ? rewriteSettings.note : '');
+    if (!loaded) {
+      setText('rewrite-save-status', '');
+      setText('rewrite-test-status', '');
+    }
+  }
+
+  function saveRewriteSettings() {
+    if (rewriteSettingsBusy) return;
+    var envelope = rewriteSettingsEnvelope();
+    if (!envelope.backend) {
+      setText('rewrite-settings-error', 'Choose a rewriter first.');
+      return;
+    }
+    rewriteSettingsBusy = true;
+    $('rewrite-save').disabled = true;
+    $('rewrite-save').setAttribute('aria-busy', 'true');
+    setText('rewrite-save-status', 'Saving…');
+    setText('rewrite-settings-error', '');
+    apiRequest(API_REWRITE_SETTINGS, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json',
+                 'X-Qwen-UI': '1' },
+      body: JSON.stringify(envelope)
+    }, 'json').then(function (r) {
+      rewriteSettingsBusy = false;
+      var button = $('rewrite-save');
+      if (button) button.removeAttribute('aria-busy');
+      if (r.network) {
+        setText('rewrite-save-status', '');
+        setText('rewrite-settings-error',
+          'The local engine server is unreachable; nothing was changed.');
+        renderRewriteSettings();
+        return;
+      }
+      var state = parseRewriteSettings(r.json);
+      if (!r.res.ok || !state) {
+        var payload = r.json;
+        setText('rewrite-save-status', '');
+        setText('rewrite-settings-error',
+          payload && typeof payload.message === 'string'
+            ? (payload.code || 'refused') + ': ' + payload.message.slice(0, 200)
+            : 'The server refused the change; the settings are unchanged.');
+        // The server is authoritative: re-read rather than keep a form the
+        // server did not accept.
+        loadRewriteSettings();
+        return;
+      }
+      rewriteSettings = state;
+      setText('rewrite-save-status',
+        'Saved. The next rewrite uses ' +
+        (state.backend ? rewriteLabel(state.backend) : 'no rewriter') +
+        (state.persistent ? '.' : ' — but this server has no cache directory, ' +
+         'so the change lasts only until it restarts.'));
+      renderRewriteSettings();
+      checkStatus();   // the Create view names the rewriter it will use
+    });
+  }
+
+  function testRewriteConnection() {
+    if (rewriteTestBusy) return;
+    var envelope = rewriteSettingsEnvelope();
+    rewriteTestBusy = true;
+    $('rewrite-test').disabled = true;
+    $('rewrite-test').setAttribute('aria-busy', 'true');
+    setText('rewrite-test-status', 'Testing…');
+    apiRequest(API_REWRITE_SETTINGS_TEST, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json',
+                 'X-Qwen-UI': '1' },
+      body: JSON.stringify({
+        schema: REWRITE_TEST_REQUEST_SCHEMA,
+        endpoint: envelope.endpoint, model: envelope.model,
+        timeout_s: envelope.timeout_s
+      }),
+      // A probe is bounded by the server; this only stops the page waiting on
+      // a socket that never answers.
+      timeoutMs: REWRITE_TIMEOUT_MS
+    }, 'json').then(function (r) {
+      rewriteTestBusy = false;
+      var button = $('rewrite-test');
+      if (button) button.removeAttribute('aria-busy');
+      renderRewriteSettings();
+      if (r.network) {
+        setText('rewrite-test-status',
+          'The local engine server is unreachable, so nothing could be tested.');
+        return;
+      }
+      var result = r.json;
+      if (!result || result.schema !== REWRITE_TEST_SCHEMA ||
+          typeof result.ok !== 'boolean' || typeof result.detail !== 'string') {
+        setText('rewrite-test-status',
+          'The test reply did not match the expected schema.');
+        return;
+      }
+      setText('rewrite-test-status',
+        (result.ok ? 'Works: ' : 'Failed: ') + result.detail.slice(0, 200) +
+        ' (' + result.elapsed_ms + ' ms)');
+    });
   }
 
   /* ---------------- Plan flow ----------------
@@ -2503,12 +2972,16 @@
     Object.keys(VIEWS).forEach(function (name) {
       $(VIEWS[name]).hidden = name !== active;
     });
-    ['create', 'history', 'settings'].forEach(function (name) {
+    ['create', 'history', 'settings', 'help'].forEach(function (name) {
       var link = $('nav-' + name);
       if (name === active) link.setAttribute('aria-current', 'page');
       else link.removeAttribute('aria-current');
     });
     activeView = active;
+    // The rewriter choice lives on the server, so opening the page RE-reads
+    // it: another browser (or another tab) may have changed it since, and a
+    // form that shows a stale choice would then be a form that lies.
+    if (active === 'settings') loadRewriteSettings();
   }
 
   function routeOnHashchange() {
@@ -3238,6 +3711,28 @@
       }
     });
 
+    // The Settings page. Every control here writes the SERVER's choice, so a
+    // change is only real once the server has answered: the form is rebuilt
+    // from the reply, never from what was typed.
+    Array.prototype.forEach.call(
+      document.querySelectorAll('input[name="rewrite-backend"]'),
+      function (radio) {
+        radio.addEventListener('change', function () {
+          setText('rewrite-save-status', '');
+          setText('rewrite-settings-error', '');
+          renderRewriteSettings();
+        });
+      });
+    ['rewrite-endpoint', 'rewrite-model', 'rewrite-timeout'].forEach(function (id) {
+      $(id).addEventListener('input', function () {
+        setText('rewrite-save-status', '');
+        setText('rewrite-test-status', '');
+        renderRewriteSettings();
+      });
+    });
+    $('rewrite-save').addEventListener('click', saveRewriteSettings);
+    $('rewrite-test').addEventListener('click', testRewriteConnection);
+
     ['steps', 'seed', 'cfg', 'width', 'height', 'prompt', 'negative'].forEach(function (id) {
       $(id).addEventListener('input', function () {
         if (id === 'width' || id === 'height') {
@@ -3284,6 +3779,9 @@
     syncPresetButtons();
     applyRecipeMode();   // lock state matches the checked recipe on load
     renderValidation(validateForm().errors);
+    // The Settings form starts unread: nothing is selectable until the server
+    // has said which rewriters it can actually run.
+    renderRewriteSettings();
 
     var generate = $('generate-btn');
     generate.disabled = true;   // enabled only by recognized server status
@@ -3309,7 +3807,7 @@
   // that shortens the whole-operation timeout so a stalled response BODY
   // can be observed quickly — production code never calls it.
   window.QwenStudio = {
-    version: 'w6-use-as-reference',
+    version: 'w7-rewriter-settings',
     formSnapshot: formSnapshot,
     buildEnvelope: buildEnvelope,
     validateForm: validateForm,
@@ -3377,6 +3875,17 @@
     showProposalRawForChecks: showProposal,
     bumpPromptRevisionForChecks: function () { bumpPromptRevision(); },
     PROMPT_MAX_CHARS: PROMPT_MAX_CHARS,
-    REWRITE_TIMEOUT_MS: REWRITE_TIMEOUT_MS
+    REWRITE_TIMEOUT_MS: REWRITE_TIMEOUT_MS,
+    // Rewriter-settings surface for the real-Chrome checks: the closed
+    // parsers, the envelope an empty box turns into null, and the two calls
+    // the Settings page makes.
+    parseRewriteBlock: parseRewriteBlock,
+    parseRewriteSettings: parseRewriteSettings,
+    rewriteSettingsEnvelope: rewriteSettingsEnvelope,
+    rewriteLabel: rewriteLabel,
+    loadRewriteSettings: loadRewriteSettings,
+    saveRewriteSettings: saveRewriteSettings,
+    testRewriteConnection: testRewriteConnection,
+    API_REWRITE_SETTINGS: API_REWRITE_SETTINGS
   };
 })();

@@ -63,7 +63,7 @@ def release_gpu_cache():
 class WebGeneration:
     def __init__(self, runtime: WebRuntime, *, trust_unbounded_host=False, executor=None,
                  performance=False, memory_release=None, reuse_verified_assets=None,
-                 gpu_cache_release=release_gpu_cache):
+                 gpu_cache_release=release_gpu_cache, gpu_lock=None):
         if _blockers(runtime):
             raise ValueError("generation runtime is incomplete or disabled")
         self.runtime = runtime
@@ -83,6 +83,15 @@ class WebGeneration:
         else:
             self.reuse_policy = VerificationReusePolicy(max_age_s=reuse_verified_assets)
         self._gpu_cache_release = gpu_cache_release
+        # The GPU is ONE resource, shared with the official prompt enhancer
+        # (9.5 GiB of the 16 GiB V100, loaded by a llama-server child that this
+        # process owns). The server creates the lock and hands the same object
+        # to the rewrite service; without it the enhancer and an image job
+        # would load onto the card together and one of them would die of it.
+        # A job WAITS here — a rewrite takes tens of seconds, which is honest
+        # queueing — while a rewrite asked to wait refuses instead, so a
+        # running image is never delayed by a text request.
+        self.gpu_lock = threading.Lock() if gpu_lock is None else gpu_lock
         self._lock = threading.Lock()
         self._metrics = {}
         self._executor = executor or self._execute
@@ -117,37 +126,43 @@ class WebGeneration:
             self._metrics[context.job_id] = {"started": started, "elapsed_ms": None,
                                              "phase_ms": {}, "completed_steps": 0,
                                              "total_steps": context.config.steps}
-        try:
-            if self.performance:
-                from qwen_engine.performance import PerformanceRecorder, stage
-                recorder = PerformanceRecorder(context.config)
-                with (Path(context.config.output_dir) / "performance.json").open("x", encoding="utf-8") as handle:
-                    status = "failed"
-                    try:
-                        with recorder.activate(), stage("total_job"):
-                            result = self._executor(context)
-                        status = "succeeded"
-                        return result
-                    finally:
-                        recorder.write(handle, status)
-            return self._executor(context)
-        except (JobCancelled, GenerationCancelled):
-            raise
-        except Exception:
-            print(f"qwen-web job {context.job_id} failed:", file=sys.stderr)
-            traceback.print_exc()
-            raise
-        finally:
-            with self._lock:
-                self._metrics[context.job_id]["elapsed_ms"] = (time.monotonic() - started) * 1000
-            # After every outcome, outside the job's elapsed time. A failed
-            # release is reported but never replaces the job's own result.
+        # Taken after the metrics bookkeeping and held across the cache release
+        # below, so the memory is back with the driver before the next holder
+        # (the following job, or the enhancer's llama-server) starts loading.
+        # Nothing else in this method may hold it, and nothing else does: a job
+        # that is queued on a rewrite has not started yet.
+        with self.gpu_lock:
             try:
-                self._gpu_cache_release()
+                if self.performance:
+                    from qwen_engine.performance import PerformanceRecorder, stage
+                    recorder = PerformanceRecorder(context.config)
+                    with (Path(context.config.output_dir) / "performance.json").open("x", encoding="utf-8") as handle:
+                        status = "failed"
+                        try:
+                            with recorder.activate(), stage("total_job"):
+                                result = self._executor(context)
+                            status = "succeeded"
+                            return result
+                        finally:
+                            recorder.write(handle, status)
+                return self._executor(context)
+            except (JobCancelled, GenerationCancelled):
+                raise
             except Exception:
-                print(f"qwen-web job {context.job_id}: GPU cache release failed:",
-                      file=sys.stderr)
+                print(f"qwen-web job {context.job_id} failed:", file=sys.stderr)
                 traceback.print_exc()
+                raise
+            finally:
+                with self._lock:
+                    self._metrics[context.job_id]["elapsed_ms"] = (time.monotonic() - started) * 1000
+                # After every outcome, outside the job's elapsed time. A failed
+                # release is reported but never replaces the job's own result.
+                try:
+                    self._gpu_cache_release()
+                except Exception:
+                    print(f"qwen-web job {context.job_id}: GPU cache release failed:",
+                          file=sys.stderr)
+                    traceback.print_exc()
 
     def report_steps(self, job_id, completed, total):
         """Actual completed sampler steps; never a wall-clock estimate."""

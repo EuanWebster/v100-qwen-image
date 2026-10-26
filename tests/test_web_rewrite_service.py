@@ -116,13 +116,23 @@ def test_disabled_settings_refuse_to_carry_a_backend_surface():
 
 def test_a_disabled_service_builds_no_client_at_all():
     service_off = rs.RewriteService(rs.RewriteSettings.disabled())
-    assert service_off._client is None
+    assert service_off._clients == {}
+    assert service_off.active_backend is None
+    assert service_off.available_backends() == []
 
 
 def test_status_block_carries_no_endpoint_or_path():
     block = service(answer()).status_block()
-    assert block == {"state": "available", "code": "rewrite_available",
-                     "backend": "local-llm", "reason": ""}
+    # The closed shape the UI parser expects, plus the two keys the amendment
+    # adds: which rewriters exist here, and the ROUTE their choice is written
+    # to. An on-disk path never appears — the file lives in the cache dir and
+    # is named on the operator's console instead.
+    assert set(block) == {"state", "code", "backend", "reason", "backends",
+                          "settings"}
+    assert block["backend"] == "local-llm" and block["reason"] == ""
+    assert [row["id"] for row in block["backends"]] == ["local-llm"]
+    assert block["settings"] == {"href": api.REWRITE_SETTINGS_HREF,
+                                 "saved": False}
     flat = json.dumps(block)
     assert "127.0.0.1" not in flat and "8079" not in flat and "http" not in flat
 

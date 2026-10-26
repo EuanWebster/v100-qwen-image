@@ -117,7 +117,9 @@ def test_disabled_server_answers_typed_503_and_touches_no_body():
 def test_default_status_block_is_the_canonical_disabled_block():
     block = api.status_response(api.WebRuntime()).payload["rewrite"]
     assert block == dict(api.REWRITE_DISABLED_BLOCK)
-    assert set(block) == {"state", "code", "backend", "reason"}
+    # The amendment adds the settings pointer to the canonical block: the page
+    # has to know where the choice lives even when nothing is configured.
+    assert set(block) == {"state", "code", "backend", "reason", "settings"}
 
 
 def test_disabled_service_is_a_real_service_without_a_client():
@@ -133,10 +135,24 @@ def test_enabled_status_block_names_only_the_backend():
     svc = service(answer())
     runtime = api.WebRuntime(rewrite_block=svc.status_block())
     block = api.status_response(runtime).payload["rewrite"]
+    # Which rewriter is live, which ones this server can run, and where the
+    # choice is changed: a route plus two labels — never an address, never a
+    # path, never a model identifier.
     assert block == {"state": "available", "code": "rewrite_available",
-                     "backend": "local-llm", "reason": ""}
+                     "backend": "local-llm", "reason": "",
+                     "backends": [{"id": "local-llm",
+                                   "label": "Local LLM service",
+                                   "tasks": ["t2i", "edit"],
+                                   "uses_gpu": False}],
+                     "settings": {"href": api.REWRITE_SETTINGS_HREF,
+                                  "saved": False}}
     # The endpoint is operator-private and must never reach the browser.
     assert ENDPOINT not in json.dumps(api.status_response(runtime).payload)
+    # And it still SERIALIZES: ``WebRuntime`` stores the block frozen, so a
+    # validator that echoed back tuples of mappingproxy would turn every
+    # status poll into a 500.
+    assert json.loads(json.dumps(
+        api.status_response(runtime).payload))["rewrite"]["backends"]
 
 
 # ------------------------------------------------------------- success

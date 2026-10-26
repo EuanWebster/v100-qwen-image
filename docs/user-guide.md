@@ -281,15 +281,23 @@ edits use essentially the whole card; Q8 does not.
 
 Design and memory matrix: [`image-edit-design.md`](image-edit-design.md).
 
-## Prompt rewriting — off by default
+## Prompt rewriting — two rewriters, chosen in Settings
 
-When the server is started **without** a rewriter (`--rewrite-backend off`, the
-default), the **Rewrite prompt** button is hidden and `POST /api/v1/rewrite`
-answers 503. Nothing about rewriting affects generation when it is off.
+When the server is started **without** any rewriter, the **Rewrite prompt**
+button is hidden and `POST /api/v1/rewrite` answers 503. Nothing about
+rewriting affects generation when it is off.
 
-To enable it, start the server against an OpenAI-compatible local service
-(`local-llm` is the only backend) and hand it the two system-prompt files the
-weights were trained on:
+Two rewriters exist, and one server can offer either or both:
+
+- **Official enhancer (Q8, uses GPU)** — the official `Qwen-Image-2.1-PE-T2I`
+  weights as a Q8_0 GGUF, run under `llama-server` for the length of one
+  rewrite and then shut down. Root measured 9.5 GiB resident on the V100,
+  about 70 tokens/s, and 14–37 s for one text-to-image draft. It rewrites
+  **text-to-image drafts only** — the edit weights are a separate model that
+  this build does not ship.
+- **Local LLM service** — an OpenAI-compatible service already running on this
+  machine (the shared Qwen3.8 by default). It never touches the GPU and answers
+  in seconds, and it is the only rewriter that can handle an **edit** draft.
 
 ```bash
 python -m qwen_engine.web --enable-generation --rewrite-backend local-llm \
@@ -300,6 +308,48 @@ python -m qwen_engine.web --enable-generation --rewrite-backend local-llm \
     --manifest models/manifest.json --models-dir models/assets \
     --cache-dir cache --output-dir output/web
 ```
+
+The enhancer needs two more flags, given together, and refuses startup with one
+line if either is missing, unreadable, or not executable:
+`--pe-llama-server /path/to/llama-server` and
+`--pe-t2i-model models/pe/PE-T2I-Q8_0/Qwen-Image-2.1-PE-T2I-Q8_0.gguf`. It
+reads the same digest-pinned t2i system prompt as the local service, so
+`--rewrite-prompt-t2i` is required alongside them. `--pe-timeout` defaults to
+300 s — the draft thinks out loud first, and that thinking is most of the
+tokens. `start-web.sh` passes all of it when both files exist; `QWEN_PE=0`
+leaves the enhancer out even then.
+
+### Settings → Prompt rewriter
+
+Which rewriter answers is **your setting, not the launch script's**. The
+**Settings** tab shows every rewriter this server can actually run — one with
+no binary, no GGUF or no system prompt on disk is not offered at all — plus the
+local service's endpoint, model name and timeout, and a **Test connection**
+button that asks the chosen rewriter for one short answer without touching the
+image model.
+
+The choice is **server-side and shared**: it is written to a `0600` JSON file
+in the server's cache directory (`cache/rewrite-settings.json`), re-read at
+startup, and every browser pointed at this server sees the same active
+rewriter. The launch flags say what is *possible* and seed the file the first
+time it is written; afterwards the file wins for the active rewriter, the
+endpoint, the model name and the timeout.
+
+Two consequences worth knowing:
+
+- The enhancer **cannot share the GPU with an image job** (9.5 GiB for it plus
+  13–15 GiB for the image model, on a 16 GiB card). An image job that is
+  already generating makes a rewrite refuse at once with `rewrite_gpu_busy`
+  rather than queue behind it; an image submitted during a rewrite waits the
+  14–37 s instead.
+- With the enhancer active, an **edit** draft still uses the local service,
+  because the enhancer has no edit weights. With no local service configured
+  that edit rewrite is refused, never answered by the wrong model.
+
+Nothing on that page accepts a filesystem path or an executable from the
+browser: the binary, the GGUF and the system prompts come from the operator's
+launch flags and are checked once at startup. The page can name a host, a port,
+a model and a number of seconds, and nothing else.
 
 The endpoint is the **full URL the client POSTs to**, not a bare base URL: it
 must be `http` (no TLS policy exists for a loopback service), name an explicit

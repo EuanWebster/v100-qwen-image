@@ -125,6 +125,13 @@ PLAN_ROUTE = "/api/v1/plan"
 EXPORT_ROUTE = "/api/v1/config/export"
 IMPORT_ROUTE = "/api/v1/config/import"
 REWRITE_ROUTE = "/api/v1/rewrite"
+
+#: The rewriter choice is SERVER-side: one page changes what every browser
+#: using this server does next, and nothing here accepts a filesystem path.
+#: ``/test`` probes the local service only — the enhancer cannot be probed
+#: without loading 9.5 GiB onto the GPU.
+SETTINGS_ROUTE = "/api/v1/settings/rewrite"
+SETTINGS_TEST_ROUTE = "/api/v1/settings/rewrite/test"
 JOBS_ROUTE = "/api/v1/jobs"
 _JOB_ROUTE = re.compile(r"/api/v1/jobs/([0-9a-f]{32})(?:/(image|cancel|forget))?\Z")
 REFERENCES_ROUTE = "/api/v1/references"
@@ -312,6 +319,8 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "static", target
         if target == STATUS_ROUTE:
             return "status", target
+        if target == SETTINGS_ROUTE:
+            return "settings_get", target
         if target == JOBS_ROUTE:
             return "jobs", target
         match = _REFERENCE_ROUTE.fullmatch(target)
@@ -326,6 +335,10 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "import", target
         if target == REWRITE_ROUTE:
             return "rewrite", target
+        if target == SETTINGS_TEST_ROUTE:
+            return "settings_test", target
+        if target == SETTINGS_ROUTE:
+            return "settings_set", target
         if target == JOBS_ROUTE:
             return "submit", target
         if target == REFERENCES_ROUTE:
@@ -349,10 +362,15 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
         raise ApiError(405, "method_not_allowed", "this route does not accept that method",
                        headers=(("Allow", "GET, POST"),))
     known = set(STATIC_ROUTES) | {STATUS_ROUTE, PLAN_ROUTE, EXPORT_ROUTE,
-                                  IMPORT_ROUTE, REWRITE_ROUTE}
+                                  IMPORT_ROUTE, REWRITE_ROUTE, SETTINGS_ROUTE,
+                                  SETTINGS_TEST_ROUTE}
     if target in known:
-        allow = "POST" if target in (PLAN_ROUTE, EXPORT_ROUTE, IMPORT_ROUTE,
-                                     REWRITE_ROUTE) else "GET"
+        # The Settings page reads its state with GET and writes it with POST;
+        # everything else here is one method only.
+        allow = ("GET, POST" if target == SETTINGS_ROUTE else
+                 "POST" if target in (PLAN_ROUTE, EXPORT_ROUTE, IMPORT_ROUTE,
+                                      REWRITE_ROUTE, SETTINGS_TEST_ROUTE)
+                 else "GET")
         raise ApiError(405, "method_not_allowed",
                        "this route does not accept that method",
                        headers=(("Allow", allow),))
@@ -668,6 +686,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, self.server.assets[asset], ctype)
             elif kind == "status":
                 self._send_api(api.status_response(self.server.web_runtime))
+            elif kind == "settings_get":
+                self._send_api(settings_get_response(
+                    getattr(self.server, "rewrite", None)))
             elif kind in ("reference", "reference_thumb"):
                 data, ctype = api.reference_bytes(self.server.web_runtime, arg,
                                                   thumb=kind == "reference_thumb")
@@ -705,6 +726,14 @@ class _Handler(BaseHTTPRequestHandler):
                 body = self.rfile.read(length)
                 if len(body) != length:
                     self.send_error(400, "request body ended early")
+                    return
+                if kind == "settings_set":
+                    self._send_api(settings_post_response(
+                        getattr(self.server, "rewrite", None), body))
+                    return
+                if kind == "settings_test":
+                    self._send_api(settings_test_response(
+                        getattr(self.server, "rewrite", None), body))
                     return
                 if kind == "plan":
                     self._send_api(api.plan_response(self.server.web_runtime, body))
@@ -1022,8 +1051,10 @@ def build_parser() -> argparse.ArgumentParser:
     # -- prompt rewriting (opt-in; off by default) --------------------------
     p.add_argument("--rewrite-backend", choices=("off",) + _rewrite_service.BACKENDS,
                    default="off",
-                   help="prompt-rewriter backend (default off: the UI hides the "
-                        "Rewrite action and /api/v1/rewrite answers 503)")
+                   help="the rewriter to START with when nothing is saved in "
+                        "Settings (default off); the enhancer is the default "
+                        "whenever its flags are given, and Settings then wins "
+                        "over both")
     p.add_argument("--rewrite-endpoint", default=None,
                    help="OpenAI-compatible base URL for the rewriter "
                         "(http(s) only; no credentials are accepted here)")
@@ -1039,6 +1070,24 @@ def build_parser() -> argparse.ArgumentParser:
                    default=_rewrite_service.DEFAULT_TIMEOUT_SECONDS,
                    help="seconds a single rewrite may take before the request "
                         f"times out (default {_rewrite_service.DEFAULT_TIMEOUT_SECONDS:g})")
+    # -- the official prompt enhancer: llama.cpp + the Q8_0 GGUF ------------
+    # These two name FILES on this machine, so they exist only as launch flags:
+    # the Settings page may CHOOSE the enhancer but can never point it at a
+    # binary or a model, and both must be given together.
+    p.add_argument("--pe-llama-server", default=None, metavar="PATH",
+                   help="llama-server binary for the official prompt enhancer "
+                        "(give it together with --pe-t2i-model; never settable "
+                        "from the browser)")
+    p.add_argument("--pe-t2i-model", default=None, metavar="PATH",
+                   help="the enhancer's Q8_0 GGUF (give it together with "
+                        "--pe-llama-server)")
+    p.add_argument("--pe-timeout", type=float,
+                   default=_rewrite_service.DEFAULT_PE_TIMEOUT_SECONDS,
+                   metavar="SECONDS",
+                   help="seconds one enhancer rewrite may take, thinking "
+                        "included (default "
+                        f"{_rewrite_service.DEFAULT_PE_TIMEOUT_SECONDS:g}: the "
+                        "thinking block alone can run to its token budget)")
     for flag in ("output-dir", "cache-dir", "log-dir", "benchmarks-dir",
                  "references-dir"):
         p.add_argument(f"--{flag}", default=None,
@@ -1055,42 +1104,166 @@ def _startup_config_or_exit(paths: dict[str, str | None]) -> int:
             print(f"config error: {err}", file=sys.stderr)
         return 2
     return 0
+def pe_flags_error(args: argparse.Namespace) -> str:
+    """One bounded startup line when the enhancer flags are wrong, else ``""``.
+
+    The binary and the GGUF must be given together and must be usable — binary
+    readable AND executable, model readable. A missing model would otherwise
+    surface as a mysterious backend failure forty seconds into the first
+    rewrite; here it is one line and exit 2. The digest-pinned system prompt the
+    enhancer reads is checked where it is loaded (:func:`load_system_prompt`),
+    because a drifted prompt is the same class of refusal.
+    """
+    binary, model = args.pe_llama_server, args.pe_t2i_model
+    if binary is None and model is None:
+        return ""
+    if binary is None or model is None:
+        return ("--pe-llama-server and --pe-t2i-model must be given together: "
+                "the enhancer needs its binary and its model")
+    if not os.path.isfile(binary) or not os.access(binary, os.R_OK | os.X_OK):
+        return f"--pe-llama-server is not a readable executable file: {binary}"
+    if not os.path.isfile(model) or not os.access(model, os.R_OK):
+        return f"--pe-t2i-model is not a readable file: {model}"
+    if args.rewrite_prompt_t2i is None:
+        return ("the enhancer needs --rewrite-prompt-t2i: the digest-pinned "
+                "system prompt its weights were trained on")
+    return ""
 
 
 def build_rewrite_service(args: argparse.Namespace,
                           references_dir: str | None = None,
+                          *, cache_dir: str | None = None,
+                          gpu_lock: threading.Lock | None = None,
                           ) -> _rewrite_service.RewriteService:
     """Construct the rewriter from the CLI flags, or refuse at startup.
 
     Operator errors are startup errors: a bad endpoint, a missing prompt or a
     digest mismatch prints ONE bounded line to stderr and exits 2 — the server
-    never starts in a half-configured state, and the browser never learns any
-    of this (its status block is four fixed keys).
+    never starts half-configured, and the browser never learns any of it (its
+    status block is a closed set of keys that carries no location).
 
-    ``off`` still yields a real service (holding no client) so the status block
-    and the typed 503 exist uniformly. ``references_dir`` is the server's
-    reference store, which edit rewrites read their images from.
+    The flags say what is POSSIBLE; the saved Settings document (applied after
+    this by :func:`load_saved_preferences`) says which possibility is ACTIVE.
+    With nothing saved the enhancer wins when it exists, because it is the
+    standard rewriter. ``references_dir`` is the store edit rewrites read their
+    images from; ``cache_dir`` holds the saved settings and the enhancer's
+    bounded log file; ``gpu_lock`` is the SAME lock the generation executor
+    takes around a job.
     """
-    if args.rewrite_backend == "off":
-        return _rewrite_service.RewriteService(_rewrite_service.RewriteSettings.disabled())
     prompts: dict[str, str] = {}
-    for task, flag in (("t2i", args.rewrite_prompt_t2i),
-                       ("edit", args.rewrite_prompt_edit)):
+    for task in rw.TASKS:
+        flag = getattr(args, f"rewrite_prompt_{task}")
         if flag is None:
-            raise rc.RewriteConfigError(
-                f"--rewrite-backend {args.rewrite_backend} needs "
-                f"--rewrite-prompt-{task}")
+            continue
         # Digest-pinned: a drifted prompt refuses here, never at request time.
         prompts[task] = rw.load_system_prompt(flag, task)
-    settings = _rewrite_service.RewriteSettings(
-        backend=args.rewrite_backend,
-        endpoint=args.rewrite_endpoint,
-        model=args.rewrite_model,
-        prompts=prompts,
-        timeout=args.rewrite_timeout,
-        references_dir=references_dir,
-    )
-    return _rewrite_service.RewriteService(settings)
+    # The local service is configured by its OWN flags, whatever the default
+    # backend is: a server that starts on the enhancer still needs it for edit
+    # drafts, and Settings still needs it to have something to switch to.
+    complete = (args.rewrite_endpoint is not None and args.rewrite_model is not None
+                and len(prompts) == len(rw.TASKS))
+    if args.rewrite_backend == "local-llm" and not complete:
+        missing = [f"--rewrite-prompt-{task}" for task in rw.TASKS
+                   if task not in prompts]
+        if args.rewrite_endpoint is None:
+            missing.append("--rewrite-endpoint")
+        if args.rewrite_model is None:
+            missing.append("--rewrite-model")
+        raise rc.RewriteConfigError(
+            f"--rewrite-backend local-llm needs {', '.join(missing)}")
+    local = (_rewrite_service.RewriteSettings(
+        backend="local-llm", endpoint=args.rewrite_endpoint,
+        model=args.rewrite_model, prompts=prompts,
+        timeout=args.rewrite_timeout, references_dir=references_dir)
+        if complete else _rewrite_service.RewriteSettings.disabled())
+    enhancer = None
+    if args.pe_llama_server is not None and args.pe_t2i_model is not None:
+        enhancer = _rewrite_service.PESettings(
+            llama_server=args.pe_llama_server, model_path=args.pe_t2i_model,
+            system_prompt=prompts.get("t2i") or "", timeout=args.pe_timeout)
+    if args.rewrite_backend == "pe-llamacpp" and enhancer is None:
+        raise rc.RewriteConfigError(
+            "--rewrite-backend pe-llamacpp needs --pe-llama-server and "
+            "--pe-t2i-model")
+    return _rewrite_service.RewriteService(local, pe=enhancer,
+                                           gpu_lock=gpu_lock,
+                                           cache_dir=cache_dir)
+
+
+def load_saved_preferences(service: _rewrite_service.RewriteService,
+                           cache_dir: str | None) -> bool:
+    """Apply the saved Settings document over the flag defaults.
+
+    A corrupt or invalid file is ONE bounded stderr line and the flag defaults:
+    a rewriter that cannot read its own preferences still starts, and the
+    operator hears about it at start-up rather than in a browser message. The
+    document is never rewritten here (``persist=False``) — loading must not
+    have side effects.
+    """
+    prefs, warning = _rewrite_service.load_preferences(
+        _rewrite_service.preferences_path(cache_dir))
+    if warning:
+        print(f"rewrite settings: {warning}", file=sys.stderr)
+    if prefs is None:
+        return False
+    service.apply_preferences(prefs, persist=False)
+    return True
+
+
+def settings_get_response(service: _rewrite_service.RewriteService | None) -> ApiResponse:
+    """``GET /api/v1/settings/rewrite``. The choice is readable even when the
+    rewriter is off — that is exactly when the page has to be able to turn it
+    on — and the payload is the validated state, which carries no path."""
+    if service is None:
+        raise ApiError(503, "settings_unavailable",
+                       "this server has no rewriter settings to read")
+    return ApiResponse(200, service.settings_state())
+
+
+def settings_post_response(service: _rewrite_service.RewriteService | None,
+                           body: bytes) -> ApiResponse:
+    """``POST /api/v1/settings/rewrite``: validate, refuse the impossible,
+    then adopt and persist, and answer with the state the NEXT rewrite uses.
+
+    A change that cannot be written to the cache dir is rolled back in memory
+    and reported: the page must never show a setting the file does not hold,
+    because the next start-up would quietly disagree with it.
+    """
+    if service is None:
+        raise ApiError(503, "settings_unavailable",
+                       "this server has no rewriter settings to change")
+    fields = api.build_rewrite_settings_request(body)
+    prefs = _rewrite_service.RewritePreferences(
+        backend=fields["backend"], endpoint=fields["endpoint"],
+        model=fields["model"], timeout_s=fields["timeout_s"])
+    service.check_preferences(prefs)
+    previous = service.preferences()
+    try:
+        service.apply_preferences(prefs)
+    except OSError:
+        # ``apply_preferences`` already put the previous choice back, so there
+        # is nothing to undo here beyond saying so: a change the cache dir
+        # refused to hold must not be shown as saved.
+        raise ApiError(503, "settings_unavailable",
+                       "the rewriter settings could not be written in the "
+                       "server cache directory; nothing was changed") from None
+    return ApiResponse(200, service.settings_state())
+
+
+def settings_test_response(service: _rewrite_service.RewriteService | None,
+                           body: bytes) -> ApiResponse:
+    """``POST /api/v1/settings/rewrite/test``: one tiny completion, in plain
+    words. It never touches the GPU and never takes the rewrite slot."""
+    if service is None:
+        raise ApiError(503, "settings_unavailable",
+                       "this server has no rewriter settings to test")
+    fields = api.build_rewrite_test_request(body)
+    try:
+        result = service.test_connection(fields["endpoint"], fields["model"],
+                                         fields["timeout_s"])
+    except rc.RewriteConfigError as exc:
+        raise ApiError(422, "endpoint_unsupported", str(exc)) from None
+    return ApiResponse(200, result)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1147,15 +1320,33 @@ def main(argv: list[str] | None = None) -> int:
     if status:
         return status
 
+    pe_error = pe_flags_error(args)
+    if pe_error:
+        # One bounded line, before any bind: the enhancer is either fully
+        # configured by the operator or not offered at all.
+        print(f"error: {pe_error}", file=sys.stderr)
+        return 2
+
+    # ONE lock for the ONE V100, handed to the rewriter and to the generation
+    # executor: 9.5 GiB of enhancer plus 13-15 GiB of image model does not fit
+    # in 16 GiB, so whichever did not ask first must not simply load.
+    gpu_lock = threading.Lock()
     try:
-        rewrite = build_rewrite_service(args, paths["references_dir"])
+        rewrite = build_rewrite_service(args, paths["references_dir"],
+                                       cache_dir=paths["cache_dir"],
+                                       gpu_lock=gpu_lock)
+        saved_warning = load_saved_preferences(rewrite, paths["cache_dir"])
     except (rc.RewriteConfigError, rw.RewriteError) as exc:
         # Bounded operator diagnostic: the message may name a path, which is
         # fine on a local console and MUST NOT reach the browser (it does not:
-        # the status block is four fixed keys and the 503 is a fixed string).
+        # the status block is a closed set of keys and the 503 is a fixed
+        # string).
         print(f"rewrite error: {exc}", file=sys.stderr)
         return 2
-
+    if saved_warning:
+        # The saved document is the user's own Settings; a broken one falls
+        # back to the flags rather than taking the server down.
+        print(f"rewrite settings: {saved_warning}", file=sys.stderr)
     if paths["manifest_path"] is None:
         summary = api.summarize_manifest_bytes(None)
     else:
@@ -1201,7 +1392,8 @@ def main(argv: list[str] | None = None) -> int:
             Path(runtime.output_dir).mkdir(parents=True, exist_ok=True)
             httpd.generation = WebGeneration(runtime, trust_unbounded_host=args.attest_unbounded_host,
                                             performance=args.performance,
-                                            reuse_verified_assets=reuse_policy)
+                                            reuse_verified_assets=reuse_policy,
+                                            gpu_lock=gpu_lock)
         except (OSError, ValueError, RuntimeError):
             for listener in listeners:
                 listener.server_close()
@@ -1222,7 +1414,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"qwen-web listening on http://{listener.bound_ip}:{port}")
     mode = "generation enabled (serial jobs)" if httpd.generation else "planning only (no generation)"
     if rewrite.available:
-        mode += f"; prompt rewriting enabled ({rewrite.settings.backend})"
+        # Which one will answer, and which ones could have: the operator sees
+        # the enhancer is the active rewriter without reading the settings file.
+        mode += (f"; prompt rewriting enabled ({rewrite.active_backend}"
+                 f" of {', '.join(rewrite.available_backends())})")
     else:
         mode += "; prompt rewriting off"
     print(f"qwen-web: {mode}; explicit address binds with per-listener "

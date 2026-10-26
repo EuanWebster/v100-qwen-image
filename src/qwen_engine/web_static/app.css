@@ -538,6 +538,53 @@ details.advanced > .help { margin-top: 10px; }
 .settings-list dt { font-weight: 650; }
 .settings-list dd { margin: 0; color: var(--text-muted); }
 
+/* ---------- Prompt rewriter settings (the server's own choice) ----------
+   The page writes ONE server-side document, so it reads as a form with an
+   explicit Save rather than like the instant-apply controls on Create. A
+   greyed-out choice stays visible WITH its reason: an absent option would
+   leave the user guessing why there is nothing to pick. */
+.settings-shared { max-width: 720px; margin: 0 0 18px; font-size: 13px; }
+.settings-section {
+  max-width: 720px; margin: 0 0 22px; padding: 16px;
+  background: var(--bg-panel); border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+}
+.settings-section h3 { margin: 0 0 6px; font-size: 15px; }
+.settings-section > .help { max-width: 62ch; }
+.settings-radios {
+  margin: 14px 0 0; padding: 12px 14px;
+  border: 1px solid var(--border-soft); border-radius: 8px;
+}
+.settings-radios legend { padding: 0 6px; font-size: 13px; font-weight: 650;
+                          color: var(--text-muted); }
+.settings-radio { display: flex; align-items: center; gap: 8px; margin: 4px 0;
+                  font-size: 14px; font-weight: 500; color: var(--text); }
+.settings-radio input { width: auto; margin: 0; flex: 0 0 auto; }
+.settings-radio input:disabled + span { color: var(--text-muted); }
+.settings-reason { margin: 2px 0 10px 26px; font-size: 12px; }
+.settings-reason:empty { display: none; }
+/* The local service's own fields belong to its radio, so they sit indented
+   under it — but they stay READABLE when another rewriter is active, because
+   an edit draft falls back to them and the user must see what it says. */
+.settings-fields { margin: 4px 0 12px 26px; padding-left: 14px;
+                   border-left: 2px solid var(--border-soft); }
+.field-narrow { max-width: 180px; }
+.field-muted { opacity: 0.72; }
+.settings-actions { display: flex; flex-wrap: wrap; gap: 10px;
+                    align-items: center; margin-top: 10px; }
+.settings-actions .help { margin: 0; }
+.settings-gpu { margin-top: 12px; }
+#rewrite-save-status:not(:empty) { color: var(--ok); }
+
+/* Which rewriter the Create page is using, and which one produced a
+   suggestion: both are stated, because the two choices cost different things. */
+.rewrite-active { margin: 6px 0 0; font-size: 12px; color: var(--text-muted); }
+.rewrite-active:empty { display: none; }
+.rewrite-change { color: var(--accent); margin-left: 6px; }
+.rewrite-source { margin: 0 0 8px; font-size: 12px; color: var(--text-muted); }
+.rewrite-source:empty { display: none; }
+.rewrite-actions .help a { color: var(--accent); }
+
 .back-link { color: var(--accent); text-decoration: none; display: inline-block;
              margin-top: 14px; }
 .back-link:hover { text-decoration: underline; }

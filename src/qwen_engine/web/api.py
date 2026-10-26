@@ -36,6 +36,7 @@ from typing import Any
 from qwen_engine import _jsonsafe
 from qwen_engine import reference_store as _reference_store
 from qwen_engine import rewrite as _rewrite
+from qwen_engine import rewrite_client as _rewrite_client
 from qwen_engine.config import REF_MAX, SEED_MAX, ConfigError, GenerationConfig
 from qwen_engine.core import plan as core_plan
 
@@ -102,10 +103,18 @@ _SEED_WIRE_RE = re.compile(r"[0-9]{1,20}\Z")
 #: Bound on any single public error message (safe, single-line, truncated).
 MAX_MESSAGE_CHARS = 200
 
-#: The rewrite status block is exactly these four keys (plan §4.1): the UI
-#: parser is strict, so the server never widens its own contract — an extra
-#: key would be a silent wire change.
+#: The rewrite status block is exactly these four keys (plan §4.1), plus the
+#: additive keys below: the UI parser is strict, so the server never widens
+#: its own contract by surprise — and a block that carries a key the validator
+#: does not know is still a wire change and is refused.
 _REWRITE_BLOCK_KEYS = frozenset({"state", "code", "backend", "reason"})
+
+#: OPTIONAL additions. A server that predates the two-backend rewriter sends
+#: neither, and the new UI must parse that block unchanged:
+#: ``backends`` — which rewriters exist here and what each can do;
+#: ``settings`` — the route the Settings page writes its choice to, and whether
+#: a saved document is on disk. A ROUTE, never a filesystem path.
+_REWRITE_BLOCK_KEYS_OPTIONAL = frozenset({"backends", "settings"})
 
 #: The CLOSED state/code pairs, mirroring ``REWRITE_STATES`` in app.js: the
 #: code is the key, the state is the value it must pair with. Rewriting is
@@ -120,10 +129,132 @@ _REWRITE_PAIRS: Mapping[str, str] = {
 #: backend lives. Refusing is cheap; a leaked loopback address is not.
 _LOCATION_MARKERS = ("://", "/", "\\")
 _IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+#: A command-line option (``-m``, ``--no-webui``, ``--port=8080``). Only the
+#: enhancer's spawn error can carry one, and nothing that reaches the browser
+#: may quote the operator's command line.
+_COMMAND_FLAG_RE = re.compile(r"(?:\A|(?<=\s))--?[A-Za-z][\w-]*")
 
-#: A backend is a short label the UI displays, matching the CLI's own names
-#: (``local-llm``); anything address-shaped is a configuration error.
+
+def strip_command(text: str) -> str:
+    """One line of prose with addresses, paths and options removed.
+
+    Shared by the two places that turn a backend or spawn failure into a
+    sentence for the page (:func:`rewrite_test_result` here, ``_public_reason``
+    in the rewrite service), so neither can drift from the other.
+    """
+    text = _IPV4_RE.sub("the host", " ".join(str(text or "").split()))
+    for marker in _LOCATION_MARKERS:
+        text = text.replace(marker, " ")
+    text = _COMMAND_FLAG_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
+#: A backend id as it travels on the wire: a label, never an address or path.
 _BACKEND_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+#: The two rewriter backends, in preference order. The official enhancer is
+#: the standard rewriter; the local LLM service is the alternative that never
+#: touches the GPU. ``off`` is NOT a backend — it is reachable from Settings
+#: only, and never builds a client.
+REWRITE_BACKENDS: tuple[str, ...] = ("pe-llamacpp", "local-llm")
+
+#: Where the rewriter choice lives, as the browser sees it: a ROUTE, never a
+#: filesystem path. ONE definition, because the status block, the Settings
+#: payload and the router must name the same door.
+REWRITE_SETTINGS_HREF = "/api/v1/settings/rewrite"
+REWRITE_SETTINGS_TEST_HREF = REWRITE_SETTINGS_HREF + "/test"
+
+#: Everything the Settings page may choose, including switching off.
+REWRITE_SETTINGS_BACKENDS: tuple[str, ...] = REWRITE_BACKENDS + ("off",)
+
+#: The friendly names. ONE definition, because the status block, the Settings
+#: payload and the suggestion box must not disagree about what a rewriter is
+#: called. A label is display text: never a path, an address or a model id.
+REWRITE_BACKEND_LABELS: Mapping[str, str] = {
+    "pe-llamacpp": "Official enhancer (Q8, uses GPU)",
+    "local-llm": "Local LLM service",
+    "off": "Off",
+}
+
+#: The closed shape of one ``backends`` row. ``tasks`` is what that backend can
+#: rewrite (the enhancer has no edit weights), ``uses_gpu`` says plainly that
+#: choosing it takes the V100 — and so waits for, or blocks, image jobs. In the
+#: Settings form a row also carries whether it is usable here and why not.
+_BACKEND_ROW_KEYS = frozenset({"id", "label", "tasks", "uses_gpu"})
+_BACKEND_ROW_KEYS_SETTINGS = _BACKEND_ROW_KEYS | {"available", "reason"}
+
+
+def validate_rewrite_backend_row(row: Any, *, settings_form: bool = False) -> dict[str, Any]:
+    """One ``backends`` row, pure. Raises :class:`ValueError`, bounded.
+
+    The label must be EXACTLY the one this module publishes: a server that
+    invented a friendlier name would be changing what the browser displays
+    without changing the browser.
+    """
+    want = _BACKEND_ROW_KEYS_SETTINGS if settings_form else _BACKEND_ROW_KEYS
+    if not isinstance(row, Mapping) or set(row) != want:
+        raise ValueError(
+            "a rewrite backend row must carry exactly "
+            f"{sorted(want)}; got {sorted(map(str, row)) if isinstance(row, Mapping) else type(row).__name__}")
+    backend = row["id"]
+    if backend not in REWRITE_BACKENDS:
+        raise ValueError(f"unknown rewrite backend id {backend!r}")
+    if row["label"] != REWRITE_BACKEND_LABELS[backend]:
+        raise ValueError(
+            f"the label for {backend!r} must be {REWRITE_BACKEND_LABELS[backend]!r}")
+    tasks = row["tasks"]
+    # A status block is validated TWICE: once by the service that built it (a
+    # plain document) and once by ``WebRuntime`` after ``freeze_json`` turned
+    # every list into a tuple. Both shapes are legal input; what comes back is
+    # always the plain JSON form, because ``json.dumps`` cannot serialize a
+    # mappingproxy and a status payload must never 500 on its own shape.
+    if (not isinstance(tasks, (list, tuple)) or not tasks
+            or len(set(tasks)) != len(tasks)
+            or any(task not in _rewrite.TASKS for task in tasks)):
+        raise ValueError(
+            f"a rewrite backend row needs a non-empty unique subset of "
+            f"{list(_rewrite.TASKS)} as tasks")
+    if type(row["uses_gpu"]) is not bool:
+        raise ValueError("a rewrite backend row needs a boolean uses_gpu")
+    if settings_form:
+        if type(row["available"]) is not bool or not isinstance(row["reason"], str):
+            raise ValueError("a settings rewrite backend row needs a boolean "
+                             "available and a string reason")
+        if row["available"]:
+            if row["reason"] != "":
+                raise ValueError("an available settings rewrite backend carries "
+                                 "no reason")
+        else:
+            if not row["reason"].strip():
+                raise ValueError("an unavailable settings rewrite backend needs "
+                                 "a reason")
+            for marker in _LOCATION_MARKERS:
+                if marker in row["reason"]:
+                    raise ValueError(
+                        "a rewrite availability reason must not disclose a "
+                        "location (URL or path)")
+            if _IPV4_RE.search(row["reason"]):
+                raise ValueError(
+                    "a rewrite availability reason must not disclose an address")
+    out = {"id": backend, "label": row["label"], "tasks": list(tasks),
+           "uses_gpu": row["uses_gpu"]}
+    if settings_form:
+        out["available"] = row["available"]
+        out["reason"] = row["reason"]
+    return out
+
+
+def validate_rewrite_backend_rows(rows: Any,
+                                  *, settings_form: bool = False) -> list[dict[str, Any]]:
+    """A non-empty list of unique backend rows, in the server's order."""
+    if not isinstance(rows, (list, tuple)) or not rows:
+        raise ValueError("the rewrite backends list must be a non-empty list")
+    checked = [validate_rewrite_backend_row(row, settings_form=settings_form)
+               for row in rows]
+    ids = [row["id"] for row in checked]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"the rewrite backends list repeats a backend: {ids}")
+    return checked
 
 
 def validate_rewrite_block(block: Any) -> dict[str, Any]:
@@ -134,16 +265,21 @@ def validate_rewrite_block(block: Any) -> dict[str, Any]:
     block through here), so the server cannot emit a document its own UI
     parser would reject. Raises :class:`ValueError` with a bounded message.
 
-    The rules are the UI's rules: exactly four keys, a CLOSED state/code pair,
-    a backend IFF available, a reason IFF unavailable, and no location in the
-    reason.
+    The rules are the UI's rules: the four keys (plus the optional additive
+    ``backends`` list and ``settings`` pointer), a CLOSED state/code pair, a
+    backend IFF available, a reason IFF unavailable, no location in the reason,
+    and a backend id that is one of the rows the block itself advertises.
     """
     if not isinstance(block, Mapping):
         raise ValueError("web rewrite block must be a JSON mapping")
-    if set(block) != _REWRITE_BLOCK_KEYS:
+    keys = set(block)
+    if not _REWRITE_BLOCK_KEYS <= keys <= (_REWRITE_BLOCK_KEYS
+                                           | _REWRITE_BLOCK_KEYS_OPTIONAL):
         raise ValueError(
-            "web rewrite block must carry exactly "
-            f"{sorted(_REWRITE_BLOCK_KEYS)}; got {sorted(map(str, block))}")
+            "web rewrite block must carry "
+            f"{sorted(_REWRITE_BLOCK_KEYS)} (plus optionally "
+            f"{sorted(_REWRITE_BLOCK_KEYS_OPTIONAL)}); "
+            f"got {sorted(map(str, keys))}")
     state, code = block["state"], block["code"]
     backend, reason = block["backend"], block["reason"]
     if _REWRITE_PAIRS.get(code) != state:
@@ -174,7 +310,37 @@ def validate_rewrite_block(block: Any) -> dict[str, Any]:
                 "a rewrite reason must not disclose a location (URL or path)")
     if _IPV4_RE.search(reason):
         raise ValueError("a rewrite reason must not disclose a location (address)")
+    if "backends" in block:
+        rows = validate_rewrite_backend_rows(block["backends"])
+        # Normalized, so what ``WebRuntime`` stores is JSON-serializable even
+        # though it arrived frozen (a tuple of mappingproxies).
+        block = {**block, "backends": rows}
+        if state == "available" and backend not in [row["id"] for row in rows]:
+            # The block would advertise one running rewriter and a different
+            # list of what may be chosen: refuse the mismatch.
+            raise ValueError(
+                f"an available rewrite block must list its own backend "
+                f"{backend!r} among its backends")
+    if "settings" in block:
+        block = {**block, "settings": validate_rewrite_settings_pointer(
+            block["settings"])}
     return dict(block)
+
+
+def validate_rewrite_settings_pointer(pointer: Any) -> dict[str, Any]:
+    """The ``settings`` key of a status block: WHERE the choice is changed.
+
+    The amendment asks status to report "the settings location". On a wire the
+    browser reads, a location is a ROUTE — the on-disk file lives in the
+    server's cache dir and is named on the operator's console, never here.
+    """
+    if (not isinstance(pointer, Mapping) or set(pointer) != {"href", "saved"}
+            or pointer["href"] != REWRITE_SETTINGS_HREF
+            or not isinstance(pointer["saved"], bool)):
+        raise ValueError(
+            "a rewrite settings pointer must be exactly "
+            f'{{"href": {REWRITE_SETTINGS_HREF!r}, "saved": <bool>}}')
+    return {"href": REWRITE_SETTINGS_HREF, "saved": pointer["saved"]}
 
 
 def _safe(text: Any, limit: int = MAX_MESSAGE_CHARS) -> str:
@@ -906,15 +1072,17 @@ def validate_rewrite_fields(request: Mapping[str, Any]) -> dict[str, Any]:
             "image_ids": image_ids}
 
 
-#: The canonical "no rewriter here" block. One source of truth: an
-#: unconfigured server, a disabled flag and a failed service all report this
-#: exact shape, so the UI's strict parser has one thing to recognise.
+#: The canonical "no rewriter here" block. One source of truth: a server built
+#: without a rewrite service reports this exact shape, so the UI's strict
+#: parser has one thing to recognise. A live service OVERWRITES the reason with
+#: its own (it knows whether the user switched it off or the flags are missing)
+#: and reports whether a saved document is on disk.
 REWRITE_DISABLED_BLOCK: Mapping[str, Any] = {
     "state": "unavailable",
     "code": "rewrite_disabled",
     "backend": None,
-    "reason": "rewriting is off by default; start the server with "
-              "--rewrite-backend local-llm to enable it",
+    "reason": "this server was started without a prompt rewriter",
+    "settings": {"href": REWRITE_SETTINGS_HREF, "saved": False},
 }
 
 
@@ -934,6 +1102,249 @@ def rewrite_status_block(runtime: WebRuntime) -> dict[str, Any]:
     if block is None:
         return dict(REWRITE_DISABLED_BLOCK)
     return dict(block)
+
+
+# ---------------------------------------------------------------------------
+# the Settings contract: which rewriter this server uses (server-side, shared)
+# ---------------------------------------------------------------------------
+
+#: Schema tags for the Settings round trip and the connection probe.
+REWRITE_SETTINGS_SCHEMA = "qwen_engine.web_rewrite_settings.v1"
+REWRITE_TEST_REQUEST_SCHEMA = "qwen_engine.web_rewrite_test_request.v1"
+REWRITE_TEST_SCHEMA = "qwen_engine.web_rewrite_test.v1"
+
+#: The closed key set of the saved/POSTed choice. Four keys, and NONE of them
+#: is a path. The llama-server binary, the GGUF, the system-prompt files and
+#: the enhancer timeout stay launch flags: a browser that may name a file can
+#: name any file on this machine, so the rule is absolute rather than scoped to
+#: a few field names.
+_REWRITE_SETTINGS_KEYS = ("backend", "endpoint", "model", "timeout_s")
+
+#: The probe's own request keys (it always tests the LOCAL service: the
+#: enhancer cannot be probed without loading 9.5 GiB onto the GPU).
+_REWRITE_TEST_KEYS = ("endpoint", "model", "timeout_s")
+
+#: A key shaped like a filesystem location. Refused with its own sentence, so
+#: a mistaken client learns the rule instead of a bare "unknown key".
+_PATH_SHAPED_KEY_RE = re.compile(
+    r"[/\\]|(^|_)(path|dir|folder|file|binary|bin|exe|gguf|model_path)$", re.I)
+
+
+def validate_rewrite_settings(payload: Any, *,
+                              allow_unset_backend: bool = False) -> dict[str, Any]:
+    """The ONE definition of a legal rewriter choice, pure.
+
+    Shared by ``POST /api/v1/settings/rewrite`` and by the loader of the saved
+    document, so a file that was written by an older version, hand-edited, or
+    produced by the route cannot disagree with the route about what is legal.
+
+    ``backend`` is CLOSED (``pe-llamacpp`` / ``local-llm`` / ``off``);
+    ``endpoint``, when present, must pass
+    :func:`qwen_engine.rewrite_client.parse_endpoint` — loopback, explicit
+    port, no credentials — because a prompt draft is user text; ``timeout_s``
+    is in ``(0, 3600]``. ``endpoint``/``model``/``timeout_s`` describe the
+    LOCAL service and may be saved while another backend is active (an edit
+    draft falls back to them); they are required only when the local service
+    itself is chosen. ``allow_unset_backend`` is for the saved document, where
+    a null backend means "not chosen: use the start-up default".
+    """
+    if not isinstance(payload, Mapping):
+        raise ApiError(400, "invalid_envelope",
+                       "the rewrite settings must be a JSON object")
+    if any(not isinstance(key, str) for key in payload):
+        raise ApiError(400, "invalid_envelope", "rewrite setting keys must be strings")
+    unknown = sorted(set(payload) - set(_REWRITE_SETTINGS_KEYS))
+    if unknown:
+        message = "unknown rewrite setting(s): " + ", ".join(map(str, unknown))
+        if any(_PATH_SHAPED_KEY_RE.search(key) for key in unknown):
+            message += (" — this server takes no filesystem path from the "
+                        "browser")
+        raise ApiError(400, "invalid_envelope", message)
+    # ``allow_unset_backend`` means the key may be ABSENT, not merely null: a
+    # saved document (and the ``local`` view of the settings state) carries the
+    # three service values only, and the state validator runs on its own
+    # output — so the rules must be idempotent or the server refuses to send
+    # what it just built.
+    required = set(_REWRITE_SETTINGS_KEYS)
+    if allow_unset_backend:
+        required.discard("backend")
+    missing = sorted(required - set(payload))
+    if missing:
+        raise ApiError(400, "invalid_envelope",
+                       "missing rewrite setting(s): " + ", ".join(missing))
+    backend = payload.get("backend")
+    if backend is None:
+        if not allow_unset_backend:
+            raise ApiError(400, "invalid_envelope",
+                           "backend must be one of "
+                           f"{list(REWRITE_SETTINGS_BACKENDS)}")
+    elif backend not in REWRITE_SETTINGS_BACKENDS:
+        raise ApiError(422, "backend_unknown",
+                       f"the rewriter must be one of "
+                       f"{list(REWRITE_SETTINGS_BACKENDS)}, got {backend!r}")
+    values: dict[str, Any] = {}
+    for name in ("endpoint", "model"):
+        value = payload[name]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            values[name] = None
+            continue
+        if not isinstance(value, str):
+            raise ApiError(400, "invalid_envelope",
+                           f"{name} must be a string or null",
+                           ((name, f"{name} must be text, or empty for none"),))
+        values[name] = value.strip()
+    timeout_s = payload["timeout_s"]
+    if timeout_s is None:
+        values["timeout_s"] = None
+    else:
+        if (isinstance(timeout_s, bool)
+                or not isinstance(timeout_s, (int, float))
+                or not 0 < float(timeout_s) <= 3600):
+            raise ApiError(400, "invalid_envelope",
+                           "timeout_s must be a number of seconds in "
+                           "(0, 3600], or null",
+                           (("timeout_s", "seconds must be in (0, 3600]"),))
+        values["timeout_s"] = float(timeout_s)
+    if values["endpoint"] is not None:
+        try:
+            _rewrite_client.parse_endpoint(values["endpoint"])
+        except _rewrite_client.RewriteConfigError as exc:
+            # The user typed this address, so the bounded reason may quote it;
+            # it is never copied into the STATUS block, whose validator refuses
+            # any location.
+            raise ApiError(422, "endpoint_unsupported", _safe(exc),
+                           (("endpoint",
+                             "use http on a loopback address with an explicit "
+                             "port, for example "
+                             "http://127.0.0.1:8079/v1/chat/completions"),)) from None
+    if backend == "local-llm" and not (values["endpoint"] and values["model"]):
+        raise ApiError(422, "backend_incomplete",
+                       "the local LLM service needs both an endpoint URL and a "
+                       "model name",
+                       (("endpoint", "required for the local LLM service"),
+                        ("model", "required for the local LLM service")))
+    return {"backend": backend, "endpoint": values["endpoint"],
+            "model": values["model"], "timeout_s": values["timeout_s"]}
+
+
+def _rewrite_envelope(raw: bytes, allowed: tuple[str, ...],
+                      schema: str, what: str) -> dict[str, Any]:
+    """The shared POST envelope: a JSON object, a schema tag, and nothing
+    outside the allowed keys — a typo is a refusal, not a silently dropped
+    field."""
+    data = parse_request_json(raw)
+    if not isinstance(data, Mapping):
+        raise ApiError(400, "invalid_envelope", f"the {what} must be a JSON object")
+    if any(not isinstance(key, str) for key in data):
+        raise ApiError(400, "invalid_envelope", "request keys must be strings")
+    missing = sorted(set(allowed) - set(data))
+    extra = sorted(set(data) - set(allowed))
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append("missing key(s): " + ", ".join(missing))
+        if extra:
+            parts.append("unexpected key(s): " + ", ".join(extra))
+            if any(_PATH_SHAPED_KEY_RE.search(key) for key in extra):
+                # Say WHICH rule was hit: a client that guessed a key named
+                # ``model_path`` deserves the reason, not a bare "unexpected".
+                parts.append("this server takes no filesystem path from the "
+                             "browser")
+        raise ApiError(400, "invalid_envelope", "; ".join(parts))
+    if data["schema"] != schema:
+        raise ApiError(400, "invalid_envelope", f"schema must be {schema!r}")
+    return {key: value for key, value in data.items() if key != "schema"}
+
+
+def build_rewrite_settings_request(raw: bytes) -> dict[str, Any]:
+    """``POST /api/v1/settings/rewrite`` body -> the validated choice."""
+    fields = _rewrite_envelope(raw, ("schema",) + _REWRITE_SETTINGS_KEYS,
+                               REWRITE_SETTINGS_SCHEMA, "rewrite settings request")
+    return validate_rewrite_settings(fields)
+
+
+def build_rewrite_test_request(raw: bytes) -> dict[str, Any]:
+    """``POST /api/v1/settings/rewrite/test`` body -> the local service to probe.
+
+    The probe is always the local service: the same field rules apply, with the
+    backend pinned, so a probe cannot ask the server to load the enhancer.
+    """
+    fields = _rewrite_envelope(raw, ("schema",) + _REWRITE_TEST_KEYS,
+                               REWRITE_TEST_REQUEST_SCHEMA,
+                               "rewrite connection test request")
+    checked = validate_rewrite_settings({"backend": "local-llm",
+                                         "endpoint": fields.get("endpoint"),
+                                         "model": fields.get("model"),
+                                         "timeout_s": fields.get("timeout_s")})
+    return checked
+
+
+def validate_rewrite_settings_state(payload: Any) -> dict[str, Any]:
+    """The ``GET /api/v1/settings/rewrite`` payload, checked before it is sent.
+
+    This is the ONE document allowed to carry the endpoint the user typed (they
+    configured it). It is never allowed to carry a filesystem path: no binary,
+    no GGUF, no prompt file, no log file — and the closed key set is what makes
+    that checkable rather than hoped for.
+    """
+    allowed = {"schema", "backend", "saved", "local", "backends", "off",
+               "persistent", "note"}
+    if not isinstance(payload, Mapping):
+        raise ValueError("the rewrite settings state must be a JSON mapping")
+    if set(payload) - allowed:
+        raise ValueError("unexpected rewrite settings state key(s): "
+                         + ", ".join(sorted(map(str, set(payload) - allowed))))
+    if payload["schema"] != REWRITE_SETTINGS_SCHEMA:
+        raise ValueError("rewrite settings state schema must be "
+                         f"{REWRITE_SETTINGS_SCHEMA!r}")
+    if payload["backend"] is not None and payload["backend"] not in REWRITE_BACKENDS:
+        raise ValueError("the active rewrite backend is unknown")
+    saved = validate_rewrite_settings(payload["saved"],
+                                     allow_unset_backend=True)
+    local = validate_rewrite_settings(payload["local"],
+                                      allow_unset_backend=True)
+    rows = validate_rewrite_backend_rows(payload["backends"], settings_form=True)
+    if [row["id"] for row in rows] != list(REWRITE_BACKENDS):
+        raise ValueError("the settings backends must be "
+                         f"{list(REWRITE_BACKENDS)}, in that order")
+    off = payload["off"]
+    if (not isinstance(off, Mapping) or set(off) != {"id", "label", "available", "reason"}
+            or off["id"] != "off" or off["label"] != REWRITE_BACKEND_LABELS["off"]
+            or off["available"] is not True or off["reason"] != ""):
+        raise ValueError("the settings off-row must be off/Off/available/no reason")
+    if type(payload["persistent"]) is not bool:
+        raise ValueError("the rewrite settings persistent flag must be a boolean")
+    note = payload.get("note")
+    if note is not None and (not isinstance(note, str) or not note.strip()):
+        raise ValueError("the rewrite settings note must be a non-empty string")
+    checked = {"schema": REWRITE_SETTINGS_SCHEMA, "backend": payload["backend"],
+               "saved": saved,
+               # What the LOCAL service would be reached as RIGHT NOW: the
+               # saved override where there is one, else the launch flags. The
+               # page prefills from this, so it never shows a field the server
+               # is not actually using.
+               "local": {key: local[key] for key in ("endpoint", "model",
+                                                     "timeout_s")},
+               "backends": rows, "off": dict(off),
+               "persistent": payload["persistent"]}
+    if note is not None:
+        checked["note"] = note
+    return checked
+
+
+def rewrite_test_result(ok: bool, detail: str, elapsed_ms: int) -> dict[str, Any]:
+    """The probe's answer, with any location or command line removed from the
+    plain-words line.
+
+    A failed connection may quote an address; a spawn failure may quote the
+    command that failed. The page only needs to know that it failed and why in
+    words, so addresses, path markers and option flags are stripped here
+    rather than trusted to whatever the exception happened to carry.
+    """
+    text = strip_command(detail)
+    return {"schema": REWRITE_TEST_SCHEMA, "ok": bool(ok),
+            "detail": _safe(text) or ("ok" if ok else "failed"),
+            "elapsed_ms": max(0, int(elapsed_ms))}
 
 
 def internal_error_response() -> ApiResponse:
@@ -958,6 +1369,15 @@ __all__ = [
     "MAX_REWRITE_REQUEST_BYTES", "REWRITE_DISABLED_BLOCK",
     "build_rewrite_request", "validate_rewrite_fields", "validate_rewrite_block",
     "rewrite_status_block",
+    # Two backends plus the server-side Settings choice (schema tags, closed
+    # rows, and the one validator each document goes through).
+    "REWRITE_BACKENDS", "REWRITE_SETTINGS_BACKENDS", "REWRITE_BACKEND_LABELS",
+    "REWRITE_SETTINGS_HREF",
+    "REWRITE_SETTINGS_SCHEMA", "REWRITE_TEST_REQUEST_SCHEMA",
+    "REWRITE_TEST_SCHEMA", "validate_rewrite_backend_row",
+    "validate_rewrite_backend_rows", "validate_rewrite_settings",
+    "validate_rewrite_settings_state", "build_rewrite_settings_request",
+    "build_rewrite_test_request", "rewrite_test_result", "strip_command",
 ]
 
 

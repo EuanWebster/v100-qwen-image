@@ -17,6 +17,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import qwen_engine
@@ -133,16 +135,20 @@ def test_generation_is_status_gated_with_only_same_origin_api_calls():
         assert "capability" not in text.lower(), f"{name} still probes capability"
         assert "location.protocol" not in text
     js = _read("app.js")
-    # Every fetch target is one of the four relative API constants — never
+    # Every fetch target is one of the relative API constants — never
     # a string-literal URL, never a host, never an absolute origin.
     assert not re.search(r"fetch\(\s*['\"]", js), "fetch must use API constants only"
     for const, route in (("API_STATUS", "/api/v1/status"),
                          ("API_PLAN", "/api/v1/plan"),
                          ("API_EXPORT", "/api/v1/config/export"),
-                         ("API_REWRITE", "/api/v1/rewrite")):
+                         ("API_REWRITE", "/api/v1/rewrite"),
+                         ("API_REWRITE_SETTINGS", "/api/v1/settings/rewrite")):
         m = re.search(rf"var {const} = '([^']+)'", js)
         assert m, f"{const} missing"
         assert m.group(1) == route
+    # The connection probe hangs off the settings route rather than inventing
+    # a third one, so it is built from the constant above.
+    assert "var API_REWRITE_SETTINGS_TEST = API_REWRITE_SETTINGS + '/test';" in js
     assert "!apiConnected || !generationConnected || submittingJob" in js
     html = _read("index.html")
     m = re.search(r'id="generate-btn"[^>]*', html)
@@ -183,9 +189,15 @@ def test_form_snapshot_uses_exact_config_enums_and_keys():
         values = set(re.findall(r'value="([^"]+)"', m.group(0)))
         assert values == {member.value for member in enum_cls}, \
             f"{select_id} options diverge from {enum_cls.__name__}"
+    # No invented option values in the generation form. The scope is the Create
+    # and History views on purpose: the Settings page has its own closed value
+    # set — the three rewriter ids, ``pe-llamacpp``/``local-llm``/``off``, which
+    # the server publishes and the settings tests below pin — and scanning the
+    # whole page would ban the one legitimate ``off`` with it.
+    generation_markup = html[:html.index('id="view-settings"')]
     for invented in ("candidate-a", "candidate-b", 'value="on"',
                      'value="off"', 'value="default"'):
-        assert invented not in html
+        assert invented not in generation_markup, invented
 
 
 def test_validation_marks_aria_invalid_on_every_control():
@@ -1586,11 +1598,13 @@ def test_use_as_reference_reads_the_job_image_endpoint_and_reuses_the_upload():
     assert "API_REFERENCES" not in body, \
         "the upload route is reached via addReferenceFiles, never hand-built"
     assert "JSON.stringify" not in body and "btoa(" not in body
-    # No new endpoint: the closed set of routes the page knows is unchanged
-    # (this feature is a GET of an existing route plus an existing POST).
+    # The closed set of routes the page knows. The rewriter Settings page adds
+    # exactly two (read the choice, write the choice) plus the probe hanging off
+    # the write route; nothing else may appear.
     assert sorted(set(re.findall(r"var (API_[A-Z_]+) = ", js))) == \
         ["API_EXPORT", "API_IMPORT", "API_JOBS", "API_PLAN", "API_REFERENCES",
-         "API_REWRITE", "API_STATUS"]
+         "API_REWRITE", "API_REWRITE_SETTINGS", "API_REWRITE_SETTINGS_TEST",
+         "API_STATUS"]
     # Every failure mode is narrated on the reference status line, never an
     # alert(): network, unusable body, typed HTTP error, empty body.
     assert "alert(" not in body
@@ -1695,9 +1709,13 @@ def test_finished_image_response_gets_its_own_bounded_cap():
     assert "cap = MAX_RESPONSE_BYTES;" in reader, \
         "a missing or absurd cap fails closed to the default"
     assert "if (total > cap) {" in reader and "reader.cancel()" in reader
-    # Exactly one caller raises it: every other route keeps 256 KiB.
+    # Exactly one caller raises it: every other route keeps 256 KiB — including
+    # the rewriter-settings routes, whose documents are small JSON.
     assert js.count("maxBytes:") == 1, "the cap override has one caller"
     assert "maxBytes: MAX_JOB_IMAGE_BYTES" in _js_function(js, "useJobImageAsReference")
+    for fn in ("saveRewriteSettings", "testRewriteConnection", "loadRewriteSettings"):
+        assert "maxBytes" not in _js_function(js, fn), \
+            f"{fn} must keep the default response cap"
 
 
 def test_every_output_format_the_engine_writes_is_accepted_as_a_reference():
@@ -1958,3 +1976,362 @@ def test_preview_keeps_the_shown_images_shape_and_labels_the_next_size():
     label = _js_function(js, "sizeLabel")
     assert "PRESETS[name].ratio" in label
     assert ".preview-next-size {" in _read("app.css")
+
+
+# --------------------------------------------- rewriter settings (amendment)
+
+
+SETTINGS_FNS = ("parseRewriteSettings", "parseRewriteChoice",
+                "parseRewriteLocal", "parseRewriteLocalFields", "hasOnlyKeys",
+                "parseRewriteSettingsRows", "rewriteSettingsEnvelope",
+                "loadRewriteSettings", "renderRewriteSettings",
+                "saveRewriteSettings", "testRewriteConnection")
+
+
+def test_the_rewriter_is_chosen_once_on_the_server_not_per_rewrite():
+    """The amendment removed the per-request picker.
+
+    The rewrite request therefore carries FOUR fields and no backend, and the
+    only place the choice changes is the Settings page. A select next to
+    **Rewrite prompt** would be a second, browser-local answer to a question
+    the server has already answered — and the two would disagree.
+    """
+    html = _read("index.html")
+    js = _read("app.js")
+    assert "rewrite-backend-select" not in html
+    assert "rewrite_backend" not in js
+    prompt_area = html[html.index('id="prompt"'):html.index('id="rewrite-proposal"')]
+    assert "<select" not in prompt_area, "no dropdown beside the draft"
+    req = _js_function(js, "requestRewrite")
+    body = req[req.index("body: JSON.stringify({"):]
+    for key in ("schema", "task", "prompt", "draft_revision", "image_ids"):
+        assert f"{key}:" in body
+    assert "backend" not in body, "the rewrite request names no backend"
+    # And the choice lives on a view of its own, reachable from the header.
+    assert 'href="#settings" id="nav-settings"' in html
+    assert 'id="view-settings"' in html
+    assert '<section id="view-settings" class="view" hidden' in html
+    assert "settings: 'view-settings'" in js
+    assert "if (active === 'settings') loadRewriteSettings();" in \
+        _js_function(js, "renderView"), "opening Settings re-reads the server"
+
+
+def test_the_settings_page_offers_every_rewriter_and_the_local_service_fields():
+    """Three radios (enhancer, local service, off), each with the reason it is
+    greyed out; three fields for the local service; save and probe buttons; and
+    a live region for each answer. Nothing on the page is a file picker."""
+    html = _read("index.html")
+    section = html[html.index('id="rewrite-settings-heading"'):
+                   html.index('id="rewrite-settings-note"')]
+    assert 'name="rewrite-backend"' in section
+    for value, label in (("pe-llamacpp", "Official enhancer (Q8, uses GPU)"),
+                         ("local-llm", "Local LLM service"), ("off", "Off")):
+        assert f'value="{value}"' in section, value
+        assert label in section, label
+    for node in ("rewrite-backend-pe-reason", "rewrite-backend-local-reason",
+                 "rewrite-backend-off-reason", "rewrite-endpoint",
+                 "rewrite-model", "rewrite-timeout", "rewrite-test",
+                 "rewrite-save", "rewrite-save-status", "rewrite-test-status",
+                 "rewrite-settings-error"):
+        assert f'id="{node}"' in section, node
+    # Every field is labelled and the refusals are announced.
+    for node in ("rewrite-endpoint", "rewrite-model", "rewrite-timeout"):
+        assert f'<label for="{node}">' in section, node
+    assert 'aria-live="polite"' in section
+    assert 'type="file"' not in section and 'type="password"' not in section
+    # A shared server-side setting says so, or a second browser is confused.
+    assert "stored by the server" in html
+    # The GPU note has to be true: the enhancer is REFUSED outright while an
+    # image is generating (503 rewrite_gpu_busy) — it never queues behind one.
+    # The generation that waits is the one started during a rewrite.
+    note = section[section.index('id="rewrite-gpu-note"'):]
+    note = re.sub(r"\s+", " ", note[:note.index("</p>")])
+    assert "loads a Q8 model onto the graphics card" in note
+    assert "It is unavailable while an image is generating" in note
+    assert "an image started during a rewrite waits for it" in note
+    assert "it waits for" not in note
+
+
+def test_the_settings_form_is_closed_and_never_carries_a_path():
+    js = _read("app.js")
+    assert "REWRITE_SETTINGS_KEYS = ['schema', 'backend', 'saved', 'local'," in js
+    assert "'off', 'persistent', 'note'];" in js
+    assert "REWRITE_CHOICE_KEYS = ['backend', 'endpoint', 'model', 'timeout_s'];" in js
+    # The block that describes the local service selects nothing, so its closed
+    # key set has no backend — the server sends it without one.
+    assert "REWRITE_LOCAL_KEYS = ['endpoint', 'model', 'timeout_s'];" in js
+    assert "REWRITE_SETTINGS_BACKENDS = ['pe-llamacpp', 'local-llm', 'off'];" in js
+    env = _js_function(js, "rewriteSettingsEnvelope")
+    assert "schema: REWRITE_SETTINGS_SCHEMA" in env
+    assert "selectedRewriteBackend()" in env
+    # An empty box is null ("keep what the server was started with"), never an
+    # empty string the server would refuse as a malformed address.
+    assert "|| null" in env
+    for forbidden in ("path", "binary", "dir", "file", "gguf", "exe"):
+        assert forbidden not in env.lower(), f"{forbidden} must not be a field"
+    saved = _js_function(js, "saveRewriteSettings")
+    assert "apiRequest(API_REWRITE_SETTINGS, {" in saved
+    assert "method: 'POST'" in saved
+    assert "JSON.stringify(envelope)" in saved
+    assert "'X-Qwen-UI': '1'" in saved, "a write needs the UI header"
+    probe = _js_function(js, "testRewriteConnection")
+    assert "API_REWRITE_SETTINGS_TEST" in probe
+    assert "REWRITE_TEST_REQUEST_SCHEMA" in probe
+    assert "backend" not in probe, \
+        "a probe carries no backend: it may not ask for the enhancer"
+
+
+def test_an_unexpected_settings_document_is_refused_rather_than_rendered():
+    js = _read("app.js")
+    parse = _js_function(js, "parseRewriteSettings")
+    assert "REWRITE_SETTINGS_KEYS.indexOf(keys[i]) === -1" in parse
+    assert "payload.schema !== REWRITE_SETTINGS_SCHEMA" in parse
+    rows = _js_function(js, "parseRewriteSettingsRows")
+    assert "REWRITE_SETTINGS_ROW_KEYS.indexOf(keys[k]) === -1" in rows
+    # A label that looks like a location is refused outright: the page shows
+    # labels, and a server that leaked a path would be caught here too.
+    assert "row.label" in rows and "test(row.label)" in rows
+    # What each parser accepts and rejects is EXECUTED below against real
+    # server documents, not string-matched here.
+    # Nothing model-shaped is ever treated as markup.
+    for fn in SETTINGS_FNS:
+        body = _js_function(js, fn)
+        assert "innerHTML" not in body and "insertAdjacentHTML" not in body, fn
+
+
+def test_the_settings_page_stores_nothing_in_the_browser():
+    """The setting is the server's; a browser-local copy would be a second
+    source of truth that disagrees the moment someone else saves."""
+    js = _read("app.js")
+    for fn in SETTINGS_FNS:
+        body = _js_function(js, fn)
+        assert "localStorage" not in body, fn
+        assert "sessionStorage" not in body, fn
+        assert "document.cookie" not in body, fn
+    # The theme key remains the only thing this page keeps locally.
+    assert js.count("localStorage.setItem(") == 1
+
+
+def test_the_page_says_which_rewriter_answered():
+    """One GPU-bound, one not: a suggestion must name its source, because the
+    wait the user just experienced is explained by it."""
+    html = _read("index.html")
+    js = _read("app.js")
+    assert 'id="rewrite-source"' in html
+    shown = _js_function(js, "showProposal")
+    assert "setText('rewrite-source'" in shown
+    assert "rewriteLabel(answer.backend)" in shown
+    # The Create view states the rewriter it will use, and a save refreshes it.
+    state = _js_function(js, "setRewriterState")
+    assert "Rewriter in use: " in state
+    assert "rewriteLabel(rewriteBackend)" in state
+    saved = _js_function(js, "saveRewriteSettings")
+    assert "checkStatus();" in saved, "a save refreshes the Create view"
+    hidden = _js_function(js, "hideProposal")
+    assert "setText('rewrite-source', '');" in hidden
+    # The friendly names are the server's rows, with a bounded fallback.
+    label = _js_function(js, "rewriteLabel")
+    assert "rewriteBackends[i].label" in label
+    assert "Official enhancer (Q8, uses GPU)" in label
+    assert "Local LLM service" in label
+    assert "127.0.0.1" not in label and "http" not in label
+
+
+# --------------------------------------------------------------------------
+# The Settings parsers, EXECUTED in node over the documents the server really
+# sends. A string check cannot see a real document being rejected: the server's
+# `local` block is {endpoint, model, timeout_s} with NO backend key (a block
+# that describes the local service selects nothing) while `saved` is a choice
+# and does carry one. Parsing both as choices rejected every document, so the
+# page read "did not match the expected schema" on every load — which is what
+# this section pins, together with the radio that must end up checked.
+# --------------------------------------------------------------------------
+
+PARSE_VARS = ("REWRITE_SETTINGS_SCHEMA", "REWRITE_SETTINGS_KEYS",
+              "REWRITE_CHOICE_KEYS", "REWRITE_LOCAL_KEYS",
+              "REWRITE_SETTINGS_ROW_KEYS", "REWRITE_SETTINGS_BACKENDS",
+              "REWRITE_TASKS")
+PARSE_FNS = ("hasOnlyKeys", "parseRewriteLocalFields", "parseRewriteChoice",
+             "parseRewriteLocal", "parseRewriteSettingsRows",
+             "parseRewriteSettings")
+RENDER_FNS = ("pyStrip", "rewriteRow", "selectedRewriteBackend",
+              "renderRewriteSettings")
+
+_HARNESS = """// Built by tests/test_web_static.py: the real app.js functions, extracted
+// verbatim, run over real server documents with the smallest DOM that
+// renderRewriteSettings touches. Nothing here reimplements a product rule.
+var fs = require("node:fs");
+__PARTS__
+
+var textSets = {};
+function setText(id, value) { textSets[id] = String(value); }
+var ELEMENTS = {};
+["rewrite-endpoint", "rewrite-model", "rewrite-timeout"].forEach(function (id) {
+  ELEMENTS[id] = { id: id, value: "", disabled: true,
+                   closest: function () { return null; } };
+});
+["rewrite-test", "rewrite-save"].forEach(function (id) {
+  ELEMENTS[id] = { id: id, disabled: true };
+});
+["pe", "local", "off"].forEach(function (which) {
+  ELEMENTS["rewrite-backend-" + which + "-reason"] =
+    { id: "rewrite-backend-" + which + "-reason" };
+});
+function $(id) { return ELEMENTS[id]; }
+var RADIOS = ["pe-llamacpp", "local-llm", "off"].map(function (value) {
+  return { value: value, checked: false, disabled: true };
+});
+var document = { querySelectorAll: function () { return RADIOS; } };
+
+var rewriteSettings = null;
+var rewriteSettingsBusy = false;
+var rewriteTestBusy = false;
+
+var docs = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+var out = docs.map(function (doc) {
+  RADIOS.forEach(function (r) { r.checked = false; r.disabled = true; });
+  ["rewrite-endpoint", "rewrite-model", "rewrite-timeout"].forEach(function (id) {
+    ELEMENTS[id].value = "";
+  });
+  textSets = {};
+  var state = parseRewriteSettings(doc);
+  rewriteSettings = state;
+  renderRewriteSettings();
+  return {
+    parsed: state,
+    checked: RADIOS.filter(function (r) { return r.checked; })
+                   .map(function (r) { return r.value; }),
+    fields: { endpoint: ELEMENTS["rewrite-endpoint"].value,
+              model: ELEMENTS["rewrite-model"].value,
+              timeout: ELEMENTS["rewrite-timeout"].value },
+    sets: textSets
+  };
+});
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def _js_var(js: str, name: str) -> str:
+    """One top-level ``var <name> = ...;`` statement from app.js, verbatim."""
+    m = re.search(rf"^  var {re.escape(name)} = [\s\S]*?;$", js, re.M)
+    assert m, f"{name} not found in app.js"
+    return m.group(0)
+
+
+def _run_settings_parsers(tmp_path: Path, docs: list[dict]) -> list[dict]:
+    """Run the real parsers + render path over `docs`, in node."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed, so app.js cannot be executed")
+    js = _read("app.js")
+    parts = "\n".join([_js_var(js, name) for name in PARSE_VARS]
+                      + [_js_function(js, fn) for fn in PARSE_FNS + RENDER_FNS])
+    harness = tmp_path / "settings_harness.js"
+    documents = tmp_path / "documents.json"
+    harness.write_text(_HARNESS.replace("__PARTS__", parts), encoding="utf-8")
+    documents.write_text(json.dumps(docs), encoding="utf-8")
+    run = subprocess.run([node, str(harness), str(documents)],
+                         capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, f"node harness failed: {run.stderr[:2000]}"
+    return json.loads(run.stdout)
+
+
+def _settings_services(tmp_path: Path) -> list[tuple[str, object, str | None]]:
+    """(name, service, backend the page must show) for every real shape."""
+    from qwen_engine.web import rewrite_service as rs
+
+    endpoint = "http://127.0.0.1:8079/v1/chat/completions"
+    pe = rs.PESettings(llama_server="/opt/llama/llama-server",
+                       model_path="/models/pe/PE.gguf",
+                       system_prompt="pe prompt", timeout=300.0)
+
+    def local_settings(**overrides):
+        fields = dict(backend="local-llm", endpoint=endpoint, model="Qwen3.8",
+                      prompts={"t2i": "sys t2i", "edit": "sys edit"}, timeout=30.0)
+        fields.update(overrides)
+        return rs.RewriteSettings(**fields)
+
+    def make(cache_dir, local, pe_cfg, prefs=None):
+        return rs.RewriteService(local, transport=lambda _body: b"{}",
+                                 pe=pe_cfg, cache_dir=cache_dir,
+                                 preferences=prefs,
+                                 client_factory=lambda *_args: None)
+
+    cache = str(tmp_path / "cache")
+    saved_local = rs.RewritePreferences(
+        backend="local-llm",
+        endpoint="http://127.0.0.1:8081/v1/chat/completions",
+        model="Other", timeout_s=45.0)
+    return [
+        ("both backends, nothing saved",
+         make(cache, local_settings(), pe), "pe-llamacpp"),
+        ("both backends, saved local service",
+         make(cache, local_settings(), pe, saved_local), "local-llm"),
+        ("both backends, saved enhancer",
+         make(cache, local_settings(), pe,
+              rs.RewritePreferences(backend="pe-llamacpp")), "pe-llamacpp"),
+        ("enhancer only", make(cache, rs.RewriteSettings.disabled(), pe),
+         "pe-llamacpp"),
+        ("local service only, nothing persistent",
+         make(None, local_settings(), None), "local-llm"),
+        ("saved off", make(cache, local_settings(), pe,
+                           rs.RewritePreferences(backend="off")), None),
+    ]
+
+
+def test_the_settings_parsers_accept_the_documents_the_server_sends(tmp_path):
+    from qwen_engine.web import api
+
+    cases = _settings_services(tmp_path)
+    documents = []
+    for name, subject, _active in cases:
+        state = subject.settings_state()
+        assert state["schema"] == api.REWRITE_SETTINGS_SCHEMA, name
+        documents.append(state)
+    results = _run_settings_parsers(tmp_path, documents)
+
+    for (name, subject, active), state, result in zip(cases, documents, results):
+        parsed = result["parsed"]
+        assert parsed is not None, f"{name}: the page would call this invalid"
+        assert parsed["backend"] == active, name
+        # What the block describes is what the fields are prefilled with.
+        assert parsed["local"] == state["local"], name
+        assert result["fields"]["endpoint"] == (state["local"]["endpoint"] or "")
+        assert result["fields"]["model"] == (state["local"]["model"] or "")
+        timeout = state["local"]["timeout_s"]
+        shown = result["fields"]["timeout"]
+        assert (shown == "" if timeout is None else float(shown) == timeout), name
+        assert parsed["saved"] == state["saved"], name
+        assert parsed["persistent"] == state["persistent"], name
+        # The radio for the backend actually in use is the checked one, and with
+        # nothing saved "Off" is only checked when Off is what is in force.
+        assert result["checked"] == [active or "off"], (name, result["checked"])
+        note = state.get("note", "")
+        assert result["sets"].get("rewrite-settings-note", "") == note, name
+
+
+def test_the_settings_parsers_still_refuse_a_document_that_is_not_theirs(tmp_path):
+    """The two key sets are closed on purpose: a local block that suddenly
+    carries a backend, a path-shaped key, or a value outside the server's own
+    bounds rejects the whole document rather than rendering half of it."""
+    base = _settings_services(tmp_path)[0][1].settings_state()
+    tampered = {
+        "local block selects a backend": {**base, "local": {
+            **base["local"], "backend": "local-llm"}},
+        "local block carries a path": {**base, "local": {
+            **base["local"], "model_path": "/models/pe/PE.gguf"}},
+        "saved names an unknown backend": {**base, "saved": {
+            **base["saved"], "backend": "gguf-direct"}},
+        "timeout beyond the server bound": {**base, "local": {
+            **base["local"], "timeout_s": 9000}},
+        "endpoint is not a string": {**base, "local": {
+            **base["local"], "endpoint": 8079}},
+        "unknown top-level key": {**base, "rewriter": "pe-llamacpp"},
+        "wrong schema tag": {**base, "schema": base["schema"] + ".next"},
+    }
+    results = _run_settings_parsers(tmp_path, list(tampered.values()))
+    for (why, _doc), result in zip(tampered.items(), results):
+        assert result["parsed"] is None, f"{why} was accepted"
+        # A rejected document leaves the page with nothing filled in at all.
+        assert result["checked"] == [], why
+        assert result["fields"] == {"endpoint": "", "model": "", "timeout": ""}

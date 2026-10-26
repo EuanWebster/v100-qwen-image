@@ -26,3 +26,6 @@ output/
 cache/
 benchmarks/
 logs/
+
+# The official prompt enhancer (PE-T2I) GGUF weights, downloaded out of band
+models/pe/
