@@ -26,6 +26,31 @@ def test_legacy_export_defaults_to_jpg():
     assert response.payload['config']['output_format'] == 'jpg'
 
 
+def test_raw_export_carries_transparency_and_legacy_raw_file_defaults_false():
+    runtime = api.WebRuntime()
+    exported = api.export_response(runtime, json.dumps({
+        'schema': api.WEB_PLAN_REQUEST_SCHEMA,
+        'config': {'prompt': 'a jar', 'transparent_background': True,
+                   'output_format': 'png'}}).encode())
+    assert json.loads(exported.body)['transparent_background'] is True
+    imported = api.import_response(runtime, exported.body)
+    assert imported.status == 200, imported.payload
+    assert imported.payload['config']['transparent_background'] is True
+    legacy = api.import_response(runtime, b'{"prompt":"legacy file"}')
+    assert legacy.payload['config']['transparent_background'] is False
+    # Raw import of an alpha request still cannot smuggle jpg through.
+    refused = api.import_response(runtime,
+        b'{"prompt":"a","transparent_background":true,"output_format":"jpg"}')
+    assert refused.status == 422
+    assert [f['field'] for f in refused.payload['fields']] == ['output_format']
+
+
+def test_legacy_export_without_recipe_imports_as_the_reference_recipe():
+    response = api.import_response(api.WebRuntime(), b'{"prompt":"legacy file"}')
+    assert response.status == 200
+    assert response.payload['config']['recipe'] == 'base'
+
+
 @pytest.mark.parametrize('data', [
     b'{"prompt":"a","seed":1,"seed":2}', b'{"prompt":"a","seed":true}',
     b'{"prompt":"a","seed":1.5}', b'{"prompt":"a","seed":18446744073709551616}',

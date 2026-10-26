@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from enum import StrEnum
@@ -38,9 +39,31 @@ SEED_MIN, SEED_MAX = 0, 2**64 - 1
 CFG_SCALE_MIN = 1.0
 DEFAULT_STEPS = 40
 
+#: Plan §4: at most ten reference images per run (V100 token budget; the
+#: measured matrix may lower this, nothing raises it without new evidence).
+REF_MAX = 10
+
+#: Canonical reference content id: sha256 hex digest, lowercase.
+REFERENCE_ID_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+# --- transparency wrapper (core) ---------------------------------------------
+#: Versioned identity of the exact wrapper text below. Future metadata/audit
+#: records should cite this constant so a later wrapper revision can never be
+#: confused with this one. It is identity only — it changes no behaviour.
+TRANSPARENCY_WRAPPER_REVISION = "qwen-engine.transparent-wrapper.v1"
+
+#: Exact upstream wrapper contract. Applied to the *positive* prompt only, via
+#: the derived :attr:`GenerationConfig.effective_prompt`; ``prompt`` itself is
+#: never mutated. Deterministic pure concatenation — no stripping, no
+#: normalization — so repeated property calls can never accumulate wrappers.
+TRANSPARENCY_PROMPT_PREFIX = "This is an RGBA image with transparency. "
+TRANSPARENCY_PROMPT_SUFFIX = (
+    " The image has alpha channel and the background is transparent."
+)
+
 #: Fields that must name an existing *directory* when they exist on disk.
 _DIR_FIELDS = ("output_dir", "cache_dir", "log_dir", "benchmarks_dir",
-               "models_dir")
+               "models_dir", "references_dir")
 #: Fields that must name an existing *file* when they exist on disk.
 _FILE_FIELDS = ("manifest_path", "q8_manifest_path")
 
@@ -56,6 +79,11 @@ class OutputFormat(StrEnum):
     WEBP = "webp"
 
 
+#: Formats that can carry an alpha channel. JPEG cannot, so a transparent
+#: background is refused with ``output_format=jpg``.
+ALPHA_OUTPUT_FORMATS = frozenset({OutputFormat.PNG, OutputFormat.WEBP})
+
+
 class OffloadMode(StrEnum):
     RESIDENT = "resident"
     STREAMED = "streamed"
@@ -67,6 +95,19 @@ class AttentionBackend(StrEnum):
     SDPA = "sdpa"
     EFFICIENT = "efficient"
     EAGER = "eager"
+
+
+class Recipe(StrEnum):
+    """Weight/sampling recipe. ``base`` is the full reference pipeline at any
+    step count; ``turbo`` is the reviewed Turbo-transformer profile whose
+    shipped sigmas make ``num_inference_steps`` inert — the recipe therefore
+    OWNS the step count (docs/turbo-plan.md §3.1)."""
+    BASE = "base"
+    TURBO = "turbo"
+
+
+#: The Turbo recipe runs exactly the eight shipped sigmas — nothing else.
+TURBO_STEPS = 8
 
 
 @dataclass(frozen=True)
@@ -148,8 +189,16 @@ class GenerationConfig:
     quant: Quant = Quant.FP16
     offload: OffloadMode = OffloadMode.RESIDENT
     attention_backend: AttentionBackend = AttentionBackend.AUTO
+    #: Sampling/weights recipe ("base" | "turbo"); turbo pins steps to 8,
+    #: refuses true-CFG and Q8 (validated in __post_init__ and the adapter
+    #: policy), and swaps the DiT+scheduler for the Turbo profile.
+    recipe: Recipe = Recipe.BASE
     vae_tiled_decode: bool = False
     output_format: OutputFormat = OutputFormat.JPG
+    #: Native transparency core flag: when True the positive prompt sent to the
+    #: encoder carries the upstream RGBA wrapper (see ``effective_prompt``) and
+    #: the output format must be alpha-capable (PNG/WEBP). Strict bool.
+    transparent_background: bool = False
     # Relocatable runtime paths (R7). None = not configured -> nothing is
     # written there; tests redirect all of these to tmp_path.
     output_dir: str | None = None
@@ -159,12 +208,18 @@ class GenerationConfig:
     models_dir: str | None = None
     manifest_path: str | None = None
     q8_manifest_path: str | None = None
+    #: Ordered reference-image content ids (design §2.1): each a sha256 hex
+    #: digest of a blob in ``references_dir``. Duplicates are legal — the same
+    #: image may fill two ``<imageN>`` slots. Empty means text-to-image.
+    references: tuple[str, ...] = ()
+    references_dir: str | None = None
 
     _ENUM_FIELDS: ClassVar[dict[str, type[StrEnum]]] = {
         "quant": Quant,
         "offload": OffloadMode,
         "attention_backend": AttentionBackend,
         "output_format": OutputFormat,
+        "recipe": Recipe,
     }
 
     def __post_init__(self) -> None:
@@ -260,6 +315,69 @@ class GenerationConfig:
                     f"must be a boolean, got {self.vae_tiled_decode!r}",
                 )
             )
+        if not isinstance(self.transparent_background, bool):
+            errors.append(
+                FieldError(
+                    "transparent_background",
+                    f"must be a boolean, got {self.transparent_background!r}",
+                )
+            )
+        elif self.transparent_background and self.output_format not in ALPHA_OUTPUT_FORMATS:
+            # Alpha cannot survive JPEG; refuse clearly instead of silently
+            # flattening or silently rewriting the user's chosen format.
+            errors.append(
+                FieldError(
+                    "output_format",
+                    "transparent_background=True requires an alpha-capable "
+                    "output format (png or webp); alpha cannot be stored in "
+                    f"jpg, got {self.output_format.value!r}",
+                )
+            )
+        if self.recipe is Recipe.TURBO:
+            # Every turbo rule is a refusal, never a silent rewrite: the
+            # saved sigmas ignore num_inference_steps, upstream evaluated only
+            # CFG 1, and no Q8 Turbo artifact exists yet (turbo + references
+            # stays allowed but is recorded as unmeasured by the adapter).
+            if self.steps != TURBO_STEPS:
+                errors.append(FieldError(
+                    "steps",
+                    f"recipe 'turbo' owns the shipped eight-step sigma "
+                    f"schedule: steps must be exactly {TURBO_STEPS}, got {self.steps!r}"))
+            if self.cfg_active:
+                errors.append(FieldError(
+                    "true_cfg_scale",
+                    "recipe 'turbo' is upstream-evaluated at CFG 1.0 with no "
+                    "negative prompt; a true-CFG request is refused until measured"))
+            if self.quant is Quant.Q8:
+                errors.append(FieldError(
+                    "quant",
+                    "recipe 'turbo' has no reviewed Q8 artifact yet; "
+                    "use quant 'fp16'"))
+        if not isinstance(self.references, (tuple, list)):
+            errors.append(
+                FieldError("references", f"must be a list of content ids, got {self.references!r}")
+            )
+        else:
+            references = tuple(self.references)
+            object.__setattr__(self, "references", references)
+            if len(references) > REF_MAX:
+                errors.append(
+                    FieldError("references",
+                               f"at most {REF_MAX} reference ids are allowed, "
+                               f"got {len(references)}")
+                )
+            if not all(isinstance(value, str) and REFERENCE_ID_RE.fullmatch(value)
+                       for value in references):
+                errors.append(
+                    FieldError("references",
+                               "every entry must be a 64-character lowercase hex "
+                               "content id of a stored reference")
+                )
+            if references and self.references_dir is None:
+                errors.append(
+                    FieldError("references_dir",
+                               "reference ids require the store directory")
+                )
 
         if errors:
             raise ConfigError(errors)
@@ -286,6 +404,20 @@ class GenerationConfig:
         (CFG duplication in the R4 descriptor keys off it).
         """
         return bool(self.negative_prompt.strip()) and self.true_cfg_scale > 1.0
+
+    @property
+    def effective_prompt(self) -> str:
+        """Positive prompt actually sent to the encoder.
+
+        With ``transparent_background=True`` this is exactly the upstream
+        wrapper applied to the untouched ``prompt``:
+        ``TRANSPARENCY_PROMPT_PREFIX + prompt + TRANSPARENCY_PROMPT_SUFFIX``.
+        Otherwise it is ``prompt`` verbatim. Pure function of frozen fields —
+        repeated calls never mutate, accumulate, or normalize anything.
+        """
+        if self.transparent_background:
+            return TRANSPARENCY_PROMPT_PREFIX + self.prompt + TRANSPARENCY_PROMPT_SUFFIX
+        return self.prompt
 
     # --- JSON / dict round-trip -----------------------------------------------
 

@@ -499,7 +499,7 @@ def test_inactive_cfg_never_validates_or_encodes_negative(negative, monkeypatch)
     assert negative in str(req.key_document())  # identity keeps the text
 
 
-def test_prompt_scalar_nonblank_and_images_required_empty():
+def test_prompt_scalar_nonblank_and_image_count_cap():
     req = make_request()
     object.__setattr__(req, "prompt", "   \n ")
     with pytest.raises(EncoderRequestError, match="prompt"):
@@ -508,9 +508,14 @@ def test_prompt_scalar_nonblank_and_images_required_empty():
     object.__setattr__(req, "prompt", ["not", "scalar"])
     with pytest.raises(EncoderRequestError, match="prompt"):
         ep.validate_production_request(req)
+    # ordered references are accepted production conditioning up to the cap
+    ok = make_request(images=tuple(f"{i:064x}"
+                                   for i in range(ep.REFERENCE_MAX_FILES)))
+    assert ep.validate_production_request(ok).cfg_active is False
+    too_many = make_request(images=tuple(f"{i:064x}"
+                                         for i in range(ep.REFERENCE_MAX_FILES + 1)))
     with pytest.raises(EncoderRequestError, match="images"):
-        ep.validate_production_request(
-            make_request(images=(SHA_A,)))
+        ep.validate_production_request(too_many)
 
 
 def test_implementation_identity_mandatory():
@@ -1163,3 +1168,156 @@ def test_payload_identity_validated_even_without_expected_request(monkeypatch):
     with pytest.raises(EncoderProtocolError, match="cache key"):
         ep.payload_to_branches(rewrapped(payload, metadata=md))
     assert st.load_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Image conditioning (TI2I): resize wiring, mask policy, payload round-trip
+# ---------------------------------------------------------------------------
+
+
+class PilStub:
+    """Stand-in for PIL's Image class at the lazy Pillow boundary."""
+
+    def __init__(self, size=(200, 100), mode="RGB", load_error=None):
+        self.size = size
+        self.mode = mode
+        self.load_error = load_error
+        self.loaded = False
+
+    def load(self):
+        if self.load_error is not None:
+            raise self.load_error
+        self.loaded = True
+
+    def convert(self, mode):
+        return PilStub(self.size, mode, load_error=self.load_error)
+
+
+def pil_module(image=None, open_error=None):
+    def open(source):
+        if open_error is not None:
+            raise open_error
+        return image
+    return SimpleNamespace(Image=PilStub, open=open, LANCZOS=1)
+
+
+def pinned_stub(log):
+    def calculate_dimensions(area, ratio):
+        log.append(("dimensions", area, ratio))
+        return (1440, 704, None)
+
+    class Processor:
+        def resize(self, image, *, width, height):
+            log.append(("resize", width, height, image.mode))
+            return f"resized-{image.mode}"
+
+    return calculate_dimensions, Processor()
+
+
+@pytest.fixture
+def stub_pil_and_pinned(monkeypatch):
+    log = []
+    monkeypatch.setattr(ep, "_load_pil_image", lambda: pil_module(PilStub()))
+    monkeypatch.setattr(ep, "_pinned_reference_helpers", lambda: pinned_stub(log))
+    return log
+
+
+def test_reference_resize_follows_pinned_pipeline_rules(monkeypatch):
+    log = []
+    image = PilStub(size=(2000, 1000), mode="RGB")
+    monkeypatch.setattr(ep, "_load_pil_image", lambda: pil_module(image))
+    monkeypatch.setattr(ep, "_pinned_reference_helpers", lambda: pinned_stub(log))
+    refs = ep.reference_images_from_blobs(make_request(images=(SHA_A,)), [b"fake"])
+    assert refs == ["resized-RGBA"]  # RGBA-converted before the pinned resize
+    assert image.loaded              # full decode happened for accepted sizes
+    assert log == [("dimensions", ep.REFERENCE_TARGET_AREA, 2.0),
+                   ("resize", 1440, 704, "RGBA")]
+
+
+@pytest.mark.parametrize("size", [(5000, 10), (10, 5000), (4096, 4097)])
+def test_reference_dimension_caps_refuse_before_full_load(monkeypatch, size):
+    image = PilStub(size=size)
+    monkeypatch.setattr(ep, "_load_pil_image", lambda: pil_module(image))
+    monkeypatch.setattr(ep, "_pinned_reference_helpers", lambda: pinned_stub([]))
+    with pytest.raises(EncoderRequestError, match="dimensions"):
+        ep.reference_images_from_blobs(make_request(images=(SHA_A,)), [b"x"])
+    assert not image.loaded
+
+
+def test_reference_decode_and_count_failures_are_typed(monkeypatch):
+    monkeypatch.setattr(ep, "_pinned_reference_helpers", lambda: pinned_stub([]))
+    monkeypatch.setattr(ep, "_load_pil_image",
+                        lambda: pil_module(open_error=OSError("truncated")))
+    with pytest.raises(EncoderRequestError, match="cannot be opened"):
+        ep.reference_images_from_blobs(make_request(images=(SHA_A,)), [b"x"])
+    monkeypatch.setattr(ep, "_load_pil_image",
+                        lambda: pil_module(PilStub(load_error=OSError("boom"))))
+    with pytest.raises(EncoderRequestError, match="cannot be decoded"):
+        ep.reference_images_from_blobs(make_request(images=(SHA_A,)), [b"x"])
+    monkeypatch.setattr(ep, "_load_pil_image", lambda: pil_module(PilStub()))
+    with pytest.raises(EncoderRequestError, match="ordered image hashes"):
+        ep.reference_images_from_blobs(make_request(images=(SHA_A, SHA_B)), [b"x"])
+    with pytest.raises(EncoderRequestError, match="text-only"):
+        ep.reference_images_from_blobs(make_request(), [b"x"])
+
+
+def test_image_branches_pass_resized_pil_to_upstream_both_sides(monkeypatch):
+    install_ml(monkeypatch)
+    monkeypatch.setattr(ep, "_load_pil_image", lambda: pil_module())
+    refs = [PilStub(mode="RGBA"), PilStub(mode="RGBA")]
+    pipeline = FakePipeline({"a red cube on a table": triple(img_true=True),
+                             "ugly, blurry": triple(shape=(1, 3, 8), img_true=True)})
+    req = prod_request(images=(SHA_A, SHA_B))
+    payload = ep.encode_with_supplied_pipeline(pipeline, req, refs)
+    assert [call["image"] for call in pipeline.calls] == [refs, refs]
+    bundle = ep.payload_to_branches(payload, expect_request=req)
+    assert any(bundle.positive.image_pad_mask.tolist())
+    assert any(bundle.negative.image_pad_mask.tolist())
+
+
+def test_image_branch_reference_image_argument_contract(monkeypatch):
+    install_ml(monkeypatch)
+    monkeypatch.setattr(ep, "_load_pil_image", lambda: pil_module())
+    pipeline = FakePipeline({}, raises=AssertionError("must not encode"))
+    req = make_request(images=(SHA_A,))
+    with pytest.raises(EncoderRequestError, match="resized reference"):
+        ep.encode_with_supplied_pipeline(pipeline, req)
+    with pytest.raises(EncoderRequestError, match="ordered image hashes"):
+        ep.encode_with_supplied_pipeline(
+            pipeline, req, [PilStub(mode="RGBA"), PilStub(mode="RGBA")])
+    with pytest.raises(EncoderRequestError, match="PIL Image"):
+        ep.encode_with_supplied_pipeline(pipeline, req, ["not-an-image"])
+    with pytest.raises(EncoderRequestError, match="text-only request"):
+        ep.encode_with_supplied_pipeline(pipeline, make_request(),
+                                         [PilStub(mode="RGBA")])
+
+
+def test_mask_and_conditioning_must_agree_in_both_directions(monkeypatch):
+    install_ml(monkeypatch)
+    monkeypatch.setattr(ep, "_load_pil_image", lambda: pil_module())
+    req = make_request(images=(SHA_A,))
+    with pytest.raises(EncoderProtocolError, match="vision token"):
+        ep.encode_with_supplied_pipeline(
+            FakePipeline({req.prompt: triple(img_true=False)}), req,
+            [PilStub(mode="RGBA")])
+    t2i = make_request()
+    with pytest.raises(EncoderProtocolError, match="all-False"):
+        ep.encode_with_supplied_pipeline(
+            FakePipeline({t2i.prompt: triple(img_true=True)}), t2i)
+
+
+def test_image_payload_flattened_mask_is_refused_on_decode(monkeypatch):
+    install_ml(monkeypatch)
+    monkeypatch.setattr(ep, "_load_pil_image", lambda: pil_module())
+    req = make_request(images=(SHA_A,))
+    payload = ep.encode_with_supplied_pipeline(
+        FakePipeline({req.prompt: triple(img_true=True)}), req,
+        [PilStub(mode="RGBA")])
+    header, _ = st_split(payload.blobs[0].data)
+    tampered = st_bytes({"positive.embeds": embeds_tensor(),
+                         "positive.attention_mask": mask_tensor([1, 1, 1, 1]),
+                         "positive.image_pad_mask": image_mask_tensor()},
+                        metadata=header["__metadata__"])
+    with pytest.raises(EncoderProtocolError, match="vision token"):
+        ep.payload_to_branches(rewrapped(payload, data=tampered),
+                               expect_request=req)

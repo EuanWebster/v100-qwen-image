@@ -667,6 +667,28 @@ def test_verified_assets_no_output_dir_never_creates_adapter_exits_2(
     assert not (tmp_path / "output").exists()
 
 
+def test_untiled_fp32_decode_run_exits_2_before_model_load(tmp_path, capsys):
+    """THE real CLI ordering for the measured decode envelope: a reference
+    run above 4096 latent tokens without --tiled-decode must die as a typed
+    config error 2 naming the flag — never a silent tiling switch, and on a
+    CPU-only box a clean exit 2 proves nothing model-side was touched."""
+    mpath = write_manifest(tmp_path)
+    (tmp_path / "models" / "dit").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "models" / "dit" / "model.bin").write_bytes(b"payload")
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps({
+        "prompt": "a red cube", "manifest_path": str(mpath),
+        "models_dir": str(tmp_path / "models"),
+        "output_dir": str(tmp_path / "out"), "cache_dir": str(tmp_path / "cache"),
+        "height": 1088, "width": 1088,  # 4624 latent tokens
+        "references": ["a" * 64], "references_dir": str(tmp_path / "store"),
+    }))
+    assert run_cli(tmp_path, ["--config", cfg_path, "--run"]) == 2
+    err = capsys.readouterr().err
+    assert "vae_tiled_decode" in err and "--tiled-decode" in err
+    assert "Traceback" not in err
+
+
 def test_config_file_true_cfg_scale_overflow_exits_2(tmp_path, capsys):
     """A 10**1000 int literal in the config file: OverflowError from
     math.isfinite would exit 1 with a generic unexpected-error line; the
@@ -756,3 +778,229 @@ def test_cli_config_replacement_during_read_is_typed_and_no_adapter(tmp_path, ca
     monkeypatch.setattr(os, "read", read)
     assert run_cli(tmp_path, ["--config", path, "--run"]) == 2
     assert "changed during read" in capsys.readouterr().err
+
+
+# --- recipe flag + turbo asset resolution (docs/turbo-plan.md §4.3/§5.2) --------
+
+
+def test_recipe_flag_echoes_into_the_plan(tmp_path, capsys):
+    assert run_cli(tmp_path, ["--dry-run", "--recipe", "turbo", "--steps", "8"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["config"]["recipe"] == "turbo" and doc["config"]["steps"] == 8
+
+
+def test_recipe_defaults_to_base_in_the_plan(tmp_path, capsys):
+    assert run_cli(tmp_path, ["--dry-run"]) == 0
+    assert json.loads(capsys.readouterr().out)["config"]["recipe"] == "base"
+
+
+def test_cli_refuses_turbo_step_mismatch_before_any_asset_work(tmp_path, capsys):
+    assert run_cli(tmp_path, ["--dry-run", "--recipe", "turbo", "--steps", "40"]) == 2
+    assert "eight-step" in capsys.readouterr().err
+
+
+def _asset_tree(root: Path, roles, repo: str,
+                manifest: Path | None = None) -> Path:
+    """A minimal resolvable manifest + one small file per role."""
+    import hashlib
+
+    artifacts = []
+    for role in roles:
+        content = f"{repo}:{role}".encode()
+        path = root / role / "model.bin"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        artifacts.append({"role": role, "repo": repo, "revision": REV,
+                          "filename": f"{role}/model.bin",
+                          "sha256": hashlib.sha256(content).hexdigest(),
+                          "bytes": len(content)})
+    manifest = manifest if manifest is not None else root / "manifest.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"schema_version": mf.MANIFEST_SCHEMA_VERSION,
+                                    "artifacts": artifacts}))
+    return manifest
+
+
+def test_verify_assets_merges_turbo_roles_without_touching_base_encoder(tmp_path):
+    base_manifest = _asset_tree(tmp_path / "models",
+                                ["text_encoder", "dit", "vae", "scheduler", "processor"], REPO)
+    _asset_tree(tmp_path / "models" / "turbo" / "assets",
+                ["dit", "scheduler", "pipeline"], "Qwen/Qwen-Image-2.1-Turbo",
+                manifest=tmp_path / "models" / "turbo" / "manifest.json")
+    turbo = GenerationConfig(manifest_path=str(base_manifest),
+                             models_dir=str(tmp_path / "models"),
+                             recipe="turbo", steps=8)
+    report = cli._verify_assets(turbo)
+    assert report.resolved["dit"] == (
+        tmp_path / "models" / "turbo" / "assets" / "dit" / "model.bin",)
+    assert report.resolved["text_encoder"] == (
+        tmp_path / "models" / "text_encoder" / "model.bin",)
+    # the same tree under the base recipe never sees the turbo directory
+    base = cli._verify_assets(GenerationConfig(manifest_path=str(base_manifest),
+                                               models_dir=str(tmp_path / "models")))
+    assert base.resolved["dit"] == (tmp_path / "models" / "dit" / "model.bin",)
+
+
+def test_verify_assets_refuses_turbo_without_its_manifest_or_artifacts(tmp_path):
+    from qwen_engine.manifest import ManifestError
+
+    base_manifest = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    _asset_tree(tmp_path / "models" / "turbo" / "assets", ["dit"],
+                "Qwen/Qwen-Image-2.1-Turbo",
+                manifest=tmp_path / "models" / "turbo" / "manifest.json")
+    turbo = GenerationConfig(manifest_path=str(base_manifest),
+                             models_dir=str(tmp_path / "models"),
+                             recipe="turbo", steps=8)
+    (tmp_path / "models" / "turbo" / "manifest.json").unlink()
+    with pytest.raises(ManifestError, match="turbo manifest"):
+        cli._verify_assets(turbo)
+
+
+def test_verify_assets_refuses_hash_drifted_turbo_artifact(tmp_path):
+    from qwen_engine.manifest import ManifestError
+
+    base_manifest = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    _asset_tree(tmp_path / "models" / "turbo" / "assets", ["dit"],
+                "Qwen/Qwen-Image-2.1-Turbo",
+                manifest=tmp_path / "models" / "turbo" / "manifest.json")
+    (tmp_path / "models" / "turbo" / "assets" / "dit" / "model.bin").write_bytes(b"swallowed")
+    turbo = GenerationConfig(manifest_path=str(base_manifest),
+                             models_dir=str(tmp_path / "models"),
+                             recipe="turbo", steps=8)
+    with pytest.raises(ManifestError, match="turbo artifact"):
+        cli._verify_assets(turbo)
+
+
+# ---------------------------------------------------------------------------
+# _verify_assets(reuse_policy=...): opt-in, default-OFF hash reuse
+# ---------------------------------------------------------------------------
+
+
+def _hash_counter(monkeypatch):
+    """Count full content-hashing resolver calls made through cli."""
+    calls = []
+    real = cli.resolve_manifest
+
+    def spy(manifest, root):
+        calls.append(str(root))
+        return real(manifest, root)
+
+    monkeypatch.setattr(cli, "resolve_manifest", spy)
+    return calls
+
+
+def test_verify_assets_default_path_rehashes_every_call(tmp_path, monkeypatch):
+    from qwen_engine.local_bundle import clear_verification_records
+
+    clear_verification_records()
+    calls = _hash_counter(monkeypatch)
+    mpath = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    cfg = GenerationConfig(manifest_path=str(mpath),
+                           models_dir=str(tmp_path / "models"))
+    first = cli._verify_assets(cfg)
+    second = cli._verify_assets(cfg)
+    assert len(calls) == 2 and first is not second
+
+
+def test_verify_assets_reuse_skips_second_hash_until_drift(tmp_path, monkeypatch):
+    from qwen_engine.local_bundle import (VerificationReusePolicy,
+                                          clear_verification_records)
+
+    clear_verification_records()
+    calls = _hash_counter(monkeypatch)
+    mpath = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    cfg = GenerationConfig(manifest_path=str(mpath),
+                           models_dir=str(tmp_path / "models"))
+    policy = VerificationReusePolicy(max_age_s=60)
+    first = cli._verify_assets(cfg, reuse_policy=policy)
+    second = cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 1 and second is first
+    # a rewrite with identical bytes still moves mtime/ctime -> rehash
+    model_file = tmp_path / "models" / "dit" / "model.bin"
+    model_file.write_bytes(model_file.read_bytes())  # identical bytes rewrite
+    third = cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 2 and third is not first
+    # the rehash repopulated the record: the next job is cached again
+    fourth = cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 2 and fourth is third
+
+
+def test_verify_assets_reuse_expires(tmp_path, monkeypatch):
+    from qwen_engine import local_bundle as lb
+    from qwen_engine.local_bundle import VerificationReusePolicy, clear_verification_records
+
+    clear_verification_records()
+    clock = {"now": 500.0}
+    monkeypatch.setattr(lb, "_MONOTONIC", lambda: clock["now"])
+    calls = _hash_counter(monkeypatch)
+    mpath = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    cfg = GenerationConfig(manifest_path=str(mpath),
+                           models_dir=str(tmp_path / "models"))
+    policy = VerificationReusePolicy(max_age_s=30)
+    cli._verify_assets(cfg, reuse_policy=policy)
+    clock["now"] += 29
+    cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 1
+    clock["now"] += 2
+    cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 2
+
+
+def test_verify_assets_never_reuses_a_failed_verification(tmp_path, monkeypatch):
+    from qwen_engine.manifest import ManifestError
+    from qwen_engine.local_bundle import VerificationReusePolicy, clear_verification_records
+
+    clear_verification_records()
+    calls = _hash_counter(monkeypatch)
+    mpath = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    cfg = GenerationConfig(manifest_path=str(mpath),
+                           models_dir=str(tmp_path / "models"))
+    policy = VerificationReusePolicy(max_age_s=60)
+    cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 1
+    victim = tmp_path / "models" / "dit" / "model.bin"
+    victim.write_bytes(b"corrupted")
+    with pytest.raises(ManifestError):
+        cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 2
+    # restoring the exact original bytes must NOT resurrect the old record:
+    # the failed run left nothing behind, so this call hashes again.
+    victim.write_bytes(f"{REPO}:dit".encode())
+    cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 3
+
+
+def test_verify_assets_reuse_covers_both_turbo_trees(tmp_path, monkeypatch):
+    from qwen_engine.local_bundle import VerificationReusePolicy, clear_verification_records
+
+    clear_verification_records()
+    calls = _hash_counter(monkeypatch)
+    base_manifest = _asset_tree(tmp_path / "models",
+                                ["text_encoder", "dit", "vae"], REPO)
+    _asset_tree(tmp_path / "models" / "turbo" / "assets", ["dit"],
+                "Qwen/Qwen-Image-2.1-Turbo",
+                manifest=tmp_path / "models" / "turbo" / "manifest.json")
+    turbo = GenerationConfig(manifest_path=str(base_manifest),
+                             models_dir=str(tmp_path / "models"),
+                             recipe="turbo", steps=8)
+    policy = VerificationReusePolicy(max_age_s=60)
+    cli._verify_assets(turbo, reuse_policy=policy)
+    assert sorted(calls) == sorted([str(tmp_path / "models"),
+                                    str(tmp_path / "models" / "turbo" / "assets")])
+    cli._verify_assets(turbo, reuse_policy=policy)
+    assert len(calls) == 2  # neither tree re-hashed
+    # touching ONLY the turbo tree rehashes only that tree
+    (tmp_path / "models" / "turbo" / "assets" / "dit" / "model.bin").write_bytes(b"x" * 13)
+    with pytest.raises(Exception):
+        # content now contradicts the turbo manifest -> refusal, but the
+        # BASE tree must not have been re-hashed on the way there
+        cli._verify_assets(turbo, reuse_policy=policy)
+    assert len([c for c in calls if c.endswith("models")]) == 1
+
+
+def test_verify_assets_reuse_policy_type_is_enforced(tmp_path):
+    mpath = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    cfg = GenerationConfig(manifest_path=str(mpath),
+                           models_dir=str(tmp_path / "models"))
+    with pytest.raises(ValueError):
+        cli._verify_assets(cfg, reuse_policy=60)

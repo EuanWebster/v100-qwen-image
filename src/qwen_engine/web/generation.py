@@ -12,9 +12,11 @@ import sys
 import threading
 import time
 import traceback
+from pathlib import Path
 from dataclasses import replace
 
 from qwen_engine.config import ConfigError
+from qwen_engine.local_bundle import VerificationReusePolicy
 from qwen_engine.core import generate
 from qwen_engine.errors import GenerationCancelled
 from qwen_engine.jobs import JobCancelled, JobController, JobError
@@ -26,25 +28,53 @@ from qwen_engine.web.api import (
 
 JOB_SCHEMA = "qwen_engine.web_job.v1"
 JOBS_SCHEMA = "qwen_engine.web_jobs.v1"
+#: Closed map from executor failure codes to public web error codes (all
+#: fixed, prompt-free literals). ``out_of_gpu_memory`` is a classified CUDA
+#: out-of-memory at the executor boundary instead of the generic
+#: ``execution_failed``; an unknown job-layer code passes through unchanged
+#: (a new engine code must never be silently hidden from the UI).
+PUBLIC_ERROR_CODES = {
+    "execution_failed": "execution_failed",
+    "worker_stopped": "worker_stopped",
+    "invalid_cancellation_acknowledgment": "invalid_cancellation_acknowledgment",
+    "out_of_gpu_memory": "out_of_gpu_memory",
+}
 
 
 class WebGeneration:
-    def __init__(self, runtime: WebRuntime, *, trust_unbounded_host=False, executor=None):
+    def __init__(self, runtime: WebRuntime, *, trust_unbounded_host=False, executor=None,
+                 performance=False, memory_release=None, reuse_verified_assets=None):
         if _blockers(runtime):
             raise ValueError("generation runtime is incomplete or disabled")
         self.runtime = runtime
+        if type(performance) is not bool:
+            raise ValueError("performance must be boolean")
+        self.performance = performance
         self.trust_unbounded_host = trust_unbounded_host
+        # Opt-in verification reuse (server flag --reuse-verified-assets):
+        # None (default) content-verifies every artifact on every job; a
+        # positive-finite age (seconds) or a ready-made policy lets a job
+        # reuse a recorded SUCCESSFUL verification while every artifact's
+        # stat fingerprint is unchanged — strictly weaker than re-hashing.
+        if reuse_verified_assets is None:
+            self.reuse_policy = None
+        elif isinstance(reuse_verified_assets, VerificationReusePolicy):
+            self.reuse_policy = reuse_verified_assets
+        else:
+            self.reuse_policy = VerificationReusePolicy(max_age_s=reuse_verified_assets)
         self._lock = threading.Lock()
         self._metrics = {}
         self._executor = executor or self._execute
-        self.controller = JobController(runtime.output_dir, self._run)
+        self.controller = JobController(runtime.output_dir, self._run, memory_release=memory_release)
 
     def _execute(self, context):
-        # Identical asset verification, adapter and host policy to --run.
+        # Identical asset verification, adapter and host policy to --run,
+        # including the operator's opt-in reuse policy (None = full
+        # content verification per job, the default).
         from qwen_engine.cli import _make_adapter, _verify_assets
 
         context.check_cancelled()
-        assets = _verify_assets(context.config)
+        assets = _verify_assets(context.config, reuse_policy=self.reuse_policy)
         context.check_cancelled()
         adapter = _make_adapter(trust_unbounded_host=self.trust_unbounded_host)
         progress_binder = getattr(adapter, "set_progress_callback", None)
@@ -67,6 +97,18 @@ class WebGeneration:
                                              "phase_ms": {}, "completed_steps": 0,
                                              "total_steps": context.config.steps}
         try:
+            if self.performance:
+                from qwen_engine.performance import PerformanceRecorder, stage
+                recorder = PerformanceRecorder(context.config)
+                with (Path(context.config.output_dir) / "performance.json").open("x", encoding="utf-8") as handle:
+                    status = "failed"
+                    try:
+                        with recorder.activate(), stage("total_job"):
+                            result = self._executor(context)
+                        status = "succeeded"
+                        return result
+                    finally:
+                        recorder.write(handle, status)
             return self._executor(context)
         except (JobCancelled, GenerationCancelled):
             raise
@@ -106,7 +148,12 @@ class WebGeneration:
             "cancel_requested": record.cancel_requested,
             "config": editable_config_dict(record.config),
             "elapsed_ms": elapsed, "phase_ms": phases,
-            "error_code": record.error_code,
+            "error_code": (PUBLIC_ERROR_CODES.get(record.error_code, record.error_code)
+                           if record.error_code else None),
+            # Prompt-free boundary release cost for terminal failed/cancelled
+            # jobs (None for successes and never-executed cancellations); it
+            # is recorded just after the terminal state becomes visible.
+            "collect_ms": self.controller.collect_ms(record.job_id),
             "progress": {"completed_steps": completed, "total_steps": record.config.steps},
             "image_url": (f"/api/v1/jobs/{record.job_id}/image" if record.artifact else None),
             "image_filename": record.artifact.filename if record.artifact else None,
@@ -114,14 +161,25 @@ class WebGeneration:
 
     def submit(self, body):
         config = build_config(self.runtime, parse_request_json(body))
+        if config.references:
+            # Every id must resolve to a hash-verified blob BEFORE enqueue:
+            # a job may not fail deep in the worker over something the server
+            # can see now. Public message carries the ORDINAL only — never
+            # the id, never the store path (design §2.4).
+            self._require_references(config.references)
         from qwen_engine.adapters.qwen21_diffusers import _validate_policy
 
         try:
             _validate_policy(config)
         except ConfigError as exc:
             # Path values never cross the wire. Editable policy errors are safe.
+            # The recipe gate is an editable policy rule too (turbo owns the
+            # step count and refuses true-CFG / Q8), so those fields must be
+            # named rather than dropped into an empty field list.
+            editable_policy = ("quant", "offload", "attention_backend",
+                               "steps", "true_cfg_scale", "recipe")
             fields = tuple((e.field, e.message) for e in exc.errors
-                           if e.field in ("quant", "offload", "attention_backend"))
+                           if e.field in editable_policy)
             raise ApiError(422, "unsupported_generation_config",
                            "this configuration is not supported by the current adapter", fields) from None
         if config.latent_tokens > 4096 and not config.vae_tiled_decode:
@@ -134,6 +192,20 @@ class WebGeneration:
         except (JobError, OSError):
             raise ApiError(409, "job_submission_refused", "job queue/history is full or its output storage is unavailable") from None
         return ApiResponse(202, self.public_job(record))
+
+    def _require_references(self, references):
+        from qwen_engine import reference_store
+        root = self.runtime.references_dir
+        if root is None:  # unreachable via build_config pairing; belt and braces
+            raise ApiError(422, "reference_unavailable",
+                           "the server reference store is not configured")
+        for ordinal, reference_id in enumerate(references, start=1):
+            try:
+                reference_store.read_blob(root, reference_id)
+            except reference_store.ReferenceStoreError:
+                raise ApiError(422, "reference_unavailable",
+                               f"reference {ordinal} is not available in the "
+                               "server reference store") from None
 
     def list_response(self):
         return ApiResponse(200, {"schema": JOBS_SCHEMA,

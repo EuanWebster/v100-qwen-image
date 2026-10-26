@@ -15,6 +15,7 @@ suite and both require ``CHROME_PATH``.
 from __future__ import annotations
 
 import dataclasses
+import json
 import re
 from pathlib import Path
 
@@ -117,21 +118,28 @@ def test_seed_row_is_a_full_row_with_short_helper_and_accessible_range():
 
 
 def test_generation_is_status_gated_with_only_same_origin_api_calls():
-    # W2 truth: the page may talk ONLY to the three same-origin relative
-    # endpoints (/api/v1/status, /api/v1/plan, /api/v1/config/export).
-    # Generate stays unconditionally disabled (generation is W3); the
-    # submit handlers refuse directly — the disabled button is not the gate.
+    # W2 truth: the page may talk ONLY to the same-origin relative endpoints
+    # (/api/v1/status, /api/v1/plan, /api/v1/config/export, and — R4 — the
+    # rewrite route). Generate stays unconditionally disabled (generation is
+    # W3); the submit handlers refuse directly — the disabled button is not
+    # the gate.
+    #
+    # The "capability" ban is about BROWSER capability probing (navigator.gpu,
+    # WebGPU/WebNN feature detection): the server's rewrite status block is
+    # named for what it is (a rewriter state), never "capability", so this
+    # assertion keeps its original force.
     for name in ASSETS:
         text = _read(name)
         assert "capability" not in text.lower(), f"{name} still probes capability"
         assert "location.protocol" not in text
     js = _read("app.js")
-    # Every fetch target is one of the three relative API constants — never
+    # Every fetch target is one of the four relative API constants — never
     # a string-literal URL, never a host, never an absolute origin.
     assert not re.search(r"fetch\(\s*['\"]", js), "fetch must use API constants only"
     for const, route in (("API_STATUS", "/api/v1/status"),
                          ("API_PLAN", "/api/v1/plan"),
-                         ("API_EXPORT", "/api/v1/config/export")):
+                         ("API_EXPORT", "/api/v1/config/export"),
+                         ("API_REWRITE", "/api/v1/rewrite")):
         m = re.search(rf"var {const} = '([^']+)'", js)
         assert m, f"{const} missing"
         assert m.group(1) == route
@@ -157,10 +165,13 @@ def test_form_snapshot_uses_exact_config_enums_and_keys():
     config_fields = {f.name for f in dataclasses.fields(GenerationConfig)}
     assert keys - {"kind"} <= config_fields, \
         f"snapshot keys outside GenerationConfig fields: {keys - config_fields}"
-    assert keys - {"kind"} == config_fields - {
-        "output_dir", "cache_dir", "log_dir", "benchmarks_dir",
-        "models_dir", "manifest_path", "q8_manifest_path",
-    }, "snapshot must carry every non-path GenerationConfig field, no aliases"
+    # Path fields belong to the SERVER's runtime; use the API's own closed
+    # sets instead of a literal list so a new path field cannot silently pass,
+    # and so an announced deferral (recipe — docs/turbo-plan.md §6) is the
+    # only other class of field the wire may omit.
+    from qwen_engine.web.api import DEFERRED_WIRE_FIELDS, RUNTIME_PATH_FIELDS
+    assert keys - {"kind"} == config_fields - set(RUNTIME_PATH_FIELDS) - set(DEFERRED_WIRE_FIELDS), \
+        "snapshot must carry every non-path, non-deferred GenerationConfig field, no aliases"
 
     # Selects expose EXACTLY the config.py enum values — no invented options,
     # no aliases, compared against the real Python enums.
@@ -722,3 +733,763 @@ def test_api_requests_bypass_the_http_cache():
     m = re.search(r"function apiRequest\([^)]*\)\s*\{([\s\S]*?)\n  \}", js)
     assert m, "apiRequest not found"
     assert "requestOpts.cache = 'no-store'" in m.group(1)
+
+
+# ------------------------------------------------------ transparency (D1)
+
+
+def test_transparency_control_markup_is_labelled_and_described():
+    html = _read("index.html")
+    block = re.search(r'<div class="field transparency-field">.*?\n          </div>',
+                      html, re.S)
+    assert block, "transparency field block missing"
+    body = block.group(0)
+    assert 'id="transparent"' in body and 'name="transparent_background"' in body
+    assert 'type="checkbox"' in body
+    assert '<label for="transparent">Transparent background</label>' in body
+    assert 'aria-describedby="transparency-help transparency-note"' in body
+    assert 'id="transparency-help"' in body and 'id="transparency-note"' in body
+    # The effective prompt is display-only: no input control, starts hidden.
+    effective = re.search(r'<p id="effective-prompt-field"[^>]*>', body)
+    assert effective and "hidden" in effective.group(0)
+    assert '<span id="effective-prompt"' in body
+    assert 'readonly' not in body   # it is not an editable field at all
+    # The format error id the JS writes must exist, and the select points at it.
+    assert 'id="format-error"' in html
+    select = re.search(r'<select id="output-format"[^>]*>', html).group(0)
+    assert 'aria-describedby="format-error"' in select
+    # Plain-language explanation names the jpg restriction.
+    assert "JPEG cannot store transparency" in body
+
+
+def test_transparency_wrapper_literals_match_config_py_exactly():
+    from qwen_engine.config import (TRANSPARENCY_PROMPT_PREFIX,
+                                    TRANSPARENCY_PROMPT_SUFFIX,
+                                    TRANSPARENCY_WRAPPER_REVISION)
+    js = _read("app.js")
+
+    def js_string(value: str) -> str:
+        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+    assert f"var TRANSPARENT_PREFIX = {js_string(TRANSPARENCY_PROMPT_PREFIX)};" in js
+    assert f"var TRANSPARENT_SUFFIX =\n    {js_string(TRANSPARENCY_PROMPT_SUFFIX)};" in js
+    # The revision constant is cited so a later wrapper bump is traceable.
+    assert TRANSPARENCY_WRAPPER_REVISION in js
+    from qwen_engine.config import ALPHA_OUTPUT_FORMATS
+    assert set(re.findall(r"'(\w+)'", re.search(r"var ALPHA_FORMATS = \[([^\]]*)\]", js).group(1))) \
+        == {fmt.value for fmt in ALPHA_OUTPUT_FORMATS}
+
+
+def test_transparency_checkbox_switches_jpg_to_png_and_explains_it():
+    js = _read("app.js")
+    m = re.search(r"function onTransparencyChange\(\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "onTransparencyChange not found"
+    body = m.group(1)
+    assert "ALPHA_FORMATS.indexOf($('output-format').value) === -1" in body
+    assert "$('output-format').value = 'png'" in body
+    assert "switched from jpg to png" in body
+    # Unticking never rewrites the format: the switch is gated on .checked.
+    switch = body[body.index("$('transparent').checked"):]
+    assert "= 'jpg'" not in body and "= 'webp'" not in body
+    assert switch.index("$('transparent').checked") < switch.index("value = 'png'")
+    # Wired as a real handler, and validated/staled like every other edit.
+    assert "$('transparent').addEventListener('change', onTransparencyChange);" in js
+    assert "syncPlanStaleness();" in body
+    # The explanation is a persistent note, not a one-frame flash.
+    assert "transparencySwitchNote" in js
+
+
+def test_transparency_state_renders_effective_prompt_and_format_reason():
+    js = _read("app.js")
+    m = re.search(r"function syncTransparency\(\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "syncTransparency not found"
+    body = m.group(1)
+    assert "TRANSPARENT_PREFIX + $('prompt').value + TRANSPARENT_SUFFIX" in body
+    assert "$('effective-prompt-field').hidden = !on" in body
+    # The prompt FIELD itself is never rewritten by the wrapper.
+    assert "$('prompt').value =" not in body
+    # The mismatch reason is stated, never auto-corrected silently here.
+    assert "JPEG cannot keep transparency" in body
+    # Wired into the validation pass (so aria-invalid/format errors agree).
+    m = re.search(r"function renderValidation\(errors\)\s*\{(.*?)\n  \}", js, re.S)
+    assert m and "syncTransparency();" in m.group(1)
+    assert "setText('format-error', errors.format || '')" in m.group(1)
+    assert "setAriaInvalid('output-format', !!errors.format)" in m.group(1)
+
+
+def test_transparency_local_validation_mirrors_the_server_rule():
+    js = _read("app.js")
+    m = re.search(r"function validateForm\(\)\s*\{(.*?)\n  \}", js, re.S)
+    assert m, "validateForm not found"
+    assert "transparencyFormatMismatch()" in m.group(1)
+    assert "errors.format" in m.group(1)
+    m = re.search(r"function transparencyFormatMismatch\(\)\s*\{(.*?)\n  \}", js, re.S)
+    assert m, "transparencyFormatMismatch not found"
+    assert "ALPHA_FORMATS.indexOf($('output-format').value) === -1" in m.group(1)
+
+
+def test_plan_parsing_requires_transparent_boolean_and_alpha_format():
+    js = _read("app.js")
+    m = re.search(r"function parsePlan\(raw\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m
+    body = m.group(1)
+    assert "'transparent_background'" in body, "parsePlan exact-key list must include it"
+    assert "typeof c.transparent_background !== 'boolean'" in body
+    assert "ALPHA_FORMATS.indexOf(c.output_format) === -1" in body
+
+
+def test_parse_job_accepts_13_keys_and_keeps_legacy_shapes_honest():
+    js = _read("app.js")
+    m = re.search(r"function parseJob\(job\)\s*\{([\s\S]*?)\n    return job;\n  \}", js)
+    assert m, "parseJob not found"
+    body = m.group(0)
+    assert "ckeys.length === 13" in body
+    assert "ckeys.length === 12" in body and "ckeys.length === 11" in body
+    assert "!hasKey('transparent_background')" in body
+    assert "c.transparent_background = false" in body
+    assert "typeof c.transparent_background !== 'boolean'" in body
+
+
+def test_job_error_code_gate_matches_the_python_public_map():
+    """The UI's closed error_code list and the web layer's PUBLIC_ERROR_CODES
+    map are ONE contract; drift means a real failure silently renders as an
+    invalid job (server codes are fixed literals, prompt-free)."""
+    from qwen_engine.web.generation import PUBLIC_ERROR_CODES
+    js = _read("app.js")
+    m = re.search(r"if \(\[null,([^\]]*?)\]\.indexOf\(job\.error_code\)", js, re.S)
+    assert m, "parseJob error_code gate not found"
+    assert set(re.findall(r"'([a-z_]+)'", m.group(1))) == set(PUBLIC_ERROR_CODES)
+
+
+def test_gpu_oom_failure_message_is_plain_language_and_actionable():
+    js = _read("app.js")
+    m = re.search(r"out_of_gpu_memory: '([^']*)' \+\s*\n?\s*'([^']*)'", js)
+    assert m, "out_of_gpu_memory message not found"
+    assert "".join(m.groups()) == ("The GPU ran out of memory for this job. "
+                                   "Try Q8, a smaller size, fewer reference images, "
+                                   "or Turbo.")
+    # only the closed map may replace the generic sentence; no server text
+    assert "failureMessages[job.error_code] ||" in js
+
+
+def test_recipe_field_mirrors_the_config_gates():
+    html = _read("index.html")
+    js = _read("app.js")
+    css = _read("app.css")
+    from qwen_engine.config import Recipe, TURBO_STEPS
+
+    # The UI's Turbo step count and recipe names are the SAME values the
+    # server validates against.
+    assert f"var TURBO_STEPS = {TURBO_STEPS};" in js
+    m = re.search(r"var RECIPES = \[([^\]]*)\];", js)
+    assert m, "RECIPES not found"
+    assert re.findall(r"'([a-z]+)'", m.group(1)) == [r.value for r in Recipe]
+    # One radio group, both values, Quality checked by default.
+    assert re.search(r'<fieldset[^>]*id="recipe-field"[^>]*>', html)
+    for value in ("base", "turbo"):
+        assert f'id="recipe-{value}" name="recipe" type="radio" value="{value}"' in html
+    assert re.search(r'id="recipe-base"[^>]*checked', html, re.S)
+    assert 'id="recipe-help"' in html and 'id="recipe-note"' in html
+    assert 'id="recipe-error"' in html
+    # The note is a live region and is referenced by the locked controls so
+    # the reason for the lock reaches assistive tech.
+    note = re.search(r'<p id="recipe-note"[^>]*>', html).group(0)
+    assert 'role="status"' in note
+    for control in ("steps", "recipe-base", "recipe-turbo"):
+        tag = re.search(rf'<input id="{control}"[^>]*', html, re.S)
+        assert tag and "recipe-note" in tag.group(0), f"#{control} must describe the recipe note"
+    assert re.search(r'<input id="steps"[^>]*aria-describedby="steps-error recipe-note"',
+                     html, re.S)
+    # Plan panel echoes the recipe.
+    assert 'id="plan-recipe"' in html
+    # Locks are STYLED (visible-but-inert), never just hidden.
+    assert ".radio-row" in css and ".radio-field" in css
+    assert "input:disabled" in css and "select:disabled" in css
+
+
+def test_apply_recipe_mode_locks_and_restores_the_gated_controls():
+    js = _read("app.js")
+    body = _js_function(js, "applyRecipeMode")
+    # Turbo pins exactly what config.py refuses to see otherwise.
+    assert "steps.value = String(TURBO_STEPS);" in body
+    assert "cfg.value = '1.0';" in body
+    assert "quant.value = 'fp16';" in body
+    # All four gated controls are locked, and the reason is written down.
+    for control in ("steps", "cfg", "negative", "quant"):
+        assert f"{control}.disabled = turbo;" in body, f"{control} must be locked under Turbo"
+    assert "recipe-note" in body and "hidden = !turbo" in body
+    # Leaving Turbo restores the user's own values instead of keeping pins.
+    assert "recipeSaved" in body and "steps.value = recipeSaved.steps;" in body
+    assert "cfg.value = recipeSaved.cfg;" in body
+    assert "quant.value = recipeSaved.quant;" in body
+    # An imported plan supplies the recipe's own values: no capture.
+    assert "keepValues" in body
+    m = re.search(r"function applyImportedPlan\(plan\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "applyImportedPlan not found"
+    imported = m.group(1)
+    assert "applyRecipeMode(true)" in imported
+    # Order matters: the recipe is applied after the file's values so the
+    # locks match the file, not a leftover draft.
+    assert imported.index("setRecipeControl(c.recipe)") > imported.index("c.quant")
+    assert "recipeSaved = null;" in imported
+
+
+def test_recipe_contract_is_mirrored_by_parse_plan_and_parse_job():
+    js = _read("app.js")
+    body = _js_function(js, "recipeConsistent")
+    assert "PLAN_ENUMS.recipe.indexOf(c.recipe) === -1" in body
+    assert "c.steps === TURBO_STEPS" in body
+    assert "c.quant === 'fp16'" in body
+    assert "true_cfg_scale > 1" in body
+    # Both parsers refuse an echo the server could not have produced.
+    assert "recipeConsistent(c)" in _js_function(js, "parsePlan")
+    assert "recipeConsistent(c)" in _js_function(js, "parseJob")
+    # The history label distinguishes the two recipes.
+    assert "job.config.recipe === 'turbo' ? ' · Turbo' : ''" in js
+    # Server refusals are mapped onto the recipe's own fields.
+    assert "recipe: 'recipe-error'" in js and "recipe: 'recipe-field'" in js
+    for fn in ("runPlan", "submitGeneration"):
+        assert "applyServerFieldErrors(" in _js_function(js, fn), \
+            f"{fn} must render per-field server refusals"
+
+
+def test_recipe_radios_are_wired_and_locked_on_load():
+    js = _read("app.js")
+    assert 'document.querySelectorAll(\'input[name="recipe"]\')' in js
+    # The group handler re-derives the locks, re-renders errors and stales
+    # any visible plan result — the same contract as every other field.
+    m = re.search(r"input\[name=\"recipe\"\]'\),([\s\S]*?)\}\);\n", js)
+    assert m and "applyRecipeMode();" in m.group(1)
+    assert "renderValidation(validateForm().errors);" in m.group(1)
+    assert "syncPlanStaleness();" in m.group(1)
+    # Locks exist on first paint, not only after the first change event.
+    assert "applyRecipeMode();   // lock state matches" in js
+    # The envelope carries the recipe value (not a derived boolean).
+    assert "recipe: currentRecipe()," in js
+    assert "recipe: snap.recipe," in js
+
+
+def test_import_applies_transparent_background_without_auto_switch():
+    js = _read("app.js")
+    m = re.search(r"function applyImportedPlan\(plan\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m, "applyImportedPlan not found"
+    body = m.group(1)
+    assert "$('transparent').checked = c.transparent_background;" in body
+    # An imported, server-validated plan is applied verbatim: no local rewrite.
+    assert "onTransparencyChange" not in body
+    assert body.index("$('output-format').value = c.output_format;") < \
+        body.index("$('transparent').checked = c.transparent_background;")
+
+
+def test_plan_panel_shows_the_transparency_row():
+    html = _read("index.html")
+    assert 'id="plan-transparency"' in html
+    js = _read("app.js")
+    m = re.search(r"function planRenderFields\(plan\)\s*\{([\s\S]*?)\n  \}", js)
+    assert m and "setText('plan-transparency'" in m.group(1)
+    assert "plan.config.transparent_background" in m.group(1)
+
+
+def test_alpha_results_are_previewed_on_a_checkerboard_only():
+    css = _read("app.css")
+    rule = re.search(r"\.history-card img \{([^}]*)\}", css)
+    assert rule and "repeating-conic-gradient" in rule.group(1), \
+        "transparent thumbnails need a checkerboard behind them"
+    assert 'data-theme="paper"' in css and ".history-card img" in css
+    # Preview only: nothing in the CSS or JS writes pixels into the saved file.
+    js = _read("app.js")
+    assert "canvas" not in js and "toBlob" not in js
+    # The transparency row has its own visible styles.
+    assert ".transparency-field" in css and ".effective-prompt-text" in css
+
+
+def test_a_history_entry_whose_image_fails_to_load_stays_listed_and_is_stated():
+    js, css, html = _read("app.js"), _read("app.css"), _read("index.html")
+    assert 'id="history-missing-note"' in html and 'role="status"' in html
+    body = _js_function(js, "renderHistory")
+    assert "image.addEventListener('error'" in body
+    # The observer states only what it saw: a failed request does not prove
+    # the file changed, and it must not claim the entry was dropped — the
+    # server keeps the record and refuses only the image.
+    assert 'history-missing-note' in body and "hidden = false" in body
+    assert "isConnected" in body, "a rebuilt grid must not be narrated for"
+    spoken = body[body.index("setText('history-missing-note'"):]
+    spoken = spoken[:spoken.index(");")]
+    assert "could not" in spoken
+    for claim in ("tampered", "deleted", "changed", "removed", "missing from"):
+        assert claim not in spoken, f"unobserved claim shown to the user: {claim}"
+    # The failure is visible, not a silent icon: the rule hides the broken
+    # image and states unavailability instead.
+    rule = re.search(r"\.history-card\.history-missing::before \{([^}]*)\}", css)
+    assert rule and "Image unavailable" in rule.group(1)
+    assert "history-missing img { display: none; }" in css.replace("\n", " ")
+
+
+# ---------------------------------------------------------------------------
+# W4 — reference images (design §2.4 / §5)
+#
+# The upload route takes RAW file bytes; the JSON routes cap bodies at
+# 64 KiB while one reference may be 32 MiB, so base64-in-JSON is not an
+# option and the tests refuse it outright. Conditioning order is the
+# DISPLAYED order, so the envelope must carry the ids in list order.
+# ---------------------------------------------------------------------------
+
+
+def _js_function(js: str, signature: str) -> str:
+    """Body of a top-level ``function <signature>(...) { ... }`` in app.js.
+
+    The file is 2-space indented and every top-level function closes on a
+    line that is exactly ``  }``; the regex is anchored there so a nested
+    block can never end the match early.
+    """
+    m = re.search(rf"function {re.escape(signature)}\([\s\S]*?\n  \}}", js)
+    assert m, f"{signature} not found in app.js"
+    return m.group(0)
+
+
+def test_w4_constants_mirror_the_python_caps_and_schema():
+    from qwen_engine import reference_store
+    from qwen_engine.config import REF_MAX
+    from qwen_engine.web import api
+
+    js = _read("app.js")
+    assert f"var MAX_REFERENCES = {REF_MAX};" in js
+    assert f"var MAX_REFERENCE_BYTES = {reference_store.MAX_REFERENCE_BYTES};" in js or \
+        f"32 * 1024 * 1024" in js
+    assert f"var MAX_REFERENCE_DIM = {reference_store.MAX_REFERENCE_DIM};" in js
+    assert f"var REFERENCE_SCHEMA = '{api.WEB_REFERENCE_SCHEMA}';" in js
+    # The upload route is the server's own path, relative (same-origin only).
+    assert "var API_REFERENCES = '/api/v1/references';" in js
+    # The id is a content digest the server also validates: lowercase only.
+    assert r"[0-9a-f]{64}" in js
+    assert "REFERENCE_ACCEPT = 'image/png,image/jpeg,image/webp'" in js
+
+
+def test_w4_editable_keys_match_the_server_set_exactly():
+    from qwen_engine.web.api import EDITABLE_FIELDS
+
+    js = _read("app.js")
+    m = re.search(r"var EDITABLE_KEYS = \[([\s\S]*?)\];", js)
+    assert m, "EDITABLE_KEYS not found"
+    keys = re.findall(r"'([a-z_]+)'", m.group(1))
+    assert len(keys) == len(set(keys)) == 15, keys
+    assert set(keys) == set(EDITABLE_FIELDS), (
+        f"EDITABLE_KEYS diverge from api.EDITABLE_FIELDS: "
+        f"{set(keys) ^ set(EDITABLE_FIELDS)}")
+    assert keys[-1] == "references", "references is the newest (last) wire field"
+    assert keys.index("recipe") == keys.index("steps") + 1, \
+        "recipe sits with the sampling fields, right after steps"
+
+
+def test_w4_reference_fieldset_markup_is_labelled_and_announced():
+    html = _read("index.html")
+    m = re.search(r'<fieldset[^>]*id="reference-field"[^>]*>([\s\S]*?)</fieldset>', html)
+    assert m, "reference fieldset missing"
+    block = m.group(0)
+    assert "<legend>Reference images</legend>" in block
+    # Plain-language help states the numbering contract and that size comes
+    # from the preset, not the images.
+    assert "image 1, image 2" in block
+    assert "Output size comes from the preset" in block
+    # File input: accepted types mirror the server's formats, multi-select,
+    # hidden (the visible button opens it) — never a drag-only affordance.
+    assert 'accept="image/png,image/jpeg,image/webp"' in block
+    assert " multiple" in block and "hidden" in block
+    for control in ("add-reference", "reference-file", "reference-list",
+                    "reference-count", "reference-empty", "reference-status",
+                    "reference-limit"):
+        assert f'id="{control}"' in block, f"missing #{control}"
+    assert 'aria-describedby="reference-help reference-status"' in block
+    assert 'role="status"' in block and 'aria-live="polite"' in block
+    assert 'aria-label="Reference images, in prompt order"' in block
+    # The disabled Add button is never the only guard, and there is no
+    # draggable attribute anywhere: reordering is button-only.
+    assert "draggable" not in block
+
+
+def test_w4_upload_sends_raw_bytes_never_base64_or_json():
+    js = _read("app.js")
+    body = _js_function(js, "uploadReference")
+    assert "Content-Type': 'application/octet-stream'" in body
+    assert "'X-Qwen-UI': '1'" in body
+    assert "body: bytes" in body
+    # The file is read as an ArrayBuffer and wrapped in a Uint8Array; the
+    # page never base64-encodes it and never JSON-wraps the bytes.
+    reader = _js_function(js, "readFileBytes")
+    assert "readAsArrayBuffer" in reader
+    assert "new Uint8Array(bytes)" in reader
+    assert "JSON.stringify" not in body
+    # No base64 path exists at all: no encoder, no data-URL reader.
+    for forbidden in ("btoa(", "atob(", "readAsDataURL", "toDataURL", "FileReaderSync"):
+        assert forbidden not in js, f"app.js must not use {forbidden}"
+    # The upload is gated on a recognized status: writes need one.
+    add = _js_function(js, "addReferenceFiles")
+    assert "if (!apiConnected)" in add
+    # Config import reuses the same bounded read path — one convention.
+    limited = _js_function(js, "readFileLimited")
+    assert "readFileBytes(file, MAX_IMPORT_FILE_BYTES)" in limited
+
+
+def test_w4_upload_refusals_are_typed_and_bounded():
+    js = _read("app.js")
+    body = _js_function(js, "uploadReference")
+    # Status codes reach the user as the server's own closed code pattern,
+    # truncated, never a raw message of unbounded length.
+    assert r"/^[a-z0-9_]{1,64}$/" in body
+    assert "payload.message.slice(0, 200)" in body
+    assert "setReferenceStatus(" in body
+    # A schema-invalid 201 is a contract rejection: availability is dropped,
+    # never rendered as a successful upload.
+    assert "parseReferenceResponse(r.json)" in body
+    assert "setApiAvailable(false)" in body
+    # Content addressing: the same bytes are the same id, added once.
+    assert "referenceIds().indexOf(ref.id)" in body
+
+
+def test_w4_hard_cap_is_a_stated_stop_not_a_silent_drop():
+    js = _read("app.js")
+    add = _js_function(js, "addReferenceFiles")
+    assert "MAX_REFERENCES - references.length" in add
+    assert "files.slice(0, room)" in add
+    assert "were not uploaded" in add or "not uploaded" in add
+    # Room is computed BEFORE any bytes are sent: no over-cap upload can
+    # even start.
+    assert add.index("var room = MAX_REFERENCES - references.length") < \
+        add.index("return step()")
+    controls = _js_function(js, "updateReferenceControls")
+    assert "references.length >= MAX_REFERENCES" in controls
+    assert "$('add-reference').disabled" in controls
+
+
+def test_w4_parse_reference_response_is_a_closed_shape():
+    js = _read("app.js")
+    body = _js_function(js, "parseReferenceResponse")
+    assert body.count("return null") >= 6
+    assert "Object.keys(raw).length !== 6" in body
+    for field in ("width", "height", "has_alpha", "bytes"):
+        assert field in body
+    for cap in ("MAX_REFERENCE_DIM", "MAX_REFERENCE_BYTES"):
+        assert cap in body, f"{cap} not enforced on the response"
+
+
+def test_w4_parse_plan_and_job_keep_explicit_legacy_branches():
+    js = _read("app.js")
+    plan = _js_function(js, "parsePlan")
+    # Current shape first, then the four explicitly-gated older shapes (the
+    # recipe era, then references, transparency and output_format).
+    assert "var want = EDITABLE_KEYS;" in plan
+    assert "have.length === want.length" in plan
+    for n in (14, 13, 12, 11):
+        assert f"have.length === {n}" in plan, f"parsePlan misses the {n}-key branch"
+    # Every legacy branch is gated on the recipe key too, so a 14-key echo
+    # that HAS recipe (i.e. some other key missing) is a rejection.
+    assert "!hasKey('recipe')" in plan
+    assert "c.recipe = 'base';" in plan
+    assert "c.references = [];" in plan
+    assert "Object.keys(c).length !== want.length" in plan
+    assert "Array.isArray(c.references)" in plan and \
+        "c.references.length > MAX_REFERENCES" in plan
+    assert "REFERENCE_ID_RE.test(c.references[i])" in plan
+
+    job = _js_function(js, "parseJob")
+    for n in (15, 14, 13, 12, 11):
+        assert f"ckeys.length === {n}" in job, f"parseJob misses the {n}-key branch"
+    assert "!hasKey('recipe')" in job
+    assert "c.recipe = 'base';" in job
+    assert "c.references = [];" in job
+    assert "REFERENCE_ID_RE.test(c.references[r])" in job
+    # An over-cap list is refused, never truncated.
+    assert "c.references.length > MAX_REFERENCES" in job
+
+
+def test_w4_reference_ids_are_validated_but_duplicates_are_legal():
+    js = _read("app.js")
+    plan = _js_function(js, "parsePlan")
+    assert "typeof c.references[i] !== 'string'" in plan
+    # config.py allows repeating an id (the same image cited twice), so the
+    # parser must not de-duplicate or unique-filter the list.
+    assert "new Set(" not in plan
+    assert ".filter(" not in plan.split("c.references")[0]
+
+
+def test_w4_import_round_trips_reference_ids_in_file_order():
+    js = _read("app.js")
+    body = _js_function(js, "applyImportedPlan")
+    assert "references = c.references.map(" in body
+    # Order is the FILE's order, and the display metadata is honestly
+    # unknown (the export carries ids only).
+    assert "id: id, width: null, height: null, has_alpha: null, bytes: null" in body
+    assert "renderReferences()" in body
+
+
+def test_w4_plan_panel_shows_the_reference_count():
+    html = _read("index.html")
+    assert 'id="plan-references"' in html
+    js = _read("app.js")
+    body = _js_function(js, "planRenderFields")
+    assert "setText('plan-references'" in body
+    assert "plan.config.references.length" in body
+
+
+def test_w4_envelope_and_render_agree_on_order():
+    js = _read("app.js")
+    snapshot = _js_function(js, "formSnapshot")
+    assert "references: referenceIds()" in snapshot
+    envelope = re.search(r"buildEnvelope\(\)[\s\S]*?transparent_background: snap\."
+                         r"transparent_background,\s*\n\s*references: snap\.references",
+                         js)
+    assert envelope, "buildEnvelope must forward snap.references verbatim"
+    # The list is renumbered from POSITION on every render — never stored —
+    # so a remove/reorder cannot leave a stale ordinal.
+    render = _js_function(js, "renderReferences")
+    assert "referenceCard(references[i], i)" in render, \
+        "renderReferences must number cards from their list position"
+    assert "'Image ' + (index + 1)" in _js_function(js, "referenceCard")
+    assert "renderReferences();" in _js_function(js, "moveReference")
+    assert "renderReferences();" in _js_function(js, "removeReference")
+    # Every reorder/remove also bumps the draft revision via staleness.
+    for fn in ("moveReference", "removeReference"):
+        assert "syncPlanStaleness()" in _js_function(js, fn), f"{fn} must stale plans"
+
+
+def test_w4_reorder_buttons_are_keyboard_accessible_and_end_aware():
+    js = _read("app.js")
+    render = _js_function(js, "referenceCard")
+    assert "button.type = 'button'" in render
+    assert "setAttribute('aria-label', buttons[b][2])" in render
+    assert "'Move reference image ' + (index + 1) + ' up'" in render
+    # The ends are honestly unavailable, not silent no-ops.
+    assert "button.disabled = index === 0" in render
+    assert "button.disabled = index === references.length - 1" in render
+    # Focus survives the re-render (the list is rebuilt every time).
+    assert "want.focus()" in _js_function(js, "focusReferenceButton")
+
+
+def test_w4_submit_surfaces_reference_unavailable():
+    js = _read("app.js")
+    submit = _js_function(js, "submitGeneration")
+    assert "r.json.code === 'reference_unavailable'" in submit
+    assert "referenceNumberFromError(" in submit
+    helper = _js_function(js, "referenceNumberFromError")
+    # Only the ORDINAL is extracted from server text, and only when it
+    # matches the documented message; anything else falls back safely.
+    assert r"/^reference (\d{1,2}) is not available/" in helper
+    assert "MAX_REFERENCES" in helper
+
+
+def test_w4_reference_thumbnails_use_the_checkerboard_background():
+    css = _read("app.css")
+    rule = re.search(r"\.reference-card img \{([^}]*)\}", css)
+    assert rule and "repeating-conic-gradient" in rule.group(1), \
+        "alpha reference thumbnails need a checkerboard behind them"
+    assert re.search(r':root\[data-theme="paper"\] \.reference-card img \{([^}]*)\}',
+                     css) and "repeating-conic-gradient" in \
+        re.search(r':root\[data-theme="paper"\] \.reference-card img \{([^}]*)\}',
+                  css).group(1)
+    for selector in (".reference-field", ".reference-list", ".reference-actions",
+                     ".reference-status", ".reference-ordinal", ".reference-meta"):
+        assert selector in css, f"missing {selector} styles"
+
+
+def test_w4_reference_cards_wrap_instead_of_forcing_a_wider_viewport():
+    """A 4-column grid over ordinal+thumb+meta+3 buttons overflowed 320px.
+
+    The browser check measures the symptom (innerWidth widening past the
+    emulated 320px); this pins the layout choice that prevents it.
+    """
+    css = _read("app.css")
+    card = re.search(r"\.reference-card \{([^}]*)\}", css)
+    assert card, "missing .reference-card rule"
+    assert "display: flex" in card.group(1) and "flex-wrap: wrap" in card.group(1), \
+        "reference cards must wrap; a rigid grid widens the layout viewport"
+    assert "grid-template-columns" not in card.group(1)
+    meta = re.search(r"\.reference-meta \{([^}]*)\}", css)
+    assert meta and "min-width: 0" in meta.group(1), \
+        "the metadata cell must be allowed to shrink for overflow-wrap to apply"
+    actions = re.search(r"\.reference-actions \{([^}]*)\}", css)
+    assert actions and "flex: 0 0 auto" in actions.group(1), \
+        "action buttons keep their hit size and wrap as a unit"
+
+
+def test_w4_batch_end_rerenders_so_remove_is_enabled_again():
+    """Cards are rendered while uploadingReference is true.
+
+    Only refreshing the toolbar at the batch end left every Remove button
+    permanently disabled (found by screenshot, now pinned two ways).
+    """
+    js = _read("app.js")
+    add = _js_function(js, "addReferenceFiles")
+    assert add.count("renderReferences();") == 2, \
+        "both the success and failure paths must re-render the card list"
+    assert "button.disabled = uploadingReference" in _js_function(
+        js, "referenceCard")
+
+
+def test_w4_a_pruned_reference_states_the_thumbnail_is_gone():
+    """A 422 names the ordinal; the card must not stay a silent broken icon.
+
+    The card keeps its LIST POSITION (the envelope must show the order the
+    user would submit), so the absence is stated on the card and in the
+    aria-live status line instead.
+    """
+    render = _js_function(_read("app.js"), "referenceCard")
+    assert "img.addEventListener('error'" in render
+    assert "reference-missing" in render
+    assert "thumbnail unavailable" in render
+    assert "setReferenceStatus(" in render
+    # `var i` is function-scoped: an error handler that reads the loop
+    # variable narrates one past the end of the list. The ordinal must be
+    # read from the live DOM position instead.
+    # The handler BODY only: the buttons loop later in renderReferences uses
+    # `i` correctly (synchronously, before any re-render).
+    start = render.index("img.addEventListener('error'")
+    handler = render[start:render.index("});", start)]
+    assert "pos + 1" in handler
+    # Parent-relative, so the card needs no closure over the render list.
+    assert "indexOf.call(item.parentNode.children, item)" in handler
+    assert "(i + 1)" not in handler
+    assert "isConnected" in handler, "discarded cards must not narrate"
+    css = _read("app.css")
+    assert ".reference-card.reference-missing" in css
+    rule = re.search(r"\.reference-card\.reference-missing \{([^}]*)\}", css)
+    # Every theme defines --error; no theme defines a --warning token.
+    assert "--error" in rule.group(1)
+    for token in ("--bg:", "--text:", "--border:", "--accent:", "--error:"):
+        assert css.count(token) >= 3, f"{token} must be defined in all 3 themes"
+
+
+def test_w4_each_card_gets_its_own_closure_scope():
+    """`var` is function-scoped: building cards inside one loop function
+    left every error handler bound to the LAST card's item/img/meta.
+
+    Each card is now built by its own function call, so the handler's
+    bindings are per-card. A report of the wrong ordinal/card traced
+    directly to this.
+    """
+    js = _read("app.js")
+    render = _js_function(js, "renderReferences")
+    card = _js_function(js, "referenceCard")
+    # The DOM nodes are created inside referenceCard, never the render loop.
+    for creation in ("document.createElement('li')", "document.createElement('img')"):
+        assert creation in card, f"referenceCard must create {creation}"
+        assert creation not in render, \
+            f"{creation} in renderReferences re-creates the shared-scope bug"
+    # The handler must not read the render loop's variable at all.
+    assert "img.addEventListener('error'" in card
+    assert "list.children" not in card
+
+
+def test_test_surface_is_exposed_for_the_browser_checks():
+    js = _read("app.js")
+    surface = js[js.index("window.QwenStudio = {"):]
+    # The version is a cache-buster/attribution marker, not a contract: assert
+    # its SHAPE so a deliberate bump never fails this check.
+    assert re.search(r"version: 'w[0-9]+-[a-z0-9-]+'", surface), "version marker missing"
+    for name in ("referenceIds", "addReferenceFiles", "removeReference",
+                 "moveReference", "parseReferenceResponse", "MAX_REFERENCES",
+                 "parseRewriteBlock", "parseRewriteAnswer", "setRewriterState",
+                 "presetForRatio", "requestRewrite", "applyProposal",
+                 "keepOriginal", "rewriteState"):
+        assert f"{name}: {name}" in surface, f"QwenStudio must expose {name}"
+
+
+def test_w5_rewrite_ui_is_a_suggestion_flow_not_an_automatic_edit():
+    """The Rewrite action must never change the draft on its own.
+
+    Pins the four load-bearing properties (plan R4): the proposal block is a
+    separate, initially-hidden region; Apply/Edit are the ONLY writers of
+    ``prompt`` from the rewrite module; the fetch carries the separate long
+    timeout; and an unavailable rewriter is hidden, not disabled-and-explained.
+    """
+    html = _read("index.html")
+    js = _read("app.js")
+
+    # -- markup: the block starts hidden and is a labelled group ----------
+    block = re.search(r'<div id="rewrite-proposal".*?\n {14}</div>', html, re.S)
+    assert block, "the proposal block must exist"
+    block = block.group(0)
+    assert "hidden" in block.split(">", 1)[0], "proposal starts hidden"
+    assert 'tabindex="-1"' in block, "proposal must be focusable for a11y"
+    assert 'role="group"' in block
+    assert 'aria-labelledby="rewrite-proposal-heading"' in block
+    for node in ("rewrite-original", "rewrite-suggested", "rewrite-ratio",
+                 "rewrite-apply", "rewrite-edit", "rewrite-keep",
+                 "rewrite-apply-ratio", "rewrite-error"):
+        assert f'id="{node}"' in block, f"proposal must contain #{node}"
+    # The button starts hidden AND disabled: an absent rewriter is not a
+    # broken one, so there is nothing to press.
+    button = re.search(r'<button[^>]*id="rewrite-btn"[^>]*>', html).group(0)
+    assert "hidden" in button and "disabled" in button
+    assert 'id="rewrite-hint"' in html
+    # The help copy names the action and that it is opt-in.
+    help_text = re.search(r'<p id="prompt-help".*?</p>', html, re.S).group(0)
+    assert "Rewrite" in help_text and "Apply" in help_text
+
+    # -- the ONLY prompt writes from the rewrite module -------------------
+    rewrite_region = js[js.index("function setRewriterState"):
+                        js.index("function apiErrorPayloadFromBytes")]
+    for fn in ("applyProposal", "editProposal"):
+        body = _js_function(js, fn)
+        assert "$('prompt').value = proposal.prompt;" in body
+    # Showing a proposal never writes the textarea.
+    assert "$('prompt').value =" not in _js_function(js, "showProposal")
+    assert "$('prompt').value =" not in _js_function(js, "requestRewrite")
+    assert "$('prompt').value =" not in rewrite_region.split("function applyProposal")[0]
+
+    # -- separate, longer timeout; shared one untouched -------------------
+    assert re.search(r"var REWRITE_TIMEOUT_MS = \d+;", js)
+    assert "REWRITE_TIMEOUT_MS" in _js_function(js, "requestRewrite")
+    assert "timeoutMs: REWRITE_TIMEOUT_MS" in js
+    assert int(re.search(r"var REWRITE_TIMEOUT_MS = (\d+);", js).group(1)) >= 240000
+    assert int(re.search(r"var FETCH_TIMEOUT_MS = (\d+);", js).group(1)) <= 30000
+    # The route constant is the only rewrite URL, and it is relative.
+    assert re.search(r"var API_REWRITE = '/api/v1/rewrite';", js)
+    assert re.search(r"var REWRITE_REQUEST_SCHEMA = 'qwen_engine\.web_rewrite_request\.v1';", js)
+    assert re.search(r"var REWRITE_SCHEMA = 'qwen_engine\.web_rewrite\.v1';", js)
+
+    # -- stale discard: BOTH the revision and the echoed text -------------
+    req = _js_function(js, "requestRewrite")
+    assert "answer.draft_revision !== promptRevision" in req
+    assert "answer.original_prompt !== $('prompt').value" in req
+    # A suggestion dies when the prompt text moves — but a width/steps change
+    # must NOT throw it away, so the counter is its own.
+    assert re.search(r"var promptRevision = 0;", js)
+    assert re.search(r"var draftRevision = 0;", js), \
+        "the plan/import revision must stay separate from the prompt revision"
+    # syncPlanStaleness owns draftRevision; it must NOT bump the prompt one,
+    # or a resolution change would silently discard a good suggestion.
+    staleness = _js_function(js, "syncPlanStaleness")
+    assert "draftRevision++" in staleness
+    assert "promptRevision" not in staleness
+
+    # -- an edit rewrite sends its references, in the displayed order -----
+    # The request must carry the ids the list shows, in that order: reference N
+    # is <imageN> in the edit system prompt. A hardcoded empty list would send
+    # an edit draft with no pictures, and a sorted list would silently
+    # re-point every <imageN>.
+    assert "image_ids: []" not in req, \
+        "the request must not hardcode an empty image_ids"
+    assert "image_ids: imageIds" in req
+    assert "var imageIds = task === 'edit' ? referenceIds() : [];" in req
+    assert "var task = rewriteTask();" in req
+    # The button is availability-gated on the task it would send.
+    available = _js_function(js, "rewriteAvailable")
+    assert "referenceIds().length > 0" in available
+    assert "rewriteTask() === 't2i'" in available
+    assert "disabled = !rewriteAvailable()" in _js_function(js, "setRewriterState")
+    # A reference change is a rewrite input: it must bump the PROMPT revision
+    # (which kills a visible proposal), not only the plan's draftRevision.
+    for fn in ("removeReference", "moveReference"):
+        body = _js_function(js, fn)
+        assert "bumpPromptRevision();" in body, \
+            f"{fn} must stale a visible rewrite proposal"
+    add = _js_function(js, "addReferenceFiles")
+    assert "bumpPromptRevision();" in add or "bumpPromptRevision();" in \
+        js[js.index("references.push(ref)"):js.index("references.push(ref)") + 600]
+
+    # -- no model-generated text is ever treated as HTML ------------------
+    for fn in ("showProposal", "renderRewriteError", "setRewriterState",
+               "requestRewrite", "bumpPromptRevision"):
+        body = _js_function(js, fn)
+        assert "innerHTML" not in body, f"{fn} must not assign innerHTML"
+        assert "insertAdjacentHTML" not in body, f"{fn} must not insert HTML"

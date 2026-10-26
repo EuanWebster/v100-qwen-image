@@ -22,16 +22,22 @@ from qwen_engine._jsonsafe import plain_json, reject_constant
 from qwen_engine.encoder import (
     DEFAULT_MAX_RESPONSE_BYTES, RESULT_SCHEMA, EncodedPayload, EncoderError,
     EncoderProtocolError, EncoderRequest, EncoderRequestError, EncoderSetupError,
+    request_image_files,
 )
 from qwen_engine.encoder_assets import (
     CHECKPOINT_DTYPE, EncoderAssetError, VerifiedEncoderAssets,
     preflight_encoder_tree, verify_encoder_assets,
 )
 from qwen_engine.encoder_identity import complete_encoder_seed, validate_worker_request_identity
-from qwen_engine.encoder_production import encode_with_supplied_model, validate_production_request
+from qwen_engine.encoder_production import (
+    encode_with_supplied_model, reference_images_from_blobs,
+    validate_production_request,
+)
 from qwen_engine.local_bundle import ENCODER_ROLES, validate_local_reference_layout
+from qwen_engine.reference_store import MAX_REFERENCE_BYTES
 from qwen_engine.manifest import ManifestError, ManifestFormatError, manifest_from_dict
 from qwen_engine.mem_preflight import MemoryPreflightError, require_encoder_memory_fit
+from qwen_engine.performance import stage, PerformanceRecorder
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
@@ -52,6 +58,39 @@ def _offline_audit(event, args):
     if event.startswith("socket."):
         raise OfflineViolation(f"encoder worker offline policy refuses {event}")
 
+#: Encoder threading knobs (docs/encoder-cpu-performance.md). Threads
+#: default to min(16, cpu_count): bf16 AVX512 matmul values were proven
+#: BIT-IDENTICAL to one thread across text-only+CFG, 1-ref and 2-ref
+#: requests (t1/t16 value-hash matrix), and child VmHWM is unchanged by
+#: thread count, so the memory gate sees the same peak. QWEN_ENCODER_THREADS
+#: still overrides for diagnosis. ATTENTION stays single-kernel eager by
+#: default: sdpa is 1.5x faster but materially changes embeddings (global
+#: cosine 0.936) and is refused as a default. Children inherit the parent
+#: environment, so these must be validated and applied HERE, before torch
+#: imports (Open/MKL pinning is fixed at first BLAS init).
+THREADS_ENV = "QWEN_ENCODER_THREADS"
+ATTN_ENV = "QWEN_ENCODER_ATTN"
+ATTN_CHOICES = ("eager", "sdpa")
+
+
+def _requested_threads() -> int:
+    raw = os.environ.get(THREADS_ENV, str(min(16, os.cpu_count() or 1)))
+    try:
+        value = int(raw)
+    except ValueError:
+        raise EncoderSetupError(f"{THREADS_ENV} must be an integer in 1..64") from None
+    if not 1 <= value <= 64:
+        raise EncoderSetupError(f"{THREADS_ENV} must be an integer in 1..64")
+    return value
+
+
+def _requested_attn() -> str:
+    value = os.environ.get(ATTN_ENV, "eager")
+    if value not in ATTN_CHOICES:
+        raise EncoderSetupError(
+            f"{ATTN_ENV} must be one of {'/'.join(ATTN_CHOICES)}")
+    return value
+
 
 def install_offline_guard() -> None:
     """Irreversible child-only socket guard, installed before lazy ML imports."""
@@ -60,11 +99,12 @@ def install_offline_guard() -> None:
         return
     if any(m in sys.modules for m in ("torch", "diffusers", "transformers")):
         raise EncoderSetupError("offline guard must be installed in a fresh child before ML imports")
+    threads = str(_requested_threads())
     os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
                       HF_DATASETS_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1",
                       TOKENIZERS_PARALLELISM="false", PYTHONDONTWRITEBYTECODE="1",
-                      OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
-                      NUMEXPR_NUM_THREADS="1")
+                      OMP_NUM_THREADS=threads, MKL_NUM_THREADS=threads,
+                      OPENBLAS_NUM_THREADS=threads, NUMEXPR_NUM_THREADS=threads)
     sys.dont_write_bytecode = True
     sys.addaudithook(_offline_audit)
     _OFFLINE_INSTALLED = True
@@ -169,6 +209,38 @@ def read_bounded_json(path, cap: int, label: str):
     except (OSError, ValueError, TypeError, RuntimeError, EncoderSetupError) as exc:
         raise EncoderRequestError(f"{label}: cannot read input file: {exc}") from exc
 
+def read_bounded_bytes(path, cap: int, label: str) -> bytes:
+    """One bounded, no-follow, identity-checked regular-file read (the
+    reference-image sibling of :func:`read_bounded_json`)."""
+    if type(cap) is not int or cap < 1:
+        raise EncoderRequestError(f"{label}: invalid input byte cap")
+    try:
+        with _parent(path) as (_, name, directory):
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            try:
+                before = os.fstat(fd)
+                if not stat.S_ISREG(before.st_mode) or before.st_size > cap:
+                    raise EncoderRequestError(f"{label}: not a bounded regular file")
+                data = bytearray()
+                while True:
+                    block = os.read(fd, min(65536, cap + 1 - len(data)))
+                    if not block:
+                        break
+                    data.extend(block)
+                    if len(data) > cap:
+                        raise EncoderRequestError(f"{label}: byte cap exceeded")
+                if not data:
+                    raise EncoderRequestError(f"{label}: empty file")
+                after = os.fstat(fd)
+                published = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if len(data) != before.st_size or _sig(before) != _sig(after) or _sig(before) != _sig(published):
+                    raise EncoderRequestError(f"{label}: changed during read")
+                return bytes(data)
+            finally:
+                os.close(fd)
+    except (OSError, ValueError, TypeError, RuntimeError, EncoderSetupError) as exc:
+        raise EncoderRequestError(f"{label}: cannot read input file: {exc}") from exc
+
 
 def validate_shard_index(assets: VerifiedEncoderAssets) -> None:
     path = assets.component_dirs["text_encoder"] / "model.safetensors.index.json"
@@ -196,7 +268,7 @@ def validate_shard_index(assets: VerifiedEncoderAssets) -> None:
 def _load_classes():
     try:
         torch = importlib.import_module("torch")
-        torch.set_num_threads(1)
+        torch.set_num_threads(_requested_threads())
         torch.set_num_interop_threads(1)
         transformers = importlib.import_module("transformers")
         return torch, transformers.Qwen3VLProcessor, transformers.Qwen3VLForConditionalGeneration
@@ -215,7 +287,7 @@ def _load_local_components(assets: VerifiedEncoderAssets, dtype: str):
             model = model_class.from_pretrained(str(assets.component_dirs["text_encoder"]),
                 **common, dtype=want, device_map={"": "cpu"}, use_safetensors=True,
                 weights_only=True, low_cpu_mem_usage=True,
-                attn_implementation="eager", use_kernels=False, allow_all_kernels=False)
+                attn_implementation=_requested_attn(), use_kernels=False, allow_all_kernels=False)
             # Qwen has a nested text config; setting only the outer config
             # need not disable the language model's autoregressive KV cache.
             model.config.get_text_config().use_cache = False
@@ -225,8 +297,37 @@ def _load_local_components(assets: VerifiedEncoderAssets, dtype: str):
     return model, processor
 
 
-def _encode_request(request, manifest, models_dir, headroom_bytes, *,
-                    attested_unbounded_host=False):
+def _read_reference_blobs(request, image_files):
+    """Bounded, identity-bound read of reference image bytes (request v3).
+
+    Each ordered path is read once as a bounded regular file and its sha256
+    MUST equal the matching ``request.images`` hash — binding the pixels the
+    model will see to the exact bytes the conditioning identity was formed
+    over (a stored blob changed after submission fails closed). Text-only
+    requests carry neither hashes nor paths."""
+    if not request.images:
+        if image_files:
+            raise EncoderRequestError(
+                "image_files supplied for a text-only request (images is empty)")
+        return []
+    if len(image_files) != len(request.images):
+        raise EncoderRequestError(
+            f"image_files must list exactly one path per image hash "
+            f"({len(request.images)} required), got {len(image_files)}")
+    blobs = []
+    for index, (path, digest) in enumerate(zip(image_files, request.images)):
+        raw = read_bounded_bytes(path, MAX_REFERENCE_BYTES,
+                                 f"reference image {index}")
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise EncoderRequestError(
+                f"reference image {index}: content does not match its request "
+                "hash (the stored blob changed since submission)")
+        blobs.append(raw)
+    return blobs
+
+
+def _encode_request(request, manifest, models_dir, headroom_bytes,
+                    image_files=(), *, attested_unbounded_host=False):
     validate_production_request(request)
     validate_local_reference_layout(manifest)
     checkpoint = sum(a.bytes for a in manifest.artifacts
@@ -235,6 +336,15 @@ def _encode_request(request, manifest, models_dir, headroom_bytes, *,
                               target_dtype=request.dtype, headroom_bytes=headroom_bytes,
                               attested_unbounded_host=attested_unbounded_host)
     validate_worker_request_identity(request, manifest)
+    # References are read, hash-bound, decode-capped and resized BEFORE the
+    # expensive asset verification and the model load: bad user bytes must
+    # never pay the checkpoint cost, and must never reach the model. (No
+    # stage() wrapper: performance.CHILD_STAGES is a fixed child-phase name
+    # allow-list; reference preparation is deliberately not a reported one.)
+    reference_images = []
+    if request.images:
+        reference_images = reference_images_from_blobs(
+            request, _read_reference_blobs(request, image_files))
     # Rechecks actual memory immediately before fresh asset verification.
     assets = verify_encoder_assets(manifest, models_dir, target_dtype=request.dtype,
                                    headroom_bytes=headroom_bytes,
@@ -242,9 +352,17 @@ def _encode_request(request, manifest, models_dir, headroom_bytes, *,
     if assets.encoder_artifact_set_sha256 != request.implementation_identity.encoder_artifact_set_sha256:
         raise EncoderRequestError("verified encoder artifacts disagree with request identity")
     validate_shard_index(assets)
-    model, processor = _load_local_components(assets, request.dtype)
-    return encode_with_supplied_model(model, processor, request)
-
+    with stage("text_encoder_loading"):
+        model, processor = _load_local_components(assets, request.dtype)
+    try:
+        with stage("prompt_encoding"):
+            return encode_with_supplied_model(model, processor, request,
+                                              reference_images or None)
+    finally:
+        with stage("text_encoder_cleanup"):
+            # The child exits after publishing. Drop owned references here;
+            # no allocator flushing or extra collection in this CPU process.
+            model = processor = None
 
 def result_bytes(payload: EncodedPayload, request_id: str, cap=DEFAULT_MAX_RESPONSE_BYTES) -> bytes:
     """Budget complete JSON/base64 wire size BEFORE base64 expansion."""
@@ -311,9 +429,10 @@ def _publish_response(parent: Path, name: str, directory: int, raw: bytes):
 def _read_request(request_path):
     doc, _ = read_bounded_json(request_path, MAX_REQUEST_BYTES, "encoder request")
     request, rid = EncoderRequest.from_request_dict(doc)
+    image_files = request_image_files(doc)
     if len(rid) > 128:
         raise EncoderRequestError("request_id exceeds 128 characters")
-    return request, rid
+    return request, rid, image_files
 
 
 def _read_manifest(manifest_path):
@@ -339,14 +458,18 @@ def execute_worker(request_path, response_path, manifest_path, models_dir, *,
                    headroom_bytes: int, attested_unbounded_host: bool = False):
     """Run only in a fresh child: offline guard lifetime is process-wide."""
     install_offline_guard()
-    request, rid = _read_request(request_path)
+    request, rid, image_files = _read_request(request_path)
     validate_production_request(request)
+    if request.images and not image_files:
+        raise EncoderRequestError(
+            "image conditioning requires ordered image_files paths on the "
+            "request document (request v3)")
     manifest = _read_manifest(manifest_path)
     with _response_destination(response_path) as (parent, name, directory):
         payload = _encode_request(request, manifest, models_dir, headroom_bytes,
+                                  image_files,
                                   attested_unbounded_host=attested_unbounded_host)
         _publish_response(parent, name, directory, result_bytes(payload, rid))
-
 
 def execute_projection(request_path, response_path, manifest_path):
     """Fresh-child metadata-only projection: no ML, model-root or byte reads.
@@ -355,7 +478,11 @@ def execute_projection(request_path, response_path, manifest_path):
     enforced; the real loading worker still performs all its existing gates.
     """
     install_offline_guard()
-    seed, rid = _read_request(request_path)
+    seed, rid, image_files = _read_request(request_path)
+    if image_files:
+        raise EncoderRequestError(
+            "projection requests must not carry image_files (metadata-only "
+            "identity path; no model-root byte access)")
     manifest = _read_manifest(manifest_path)
     with _response_destination(response_path) as (parent, name, directory):
         request = complete_encoder_seed(seed, manifest)
@@ -381,6 +508,7 @@ def main(argv=None) -> int:
         parser.add_argument(f"--{flag}", required=True)
     parser.add_argument("--project-identity", action="store_true",
                         help="metadata-only seed projection; no ML/model-root access or loading")
+    parser.add_argument("--performance-report", type=Path)
     parser.add_argument("--models-dir")
     parser.add_argument("--headroom-bytes", type=_headroom_arg)
     parser.add_argument("--attest-unbounded-host", action="store_true",
@@ -390,7 +518,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.project_identity:
         if (args.models_dir is not None or args.headroom_bytes is not None
-                or args.attest_unbounded_host):
+                or args.attest_unbounded_host or args.performance_report is not None):
             parser.error("--project-identity refuses loading flags "
                          "--models-dir/--headroom-bytes/--attest-unbounded-host")
     elif args.models_dir is None or args.headroom_bytes is None:
@@ -399,9 +527,19 @@ def main(argv=None) -> int:
         if args.project_identity:
             execute_projection(args.request, args.response, args.manifest)
         else:
-            execute_worker(args.request, args.response, args.manifest, args.models_dir,
-                           headroom_bytes=args.headroom_bytes,
-                           attested_unbounded_host=args.attest_unbounded_host)
+            from contextlib import nullcontext
+            perf = PerformanceRecorder() if args.performance_report is not None else None
+            with (args.performance_report.open("x", encoding="utf-8") if perf else nullcontext()) as handle:
+                status = "failed"
+                try:
+                    with (perf.activate() if perf else nullcontext()):
+                        execute_worker(args.request, args.response, args.manifest, args.models_dir,
+                                       headroom_bytes=args.headroom_bytes,
+                                       attested_unbounded_host=args.attest_unbounded_host)
+                    status = "succeeded"
+                finally:
+                    if perf:
+                        perf.write(handle, status)
         return 0
     except MemoryPreflightError as exc:
         return _report_failure(3, exc)

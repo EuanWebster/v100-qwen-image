@@ -7,10 +7,10 @@ no model, no torch.
 
 Pieces
 ------
-* **Wire schemas** (versioned tags, strict validation):
-
-  - ``qwen_engine.encoder_request.v2`` — what the engine hands the worker
-    (v2 adds the optional :class:`EncoderImplementationIdentity` block).
+  - ``qwen_engine.encoder_request.v3`` — what the engine hands the worker
+    (v2 added the optional :class:`EncoderImplementationIdentity` block;
+    v3 adds the WIRE-ONLY ``image_files`` list — ordered absolute paths for
+    the content hashes in ``images``, never part of the cache key).
   - ``qwen_engine.encoder_result.v1``  — what the worker writes back
     (status ok/error; payload blobs are opaque base64 bytes on the wire).
 
@@ -110,7 +110,7 @@ from qwen_engine.log import PhaseLogger
 # Versioned schema tags
 # ---------------------------------------------------------------------------
 
-REQUEST_SCHEMA = "qwen_engine.encoder_request.v2"
+REQUEST_SCHEMA = "qwen_engine.encoder_request.v3"
 RESULT_SCHEMA = "qwen_engine.encoder_result.v1"
 CACHE_KEY_SCHEMA = "qwen_engine.embed_cache_key.v3"
 ENTRY_SCHEMA = "qwen_engine.embed_entry.v1"
@@ -485,10 +485,24 @@ class EncoderRequest:
                 else self.implementation_identity.to_dict()),
         }
 
-    def to_request_dict(self, request_id: str) -> dict[str, Any]:
+    def to_request_dict(self, request_id: str,
+                        image_files: Sequence[str] | None = None) -> dict[str, Any]:
+        """The wire document for this request (schema v3). ``image_files``
+        is WIRE-ONLY — validated here, added to the document, and never
+        part of :meth:`key_document` or :func:`cache_key`. Absent/empty
+        image files produce exactly the schema-v2-shaped document, so a
+        text-only request file stays byte-identical."""
         doc = self.key_document()
         doc["schema"] = REQUEST_SCHEMA
         doc["request_id"] = request_id
+        if image_files is not None:
+            errors = _image_files_violations({"image_files": image_files},
+                                             list(self.images))
+            if errors:
+                raise EncoderRequestError("invalid encoder request: "
+                                          + "; ".join(errors))
+            if len(image_files):
+                doc["image_files"] = [str(path) for path in image_files]
         return doc
 
     @classmethod
@@ -505,7 +519,7 @@ class EncoderRequest:
                       f"must be {REQUEST_SCHEMA!r}, got {data.get('schema')!r}")
         known = {"schema", "request_id", "prompt", "negative_prompt", "dtype",
                  "model", "processor", "tokenizer", "chat_template", "kwargs",
-                 "images", "implementation_identity"}
+                 "images", "implementation_identity", "image_files"}
         for key in sorted(set(data) - known, key=repr):
             _err_list(errors, key, "unknown request key")
         rid = data.get("request_id")
@@ -547,6 +561,9 @@ class EncoderRequest:
                 for i in images):
             _err_list(errors, "images",
                       f"must be a list of 64-hex sha256 content hashes, got {images!r}")
+        else:
+            errors.extend(_image_files_violations(
+                data, images if isinstance(images, list) else []))
         impl: EncoderImplementationIdentity | None = None
         if "implementation_identity" in data and data["implementation_identity"] is not None:
             impl_value = data["implementation_identity"]
@@ -582,6 +599,54 @@ class EncoderRequest:
         except EncoderRequestError as exc:
             raise EncoderRequestError(f"invalid encoder request: {exc}") from exc
         return request, rid
+
+# ---------------------------------------------------------------------------
+# Wire-only reference channel (request v3)
+# ---------------------------------------------------------------------------
+
+
+def _image_files_violations(data: Mapping[str, Any], images: list) -> list[str]:
+    """Validate the optional wire-only ``image_files`` key of a request
+    document. The key lists, in order, one readable absolute path per entry
+    of ``images``; it is NEVER part of ``key_document()``/``cache_key()`` —
+    conditioning identity stays content-hash based. A text-only request has
+    neither ``images`` nor ``image_files`` (the document then stays
+    byte-identical to what schema v2 wrote)."""
+    if "image_files" not in data or data["image_files"] is None:
+        return []
+    errors: list[str] = []
+    files = data["image_files"]
+    if isinstance(files, (str, bytes)) or not isinstance(files, Sequence):
+        _err_list(errors, "image_files",
+                  f"must be a list of absolute path strings, got {files!r}")
+        return errors
+    paths = list(files)
+    if paths and not images:
+        _err_list(errors, "image_files",
+                  "is only allowed when images is non-empty (reference "
+                  "channel, request v3)")
+    if len(paths) != len(images):
+        _err_list(errors, "image_files",
+                  f"must list exactly one path per image hash "
+                  f"({len(images)} required), got {len(paths)}")
+    for i, path in enumerate(paths):
+        if (not isinstance(path, str) or not path.strip() or "\0" in path
+                or not os.path.isabs(path)):
+            _err_list(errors, f"image_files[{i}]",
+                      f"must be a non-blank absolute path without NUL, got {path!r}")
+    return errors
+
+
+def request_image_files(data: Mapping[str, Any]) -> tuple[str, ...]:
+    """The ordered path list of a parsed request document (wire-only).
+    Re-validates and raises :class:`EncoderRequestError` on any violation;
+    text-only documents yield an empty tuple."""
+    images = data.get("images", [])
+    errors = _image_files_violations(data, images if isinstance(images, list) else [])
+    if errors:
+        raise EncoderRequestError("invalid encoder request: " + "; ".join(errors))
+    return tuple(data.get("image_files") or ())
+
 
 
 def _nonempty(errors: list[str], name: str, value: Any) -> None:
@@ -1503,7 +1568,11 @@ class EncoderWorker:
                  cancel_grace_s: float = 5.0,
                  python: str | None = None,
                  max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
-                 logger: PhaseLogger | None = None) -> None:
+                 logger: PhaseLogger | None = None,
+                 performance_supported: bool = False) -> None:
+        if type(performance_supported) is not bool:
+            raise EncoderSetupError("performance_supported must be boolean")
+        self.performance_supported = performance_supported
         cmd = list(command) if (not isinstance(command, (str, bytes))
                                 and isinstance(command, Sequence)) else None
         if cmd is None:
@@ -1586,11 +1655,14 @@ class EncoderWorker:
             return payload
 
     def run(self, request: EncoderRequest, *, request_id: str | None = None,
-            cancel_event: threading.Event | None = None) -> EncodedPayload:
+            cancel_event: threading.Event | None = None,
+            image_files: Sequence[str] | None = None) -> EncodedPayload:
         """One worker process, no cache. Raises a typed :class:`EncoderError`
         subclass on every failure path; **every exit path** — success, typed
         failure, unexpected exception, ``KeyboardInterrupt`` — reaps a live
-        child before the scratch dir is removed."""
+        child before the scratch dir is removed. ``image_files`` (request
+        v3) is passed through to :meth:`EncoderRequest.to_request_dict` and
+        is wire-only: it never enters the cache key or any payload."""
         rid = request_id or uuid.uuid4().hex
         key = cache_key(request)
         try:
@@ -1605,7 +1677,8 @@ class EncoderWorker:
         try:
             try:
                 req_path.write_bytes(
-                    (json.dumps(request.to_request_dict(rid), sort_keys=True,
+                    (json.dumps(request.to_request_dict(rid, image_files=image_files),
+                                sort_keys=True,
                                 ensure_ascii=True) + "\n").encode("utf-8"))
             except OSError as exc:
                 raise EncoderSetupError(
@@ -1614,6 +1687,10 @@ class EncoderWorker:
                    .replace("{request}", str(req_path))
                    .replace("{response}", str(resp_path))
                    for tok in self.command]
+            from qwen_engine.performance import current
+            performance = current() if self.performance_supported else None
+            if performance is not None:
+                cmd += ["--performance-report", str(resp_path) + ".performance.json"]
             self._event("encoder_worker_start", cache_key=key, request_id=rid,
                         command=cmd)
             # stdio goes to scratch *files*: repeated polling can never lose
@@ -1647,6 +1724,8 @@ class EncoderWorker:
                     # KeyboardInterrupt, ...) must never orphan the child.
                     if proc.poll() is None:
                         self._terminate(proc)
+                    if performance is not None:
+                        performance.import_encoder_report(str(resp_path) + ".performance.json")
             finally:
                 for fh in (out_fh, err_fh):
                     try:

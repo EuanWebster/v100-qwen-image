@@ -1,7 +1,9 @@
 """Owned lifecycle over explicit CPU fixture adapters, no ML/real images."""
 from __future__ import annotations
 
+import gc
 import threading
+import weakref
 from pathlib import Path
 
 import pytest
@@ -161,3 +163,57 @@ def test_job_controller_recognizes_engine_cancellation(tmp_path):
     finally:
         release.set()
         assert controller.close()
+
+
+class TensorOwner:
+    """Weakref-able stand-in for an object owning CUDA tensors."""
+
+
+@pytest.mark.parametrize("kind", ["cancelled", "failed", "gpu-oom"])
+def test_terminal_job_releases_executor_frames_without_gc(tmp_path, kind):
+    # Regression for the cancelled-run 14 GB retention: the adapter fails
+    # inside the denoise frame while a tensor owner is still a live local.
+    # If the engine kept the raised exception reachable through a reference
+    # cycle (exception -> traceback -> frame -> frame local -> exception),
+    # the owner could only die in a cyclic GC pass.  With gc disabled for
+    # the whole observation window, refcounting alone must free the owner
+    # by the time the real controller has recorded the terminal state.
+    refs = []
+
+    class HoldingAdapter(Adapter):
+        def denoise(self, config, conditioning):
+            owner = TensorOwner()
+            refs.append(weakref.ref(owner))
+            self.calls.append("denoise")
+            if kind == "cancelled":
+                self.event.set()
+                raise GenerationCancelled("fixture mid-denoise cancellation")
+            if kind == "gpu-oom":
+                # torch-identity fake: jobs.py classifies CUDA OOM without
+                # importing torch, and the classifier must NOT retain the
+                # traceback (the denoise frame owns the tensor owner here)
+                torch_oom = type("OutOfMemoryError", (RuntimeError,), {})
+                torch_oom.__module__ = "torch"
+                raise torch_oom("fixture mid-denoise CUDA out of memory")
+            raise RuntimeError("fixture mid-denoise failure")
+
+    adapter = HoldingAdapter()
+    controller = JobController(
+        tmp_path, lambda context: generate(
+            context.config, adapter, {}, cancel_event=context._cancel,
+            phase_callback=context.report_phase),
+        # no-op boundary release: only refcounting may free the owner here
+        memory_release=lambda: None)
+    try:
+        gc.collect()  # clear unrelated pre-existing cycles first
+        gc.disable()
+        record = controller.submit(GenerationConfig())
+        done = controller.wait(record.job_id)
+        assert refs and all(ref() is None for ref in refs)
+    finally:
+        gc.enable()
+    assert done.state == (JobState.CANCELLED if kind == "cancelled" else JobState.FAILED)
+    assert done.error_code == {"cancelled": None, "failed": "execution_failed",
+                               "gpu-oom": "out_of_gpu_memory"}[kind]
+    assert adapter.calls == ["bind", "load", "encode", "denoise", "close"]
+    assert controller.close()

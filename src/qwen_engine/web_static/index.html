@@ -50,8 +50,34 @@
                 placeholder="Describe the image you want to generate…"
                 aria-describedby="prompt-help prompt-error"></textarea>
               <p id="prompt-help" class="help">Your words are used exactly as typed.
-                Nothing is generated or auto-filled for you.</p>
+                Nothing is generated or auto-filled for you. The optional
+                Rewrite action <em>suggests</em> a reworded version — it never
+                replaces your draft unless you press Apply.</p>
               <p class="error" id="prompt-error" aria-live="polite"></p>
+              <div class="rewrite-actions">
+                <button type="button" id="rewrite-btn" class="btn-secondary" hidden disabled>
+                  Rewrite prompt</button>
+                <p id="rewrite-hint" class="help">Rewriting is unavailable:
+                  this server was started without a rewriter.</p>
+                <p id="rewrite-status" class="help" role="status" aria-live="polite"></p>
+              </div>
+              <div id="rewrite-proposal" class="rewrite-proposal" hidden tabindex="-1"
+                   role="group" aria-labelledby="rewrite-proposal-heading">
+                <h3 id="rewrite-proposal-heading">Suggested prompt — not applied</h3>
+                <p class="rewrite-label">Your draft</p>
+                <p id="rewrite-original" class="rewrite-original"></p>
+                <p class="rewrite-label">Suggestion</p>
+                <p id="rewrite-suggested" class="rewrite-suggested"></p>
+                <p id="rewrite-ratio" class="help"></p>
+                <div class="rewrite-buttons">
+                  <button type="button" id="rewrite-apply" class="btn-primary">Apply</button>
+                  <button type="button" id="rewrite-edit" class="btn-secondary">Edit</button>
+                  <button type="button" id="rewrite-keep" class="btn-secondary">Keep original</button>
+                  <button type="button" id="rewrite-apply-ratio" class="btn-secondary" hidden>
+                    Apply ratio</button>
+                </div>
+                <p class="error" id="rewrite-error" aria-live="polite"></p>
+              </div>
             </div>
 
           <div class="actions job-actions">
@@ -69,6 +95,30 @@
           </div>
 
           <div class="settings-scroll" tabindex="0" role="region" aria-label="Generation settings">
+          <fieldset class="field reference-field" id="reference-field">
+            <legend>Reference images</legend>
+            <p id="reference-help" class="help">Optional. Add up to
+              <span id="reference-limit">10</span> images (PNG, JPEG or WebP) and
+              refer to them as image 1, image 2 … in your prompt, in the order
+              shown here. Output size comes from the preset, not from the
+              images. Transparent PNG or WebP references keep their
+              transparency, but the model composites them over white when
+              reading them.</p>
+            <div class="reference-toolbar">
+              <button type="button" id="add-reference" class="btn-secondary"
+                      aria-describedby="reference-help reference-status">Add reference</button>
+              <input id="reference-file" type="file" hidden
+                     accept="image/png,image/jpeg,image/webp" multiple>
+              <span id="reference-count" class="reference-count">No references</span>
+            </div>
+            <ol id="reference-list" class="reference-list"
+                aria-label="Reference images, in prompt order"></ol>
+            <p id="reference-empty" class="help">No reference images added —
+              the prompt is used on its own.</p>
+            <p id="reference-status" class="reference-status" role="status"
+               aria-live="polite"></p>
+          </fieldset>
+
           <fieldset class="field preset-field">
             <legend>Aspect preset</legend>
             <div id="presets-1k" class="preset-row" role="group" aria-label="1K resolution presets"></div>
@@ -79,21 +129,70 @@
               Presets do not guarantee memory fit on your card.</p>
           </fieldset>
 
+          <fieldset class="field recipe-field" id="recipe-field">
+            <legend>Recipe</legend>
+            <div class="radio-row" role="radiogroup"
+                 aria-describedby="recipe-help recipe-note">
+              <div class="radio-field">
+                <input id="recipe-base" name="recipe" type="radio" value="base"
+                       checked aria-describedby="recipe-help recipe-note">
+                <label for="recipe-base">Quality</label>
+              </div>
+              <div class="radio-field">
+                <input id="recipe-turbo" name="recipe" type="radio" value="turbo"
+                       aria-describedby="recipe-help recipe-note">
+                <label for="recipe-turbo">Turbo</label>
+              </div>
+            </div>
+            <p id="recipe-help" class="help">Quality uses the reference model at
+              the step count you choose — the slowest, most faithful option.
+              Turbo uses the Turbo image model (with the same text encoder and
+              decoder as Quality) and always runs its fixed 8 sampling steps:
+              drawing is about five times faster, but loading the model and
+              reading your prompt dominate a whole run, so the total is often
+              only slightly shorter. Turbo has no negative prompt and no
+              guidance (CFG 1.0), and runs in FP16 only.</p>
+            <p id="recipe-note" class="help recipe-note" role="status"></p>
+            <p class="error" id="recipe-error" aria-live="polite"></p>
+          </fieldset>
+
           <div class="field">
             <label for="steps">Steps</label>
             <input id="steps" name="steps" type="number" min="1" max="1000"
                    step="1" value="40" inputmode="numeric"
-                   aria-describedby="steps-error">
+                   aria-describedby="steps-error recipe-note">
             <p class="error" id="steps-error" aria-live="polite"></p>
           </div>
 
           <div class="field">
             <label for="output-format">Output format</label>
-            <select id="output-format" name="output_format">
+            <select id="output-format" name="output_format"
+                    aria-describedby="format-error">
               <option value="jpg" selected>jpg</option>
               <option value="png">png</option>
               <option value="webp">webp</option>
             </select>
+            <p class="error" id="format-error" aria-live="polite"></p>
+          </div>
+
+          <div class="field transparency-field">
+            <div class="checkbox-field">
+              <input id="transparent" name="transparent_background" type="checkbox"
+                     title="Asks the model for a transparent background and saves PNG or WebP, which keep it. JPEG cannot store transparency, so the format switches to PNG while this is ticked."
+                     aria-describedby="transparency-help transparency-note">
+              <label for="transparent">Transparent background</label>
+            </div>
+            <p id="transparency-help" class="help">Asks the model for an image with a
+              see-through background and saves it in a format that can keep one
+              (PNG or WebP). JPEG cannot store transparency, so ticking this switches
+              jpg to PNG. Your prompt text is kept exactly as typed — a short fixed
+              instruction is added only to the text the model reads. The result is
+              not guaranteed to be transparent: check the image.</p>
+            <p id="transparency-note" class="help transparency-note" role="status"></p>
+            <p id="effective-prompt-field" class="effective-prompt-field" hidden>
+              <span class="stat-label">Text the model reads (read-only)</span>
+              <span id="effective-prompt" class="effective-prompt-text"></span>
+            </p>
           </div>
 
           <div class="field seed-field">
@@ -144,11 +243,12 @@
             <div class="field-row">
               <div class="field">
                 <label for="quant">Quantization</label>
-                <select id="quant" name="quant" aria-describedby="quant-help">
+                <select id="quant" name="quant" aria-describedby="quant-help quant-error">
                   <option value="fp16" selected title="Uses more graphics-card memory to keep the model's original detail. Best starting point for maximum image quality when it fits.">fp16</option>
                   <option value="q8" title="Compresses the model to use less graphics-card memory. Small image differences are possible. Looked similar to FP16 in our tests, but sampling was slightly slower. Experimental.">q8 — experimental</option>
                 </select>
                 <p id="quant-help" class="help" aria-live="polite">Uses more graphics-card memory to keep the model's original detail. Best starting point for maximum image quality when it fits.</p>
+                <p class="error" id="quant-error" aria-live="polite"></p>
               </div>
               <div class="field">
                 <label for="offload">Layer offload</label>
@@ -254,9 +354,12 @@
             <div><dt>Seed (decimal string)</dt><dd id="plan-seed">—</dd></div>
             <div><dt>Dimensions</dt><dd id="plan-dims">—</dd></div>
             <div><dt>Steps</dt><dd id="plan-steps">—</dd></div>
+            <div><dt>Recipe</dt><dd id="plan-recipe">—</dd></div>
             <div><dt>CFG</dt><dd id="plan-cfg">—</dd></div>
             <div><dt>Latent tokens</dt><dd id="plan-tokens">—</dd></div>
             <div><dt>Quant / offload / attention</dt><dd id="plan-quant">—</dd></div>
+            <div><dt>Transparent background</dt><dd id="plan-transparency">—</dd></div>
+            <div><dt>References</dt><dd id="plan-references">—</dd></div>
             <div><dt>Manifest</dt><dd id="plan-manifest">—</dd></div>
             <div><dt>Hardware</dt><dd id="plan-hardware">—</dd></div>
             <div><dt>Calibration</dt><dd id="plan-calibration">—</dd></div>
@@ -274,10 +377,12 @@
     <h2 id="history-heading" tabindex="-1">History</h2>
     <p class="history-empty" id="history-empty">
       No saved generations yet. Completed images from this machine will appear
-      here as thumbnails. History lasts until the server restarts; image files
+      here as thumbnails, including ones from earlier server runs; image files
       stay on disk when entries are forgotten.
     </p>
     <div class="history-grid" id="history-grid" aria-live="polite"></div>
+    <p class="history-note" id="history-missing-note" role="status"
+       aria-live="polite" hidden></p>
     <p><a class="back-link" href="#create">← Back to Create</a></p>
   </section>
 
@@ -316,6 +421,16 @@
         enforces nothing by itself — locality is controlled by the qwen-web
         server's explicit bind addresses. Remote access uses the LAN or
         Tailscale address selected by the operator.</dd></div>
+      <div><dt>History</dt><dd>Each finished job stores one small
+        <code>job.json</code> file inside its own output folder holding its
+        settings, state and image checksum. History is rebuilt from those
+        files at server start, so completed images reappear after a restart.
+        An image whose file no longer matches its checksum is never served:
+        the entry stays listed with its image marked unavailable, so you can
+        still read its settings and forget it.
+        "Forget entry" deletes that one <code>job.json</code> and nothing
+        else, so the image file stays on disk and the entry stays gone after
+        a restart.</dd></div>
       <div><dt>Drafts</dt><dd>Nothing is saved by the browser automatically
         except the theme choice above. Prompts, seeds and form values are
         never stored; an opt-in draft store for validated form values may

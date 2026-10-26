@@ -15,6 +15,11 @@ from qwen_engine.web import api
 
 ENVELOPE = api.WEB_PLAN_REQUEST_SCHEMA
 
+#: Two syntactically valid reference ids. The api layer checks identity only;
+#: whether they resolve to a stored blob is the service's question.
+ID_A = "a" * 64
+ID_B = "b" * 64
+
 
 def runtime(**overrides) -> api.WebRuntime:
     summary = overrides.pop("manifest_summary", None)
@@ -106,6 +111,103 @@ def test_plan_config_echo_is_editable_only():
     assert set(payload["config"]) == set(api.EDITABLE_FIELDS)
     for path_field in api.RUNTIME_PATH_FIELDS:
         assert path_field not in json.dumps(payload)
+
+
+def test_plan_echoes_transparent_background_and_refuses_jpg():
+    ok = plan_payload(plan_bytes({"prompt": "x", "transparent_background": True,
+                                  "output_format": "webp"}))
+    assert ok["config"]["transparent_background"] is True
+    assert ok["config"]["output_format"] == "webp"
+    # Absent from the envelope: defaults to false, exactly as config.py does.
+    assert plan_payload(plan_bytes({"prompt": "x"}))["config"]["transparent_background"] is False
+    # JPEG cannot store alpha: a typed FIELD error, never a silent rewrite.
+    refused = plan_payload(plan_bytes({"prompt": "x", "transparent_background": True,
+                                       "output_format": "jpg"}))
+    error_shape(refused)
+    assert refused["code"] == "invalid_config"
+    assert [f["field"] for f in refused["fields"]] == ["output_format"]
+    # A non-boolean is a typed field error on its own field, not a coercion.
+    typed = plan_payload(plan_bytes({"prompt": "x", "transparent_background": 1}))
+    assert typed["code"] == "invalid_config"
+    assert [f["field"] for f in typed["fields"]] == ["transparent_background"]
+
+
+def test_export_import_roundtrips_transparent_background():
+    rt = runtime()
+    exported = api.export_response(rt, plan_bytes({"prompt": "a jar",
+                                                   "transparent_background": True,
+                                                   "output_format": "png"}))
+    assert exported.status == 200
+    data = json.loads(exported.body)
+    assert data["transparent_background"] is True
+    imported = api.import_response(rt, exported.body)
+    assert imported.status == 200, imported.payload
+    assert imported.payload["config"]["transparent_background"] is True
+    assert imported.payload["config"]["output_format"] == "png"
+    # Legacy export without the key stays importable and means false.
+    legacy = api.import_response(rt, b'{"prompt": "old", "output_format": "webp"}')
+    assert legacy.status == 200
+    assert legacy.payload["config"]["transparent_background"] is False
+    # A legacy file asking for jpg is still refused (no silent format change).
+    refused = api.import_response(rt, b'{"prompt": "old", "transparent_background": true}')
+    assert refused.status == 422
+    assert [f["field"] for f in refused.payload["fields"]] == ["output_format"]
+
+
+def test_plan_echoes_recipe_and_refuses_broken_turbo_combinations():
+    # Default is the reference recipe and it is echoed as such.
+    assert plan_payload(plan_bytes({"prompt": "x"}))["config"]["recipe"] == "base"
+    turbo = plan_payload(plan_bytes({"prompt": "x", "recipe": "turbo",
+                                     "steps": 8, "quant": "fp16"}))
+    assert turbo["config"]["recipe"] == "turbo"
+    assert turbo["config"]["steps"] == 8
+    # cfg_active must stay false for turbo: CFG 1.0 with no negative prompt.
+    assert turbo["cfg_active"] is False
+
+    # Every turbo rule is a typed refusal on the field it describes, never a
+    # silent rewrite of steps/cfg/quant.
+    bad_steps = plan_payload(plan_bytes({"prompt": "x", "recipe": "turbo"}))
+    error_shape(bad_steps)
+    assert bad_steps["code"] == "invalid_config"
+    assert [f["field"] for f in bad_steps["fields"]] == ["steps"]
+
+    bad_cfg = plan_payload(plan_bytes({"prompt": "x", "recipe": "turbo", "steps": 8,
+                                       "negative_prompt": "blurry",
+                                       "true_cfg_scale": 4.0}))
+    assert bad_cfg["code"] == "invalid_config"
+    assert [f["field"] for f in bad_cfg["fields"]] == ["true_cfg_scale"]
+
+    bad_quant = plan_payload(plan_bytes({"prompt": "x", "recipe": "turbo",
+                                         "steps": 8, "quant": "q8"}))
+    assert bad_quant["code"] == "invalid_config"
+    assert [f["field"] for f in bad_quant["fields"]] == ["quant"]
+
+    # Unknown recipe value: typed, on its own field.
+    unknown = plan_payload(plan_bytes({"prompt": "x", "recipe": "turbo2"}))
+    assert unknown["code"] == "invalid_config"
+    assert [f["field"] for f in unknown["fields"]] == ["recipe"]
+
+
+def test_export_import_roundtrips_recipe():
+    rt = runtime()
+    exported = api.export_response(rt, plan_bytes({"prompt": "a jar",
+                                                   "recipe": "turbo", "steps": 8}))
+    assert exported.status == 200
+    data = json.loads(exported.body)
+    assert data["recipe"] == "turbo"
+    assert data["steps"] == 8
+    imported = api.import_response(rt, exported.body)
+    assert imported.status == 200, imported.payload
+    assert imported.payload["config"]["recipe"] == "turbo"
+    assert imported.payload["config"]["steps"] == 8
+    # A legacy export predating the key imports as the reference recipe.
+    legacy = api.import_response(rt, b'{"prompt": "old"}')
+    assert legacy.status == 200
+    assert legacy.payload["config"]["recipe"] == "base"
+    # A legacy file that cannot satisfy the turbo gates is refused, not fixed.
+    refused = api.import_response(rt, b'{"prompt": "old", "recipe": "turbo"}')
+    assert refused.status == 422
+    assert [f["field"] for f in refused.payload["fields"]] == ["steps"]
 
 
 def test_plan_never_leaks_server_runtime_paths(tmp_path):
@@ -418,3 +520,208 @@ def test_manifest_public_projection_is_closed_and_blocker_agrees(summary):
         assert response.payload["manifest"]["valid"] is False
         assert response.payload["manifest"]["reason"] == api.MANIFEST_INVALID
         assert "manifest_invalid" in response.payload["generation_blockers"]
+
+
+# ---------------------------------------------------------------------------
+# Prompt rewriting: the PURE request/response contract (R3/R4).
+#
+# The wire-level path is covered in test_web_rewrite.py; these tests pin the
+# api-level functions on their own, so a regression is attributed here rather
+# than to routing.
+# ---------------------------------------------------------------------------
+
+def rewrite_bytes(**fields) -> bytes:
+    body = {"schema": api.REWRITE_REQUEST_SCHEMA, "task": "t2i",
+            "prompt": "a red bicycle", "draft_revision": 0, "image_ids": []}
+    body.update(fields)
+    return json.dumps(body).encode()
+
+
+def test_rewrite_request_accepts_the_exact_five_key_envelope():
+    assert api.build_rewrite_request(rewrite_bytes()) == {
+        "task": "t2i", "prompt": "a red bicycle", "draft_revision": 0,
+        "image_ids": []}
+
+
+@pytest.mark.parametrize("mutate, status, code", [
+    (lambda d: d.pop("task"), 400, "invalid_envelope"),
+    (lambda d: d.pop("image_ids"), 400, "invalid_envelope"),
+    (lambda d: d.update(extra=1), 400, "invalid_envelope"),
+    (lambda d: d.update(schema="qwen_engine.web_rewrite.v1"), 400, "invalid_envelope"),
+    (lambda d: d.update(task="video"), 422, "task_unsupported"),
+    # image_ids is an ordered list of stored reference ids: the id GRAMMAR is
+    # an envelope question (400), while a task that cannot use images is a
+    # 422. An int or short hex is not an id at all.
+    (lambda d: d.update(image_ids=[1]), 400, "invalid_envelope"),
+    (lambda d: d.update(image_ids=["abc"]), 400, "invalid_envelope"),
+    (lambda d: d.update(image_ids=["A" * 64]), 400, "invalid_envelope"),
+    (lambda d: d.update(image_ids=[ID_A]), 422, "task_unsupported"),
+    (lambda d: d.update(image_ids="x"), 400, "invalid_envelope"),
+    (lambda d: d.update(image_ids=[ID_A] * 11), 422, "too_many_references"),
+    (lambda d: d.update(draft_revision=-1), 400, "invalid_envelope"),
+    (lambda d: d.update(draft_revision=True), 400, "invalid_envelope"),
+    (lambda d: d.update(draft_revision=1.5), 400, "invalid_envelope"),
+    (lambda d: d.update(prompt=""), 400, "invalid_envelope"),
+    (lambda d: d.update(prompt="   "), 400, "invalid_envelope"),
+    (lambda d: d.update(prompt=5), 400, "invalid_envelope"),
+])
+def test_rewrite_request_refusals_are_typed(mutate, status, code):
+    body = json.loads(rewrite_bytes())
+    mutate(body)
+    with pytest.raises(api.ApiError) as caught:
+        api.build_rewrite_request(json.dumps(body).encode())
+    assert (caught.value.status, caught.value.code) == (status, code)
+
+
+def test_rewrite_prompt_cap_is_exact_and_never_echoes_the_draft():
+    """The boundary: cap length passes, cap+1 is refused, and the message
+    carries only a LENGTH — never the prompt text."""
+    limit = api._rewrite.PROMPT_MAX_CHARS
+    assert api.build_rewrite_request(rewrite_bytes(prompt="x" * limit))["prompt"] == "x" * limit
+    with pytest.raises(api.ApiError) as caught:
+        api.build_rewrite_request(rewrite_bytes(prompt="s" * (limit + 1)))
+    assert caught.value.code == "prompt_too_long" and caught.value.status == 422
+    assert "s" * 40 not in caught.value.message
+    assert str(limit + 1) in caught.value.message
+
+
+def test_rewrite_body_cap_bounds_the_prompt_envelope():
+    # The route's derived body cap must admit a maximal legal request and
+    # refuse anything larger, so the transport and the field cap agree.
+    limit = api._rewrite.PROMPT_MAX_CHARS
+    assert api.MAX_REWRITE_REQUEST_BYTES == limit * 4 + 1024
+    assert len(rewrite_bytes(prompt="x" * limit)) < api.MAX_REWRITE_REQUEST_BYTES
+
+
+def test_rewrite_status_block_is_the_canonical_disabled_pair():
+    rt = runtime()
+    block = api.rewrite_status_block(rt)
+    assert block == dict(api.REWRITE_DISABLED_BLOCK)
+    assert set(block) == {"state", "code", "backend", "reason"}
+    assert block["state"] == "unavailable" and block["backend"] is None
+    # Never a gate: rewriting must not appear able to block generation.
+    status = api.status_response(rt).payload
+    assert "rewrite" in status
+    assert set(status["gates"]) == {"adapter", "assets", "calibration", "hardware"}
+
+
+def test_rewrite_status_block_serves_the_configured_pair():
+    configured = {"state": "available", "code": "rewrite_available",
+                  "backend": "local-llm", "reason": ""}
+    rt = runtime(rewrite_block=configured)
+    assert api.rewrite_status_block(rt) == configured
+    assert api.status_response(rt).payload["rewrite"] == configured
+
+
+@pytest.mark.parametrize("bad", [
+    {"state": "available"},
+    {"state": "available", "code": "rewrite_available", "backend": "x",
+     "reason": "", "extra": 1},
+    {"state": "available", "code": "nope", "backend": "x", "reason": ""},
+])
+def test_rewrite_block_is_refused_at_construction_not_filtered(bad):
+    """WebRuntime refuses a non-canonical block outright: a widened block is a
+    programming error, and silently filtering it would hide the bug."""
+    with pytest.raises(ValueError):
+        runtime(rewrite_block=bad)
+
+
+def test_rewrite_status_block_never_discloses_a_location():
+    """The reason is operator prose served to a page, so an address or path in
+    it is refused at construction rather than shipped to the browser."""
+    for reason in ("connected to http://127.0.0.1:8079/v1",
+                   "backend at 127.0.0.1:8079 is down",
+                   "see /etc/qwen/rewriter.toml"):
+        with pytest.raises(ValueError):
+            runtime(rewrite_block={"state": "unavailable",
+                                   "code": "rewrite_disabled",
+                                   "backend": None, "reason": reason})
+    # The canonical shipped block passes, and contains no location.
+    text = json.dumps(api.status_response(runtime()).payload)
+    assert "://" not in text.split('"rewrite"')[-1]
+
+
+def test_rewrite_is_not_an_editable_or_exported_field():
+    """A suggestion is not config: it must never enter the plan/export
+    envelope, so a rewritten prompt cannot be smuggled into a job."""
+    assert "rewrite" not in api.EDITABLE_FIELDS
+    assert "rewritten_prompt" not in api.EDITABLE_FIELDS
+    assert not set(api.DEFERRED_WIRE_FIELDS) & {"rewrite", "rewritten_prompt"}
+
+
+def test_validate_rewrite_fields_is_the_same_rule_the_builder_applies():
+    """The service validates an already-parsed mapping through this function;
+    it must agree with the wire builder rather than drift into a second rule."""
+    good = {"task": "t2i", "prompt": "a red bicycle",
+            "draft_revision": 0, "image_ids": []}
+    assert api.validate_rewrite_fields(good) == good
+    # An edit rewrite is only legal WITH references, and the builder must agree.
+    edit = dict(good, task="edit", image_ids=[ID_A])
+    assert api.validate_rewrite_fields(edit) == edit
+    assert api.build_rewrite_request(rewrite_bytes(
+        task="edit", image_ids=[ID_A])) == edit
+    assert api.build_rewrite_request(rewrite_bytes()) == good
+    for bad, status, code in [
+        ({"task": "t2i", "prompt": "x", "draft_revision": 0}, 400, "invalid_envelope"),
+        (dict(good, prompt="  "), 400, "invalid_envelope"),
+        (dict(good, task="video"), 422, "task_unsupported"),
+        # An edit rewrite NEEDS its references: the edit system prompt names
+        # them <imageN>, so a text-only edit rewrite is refused rather than
+        # sent as a question the model would invent answers to. t2i is the
+        # reverse: it has no <imageN> to point at, so images are refused
+        # there instead of being silently dropped.
+        (dict(good, task="edit"), 422, "reference_required"),
+        (dict(good, task="edit", image_ids=[ID_A]), 200, None),
+        (dict(good, task="edit", image_ids=[ID_A, ID_B]), 200, None),
+        # Duplicates follow edit-job validation, which caps the count and
+        # checks the grammar but does not forbid repeating one.
+        (dict(good, task="edit", image_ids=[ID_A, ID_A]), 200, None),
+        (dict(good, task="edit", image_ids=[ID_A] * 11), 422, "too_many_references"),
+    ]:
+        if status == 200:
+            assert api.validate_rewrite_fields(bad)["image_ids"] == bad["image_ids"]
+            continue
+        with pytest.raises(api.ApiError) as caught:
+            api.validate_rewrite_fields(bad)
+        assert (caught.value.status, caught.value.code) == (status, code), bad
+
+
+def test_validate_rewrite_fields_never_mutates_or_aliases_its_input():
+    request = {"task": "t2i", "prompt": "a red bicycle",
+               "draft_revision": 3, "image_ids": []}
+    out = api.validate_rewrite_fields(request)
+    out["prompt"] = "changed"
+    assert request["prompt"] == "a red bicycle"
+
+
+@pytest.mark.parametrize("block", [
+    {"state": "available", "code": "rewrite_available", "backend": "", "reason": ""},
+    {"state": "available", "code": "rewrite_available", "backend": "x", "reason": "why"},
+    {"state": "unavailable", "code": "rewrite_disabled", "backend": "x", "reason": "off"},
+    {"state": "unavailable", "code": "rewrite_disabled", "backend": None, "reason": "  "},
+    {"state": "enabled", "code": "rewrite_available", "backend": "x", "reason": ""},
+    {"state": "available", "code": "rewrite_disabled", "backend": "x", "reason": ""},
+])
+def test_validate_rewrite_block_closes_the_state_code_pair(block):
+    with pytest.raises(ValueError):
+        api.validate_rewrite_block(block)
+
+
+def test_validate_rewrite_block_copies_so_callers_cannot_mutate_shared_state():
+    src = {"state": "available", "code": "rewrite_available",
+           "backend": "local-llm", "reason": ""}
+    out = api.validate_rewrite_block(src)
+    out["backend"] = "other"
+    assert src["backend"] == "local-llm"
+
+
+@pytest.mark.parametrize("backend", [
+    "http://127.0.0.1:8079/v1", "/usr/bin/llama", "local llm", "", "x" * 65,
+    "C:\\\\models", "local-llm;rm -rf /",
+])
+def test_validate_rewrite_block_requires_a_backend_label(backend):
+    """`backend` is displayed by the UI, so it is a label, never an address."""
+    with pytest.raises(ValueError):
+        api.validate_rewrite_block({"state": "available",
+                                    "code": "rewrite_available",
+                                    "backend": backend, "reason": ""})

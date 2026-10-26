@@ -1,6 +1,7 @@
 """ML-free production parent/child/cache boundary with guarded tiny fixtures."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -57,7 +58,7 @@ def stub_children(client, monkeypatch):
         request = replace(seed, implementation_identity=identity)
         return EncodedPayload(metadata={"schema": ec.PROJECTION_SCHEMA,
             "request": request.to_request_dict(request_id)})
-    def load(request, *, request_id, cancel_event):
+    def load(request, *, request_id, cancel_event, image_files=()):
         events.append("load")
         return payload_for(request)
     monkeypatch.setattr(client._projector, "run", project)
@@ -328,3 +329,71 @@ def test_attestation_must_be_an_explicit_boolean(tmp_path, value):
                              scratch_dir=tmp_path, headroom_bytes=0,
                              timeout_s=20, python="selected/python",
                              attested_unbounded_host=value)
+
+
+# ---------------------------------------------------------------------------
+# image conditioning: wire-only image_files pass-through (request v3)
+# ---------------------------------------------------------------------------
+
+
+REFERENCE_A = hashlib.sha256(b"reference-a").hexdigest()
+REFERENCE_B = hashlib.sha256(b"reference-b").hexdigest()
+
+
+def test_image_conditioning_passes_wire_paths_and_binds_hashes(client, monkeypatch,
+                                                               tmp_path):
+    # The seed binds config.references itself (no simulation); the client
+    # only shuttles the ordered wire paths to the loading child.
+    hashes = (REFERENCE_A, REFERENCE_B)
+    paths = [str(tmp_path / f"ref-{i}.bin") for i in range(2)]
+    config = replace(GenerationConfig(), references=hashes, references_dir="/store")
+    events, _ = stub_children(client, monkeypatch)
+    seen = {}
+
+    def load(request, *, request_id, cancel_event, image_files=()):
+        events.append("load")
+        seen["images"] = request.images
+        seen["files"] = tuple(image_files)
+        return payload_for(request)
+
+    monkeypatch.setattr(client._loader, "run", load)
+    out = client.encode(config, encoder_dtype="fp16", image_files=paths)
+    assert events == ["projection", "load"]
+    assert seen["images"] == hashes
+    assert seen["files"] == tuple(paths)
+    assert out.request.images == hashes
+
+
+def test_wire_paths_count_against_the_request_byte_cap(client, monkeypatch):
+    config = replace(GenerationConfig(), references=(REFERENCE_A,),
+                     references_dir="/store")
+    events, _ = stub_children(client, monkeypatch)
+    with pytest.raises(EncoderRequestError, match="byte cap"):
+        client.encode(config, encoder_dtype="fp16",
+                      image_files=["/tmp/" + "x" * 300000])
+    assert events == []
+
+
+def test_seed_hashes_without_wire_paths_refuse_before_children(client, monkeypatch):
+    config = replace(GenerationConfig(), references=(REFERENCE_A,),
+                     references_dir="/store")
+    events, _ = stub_children(client, monkeypatch)
+    with pytest.raises(EncoderRequestError, match="image_files are required"):
+        client.encode(config, encoder_dtype="fp16")
+    assert events == []
+
+
+def test_wire_paths_without_seed_hashes_refuse_before_children(client, monkeypatch):
+    events, _ = stub_children(client, monkeypatch)
+    with pytest.raises(EncoderRequestError, match="carries no image hashes"):
+        client.encode(GenerationConfig(), encoder_dtype="fp16",
+                      image_files=["/tmp/ref.bin"])
+    assert events == []
+
+
+def test_image_files_must_be_a_path_sequence(client, monkeypatch):
+    events, _ = stub_children(client, monkeypatch)
+    with pytest.raises(EncoderRequestError, match="sequence of path strings"):
+        client.encode(GenerationConfig(), encoder_dtype="fp16",
+                      image_files="/tmp/ref.png")
+    assert events == []

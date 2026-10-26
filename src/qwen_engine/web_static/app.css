@@ -254,6 +254,13 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent-dim); }
 
 input:invalid, textarea:invalid { border-color: var(--border); }
 
+/* Locked by the selected recipe (Turbo owns steps/guidance/quant): the
+   controls stay VISIBLE and readable with their value shown — the value is
+   information, only the ability to change it is removed. */
+input:disabled, select:disabled, textarea:disabled {
+  opacity: 0.6; cursor: not-allowed; color: var(--text-muted);
+}
+
 /* Seed gets a FULL row (never squeezed next to Steps) so all 20 digits can
    be inspected at the 380 px desktop side panel and at 375/320 mobile. */
 .seed-field { max-width: none; }
@@ -266,6 +273,30 @@ input:invalid, textarea:invalid { border-color: var(--border); }
 
 .help { margin: 5px 0 0; font-size: 12px; color: var(--text-muted); }
 .error { margin: 5px 0 0; font-size: 12.5px; color: var(--error); min-height: 1em; }
+
+/* Rewrite suggestion block. Visually DISTINCT from the draft so a proposal
+   can never be mistaken for the live prompt, and the original stays visible
+   beside it: applying is always a comparison, never a leap of faith. */
+.rewrite-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 6px; }
+.rewrite-actions .help { margin: 0; }
+.rewrite-proposal {
+  margin-top: 10px; padding: 10px;
+  border: 1px solid var(--accent); border-radius: 8px;
+  background: var(--bg-raised);
+}
+.rewrite-proposal:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rewrite-proposal h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: var(--text); }
+.rewrite-label {
+  margin: 8px 0 2px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--text-muted);
+}
+.rewrite-original, .rewrite-suggested {
+  margin: 0; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 12em; overflow-y: auto;
+}
+.rewrite-original { color: var(--text-muted); }
+.rewrite-suggested { color: var(--text); }
+.rewrite-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 
 .preset-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .preset-btn {
@@ -350,7 +381,78 @@ details.advanced > .help { margin-top: 10px; }
 #preview-image { width: 100%; height: 100%; object-fit: contain; }
 .history-card { min-width: 0; padding: 12px; border: 1px solid var(--border);
   border-radius: 12px; overflow-wrap: anywhere; }
-.history-card img { display: block; width: 100%; height: 180px; object-fit: contain; }
+.history-card img { display: block; width: 100%; height: 180px; object-fit: contain;
+  /* Checkerboard UNDER the thumbnail: a transparent PNG/WebP must read as
+     transparent, not as a flat dark rectangle. Preview only — the saved
+     file is never altered. */
+  background:
+    repeating-conic-gradient(#1a1c20 0% 25%, #1f2226 0% 50%) 0 0 / 16px 16px;
+  border-radius: 6px; }
+:root[data-theme="paper"] .history-card img {
+  background: repeating-conic-gradient(#eee9df 0% 25%, #f7f3eb 0% 50%) 0 0 / 16px 16px;
+}
+
+/* ---------- Reference images ---------- */
+
+.reference-field { border-top: 1px solid var(--border); padding-top: 10px; }
+.reference-field .help { margin-top: 6px; }
+.reference-toolbar { display: flex; align-items: center; gap: 10px;
+  flex-wrap: wrap; margin: 8px 0 4px; }
+.reference-count { font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.reference-list { list-style: none; margin: 6px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 6px; }
+/* No --warning token exists in any theme: the missing-image state borrows
+   --error, which is defined in all three. */
+.reference-card.reference-missing { border-color: var(--error);
+  border-style: dashed; }
+/* flex-wrap, NOT a fixed 4-column grid: the ordinal + thumbnail + metadata
+   + three action buttons do not fit side by side on a 320px layout, and a
+   rigid grid forces a wider layout viewport (real horizontal overflow).
+   The action row wraps to its own line instead. */
+.reference-card { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 6px; border: 1px solid var(--border); border-radius: 8px; }
+.reference-ordinal { font-size: 12px; font-weight: 650; color: var(--text-muted);
+  font-variant-numeric: tabular-nums; flex: 0 0 auto; min-width: 52px; }
+.reference-card img { display: block; width: 56px; height: 56px; object-fit: contain;
+  border-radius: 4px; border: 1px solid var(--border);
+  /* Checkerboard UNDER the thumbnail (same treatment as history cards): a
+     transparent reference must read as transparent, not as a flat block.
+     Preview only — the stored bytes are never altered. */
+  background:
+    repeating-conic-gradient(#1a1c20 0% 25%, #1f2226 0% 50%) 0 0 / 12px 12px; }
+:root[data-theme="paper"] .reference-card img {
+  background: repeating-conic-gradient(#eee9df 0% 25%, #f7f3eb 0% 50%) 0 0 / 12px 12px;
+}
+.reference-meta { font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums; flex: 1 1 8ch; min-width: 0; }
+.reference-actions { display: flex; gap: 4px; flex: 0 0 auto; margin-left: auto; }
+.reference-actions button { font-size: 11.5px; padding: 3px 7px; }
+.reference-status { font-size: 12.5px; margin: 8px 0 0; min-height: 1.2em;
+  color: var(--text-muted); overflow-wrap: anywhere; }
+
+/* ---------- Recipe (Quality / Turbo) ---------- */
+
+.recipe-field { border-top: 1px solid var(--border); padding-top: 10px; }
+.recipe-field .help { margin-top: 6px; }
+.radio-row { display: flex; gap: 16px; flex-wrap: wrap; }
+.radio-field { display: flex; align-items: center; gap: 7px; }
+.radio-field label { display: inline; margin: 0; font-size: 13.5px; color: var(--text); }
+.radio-field input { width: auto; margin: 0; accent-color: var(--accent); }
+.recipe-note { color: var(--accent); }
+.recipe-field .recipe-note { margin-top: 10px; }
+
+/* ---------- Transparency ---------- */
+
+.transparency-field { border-top: 1px solid var(--border); padding-top: 10px; }
+.transparency-field .help { margin-top: 6px; }
+.transparency-note { color: var(--accent); }
+.effective-prompt-field { margin: 6px 0 0; display: flex; flex-direction: column;
+  gap: 3px; }
+.effective-prompt-text {
+  font-size: 12.5px; line-height: 1.45; color: var(--text-muted);
+  border: 1px dashed var(--border); border-radius: 6px; padding: 6px 8px;
+  overflow-wrap: anywhere; white-space: pre-wrap;
+}
 .history-card button { margin: 4px; }
 #job-status, #job-timings { overflow-wrap: anywhere; }
 
@@ -375,6 +477,17 @@ details.advanced > .help { margin-top: 10px; }
 }
 
 /* ---------- History & Settings ---------- */
+
+.history-note {
+  margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+  border: 1px solid var(--error); color: var(--text); max-width: 640px;
+}
+.history-card.history-missing img { display: none; }
+.history-card.history-missing::before {
+  content: "Image unavailable"; display: block; padding: 10px;
+  border: 1px dashed var(--border); border-radius: 6px;
+  color: var(--text-muted); font-size: 12px;
+}
 
 .history-empty, .settings-list { color: var(--text); }
 .history-empty {

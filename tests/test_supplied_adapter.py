@@ -1,4 +1,6 @@
 """ML-free trusted-component boundary regressions; no real generation claims."""
+import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +17,13 @@ from qwen_engine.local_bundle import (
     LOCAL_REFERENCE_LAYOUT, LOCAL_REFERENCE_PROFILE, ROLE_DIRECTORIES,
     LocalReferenceBundle, reference_bundle_fingerprints,
 )
+from qwen_engine import encoder_production as ep, reference_store
+from qwen_engine.encoder import Blob, EncodedPayload, cache_key
+from qwen_engine.encoder_client import ProductionEncoding
+from qwen_engine.encoder_identity import project_encoder_seed
 from qwen_engine.manifest import load_manifest
+from test_encoder import make_identity
+from test_encoder_production import FakeTensor, FakeTorch, install_ml, st_bytes, triple
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -255,6 +263,10 @@ def test_calibration_facts_measure_the_processed_conditioning(setup):
         "execution_dtype": "fp16",
         "use_kv_cache": True,
         "embedding_cache_hit": True,
+        "references": 0,
+        "recipe": "base",
+        "noise_seed": None,
+        "noise_seed_derivation": None,
     }
     active = replace(setup.config, negative_prompt="blurry", true_cfg_scale=2.0)
     supplied._config = active
@@ -268,4 +280,621 @@ def test_calibration_facts_measure_the_processed_conditioning(setup):
     # so the collector refuses rather than inventing a miss.
     del setup.provider.last_cache_hit
     assert supplied.calibration_facts()["embedding_cache_hit"] is None
+    supplied.close()
+
+
+def test_edit_noise_seed_domain_separation():
+    """The edit sampler noise must be a deterministic 64-bit derivation of
+    (seed, ordered reference ids) under the fixed label — never equal to the
+    plain seed (that collision WAS the 1024x1024 edit artifact), and any
+    ingredient change moves it."""
+    first, second = "a" * 64, "b" * 64
+    derived = module.derive_edit_noise_seed(42, (first,))
+    assert 0 <= derived < 2**64 and derived != 42
+    assert derived == module.derive_edit_noise_seed(42, (first,))  # deterministic
+    assert derived != module.derive_edit_noise_seed(42, (second,))  # ref identity
+    assert derived != module.derive_edit_noise_seed(7, (first,))  # seed identity
+    assert module.derive_edit_noise_seed(42, (first, second)) != \
+        module.derive_edit_noise_seed(42, (second, first))  # order-sensitive
+    assert derived != module.derive_edit_noise_seed(42, (first, second))  # membership
+    # length-prefixed ids: a concatenation can never impersonate a list
+    assert module.derive_edit_noise_seed(1, ("ab",)) != \
+        module.derive_edit_noise_seed(1, ("a", "b"))
+    assert module.EDIT_NOISE_DERIVATION == "qwen-engine.edit-noise.v1"
+
+
+# -- reference-image path (edit support, part B) -----------------------------
+
+
+def _reference_capable() -> bool:
+    from dataclasses import fields as _fields
+    names = {f.name for f in _fields(GenerationConfig)}
+    return {"references", "references_dir"} <= names
+
+
+needs_references = pytest.mark.skipif(
+    not _reference_capable(), reason="config references patch not applied yet")
+
+
+class _MiniPipe:
+    """Carries exactly the pinned ``encode_prompt`` signature the hook checks."""
+
+    def __init__(self, extra_parameter=False):
+        self.records = []
+        self.extra_parameter = extra_parameter
+
+    def encode_prompt(self, prompt, image, device, num_images_per_prompt,
+                      prompt_embeds, prompt_embeds_mask, image_pad_mask):
+        self.records.append(dict(prompt=prompt, image=image, device=device,
+                                 num_images_per_prompt=num_images_per_prompt,
+                                 prompt_embeds=prompt_embeds,
+                                 prompt_embeds_mask=prompt_embeds_mask,
+                                 image_pad_mask=image_pad_mask))
+        return "original"
+
+
+class _DriftPipe(_MiniPipe):
+    def encode_prompt(self, prompt, image, device, num_images_per_prompt,  # noqa: D102
+                      prompt_embeds, prompt_embeds_mask, image_pad_mask, extra):
+        return super().encode_prompt(prompt, image, device, num_images_per_prompt,
+                                     prompt_embeds, prompt_embeds_mask, image_pad_mask)
+
+
+def _mask_bridge(pipe):
+    from types import SimpleNamespace
+    return SimpleNamespace(_pipeline=pipe, _device="cpu")
+
+
+def _stub_mask():
+    return SimpleNamespace(to=lambda device: ("mask", device))
+
+
+def test_mask_hook_injects_by_identity_and_delegates_unmodified():
+    pipe, embeds = _MiniPipe(), object()
+    remove = module.SuppliedQwen21Adapter._install_image_pad_mask_hook(
+        _mask_bridge(pipe), [(embeds, _stub_mask())])
+    assert "encode_prompt" in vars(pipe)
+    pipe.encode_prompt(prompt=None, image=["pil"], device="cpu",
+                       num_images_per_prompt=1, prompt_embeds=embeds,
+                       prompt_embeds_mask=None, image_pad_mask=None)
+    assert pipe.records[-1]["image_pad_mask"] == ("mask", "cpu")
+    # A foreign embeds tensor is passed through untouched (identity mismatch).
+    pipe.encode_prompt(prompt=None, image=["pil"], device="cpu",
+                       num_images_per_prompt=1, prompt_embeds=object(),
+                       prompt_embeds_mask=None, image_pad_mask=None)
+    assert pipe.records[-1]["image_pad_mask"] is None
+    # An explicitly supplied mask is never overwritten.
+    explicit = object()
+    pipe.encode_prompt(prompt=None, image=["pil"], device="cpu",
+                       num_images_per_prompt=1, prompt_embeds=embeds,
+                       prompt_embeds_mask=None, image_pad_mask=explicit)
+    assert pipe.records[-1]["image_pad_mask"] is explicit
+    # Positional delegation keeps working (kwargs-only injection).
+    pipe.encode_prompt(None, ["pil"], "cpu", 1, embeds, None, None)
+    assert pipe.records[-1]["image_pad_mask"] is None
+    assert all(record["image"] == ["pil"] for record in pipe.records)
+    remove()
+    assert "encode_prompt" not in vars(pipe)
+    assert pipe.encode_prompt(prompt=None, image=None, device="cpu",
+                              num_images_per_prompt=1, prompt_embeds=embeds,
+                              prompt_embeds_mask=None,
+                              image_pad_mask=None) == "original"
+
+
+def test_mask_hook_matches_positive_and_negative_embeds_separately():
+    pipe, positive, negative = _MiniPipe(), object(), object()
+    positive_mask, negative_mask = _stub_mask(), SimpleNamespace(
+        to=lambda device: ("negative", device))
+    remove = module.SuppliedQwen21Adapter._install_image_pad_mask_hook(
+        _mask_bridge(pipe), [(positive, positive_mask), (negative, negative_mask)])
+    pipe.encode_prompt(prompt=None, image=["pil"], device="cpu",
+                       num_images_per_prompt=1, prompt_embeds=negative,
+                       prompt_embeds_mask=None, image_pad_mask=None)
+    assert pipe.records[-1]["image_pad_mask"] == ("negative", "cpu")
+    pipe.encode_prompt(prompt=None, image=["pil"], device="cpu",
+                       num_images_per_prompt=1, prompt_embeds=positive,
+                       prompt_embeds_mask=None, image_pad_mask=None)
+    assert pipe.records[-1]["image_pad_mask"] == ("mask", "cpu")
+    remove()
+
+
+@pytest.mark.parametrize("case", ["drift", "stale", "missing-mask"])
+def test_mask_hook_refuses_instead_of_guessing(case):
+    pipe = _DriftPipe() if case == "drift" else _MiniPipe()
+    bridge = _mask_bridge(pipe)
+    stale = None
+    if case == "drift":
+        with pytest.raises(EngineError, match="signature"):
+            module.SuppliedQwen21Adapter._install_image_pad_mask_hook(
+                bridge, [(object(), _stub_mask())])
+    elif case == "stale":
+        stale = pipe.encode_prompt = lambda **kwargs: None  # stale instance override
+        with pytest.raises(EngineError, match="override"):
+            module.SuppliedQwen21Adapter._install_image_pad_mask_hook(
+                bridge, [(object(), _stub_mask())])
+    else:
+        with pytest.raises(EngineError, match="image_pad_mask"):
+            module.SuppliedQwen21Adapter._install_image_pad_mask_hook(
+                bridge, [(object(), None)])
+    if stale is None:  # refusals install nothing…
+        assert "encode_prompt" not in vars(pipe)
+    else:              # …and never clobber or clear an existing override
+        assert vars(pipe)["encode_prompt"] is stale
+
+
+class _FakePIL:
+    def __init__(self, size=(64, 64), fail=False):
+        self.size, self.fail, self.loaded = size, fail, False
+
+    def load(self):
+        if self.fail:
+            raise ValueError("truncated pixel data")
+        self.loaded = True
+
+
+def _loader_bridge(monkeypatch, images_by_id, *, fail_open=()):
+    from types import SimpleNamespace
+    open_calls = []
+
+    def open(stream):
+        raw = stream.getvalue()
+        open_calls.append(raw)
+        if raw in fail_open:
+            raise OSError("cannot identify image file")
+        return images_by_id[raw]
+
+    monkeypatch.setattr(module, "reference_store", SimpleNamespace(
+        MAX_REFERENCE_DIM=4096,
+        read_blob=lambda root, reference_id: next(
+            raw for raw, image in images_by_id.items()
+            if image is not None and reference_id == raw.decode())))
+    # Module shape matches the real _libraries() return: the image MODULE at
+    # _image (open() on it, its Image CLASS for isinstance checks).
+    return SimpleNamespace(open=open, Image=_FakePIL), open_calls
+
+
+def _reference_run(setup, monkeypatch, ids, images_by_id, *, fail_open=()):
+    from types import SimpleNamespace
+    image_module, open_calls = _loader_bridge(monkeypatch, images_by_id,
+                                              fail_open=fail_open)
+    supplied = setup.make()
+    supplied.load(setup.config, setup.bundle.to_assets())
+    supplied._image = image_module
+    config = SimpleNamespace(references=ids, references_dir="/store")
+    return supplied, config, open_calls
+
+
+def test_reference_images_load_in_order_with_duplicates(setup, monkeypatch):
+    first, second = _FakePIL((64, 64)), _FakePIL((32, 16))
+    supplied, config, open_calls = _reference_run(
+        setup, monkeypatch, ("first", "second", "first"),
+        {b"first": first, b"second": second})
+    images = module.load_reference_images(config, supplied._image)
+    assert images == [first, second, first]
+    assert all(image.loaded for image in images)
+    assert open_calls == [b"first", b"second", b"first"]
+    supplied.close()
+
+
+def test_reference_images_require_id_and_store_pair(setup, monkeypatch):
+    supplied, config, _ = _reference_run(setup, monkeypatch, (), {})
+    with pytest.raises(EngineError, match="without ids or the store"):
+        module.load_reference_images(config, supplied._image)
+    config2 = SimpleNamespace(references=("first",), references_dir=None)
+    with pytest.raises(EngineError, match="without ids or the store"):
+        module.load_reference_images(config2, supplied._image)
+    supplied.close()
+
+
+def test_reference_decode_failures_are_typed(tmp_path, setup, monkeypatch):
+    big = _FakePIL((5000, 40))
+    supplied, config, _ = _reference_run(setup, monkeypatch, ("big",), {b"big": big})
+    with pytest.raises(EngineError, match="must not exceed"):
+        module.load_reference_images(config, supplied._image)
+    supplied.close()
+    supplied, config, _ = _reference_run(setup, monkeypatch, ("broken",),
+                                         {b"broken": _FakePIL()}, fail_open=(b"broken",))
+    with pytest.raises(EngineError, match="cannot be decoded"):
+        module.load_reference_images(config, supplied._image)
+    supplied.close()
+    supplied, config, _ = _reference_run(setup, monkeypatch, ("truncated",),
+                                         {b"truncated": _FakePIL(fail=True)})
+    with pytest.raises(EngineError, match="cannot be decoded"):
+        module.load_reference_images(config, supplied._image)
+    supplied.close()
+
+
+def test_reference_images_gate_on_encoded_state(setup, monkeypatch):
+    supplied, config, _ = _reference_run(setup, monkeypatch, ("first",),
+                                         {b"first": _FakePIL()})
+    with pytest.raises(EngineError):  # still "loaded": encode has not run
+        supplied.reference_images(config)
+    supplied.close()
+
+
+def test_reference_store_read_errors_propagate_verbatim(setup, monkeypatch):
+    from types import SimpleNamespace
+    from qwen_engine.reference_store import ReferenceStoreError
+
+    def read_blob(root, reference_id):
+        raise ReferenceStoreError("hash mismatch")
+
+    monkeypatch.setattr(module, "reference_store", SimpleNamespace(
+        MAX_REFERENCE_DIM=4096, read_blob=read_blob))
+    supplied = setup.make()
+    supplied.load(setup.config, setup.bundle.to_assets())
+    supplied._image = SimpleNamespace(Image=None)
+    with pytest.raises(ReferenceStoreError, match="hash mismatch"):
+        module.load_reference_images(
+            SimpleNamespace(references=("first",), references_dir="/store"),
+            supplied._image)
+    supplied.close()
+
+
+@needs_references
+def test_calibration_facts_count_the_ordered_references(setup):
+    supplied = setup.make()
+    supplied.load(setup.config, setup.bundle.to_assets())
+    supplied._state = "encoded"  # private fixture state, no production payload
+    supplied._config = replace(setup.config, references=("a" * 64, "b" * 64),
+                               references_dir="/store")
+    supplied._conditioning = SimpleNamespace(
+        positive=SimpleNamespace(embeds=SimpleNamespace(shape=(1, 25, 16))),
+        negative=None)
+    setup.provider.last_cache_hit = True
+    assert supplied.calibration_facts()["references"] == 2
+    supplied.close()
+
+
+
+def _image_payload_for(request):
+    """Positive-only payload carrying a real image_pad_mask per branch (the
+    same wire layout the real loading child produces)."""
+    tensors = {}
+    for side in ("positive", "negative") if request.kwargs["cfg_active"] else ("positive",):
+        embeds, attention, image_mask = triple(shape=(1, 4, 16), code="F16", img_true=True)
+        tensors[f"{side}.embeds"] = embeds
+        tensors[f"{side}.attention_mask"] = attention
+        tensors[f"{side}.image_pad_mask"] = image_mask
+    descriptors = [{"name": name, "dtype": tensor.code, "shape": list(tensor.shape),
+                    "bytes": len(tensor.raw)} for name, tensor in sorted(tensors.items())]
+    canonical = lambda doc: json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    metadata = {"schema": ep.TENSOR_PAYLOAD_SCHEMA, "codec": ep.SAFETENSORS_CODEC,
+                "cache_key": cache_key(request), "dtype": request.dtype,
+                "cfg_active": request.kwargs["cfg_active"],
+                "request": request.key_document(), "tensors": descriptors}
+    st_metadata = {"codec": ep.SAFETENSORS_CODEC, "cache_key": cache_key(request),
+                   "dtype": request.dtype,
+                   "cfg_active": "true" if request.kwargs["cfg_active"] else "false",
+                   "request_identity": canonical(request.key_document()),
+                   "tensor_descriptors": canonical(descriptors)}
+    return EncodedPayload(metadata=metadata,
+                          blobs=(Blob("tensors", st_bytes(tensors, st_metadata)),))
+
+
+@needs_references
+def test_references_flow_end_to_end_from_config_through_the_pinned_call(tmp_path, monkeypatch):
+    """Two references plus one duplicate travel the whole owned chain with
+    only the ML edges faked: ``config.references`` binds ``request.images``
+    through the REAL seed projection; the adapter resolves ids to store
+    paths and hands them to the encoder as ``image_files``; the REAL store
+    (bounded read + hash recheck) is hit once per position in order; real
+    Pillow decodes the blobs; the pipeline call receives the ordered PIL
+    list and the ``image_pad_mask`` instance hook injects the cached mask
+    for exactly the conditioning that was encoded."""
+    import io
+    from types import SimpleNamespace
+    from PIL import Image as PILImage
+
+    class _Generator:
+        def __init__(self, device=None):
+            self.value = None
+        def seed(self):
+            return 7
+        def manual_seed(self, value):
+            self.value = value
+
+    class _Torch(FakeTorch):
+        float16 = "torch.float16"
+        float32 = "torch.float32"
+        Generator = _Generator
+        @staticmethod
+        def isfinite(tensor):
+            return tensor.isfinite()
+
+    torch = _Torch()
+    install_ml(monkeypatch)  # ep-internal safetensors/torch use the shared fakes
+    monkeypatch.setattr(FakeTensor, "to",
+                        lambda self, device=None, dtype=None: self, raising=False)
+    monkeypatch.setattr(module, "_libraries",
+                        lambda: (torch, PILImage, (_E2EPipe, _E2ETransformer, _E2EVAE, _E2EScheduler)))
+
+    manifest = load_manifest(ROOT / "models/manifest.json")
+    bundle = LocalReferenceBundle(profile=LOCAL_REFERENCE_PROFILE, root=tmp_path,
+        root_resolved=tmp_path, repo=manifest.artifacts[0].repo,
+        revision=manifest.artifacts[0].revision,
+        assets={r: tuple(tmp_path / n for n in names) for r, names in LOCAL_REFERENCE_LAYOUT.items()},
+        component_dirs={r: tmp_path / n for r, n in ROLE_DIRECTORIES.items()},
+        fingerprints=reference_bundle_fingerprints(manifest))
+    store = tmp_path / "store"
+    store.mkdir()
+    ids = []
+    for colour, mode in (((200, 0, 0), "RGB"), ((0, 0, 200), "RGB")):
+        stream = io.BytesIO()
+        PILImage.new(mode, (16, 8), colour).save(stream, format="PNG")
+        ids.append(reference_store.put_bytes(store, stream.getvalue()))
+    ordered = (ids[0], ids[1], ids[0])  # duplicate position is legal and ordered
+    config = GenerationConfig(output_dir=tmp_path, height=256, width=256,
+                              references=ordered, references_dir=str(store))
+
+    reads = []
+    real_read_blob = reference_store.read_blob
+
+    def counted_read_blob(root, reference_id):
+        reads.append(reference_id)
+        return real_read_blob(root, reference_id)
+
+    monkeypatch.setattr(reference_store, "read_blob", counted_read_blob)
+
+    captured = {}
+    encoder_artifact = reference_bundle_fingerprints(manifest).encoder
+
+    def encode_provider(cfg, *, encoder_dtype, cancel_event, image_files):
+        captured["image_files"] = tuple(image_files)
+        seed = project_encoder_seed(cfg, manifest, encoder_dtype=encoder_dtype)
+        assert seed.images == ordered, "the seed must carry the ordered ids"
+        completed = replace(seed, implementation_identity=make_identity(
+            worker_implementation_revision="synthetic-e2e-child",
+            encoder_artifact_set_sha256=encoder_artifact))
+        return ProductionEncoding(completed, _image_payload_for(completed))
+
+    pipe = _E2EPipe()
+    supplied = module.SuppliedQwen21Adapter(
+        pipeline=pipe, encoder=SimpleNamespace(encode=encode_provider),
+        manifest=manifest, bundle=bundle, encoder_dtype="fp16")
+    supplied.load(config, bundle.to_assets())
+    branches = supplied.encode(config)
+    # The collector reads facts when the denoise phase opens, before the
+    # generator exists — encode() must already carry the derived seed.
+    encoded_facts = supplied.calibration_facts()
+
+    assert captured["image_files"] == tuple(
+        str(reference_store.path_for(store, reference_id)) for reference_id in ordered)
+    assert branches.negative is None
+
+    latents = supplied.denoise(config, branches)
+
+    # One store read per position, in order; the recheck happens inside.
+    assert reads == list(ordered)
+    # The pipeline call received the ordered PIL list, and the pinned
+    # encode_prompt contract saw the cached mask only via the hook.
+    images = pipe.call["image"]
+    assert len(images) == 3 and images[0] is not images[1]
+    assert (images[0].mode, images[0].size) == ("RGB", (16, 8))
+    assert pipe.records[-1]["prompt_embeds"] is pipe.call["prompt_embeds"]
+    assert pipe.records[-1]["image_pad_mask"] is branches.positive.image_pad_mask
+    assert "encode_prompt" not in vars(pipe)  # the finally removed the override
+    assert tuple(latents.shape) == (1, config.latent_tokens, 64)
+    # Noise domain separation on the REAL pinned call: the generator handed
+    # to the pipeline is seeded with the derived edit noise seed (config.seed
+    # here is the default 0), never the plain seed; the user-visible seed
+    # that drives the filename stays 0.
+    assert pipe.call["generator"].value == module.derive_edit_noise_seed(0, ordered)
+    assert pipe.call["generator"].value != config.seed
+    assert supplied.actual_seed == config.seed == 0
+    assert supplied._noise_seed == pipe.call["generator"].value
+    assert encoded_facts["noise_seed"] == pipe.call["generator"].value
+    assert encoded_facts["noise_seed_derivation"] == module.EDIT_NOISE_DERIVATION
+    supplied.close()
+
+
+class _E2ETransformer:
+    training = False
+    def __init__(self):
+        self.config = SimpleNamespace(in_channels=64, out_channels=64, context_in_dim=16)
+        self.parameter = SimpleNamespace(is_meta=False, device=SimpleNamespace(type="cpu"),
+                                        dtype="torch.float16")
+        self.backend = None
+    def parameters(self):
+        return iter([self.parameter])
+    def modules(self):
+        return iter([self])
+    def set_attention_backend(self, name):
+        self.backend = name
+
+
+class _E2EVAE(_E2ETransformer):
+    def __init__(self):
+        super().__init__()
+        self.config.z_dim = 64
+        self.tiled = None
+    def enable_tiling(self):
+        self.tiled = True
+    def disable_tiling(self):
+        self.tiled = False
+
+
+class _E2EScheduler:
+    pass
+
+
+class _E2EPipe:
+    """Pinned-shape witness: encode_prompt has EXACTLY the signature the
+    hook checks, and __call__ reproduces the pinned contract of fetching
+    cached conditioning WITHOUT ever forwarding image_pad_mask."""
+    def __init__(self):
+        self.transformer, self.vae, self.scheduler = _E2ETransformer(), _E2EVAE(), _E2EScheduler()
+        self.text_encoder, self.vae_scale_factor, self.latent_channels = None, 16, 64
+        self._execution_device = SimpleNamespace(type="cpu")
+        self.records, self.call = [], None
+
+    def encode_prompt(self, prompt, image, device, num_images_per_prompt,
+                      prompt_embeds, prompt_embeds_mask, image_pad_mask):
+        self.records.append(dict(image=image, prompt_embeds=prompt_embeds,
+                                 prompt_embeds_mask=prompt_embeds_mask,
+                                 image_pad_mask=image_pad_mask))
+        return "original"
+
+    def __call__(self, prompt, image, height, width, **kwargs):
+        self.call = dict(prompt=prompt, image=image, height=height, width=width, **kwargs)
+        self.encode_prompt(None, image, "cpu", 1,
+                           prompt_embeds=kwargs["prompt_embeds"],
+                           prompt_embeds_mask=kwargs["prompt_embeds_mask"],
+                           image_pad_mask=None)
+        return SimpleNamespace(images=FakeTensor("F16", (1, 256, 64), values=[0.5] * 256))
+
+
+class _StepCountingPipe(_E2EPipe):
+    """``__call__`` fires ``callback_on_step_end`` exactly ``fires`` times —
+    a sampler whose realised schedule may or may not match the recipe."""
+    fires = 3
+
+    def __call__(self, prompt, image, height, width, **kwargs):
+        self.call = dict(prompt=prompt, image=image, height=height, width=width, **kwargs)
+        callback = kwargs["callback_on_step_end"]
+        for index in range(self.fires):
+            callback(self, index, 1000.0,
+                     {"latents": FakeTensor("F16", (1, 256, 64), values=[0.5] * 256)})
+        return SimpleNamespace(images=FakeTensor("F16", (1, 256, 64), values=[0.5] * 256))
+
+
+def _text_payload_for(request):
+    """Text-only payload: the image-pad mask is all-False (§2.1 invariant)."""
+    tensors = {}
+    for side in ("positive", "negative") if request.kwargs["cfg_active"] else ("positive",):
+        embeds, attention, image_mask = triple(shape=(1, 4, 16), code="F16")
+        tensors[f"{side}.embeds"] = embeds
+        tensors[f"{side}.attention_mask"] = attention
+        tensors[f"{side}.image_pad_mask"] = image_mask
+    descriptors = [{"name": name, "dtype": tensor.code, "shape": list(tensor.shape),
+                    "bytes": len(tensor.raw)} for name, tensor in sorted(tensors.items())]
+    canonical = lambda doc: json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    metadata = {"schema": ep.TENSOR_PAYLOAD_SCHEMA, "codec": ep.SAFETENSORS_CODEC,
+                "cache_key": cache_key(request), "dtype": request.dtype,
+                "cfg_active": request.kwargs["cfg_active"],
+                "request": request.key_document(), "tensors": descriptors}
+    st_metadata = {"codec": ep.SAFETENSORS_CODEC, "cache_key": cache_key(request),
+                   "dtype": request.dtype,
+                   "cfg_active": "true" if request.kwargs["cfg_active"] else "false",
+                   "request_identity": canonical(request.key_document()),
+                   "tensor_descriptors": canonical(descriptors)}
+    return EncodedPayload(metadata=metadata,
+                          blobs=(Blob("tensors", st_bytes(tensors, st_metadata)),))
+
+
+witness_generators: list = []
+
+
+def _step_witness(tmp_path, monkeypatch, *, fires, recipe, steps):
+    """Loaded, encoded supplied adapter over a pipe firing ``fires`` step
+    callbacks; returns (adapter, config, progress records)."""
+    from PIL import Image as PILImage
+
+    class _Generator:
+        instances: list = []
+        def __init__(self, device=None):
+            self.value = None
+            self.instances.append(self)
+        def seed(self):
+            return 7
+        def manual_seed(self, value):
+            self.value = value
+
+    witness_generators.append(_Generator)
+
+
+    class _Torch(FakeTorch):
+        float16 = "torch.float16"
+        float32 = "torch.float32"
+        Generator = _Generator
+        @staticmethod
+        def isfinite(tensor):
+            return tensor.isfinite()
+
+    class _Pipe(_StepCountingPipe):
+        pass
+    _Pipe.fires = fires
+
+    install_ml(monkeypatch)
+    monkeypatch.setattr(FakeTensor, "to",
+                        lambda self, device=None, dtype=None: self, raising=False)
+    monkeypatch.setattr(module, "_libraries",
+                        lambda: (_Torch(), PILImage, (_Pipe, _E2ETransformer, _E2EVAE, _E2EScheduler)))
+
+    manifest = load_manifest(ROOT / "models/manifest.json")
+    bundle = LocalReferenceBundle(profile=LOCAL_REFERENCE_PROFILE, root=tmp_path,
+        root_resolved=tmp_path, repo=manifest.artifacts[0].repo,
+        revision=manifest.artifacts[0].revision,
+        assets={r: tuple(tmp_path / n for n in names) for r, names in LOCAL_REFERENCE_LAYOUT.items()},
+        component_dirs={r: tmp_path / n for r, n in ROLE_DIRECTORIES.items()},
+        fingerprints=reference_bundle_fingerprints(manifest))
+
+    def encode_provider(cfg, *, encoder_dtype, cancel_event, image_files):
+        assert not image_files  # text-only witness run
+        seed = project_encoder_seed(cfg, manifest, encoder_dtype=encoder_dtype)
+        completed = replace(seed, implementation_identity=make_identity(
+            worker_implementation_revision="synthetic-steps-child",
+            encoder_artifact_set_sha256=reference_bundle_fingerprints(manifest).encoder))
+        return ProductionEncoding(completed, _text_payload_for(completed))
+
+    config = GenerationConfig(output_dir=tmp_path, height=256, width=256,
+                              recipe=recipe, steps=steps)
+    supplied = module.SuppliedQwen21Adapter(
+        pipeline=_Pipe(), encoder=SimpleNamespace(encode=encode_provider),
+        manifest=manifest, bundle=bundle, encoder_dtype="fp16")
+    progress: list[tuple[int, int]] = []
+    supplied.set_progress_callback(lambda done, total: progress.append((done, total)))
+    supplied.load(config, bundle.to_assets())
+    branches = supplied.encode(config)
+    return supplied, config, branches, progress
+
+
+@needs_references
+def test_turbo_denoise_refuses_a_truncated_step_schedule(tmp_path, monkeypatch):
+    """The saved sigmas make num_inference_steps inert inside the pipeline,
+    so the adapter must witness EIGHT callbacks itself: seven (tampered or
+    truncated schedule) is a refusal before publication."""
+    supplied, config, branches, _ = _step_witness(
+        tmp_path, monkeypatch, fires=7, recipe="turbo", steps=8)
+    with pytest.raises(EngineError, match="8 shipped sigmas"):
+        supplied.denoise(config, branches)
+    assert supplied._state == "encoded"  # never published as denoised
+    supplied.close()
+
+
+@needs_references
+def test_turbo_denoise_accepts_the_eight_callback_schedule(tmp_path, monkeypatch):
+    supplied, config, branches, progress = _step_witness(
+        tmp_path, monkeypatch, fires=8, recipe="turbo", steps=8)
+    latents = supplied.denoise(config, branches)
+    assert tuple(latents.shape) == (1, config.latent_tokens, 64)
+    assert supplied._state == "denoised"
+    assert progress == [(index + 1, 8) for index in range(8)]
+    supplied.close()
+
+
+@needs_references
+def test_base_recipe_denoise_is_not_step_pinned(tmp_path, monkeypatch):
+    """Base keeps its own contract: the pipeline builds its schedule from
+    ``steps``; the turbo witness must not pin base callback counts."""
+    supplied, config, branches, _ = _step_witness(
+        tmp_path, monkeypatch, fires=3, recipe="base", steps=40)
+    latents = supplied.denoise(config, branches)
+    assert supplied._state == "denoised"
+    assert tuple(latents.shape) == (1, config.latent_tokens, 64)
+    supplied.close()
+
+
+@needs_references
+def test_text_to_image_noise_seed_stays_the_plain_seed(tmp_path, monkeypatch):
+    """Byte-identity of the T2I path: the generator is seeded with
+    config.seed exactly (no derivation) and no noise_seed is recorded."""
+    supplied, config, branches, _ = _step_witness(
+        tmp_path, monkeypatch, fires=8, recipe="turbo", steps=8)
+    config = replace(config, seed=1234)
+    supplied._config = config
+    supplied.denoise(config, branches)
+    generator = witness_generators[-1].instances[-1]
+    assert generator.value == 1234 and supplied.actual_seed == 1234
+    assert supplied._noise_seed is None
     supplied.close()

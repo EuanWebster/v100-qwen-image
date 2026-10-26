@@ -426,6 +426,18 @@ def test_config_cfg_semantics_and_manifest_components(manifest, reviewed_fixture
     ei.validate_worker_request_identity(req, manifest)
 
 
+def test_worker_identity_accepts_reference_requests_and_binds_their_images(manifest, reviewed_fixture):
+    # Regression: the worker-side projection dropped the ordered image hashes,
+    # so every real reference edit was refused before encoding on the V100.
+    first, second = "a" * 64, "b" * 64
+    config = GenerationConfig(references=(first, second, first), references_dir="/store")
+    req = ei.project_encoder_request(config, manifest, encoder_dtype="bf16")
+    assert req.images == (first, second, first)
+    # Image content/order binding is enforced by the seed comparison and the
+    # worker's per-file re-hash; this check binds code and manifest identity.
+    ei.validate_worker_request_identity(req, manifest)
+
+
 def test_generation_only_parameters_do_not_fragment_encoder_cache(manifest, reviewed_fixture):
     config = GenerationConfig(negative_prompt="negative", true_cfg_scale=2)
     first = ei.project_encoder_request(config, manifest, encoder_dtype="fp16")
@@ -538,7 +550,7 @@ def test_seed_completed_in_current_runtime_parent_coherence_does_not_reobserve(m
         ei.validate_completed_seed(seed, replace(completed, prompt="different"), manifest)
 
 
-@pytest.mark.parametrize("field,value", [("images", ("f" * 64,)), ("kwargs", {}),
+@pytest.mark.parametrize("field,value", [("kwargs", {}),
     ("kwargs", {"cfg_active": "yes"}), ("model_repo", "wrong/repo"),
     ("dtype", "FP16"), ("processor", ComponentIdentity(sha256="f" * 64))])
 def test_bad_projection_seeds_refused_before_runtime_observation(manifest, monkeypatch, field, value):
@@ -556,3 +568,39 @@ def test_projection_refuses_completed_requests_and_missing_vision(manifest, revi
     monkeypatch.setattr(ei, "observe_installed_packages", lambda: package_facts(None))
     with pytest.raises(EncoderSetupError, match="torchvision: expected"):
         ei.complete_encoder_seed(seed, manifest)
+
+
+REFERENCE_A = hashlib.sha256(b"reference-a").hexdigest()
+REFERENCE_B = hashlib.sha256(b"reference-b").hexdigest()
+REFERENCES = (REFERENCE_A, REFERENCE_B, REFERENCE_A)  # duplicates are legal
+
+
+def test_seed_and_projection_bind_config_references_in_order(manifest, reviewed_fixture):
+    config = GenerationConfig(references=REFERENCES, references_dir="/store")
+    seed = ei.project_encoder_seed(config, manifest, encoder_dtype="fp16")
+    assert seed.images == REFERENCES
+    completed = ei.complete_encoder_seed(seed, manifest)
+    assert completed == ei.project_encoder_request(config, manifest, encoder_dtype="fp16")
+    assert completed.key_document()["images"] == list(REFERENCES)
+    ei.validate_completed_seed(seed, completed, manifest)
+
+
+def test_reference_order_and_membership_are_identity(manifest):
+    config = GenerationConfig(references=REFERENCES, references_dir="/store")
+    original = ei.project_encoder_request(config, manifest, encoder_dtype="fp16")
+    for other in (replace(config, references=(REFERENCE_B, REFERENCE_A, REFERENCE_A)),
+                  replace(config, references=(REFERENCE_A, REFERENCE_B)),
+                  replace(config, references=())):
+        projected = ei.project_encoder_request(other, manifest, encoder_dtype="fp16")
+        assert projected.key_document() != original.key_document()
+
+
+def test_completed_reference_mismatch_refused(manifest, reviewed_fixture):
+    config = GenerationConfig(references=REFERENCES, references_dir="/store")
+    seed = ei.project_encoder_seed(config, manifest, encoder_dtype="fp16")
+    completed = ei.complete_encoder_seed(seed, manifest)
+    with pytest.raises(EncoderRequestError, match="disagrees"):
+        ei.validate_completed_seed(seed, replace(completed, images=(REFERENCE_B,)), manifest)
+    t2i_seed = ei.project_encoder_seed(GenerationConfig(), manifest, encoder_dtype="fp16")
+    with pytest.raises(EncoderRequestError, match="disagrees"):
+        ei.validate_completed_seed(t2i_seed, completed, manifest)

@@ -12,7 +12,8 @@ Contract summary
 ----------------
 * :func:`validate_production_request` runs **before any heavy import** and
   refuses (typed :class:`EncoderRequestError`): a non-scalar or blank
-  positive prompt; any images; an absent implementation identity (production
+  positive prompt; more than ``REFERENCE_MAX_FILES`` ordered image hashes;
+  an absent implementation identity (production
   requires the complete :class:`qwen_engine.encoder.EncoderImplementationIdentity`
   — the record's own validation already proves completeness when present); a
   dtype that is not exactly one of ``fp16`` / ``bf16`` / ``fp32``; and
@@ -26,8 +27,12 @@ Contract summary
   :func:`encode_with_supplied_pipeline` takes an already-constructed pipeline
   (the caller supplies the pinned ``QwenImage21Pipeline`` with only the text
   encoder and processor — this helper never loads, constructs, moves or
-  casts anything) and calls its ``encode_prompt`` on CPU, with ``image=None``
-  and ``num_images_per_prompt=1``, inside ``torch.inference_mode()``. It does
+  casts anything) and calls its ``encode_prompt`` on CPU, with
+  ``num_images_per_prompt=1``, inside ``torch.inference_mode()`` —
+  ``image=None`` for a text-only request, or the pipeline-identically
+  resized PIL list from :func:`reference_images_from_blobs` when the request
+  carries image hashes (positive and, with active CFG, negative branches).
+  It does
   not copy prompt control tokens, re-create them, call
   ``apply_chat_template`` / the tokenizer directly, or register any hook —
   the upstream method owns prompt formatting, the drop-index and the
@@ -37,8 +42,9 @@ Contract summary
 * Branch outputs: floating **finite** embeddings ``[1, S>=1, H>=1]`` whose
   dtype equals the requested dtype exactly; a nullable ``int64`` attention
   mask ``[1, S]`` that is binary (0/1) with at least one valid token; a
-  **mandatory** ``bool`` image-pad mask ``[1, S]`` that is all-False (T2I
-  only — a True slot would mean image conditioning, which is out of scope).
+  **mandatory** ``bool`` image-pad mask ``[1, S]``: all-False for a
+  text-only request, with at least one True vision slot when the request
+  carries image hashes.
   Positive and negative sequence lengths may differ; ``H`` and the embedding
   dtype must agree across branches. All tensors must be dense, strided,
   contiguous CPU tensors; tensor lookalikes are refused.
@@ -76,8 +82,9 @@ SystemExit) is never caught here.
 from __future__ import annotations
 
 import importlib
+import io
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from itertools import chain
 from typing import Any
@@ -145,6 +152,18 @@ BRANCH_NAMES = ("positive", "negative")
 EMBEDS_SUFFIX = ".embeds"
 ATTENTION_MASK_SUFFIX = ".attention_mask"
 IMAGE_MASK_SUFFIX = ".image_pad_mask"
+
+#: Ordered references accepted by one production request (plan §4: upstream
+#: documents up to ten; raising this cap requires measured V100 headroom —
+#: see docs/image-edit-design.md §4).
+REFERENCE_MAX_FILES = 10
+
+#: Target area of reference preprocessing: the pinned pipeline resizes every
+#: condition image to ``output_resolution**2`` (pipeline_qwenimage21.py:657-672
+#: with the default ``output_resolution=1024`` at :533). This constant MUST
+#: equal that default; a preprocessing change here is a prompt-extraction
+#: revision bump (encoder_identity.PROMPT_EXTRACTION_REVISION).
+REFERENCE_TARGET_AREA = 1024 * 1024
 
 #: Payload metadata keys (exactly these, nothing else).
 PAYLOAD_METADATA_KEYS = frozenset(
@@ -297,9 +316,10 @@ def validate_production_request(request: Any) -> ValidatedProductionRequest:
         errors.append("prompt: must not be blank (whitespace-only prompts are "
                       "refused; production never sends a blank to upstream)")
 
-    if request.images:
-        errors.append(f"images: image conditioning is out of scope, got "
-                      f"{len(request.images)} image hash(es)")
+    if len(request.images) > REFERENCE_MAX_FILES:
+        errors.append(f"images: at most {REFERENCE_MAX_FILES} ordered "
+                      f"reference hashes are supported, got "
+                      f"{len(request.images)}")
 
     if request.implementation_identity is None:
         errors.append("implementation_identity: production encoding requires "
@@ -416,7 +436,8 @@ def _validate_attention_mask(mask: Any, *, seq_len: int, at: str) -> None:
         raise _proto(f"{at}: attention mask marks no valid token (all zero)")
 
 
-def _validate_image_mask(mask: Any, *, seq_len: int, at: str) -> None:
+def _validate_image_mask(mask: Any, *, seq_len: int, at: str,
+                         images_expected: bool = False) -> None:
     if mask is None:
         raise _proto(f"{at}: the image-pad mask is mandatory (upstream always "
                      "returns one; a missing mask is a contract violation)")
@@ -427,13 +448,19 @@ def _validate_image_mask(mask: Any, *, seq_len: int, at: str) -> None:
     if _dtype_code(mask, at) != "BOOL":
         raise _proto(f"{at}: image-pad mask dtype must be bool, got "
                      f"{str(mask.dtype)!r}")
-    if mask.any().item():
-        raise _proto(f"{at}: image-pad mask must be all-False for T2I (a True "
-                     "slot is image conditioning, out of scope)")
+    if images_expected:
+        if not mask.any().item():
+            raise _proto(f"{at}: the request carries image conditioning but "
+                         "the mask marks no vision token (all-False) — "
+                         "conditioning and mask disagree")
+    elif mask.any().item():
+        raise _proto(f"{at}: image-pad mask must be all-False for a "
+                     "text-only request (a True slot is image conditioning)")
 
 
 def _validate_branch_output(raw: Any, *, side: str,
                             want_torch_str: str,
+                            images_expected: bool = False,
                             ) -> tuple[EncoderBranch, int, int, str]:
     """Validate one upstream ``encode_prompt`` triple; returns the branch
     record plus ``(S, H, code)`` for the cross-branch agreement check."""
@@ -463,6 +490,7 @@ def _validate_branch_output(raw: Any, *, side: str,
         _validate_attention_mask(mask, seq_len=seq_len,
                                  at=side + ATTENTION_MASK_SUFFIX)
     _validate_image_mask(image_mask, seq_len=seq_len,
+                         images_expected=images_expected,
                          at=side + IMAGE_MASK_SUFFIX)
     return (EncoderBranch(embeds=embeds, attention_mask=mask,
                           image_pad_mask=image_mask),
@@ -474,8 +502,103 @@ def _validate_branch_output(raw: Any, *, side: str,
 # ---------------------------------------------------------------------------
 
 
+def _load_pil_image() -> Any:
+    """Lazy Pillow (``PIL.Image`` module) for reference decode/resize —
+    never imported by text-only conditioning."""
+    try:
+        return importlib.import_module("PIL.Image")
+    except ImportError as exc:
+        raise EncoderSetupError(
+            f"image conditioning needs the pinned Pillow package: {exc}") from exc
+
+
+def _pinned_reference_helpers() -> tuple[Any, Any]:
+    """``(calculate_dimensions, image_processor)`` from the PINNED pipeline.
+
+    Reference preprocessing is owned by upstream: the child reuses the
+    pipeline's own dimension rule and an identically configured image
+    processor (pipeline_qwenimage21.py:208-210 and :657-672) instead of
+    re-implementing resize arithmetic. Importing this pulls the heavy stack,
+    so it is only ever called by :func:`reference_images_from_blobs`."""
+    try:
+        vae_processor = importlib.import_module(
+            "diffusers.image_processor").VaeImageProcessor
+        calculate_dimensions = importlib.import_module(
+            "diffusers.pipelines.qwenimage21."
+            "pipeline_qwenimage21").calculate_dimensions
+    except (ImportError, AttributeError) as exc:
+        raise EncoderSetupError(
+            "the pinned reference preprocessing helpers are unavailable: "
+            f"{exc}") from exc
+    return (calculate_dimensions,
+            vae_processor(vae_scale_factor=16, vae_latent_channels=64))
+
+
+def reference_images_from_blobs(request: EncoderRequest,
+                                blobs: Sequence[bytes]) -> list[Any]:
+    """Decode and resize reference bytes EXACTLY as the pinned pipeline
+    preprocesses condition images (pipeline_qwenimage21.py:657-672): convert
+    non-RGBA to RGBA, compute the target size from ``REFERENCE_TARGET_AREA``
+    with the pipeline's own dimension helper (both sides rounded to 32), then
+    resize with an identically configured upstream image processor. The
+    vision tower later composites RGBA over white inside ``encode_prompt``
+    — this helper must NOT flatten; upstream owns that step.
+
+    Pillow and the pinned helpers import lazily. Decode caps from
+    :mod:`qwen_engine.reference_store` are checked against the image header
+    BEFORE the full pixel load (decompression-bomb gate)."""
+    from qwen_engine.reference_store import (MAX_REFERENCE_DIM,
+                                             MAX_REFERENCE_PIXELS)
+    if not request.images:
+        raise EncoderRequestError(
+            "reference blobs supplied for a text-only request")
+    if isinstance(blobs, (bytes, bytearray, str)) or len(blobs) != len(request.images):
+        raise EncoderRequestError(
+            f"reference blobs must match the ordered image hashes "
+            f"({len(request.images)} required), got "
+            f"{'raw bytes' if isinstance(blobs, (bytes, bytearray, str)) else len(blobs)}")
+    pil = _load_pil_image()
+    dimensions, image_processor = _pinned_reference_helpers()
+    resized: list[Any] = []
+    for index, raw in enumerate(blobs):
+        try:
+            image = pil.open(io.BytesIO(bytes(raw)))
+            width, height = image.size
+        except Exception as exc:
+            raise EncoderRequestError(
+                f"reference {index}: cannot be opened as an image "
+                f"({type(exc).__name__}: {exc})") from exc
+        if (width < 1 or height < 1 or width > MAX_REFERENCE_DIM
+                or height > MAX_REFERENCE_DIM
+                or width * height > MAX_REFERENCE_PIXELS):
+            raise EncoderRequestError(
+                f"reference {index}: decoded dimensions exceed the accepted "
+                f"caps ({width}x{height}; max {MAX_REFERENCE_DIM} per side, "
+                f"{MAX_REFERENCE_PIXELS} total pixels)")
+        try:
+            image.load()
+        except Exception as exc:
+            raise EncoderRequestError(
+                f"reference {index}: cannot be decoded "
+                f"({type(exc).__name__}: {exc})") from exc
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+        target_width, target_height, _ = dimensions(
+            REFERENCE_TARGET_AREA, image.size[0] / image.size[1])
+        try:
+            resized.append(image_processor.resize(
+                image, width=target_width, height=target_height))
+        except Exception as exc:
+            raise EncoderRequestError(
+                f"reference {index}: pinned resize failed "
+                f"({type(exc).__name__}: {exc})") from exc
+    return resized
+
+
 def encode_with_supplied_model(model: Any, processor: Any,
-                               request: EncoderRequest) -> EncodedPayload:
+                               request: EncoderRequest,
+                               reference_images: Sequence[Any] | None = None,
+                               ) -> EncodedPayload:
     """Reuse the pinned upstream pipeline with a supplied CPU model/processor.
 
     The pipeline supplies its own templates, extraction and norm-hook logic.
@@ -494,16 +617,24 @@ def encode_with_supplied_model(model: Any, processor: Any,
                            text_encoder=model, processor=processor)
     except Exception as exc:
         raise EncoderSetupError(f"upstream encoder pipeline setup failed: {exc}") from exc
-    return encode_with_supplied_pipeline(pipeline, request)
+    return encode_with_supplied_pipeline(pipeline, request, reference_images)
 
 
 def encode_with_supplied_pipeline(pipeline: Any,
-                                  request: EncoderRequest) -> EncodedPayload:
+                                  request: EncoderRequest,
+                                  reference_images: Sequence[Any] | None = None,
+                                  ) -> EncodedPayload:
     """Encode a production request by calling ``encode_prompt`` on the
     SUPPLIED pinned ``QwenImage21Pipeline`` — this helper never constructs,
-    loads, moves or casts models, never touches the tokenizer / chat
-    template / control tokens, and registers no hooks (upstream owns the
-    prompt pipeline and its pre-RMSNorm hook; docs/interfaces.md §2).
+    loads, moves or casts models, never touches the prompt control tokens
+    directly, and registers no hooks (upstream owns the prompt pipeline and
+    its pre-RMSNorm hook; docs/interfaces.md §2).
+
+    Image conditioning: when ``request.images`` is non-empty the caller
+    supplies the pipeline-identically resized PIL list
+    (:func:`reference_images_from_blobs`) and it is passed to ``encode_prompt``
+    as ``image=`` for the positive and (with active CFG) the negative branch.
+    Text-only requests must pass no reference images.
 
     Returns an :class:`EncodedPayload` with exactly one safetensors blob and
     the full request identity in its metadata. The negative branch is encoded
@@ -516,9 +647,32 @@ def encode_with_supplied_pipeline(pipeline: Any,
             "the supplied pipeline must expose encode_prompt (a constructed "
             "pinned QwenImage21Pipeline with the text encoder and processor; "
             "this helper never loads a model itself)")
+    images_expected = bool(req.images)
+    if images_expected:
+        if reference_images is None:
+            raise EncoderRequestError(
+                "the request carries image hashes; the resized reference "
+                "images must be supplied alongside (worker read/hash-bind "
+                "failed or was skipped)")
+        image_class = _load_pil_image().Image
+        refs = list(reference_images)
+        if len(refs) != len(req.images):
+            raise EncoderRequestError(
+                f"reference_images must match the ordered image hashes "
+                f"({len(req.images)} required), got {len(refs)}")
+        for i, image in enumerate(refs):
+            if not isinstance(image, image_class):
+                raise EncoderRequestError(
+                    f"reference_images[{i}]: must be a PIL Image, got "
+                    f"{type(image).__name__}")
+    elif reference_images is not None:
+        raise EncoderRequestError(
+            "reference_images supplied for a text-only request "
+            "(request.images is empty)")
 
     device = torch.device("cpu")
-    kwargs = dict(image=None, device=device, num_images_per_prompt=1)
+    kwargs = dict(image=list(reference_images) if images_expected else None,
+                  device=device, num_images_per_prompt=1)
     try:
         with torch.inference_mode():
             positive_raw = pipeline.encode_prompt(prompt=req.prompt, **kwargs)
@@ -534,11 +688,13 @@ def encode_with_supplied_pipeline(pipeline: Any,
 
     want = DTYPE_TO_TORCH_STR[req.dtype]
     positive, _pos_s, pos_h, pos_code = _validate_branch_output(
-        positive_raw, side="positive", want_torch_str=want)
+        positive_raw, side="positive", want_torch_str=want,
+        images_expected=images_expected)
     negative = None
     if validated.cfg_active:
         negative, _neg_s, neg_h, neg_code = _validate_branch_output(
-            negative_raw, side="negative", want_torch_str=want)
+            negative_raw, side="negative", want_torch_str=want,
+            images_expected=images_expected)
         if neg_h != pos_h or neg_code != pos_code:
             raise _proto(f"branches: the negative branch (H={neg_h}, "
                          f"{neg_code}) must agree with the positive branch "
@@ -618,7 +774,8 @@ def validate_branch_bundle(validated: ValidatedProductionRequest,
             raise _proto(f"{side}: must be an EncoderBranch")
         _, _, width, _ = _validate_branch_output(
             (branch.embeds, branch.attention_mask, branch.image_pad_mask),
-            side=side, want_torch_str=DTYPE_TO_TORCH_STR[req.dtype])
+            side=side, want_torch_str=DTYPE_TO_TORCH_STR[req.dtype],
+            images_expected=bool(req.images))
         if hidden is not None and width != hidden:
             raise _proto("branches disagree on hidden width")
         hidden = width
@@ -1069,7 +1226,8 @@ def _inspect_payload(payload: EncodedPayload, expect_request: EncoderRequest | N
                 if mask_spec["dtype"] != code or mask_spec["shape"] != [1, shape[1]]:
                     raise _proto(f"{side + suffix}: header mask shape/dtype disagrees with embeddings")
 
-    return plan, by_name, header_names, dtype, cfg_active, blob
+    return (plan, by_name, header_names, dtype, cfg_active, blob,
+            bool(recovered.images))
 
 
 def validate_serialized_payload(payload: EncodedPayload, *, expect_request: EncoderRequest) -> None:
@@ -1091,7 +1249,8 @@ def payload_to_branches(payload: EncodedPayload, *,
     mask values are validated after deserialization. Null masks remain null.
     With expect_request, identity must match its cache key/document exactly.
     """
-    plan, by_name, header_names, dtype, cfg_active, blob = _inspect_payload(payload, expect_request)
+    (plan, by_name, header_names, dtype, cfg_active, blob,
+     images_expected) = _inspect_payload(payload, expect_request)
 
     # --- library deserialization (only now) ---------------------------------
     st = _load_safetensors()
@@ -1152,7 +1311,7 @@ def payload_to_branches(payload: EncodedPayload, *,
             _validate_attention_mask(mask, seq_len=shape[1],
                                      at=f"tensor {branch_name + ATTENTION_MASK_SUFFIX!r}")
         _validate_image_mask(tensors[branch_name + IMAGE_MASK_SUFFIX],
-                             seq_len=shape[1],
+                             seq_len=shape[1], images_expected=images_expected,
                              at=f"tensor {branch_name + IMAGE_MASK_SUFFIX!r}")
         branches[branch_name] = EncoderBranch(
             embeds=embeds, attention_mask=mask,

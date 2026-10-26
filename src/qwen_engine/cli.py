@@ -20,6 +20,7 @@ import json
 import sys
 import traceback
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ from qwen_engine.adapters.base import (
     OFFLOAD_CHOICES,
     QUANT_CHOICES,
 )
-from qwen_engine.config import ConfigError, GenerationConfig
+from qwen_engine.config import ConfigError, FieldError, GenerationConfig, Recipe
 from qwen_engine.core import generate, plan, require_run_config
 from qwen_engine.errors import (
     EngineError,
@@ -40,6 +41,11 @@ from qwen_engine.errors import (
     MemoryGuardError,
 )
 from qwen_engine.log import PhaseLogger, file_sink
+from qwen_engine.local_bundle import (TURBO_REFERENCE_PROFILE, LocalBundleError,
+                                      VerificationReusePolicy,
+                                      prime_resolution_memo,
+                                      remember_verified_resolution,
+                                      reusable_resolution)
 from qwen_engine.manifest import ManifestError, load_manifest, manifest_status, resolve_manifest
 
 _OVERRIDES = {
@@ -61,6 +67,7 @@ _OVERRIDES = {
     "manifest": "manifest_path",
     "q8_manifest": "q8_manifest_path",
     "output_format": "output_format",
+    "recipe": "recipe",
 }
 MAX_CONFIG_BYTES = 1 << 20
 
@@ -98,6 +105,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "calibration observations to PATH (requires --run). A "
                         "mid-run measurement failure keeps the generated image but "
                         "exits 1 without writing a record")
+    p.add_argument("--performance-report", type=Path, default=None, metavar="PATH",
+                   help="opt-in synchronized substage metrics without prompt contents; "
+                        "write a new JSON file (requires --run; separate from calibration)")
     # Field overrides (take precedence over --config):
     p.add_argument("--prompt")
     p.add_argument("--negative", default=None)
@@ -113,7 +123,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int)
     p.add_argument("--output-format", choices=("jpg", "png", "webp"),
                    help="saved image format (default: jpg; JPEG flattens alpha on white)")
+    p.add_argument("--transparent", dest="transparent",
+                   action=argparse.BooleanOptionalAction, default=None,
+                   help="native transparency: wraps the positive prompt with "
+                        "the RGBA/transparency prompt and requires an "
+                        "alpha-capable format (PNG/WEBP). With --transparent "
+                        "and no explicit --output-format, a jpg/default "
+                        "format switches to PNG automatically; an explicit "
+                        "--output-format jpg is refused. --no-transparent "
+                        "overrides a config-file true and keeps the format")
     p.add_argument("--quant", choices=QUANT_CHOICES)
+    p.add_argument("--recipe", choices=("base", "turbo"), default=None,
+                   help="weights/sampling recipe: 'turbo' is the Turbo "
+                        "transformer + base encoder/VAE with the shipped "
+                        "eight-step sigma schedule (steps must be 8, CFG 1, "
+                        "fp16 only); default 'base'")
     p.add_argument("--offload", choices=OFFLOAD_CHOICES)
     p.add_argument("--attention-backend", dest="attention_backend",
                    choices=ATTENTION_BACKEND_CHOICES)
@@ -128,7 +152,61 @@ def build_parser() -> argparse.ArgumentParser:
                    help="model manifest path override (default: unset -> run refuses)")
     p.add_argument("--q8-manifest", type=Path, default=None,
                    help="explicit verified Q8 GGUF sidecar manifest (required with --quant q8)")
+    p.add_argument("--reference", dest="references", action="append", default=None,
+                   metavar="PATH",
+                   help="reference image file (repeatable, ordered, at most 10): the "
+                        "bytes are copied verbatim into the reference store and the "
+                        "run carries only content ids")
+    p.add_argument("--references-dir", dest="references_dir", type=Path, default=None,
+                   help="reference store directory (default: <cache_dir>/references)")
     return p
+
+
+def _ingest_references(paths: list[Any], references_dir: Any,
+                       data: dict[str, Any]) -> None:
+    """Store CLI reference files as content blobs and point the config at ids.
+
+    Files are copied verbatim (no re-encode: identity must cover the bytes the
+    user chose); the config keeps ids + store directory only, so job envelopes
+    never carry server paths. Validation stays in the store: magic sniff,
+    decode caps, size caps, store fullness — every refusal is an exit-2
+    config error, never a traceback."""
+    from qwen_engine import reference_store
+    if references_dir is None:
+        cache_dir = data.get("cache_dir")
+        if cache_dir is None:
+            raise ConfigError(FieldError(
+                "references_dir",
+                "--reference requires --references-dir (or a cache_dir; the "
+                "store defaults to <cache_dir>/references)"))
+        references_dir = Path(str(cache_dir)) / "references"
+    store_dir = Path(str(references_dir))
+    try:
+        store_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ConfigError(FieldError(
+            "references_dir", f"store directory is not usable: {store_dir}: "
+                              f"{exc.strerror or exc}")) from exc
+    ids = []
+    for position, raw_path in enumerate(paths, start=1):
+        path = Path(str(raw_path))
+        try:
+            blob = read_bounded_file(path, reference_store.MAX_REFERENCE_BYTES)
+        except OSError as exc:
+            raise ConfigError(FieldError(
+                "references", f"reference {position} is not a readable file: "
+                              f"{path}: {exc.strerror or exc}")) from exc
+        except (ValueError, RuntimeError) as exc:
+            raise ConfigError(FieldError(
+                "references", f"reference {position} exceeds the store byte cap: "
+                              f"{path}: {exc}")) from exc
+        try:
+            ids.append(reference_store.put_bytes(store_dir, blob))
+        except EngineError as exc:
+            raise ConfigError(FieldError(
+                "references", f"reference {position} refused: {exc}")) from exc
+    data["references"] = ids
+    data["references_dir"] = str(store_dir)
 
 
 def _load_config(args: argparse.Namespace) -> GenerationConfig:
@@ -167,6 +245,22 @@ def _load_config(args: argparse.Namespace) -> GenerationConfig:
             data[field] = str(value) if isinstance(value, Path) else value
     if args.tiled_decode is not None:
         data["vae_tiled_decode"] = args.tiled_decode
+    if getattr(args, "transparent", None) is not None:
+        data["transparent_background"] = args.transparent
+        if args.transparent:
+            # Auto-flip only when --output-format was NOT explicitly given and
+            # the effective format is not already alpha-capable. Explicit
+            # --output-format jpg (or a config-file jpg) is left untouched and
+            # refused by config validation — never a hidden rewrite.
+            explicit_format = args.output_format is not None
+            current = str(data.get("output_format", "jpg")).lower()
+            if not explicit_format and current not in ("png", "webp"):
+                data["output_format"] = "png"
+    reference_paths = list(getattr(args, "references", None) or [])
+    if reference_paths:
+        _ingest_references(reference_paths, getattr(args, "references_dir", None), data)
+    elif getattr(args, "references_dir", None) is not None:
+        data["references_dir"] = str(args.references_dir)
     return GenerationConfig.from_dict(data)
 
 
@@ -176,10 +270,43 @@ def _logger_for(config: GenerationConfig) -> PhaseLogger:
     return PhaseLogger()  # nothing configured -> nothing written
 
 
-def _verify_assets(config: GenerationConfig):
+def _verified_report(manifest, root, reuse_policy, *, profile=None):
+    """One tree's verification, honoring the optional reuse policy; the
+    returned report is always a *this-process-successful* resolver result —
+    either freshly hashed or the recorded identical-bytes report. On a
+    fresh full hash that came out OK under a policy, the record is written;
+    failures are recorded as "nothing" (and erase any stale record)."""
+    if reuse_policy is None:
+        return resolve_manifest(manifest, root)
+    kwargs = {} if profile is None else {"profile": profile}
+    recorded = reusable_resolution(manifest, root, reuse_policy, **kwargs)
+    if recorded is not None:
+        return recorded
+    report = resolve_manifest(manifest, root)
+    remember_verified_resolution(manifest, root, report, reuse_policy,
+                                 **kwargs)
+    return report
+
+
+def _verify_assets(config: GenerationConfig, *, reuse_policy=None):
     """No-download contract (R3): refuse to run on any unresolved asset.
     Returns the :class:`ResolutionReport` so the caller can hand the verified,
-    role-grouped paths to the adapter."""
+    role-grouped paths to the adapter.
+
+    ``reuse_policy`` (default ``None`` = today's behaviour: content-hash
+    every artifact on every call) opts a long-lived process into the
+    stat-fingerprint record of :mod:`qwen_engine.local_bundle`: a cached
+    Turbo tree is re-used, not re-hashed, while the policy is on, every
+    file's (dev, ino, size, mode, mtime_ns, ctime_ns) is unchanged, and the
+    record is inside ``max_age_s``. Read
+    :class:`~qwen_engine.local_bundle.VerificationReusePolicy` before
+    enabling: stat-unchanged is a WEAKER guarantee than the content hash.
+    Failed verifications are never recorded and never reused."""
+    if reuse_policy is not None and not isinstance(reuse_policy,
+                                                   VerificationReusePolicy):
+        raise ValueError(
+            "reuse_policy must be None or a VerificationReusePolicy, got "
+            f"{reuse_policy!r}")
     if config.manifest_path is None:
         raise ManifestError(
             "no model manifest configured (manifest_path is null): assets are "
@@ -189,7 +316,7 @@ def _verify_assets(config: GenerationConfig):
     manifest = load_manifest(config.manifest_path)
     root = (Path(config.models_dir) if config.models_dir is not None
             else Path(config.manifest_path).parent)
-    report = resolve_manifest(manifest, root)
+    report = _verified_report(manifest, root, reuse_policy)
     if not report.ok:
         for err in report.errors:
             print(f"asset error: {err}", file=sys.stderr)
@@ -197,6 +324,48 @@ def _verify_assets(config: GenerationConfig):
             f"{len(report.errors)} model artifact(s) unresolved; nothing "
             f"downloaded (fetching is a separate operator action)"
         )
+    # Fresh-verification priming (measured 2026-10-25): adapter.load's
+    # resolve_local_bundle re-hashed every byte the line just above hashed
+    # (~19 s base + ~9 s turbo, every pass paid twice per run). Project the
+    # honest report through the SAME trusted projection and remember it for
+    # the adapter's reverify seconds later in this process. Best effort by
+    # design: a manifest outside the reviewed profile will be refused by the
+    # adapter's own trusted resolve with the same typed error it raises
+    # today — priming is a reuse, never a gate, and never stores for a
+    # refusal.
+    try:
+        prime_resolution_memo(manifest, root, report)
+    except LocalBundleError:
+        pass
+    if config.recipe is Recipe.TURBO:
+        # Turbo's fail-closed path (turbo-plan §3.3): its own manifest and
+        # root, resolved exactly like the base assets, then role-merged on
+        # top — dit/scheduler/pipeline come from the Turbo tree while
+        # text_encoder/vae/processor stay base. A missing turbo manifest is
+        # a refusal, never an implicit fallback to the base weights.
+        from qwen_engine.adapters.qwen21_diffusers import turbo_bundle_paths
+        turbo_manifest_path, turbo_root = turbo_bundle_paths(config.manifest_path)
+        try:
+            turbo_manifest = load_manifest(turbo_manifest_path)
+        except ManifestError as exc:
+            raise ManifestError(
+                f"recipe 'turbo' needs the separate turbo manifest: {exc}") from None
+        turbo_report = _verified_report(turbo_manifest, turbo_root,
+                                        reuse_policy,
+                                        profile=TURBO_REFERENCE_PROFILE)
+        if not turbo_report.ok:
+            for err in turbo_report.errors:
+                print(f"turbo asset error: {err}", file=sys.stderr)
+            raise ManifestError(
+                f"{len(turbo_report.errors)} turbo artifact(s) unresolved; "
+                f"nothing downloaded (fetching is a separate operator action)")
+        try:
+            prime_resolution_memo(turbo_manifest, turbo_root, turbo_report,
+                                  profile=TURBO_REFERENCE_PROFILE)
+        except LocalBundleError:
+            pass  # the adapter's trusted resolve owns the refusal
+        report = replace(report, resolved={**report.resolved,
+                                           **turbo_report.resolved})
     return report
 
 
@@ -229,11 +398,30 @@ def _make_adapter(*, trust_unbounded_host: bool = False) -> Any:
 def _run_generate(config: GenerationConfig, logger: PhaseLogger,
                   assets: Any = None, adapter: Any = None,
                   trust_unbounded_host: bool = False,
-                  calibration_record: Path | None = None) -> int:
+                  calibration_record: Path | None = None,
+                  performance_report: Path | None = None) -> int:
     # Refuse an unconfigured output BEFORE the adapter exists at all: an
     # adapter import/load failure is an exit-1 boundary and must not mask
     # the config-error-2 for a run with nowhere to save.
     require_run_config(config)
+    if performance_report is not None:
+        if calibration_record is not None:
+            raise ConfigError("performance and calibration collectors reset CUDA peaks; run them separately")
+        from qwen_engine.performance import PerformanceRecorder, stage
+        recorder = PerformanceRecorder(config, human_sink=lambda line: print(line, file=sys.stderr))
+        try:
+            handle = Path(performance_report).open("x", encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError("performance_report must name a new writable file") from exc
+        with handle, recorder.activate():
+            status = "failed"
+            try:
+                with stage("total_job"):
+                    code = _run_generate(config, logger, assets, adapter, trust_unbounded_host)
+                status = "succeeded"
+                return code
+            finally:
+                recorder.write(handle, status)
     adapter = adapter if adapter is not None else _make_adapter(
         trust_unbounded_host=trust_unbounded_host)
     collector = None
@@ -283,8 +471,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("error: --run and --dry-run are mutually exclusive", file=sys.stderr)
         parser.print_usage(sys.stderr)
         return int(ExitCode.CONFIG)
-    if args.calibration_record is not None and not args.run:
-        print("error: --calibration-record requires --run", file=sys.stderr)
+    if (args.calibration_record is not None or args.performance_report is not None) and not args.run:
+        print("error: a measurement report requires --run", file=sys.stderr)
         parser.print_usage(sys.stderr)
         return int(ExitCode.CONFIG)
     logger = PhaseLogger()
@@ -293,8 +481,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger = _logger_for(config)
         if args.dry_run:
             status = manifest_status(config.manifest_path, config.models_dir)
-            print(json.dumps(plan(config, manifest=status),
-                             sort_keys=True, indent=2))
+            document = plan(config, manifest=status)
+            if config.references:
+                # Echo ids, sizes and order (design §2.2); blobs are never
+                # resolved — sizes come from the freshly ingested input files,
+                # and a config-file-only run reports null sizes.
+                paths = list(args.references or [])
+                echoed = []
+                for ordinal, reference_id in enumerate(config.references, start=1):
+                    entry: dict[str, Any] = {"ordinal": ordinal, "id": reference_id}
+                    entry["bytes"] = None
+                    if ordinal <= len(paths):
+                        try:
+                            entry["bytes"] = Path(str(paths[ordinal - 1])).stat().st_size
+                        except OSError as exc:
+                            raise ConfigError(FieldError(
+                                "references", f"reference {ordinal} vanished: {exc}")) from exc
+                    echoed.append(entry)
+                document["references"] = echoed
+            print(json.dumps(document, sort_keys=True, indent=2))
             return int(ExitCode.OK)
         if not args.run:
             parser.print_help()
@@ -314,7 +519,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                       attestation="unbounded-host", source="operator")
         return _run_generate(config, logger, assets=report.resolved,
                              trust_unbounded_host=args.attest_unbounded_host,
-                             calibration_record=args.calibration_record)
+                             calibration_record=args.calibration_record,
+                             performance_report=args.performance_report)
     except ConfigError as exc:
         for err in exc.errors:
             print(f"config error: {err}", file=sys.stderr)

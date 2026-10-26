@@ -42,6 +42,7 @@ def load_q8_transformer(transformer_cls, bundle, artifact, torch, device):
     import gguf
     from diffusers import GGUFQuantizationConfig
     from diffusers.quantizers.gguf import utils as gguf_utils
+    from qwen_engine.performance import stage
 
     if gguf_utils.ops is not None:
         raise EngineError("Q8 profile refuses previously initialized remote GGUF kernels")
@@ -52,17 +53,32 @@ def load_q8_transformer(transformer_cls, bundle, artifact, torch, device):
     if gguf.GGMLQuantizationType.Q8_0 not in types or not types <= allowed:
         raise EngineError("Q8 profile requires Q8_0 tensors with only unquantized auxiliary tensors")
     del reader
-    model = transformer_cls.from_single_file(
-        str(artifact.path), config=str(bundle.root), subfolder="transformer",
-        quantization_config=GGUFQuantizationConfig(compute_dtype=torch.float16),
-        torch_dtype=torch.float16, local_files_only=True,
-    )
+    # Upstream from_single_file -> load_gguf_checkpoint reads the GGUF through
+    # a np.memmap and copies EVERY tensor into fresh heap
+    # (torch.from_numpy(tensor.data.copy()), 265x ~16.8 s warm-measured here
+    # for the 7.64 GB Q8_0 file; the copy is also why host RSS reaches
+    # ~2x file size). Measured 2026-10-26; no engine-side hash happens in
+    # this call and the artifact sha256 was verified exactly once per job
+    # before it (resolve_q8_artifact). Staged below so the next real run
+    # splits load time from device placement WITHOUT changing behaviour
+    # (stage() is a no-op when no PerformanceRecorder is active). Wall-clock
+    # only: they run inside the caller's CUDA-measured transformer_loading
+    # stage, and CUDA performance scopes must not nest.
+    with stage("q8_gguf_state_dict"):
+        model = transformer_cls.from_single_file(
+            str(artifact.path), config=str(bundle.root), subfolder="transformer",
+            quantization_config=GGUFQuantizationConfig(compute_dtype=torch.float16),
+            torch_dtype=torch.float16, local_files_only=True,
+        )
     # The upstream GGUF loader keeps BF16 auxiliaries as packed byte
     # GGUFParameters even in non-linear modules (notably text_norm). Those
     # modules do not dequantize in forward. Normalize only these unquantized
     # auxiliaries on CPU before placement; actual Q8 weights remain packed.
-    _restore_bf16_auxiliaries(model, torch, gguf_utils, gguf.GGMLQuantizationType.BF16)
-    model.to(device=device).eval()
+    with stage("q8_auxiliaries"):
+        _restore_bf16_auxiliaries(model, torch, gguf_utils, gguf.GGMLQuantizationType.BF16)
+    with stage("q8_device_placement"):
+        model.to(device=device)
+    model.eval()
     return model
 
 

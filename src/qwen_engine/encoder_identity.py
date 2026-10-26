@@ -348,9 +348,11 @@ def _projection_fields(manifest: ModelManifest, *, prompt: str, negative: str,
 
 
 def _project_request(manifest: ModelManifest, *, prompt: str, negative: str,
-                     dtype: str, cfg_active: bool) -> EncoderRequest:
+                     dtype: str, cfg_active: bool,
+                     images: tuple[str, ...] = ()) -> EncoderRequest:
     fields = _projection_fields(manifest, prompt=prompt, negative=negative, dtype=dtype, cfg_active=cfg_active)
-    request = EncoderRequest(**fields, implementation_identity=_implementation_identity(manifest))
+    request = EncoderRequest(**fields, images=tuple(images),
+                             implementation_identity=_implementation_identity(manifest))
     validate_production_request(request)
     return request
 
@@ -359,27 +361,31 @@ def project_encoder_seed(config: GenerationConfig, manifest: ModelManifest, *,
                          encoder_dtype: str) -> EncoderRequest:
     """Manifest-only projection seed, with NO claimed runtime identity.
 
-    No package inspection or asset/source reads. Never encode/cache this seed
+    The ordered reference ids of ``config.references`` ARE part of the seed
+    (identity-bound images); the wire file paths are never seen here. No
+    package inspection or asset/source reads. Never encode/cache this seed
     in production: a fresh selected child must complete its identity first.
     """
     if not isinstance(config, GenerationConfig):
         raise EncoderRequestError("a GenerationConfig is required")
-    return EncoderRequest(**_projection_fields(manifest, prompt=config.prompt,
+    return EncoderRequest(images=tuple(config.references), **_projection_fields(
+        manifest, prompt=config.effective_prompt,
         negative=config.negative_prompt, dtype=encoder_dtype, cfg_active=config.cfg_active))
 
 
 def complete_encoder_seed(seed: EncoderRequest, manifest: ModelManifest) -> EncoderRequest:
     """Complete a coherent seed using THIS interpreter's observed identity."""
     if (not isinstance(seed, EncoderRequest) or seed.implementation_identity is not None
-            or seed.images or set(seed.kwargs) != {"cfg_active"}
+            or set(seed.kwargs) != {"cfg_active"}
             or type(seed.kwargs["cfg_active"]) is not bool):
-        raise EncoderRequestError("identity projection requires a T2I seed without implementation identity")
+        raise EncoderRequestError("identity projection requires a seed without implementation identity")
     fields = _projection_fields(manifest, prompt=seed.prompt, negative=seed.negative_prompt,
                                dtype=seed.dtype, cfg_active=seed.kwargs["cfg_active"])
-    if EncoderRequest(**fields).key_document() != seed.key_document():
+    if EncoderRequest(**fields, images=seed.images).key_document() != seed.key_document():
         raise EncoderRequestError("projection seed disagrees with the manifest identity")
     return _project_request(manifest, prompt=seed.prompt, negative=seed.negative_prompt,
-                            dtype=seed.dtype, cfg_active=seed.kwargs["cfg_active"])
+                            dtype=seed.dtype, cfg_active=seed.kwargs["cfg_active"],
+                            images=seed.images)
 
 
 def validate_completed_seed(seed: EncoderRequest, request: EncoderRequest, manifest: ModelManifest) -> None:
@@ -400,8 +406,10 @@ def project_encoder_request(config: GenerationConfig, manifest: ModelManifest, *
     """
     if not isinstance(config, GenerationConfig):
         raise EncoderRequestError("a GenerationConfig is required")
-    return _project_request(manifest, prompt=config.prompt, negative=config.negative_prompt,
-                            dtype=encoder_dtype, cfg_active=config.cfg_active)
+    return _project_request(manifest, prompt=config.effective_prompt,
+                            negative=config.negative_prompt,
+                            dtype=encoder_dtype, cfg_active=config.cfg_active,
+                            images=tuple(config.references))
 
 
 def request_from_verified_bundle(config: GenerationConfig, manifest: ModelManifest,
@@ -434,6 +442,7 @@ def validate_worker_request_identity(request: EncoderRequest, manifest: ModelMan
     """
     validated = validate_production_request(request)
     expected = _project_request(manifest, prompt=request.prompt, negative=request.negative_prompt,
-                                dtype=request.dtype, cfg_active=validated.cfg_active)
+                                dtype=request.dtype, cfg_active=validated.cfg_active,
+                                images=request.images)
     if request.key_document() != expected.key_document():
         raise EncoderRequestError("production request disagrees with worker/manifest identity")

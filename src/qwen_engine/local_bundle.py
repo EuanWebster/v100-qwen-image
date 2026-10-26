@@ -12,15 +12,20 @@ second verification pass. What happens in the projection, all of it before
 any ML import:
 
 1. The supplied schema-v1 :class:`~qwen_engine.manifest.ModelManifest` must
-   match the :data:`LOCAL_REFERENCE_LAYOUT` table exactly — the committed
-   24 relative filenames, their role mapping — and carry exactly the
-   profile's pinned identity :data:`FULL_REFERENCE_REPO` @
-   :data:`FULL_REFERENCE_REVISION`. Internal consistency is NOT enough: any
-   other repo or revision (whole-set or mixed) is a different model identity
-   and requires a NEW reviewed profile, never a relaxed check here. The
-   layout is an explicit immutable table so it stays reviewable; per-file
-   SHA/byte sizes are *not* hardcoded here (the manifest owns those claims;
-   offline tests fabricate tiny contents with the same layout).
+   match a reviewed profile table exactly — the committed relative filenames
+   and their role mapping — and carry exactly that profile's pinned identity
+   (repo @ revision). Two profiles exist (:data:`PROFILES`): the base
+   full-reference set (:data:`LOCAL_REFERENCE_LAYOUT`, 24 files,
+   :data:`FULL_REFERENCE_REPO` @ :data:`FULL_REFERENCE_REVISION`) and the
+   Turbo transformer-only set (:data:`TURBO_LAYOUT`, 6 files,
+   :data:`TURBO_REFERENCE_REPO` @ :data:`TURBO_REFERENCE_REVISION`, which
+   reuses the base encoder and VAE — hence its honest label
+   :data:`TURBO_ASSET_LABEL`). Internal consistency is NOT enough: any other
+   repo or revision (whole-set or mixed) is a different model identity and
+   requires a NEW reviewed profile, never a relaxed check here. The layouts
+   are explicit immutable tables so they stay reviewable; per-file SHA/byte
+   sizes are *not* hardcoded here (the manifest owns those claims; offline
+   tests fabricate tiny contents with the same layout).
 2. The supplied :class:`~qwen_engine.manifest.ResolutionReport` must be a
    *coherent* success claim: complete, ``ok``, with an empty ``errors``
    tuple, every status ``present`` with ``error is None``, and matching the
@@ -70,8 +75,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import stat as stat_module
+import threading
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,20 +95,35 @@ from qwen_engine.manifest import (
     resolve_manifest,
 )
 
-#: Name of the one profile this module knows. Future variants (GGUF ladder,
+#: The base (full-precision reference) profile. Future variants (GGUF ladder,
 #: LoRA, single-file) are *new profiles with their own tables*, never guessed
 #: fallbacks inside this one.
 LOCAL_REFERENCE_PROFILE = "full-reference"
 
-#: The EXACT upstream identity this reviewed profile is pinned to. The named
-#: profile is not "whatever internally consistent repo/revision the manifest
-#: happens to declare" — it is *this* repo at *this* revision, so the pinned
-#: interface assumptions behind the profile hold. A manifest at any other
-#: repo or revision — however internally consistent — is a different model
-#: identity and requires a NEW reviewed profile (new name, new table, new
-#: review), never a relaxed check here.
+#: The EXACT upstream identity the base profile is pinned to. A named profile
+#: is not "whatever internally consistent repo/revision the manifest happens
+#: to declare" — it is *this* repo at *this* revision, so the pinned interface
+#: assumptions behind the profile hold. A manifest at any other repo or
+#: revision — however internally consistent — is a different model identity
+#: and requires a NEW reviewed profile (new name, new table, new review),
+#: never a relaxed check here.
 FULL_REFERENCE_REPO = "Qwen/Qwen-Image-2.1"
 FULL_REFERENCE_REVISION = "d26bb61231c349cf6b7896fa83353113880e1ba3"
+
+#: The Turbo profile: **transformer + scheduler only**. Upstream
+#: ``Qwen/Qwen-Image-2.1-Turbo`` also republishes its own processor, text
+#: encoder and VAE, but this project deliberately fetches only the Turbo
+#: transformer/scheduler and reuses the reviewed base text encoder and VAE
+#: (the measured-equal ones; see ``docs/turbo-plan.md`` §1.2/§1.3). The
+#: profile therefore pins a manifest for the DiT side alone: it has **no**
+#: encoder roles, so an encoder cache key must come from the base bundle.
+TURBO_REFERENCE_PROFILE = "turbo-transformer"
+TURBO_REFERENCE_REPO = "Qwen/Qwen-Image-2.1-Turbo"
+TURBO_REFERENCE_REVISION = "fc13ba1986fcb905854dc8de2f52eee395f49b5b"
+
+#: Honest label for a Turbo install: what is Turbo is the transformer, and
+#: nothing else. Anything user-facing that names this profile must say so.
+TURBO_ASSET_LABEL = "Turbo transformer + base encoder/VAE"
 
 #: The committed full-reference layout: role -> relative filenames, in
 #: deterministic (sorted-filename) order. 24 files, 6 roles. Identity is the
@@ -163,6 +186,40 @@ ROLE_DIRECTORIES: Mapping[str, str] = MappingProxyType({
 #: invalidate future encoder cache entries.
 ENCODER_ROLES: tuple[str, ...] = ("processor", "text_encoder")
 
+#: The committed Turbo layout: role -> relative filenames. SIX files, THREE
+#: roles — the DiT side of the Turbo release and nothing else. There is
+#: deliberately no ``processor``/``text_encoder``/``vae`` role here: those
+#: three components are reused from the base bundle (see
+#: :data:`TURBO_REFERENCE_PROFILE`). Note the role name is ``dit`` in both
+#: profiles even though the directory is ``transformer/``; the base profile's
+#: role vocabulary is reused so adapter code keeps one key.
+TURBO_LAYOUT: Mapping[str, tuple[str, ...]] = MappingProxyType({
+    "pipeline": (
+        "model_index.json",
+    ),
+    "scheduler": (
+        "scheduler/scheduler_config.json",
+    ),
+    "dit": (
+        "transformer/config.json",
+        "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+        "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+        "transformer/diffusion_pytorch_model.safetensors.index.json",
+    ),
+})
+
+#: Component directories per role for the Turbo profile — identical directory
+#: NAMES to the base profile for the roles it shares, so a Turbo root is
+#: ``pipeline`` at the root plus ``scheduler/`` and ``transformer/``.
+TURBO_ROLE_DIRECTORIES: Mapping[str, str] = MappingProxyType({
+    "pipeline": ".",
+    "scheduler": "scheduler",
+    "dit": "transformer",
+})
+
+#: The Turbo profile owns no encoder files; the base bundle supplies them.
+TURBO_ENCODER_ROLES: tuple[str, ...] = ()
+
 #: Version tag folded into every artifact-set fingerprint digest.
 ARTIFACT_SET_FINGERPRINT_VERSION = "qwen-image.artifact-set.v1"
 
@@ -211,29 +268,175 @@ class BundleTreeError(LocalBundleError):
 
 
 # ---------------------------------------------------------------------------
+# The profile registry: one reviewed table per model identity
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BundleProfile:
+    """One reviewed on-disk asset profile: its name, its pinned upstream
+    identity, its exact layout table, and its component directories.
+
+    A profile is a *reviewed literal*, not a runtime parameter: adding a
+    variant means adding a table here and re-reviewing it. Nothing in this
+    module ever falls back from one profile to another, and an unknown name
+    is a typed refusal (:func:`get_profile`), never "try the other one".
+
+    ``encoder_roles`` is empty for a profile whose manifest does not contain
+    the text encoder (the Turbo transformer-only profile reuses the base
+    bundle's encoder/VAE), so an encoder-only fingerprint is refused there
+    rather than silently digesting nothing.
+    """
+
+    name: str
+    #: Human-facing description for status/log output. It must stay honest
+    #: about what the profile actually installs.
+    label: str
+    repo: str
+    revision: str
+    layout: Mapping[str, tuple[str, ...]]
+    role_directories: Mapping[str, str]
+    encoder_roles: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        errors: list[str] = []
+        for field in ("name", "label", "repo", "revision"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"{field}: must be a non-empty string, got "
+                              f"{value!r}")
+        if not isinstance(self.layout, Mapping) or not self.layout:
+            errors.append("layout: must be a non-empty mapping")
+        else:
+            if set(self.layout) != set(self.role_directories):
+                errors.append(
+                    "layout/role_directories: the same roles must appear in "
+                    f"both, got layout={sorted(self.layout)} "
+                    f"directories={sorted(self.role_directories)}")
+            for role, filenames in self.layout.items():
+                if not isinstance(filenames, tuple) or not filenames:
+                    errors.append(f"layout[{role!r}]: must be a non-empty "
+                                  f"tuple, got {filenames!r}")
+                elif list(filenames) != sorted(filenames):
+                    errors.append(f"layout[{role!r}]: filenames must be in "
+                                  "deterministic sorted order")
+            all_files = [f for fns in self.layout.values() for f in fns]
+            if len(set(all_files)) != len(all_files):
+                errors.append("layout: one filename may appear in only one "
+                              "role")
+            unknown = sorted(set(self.encoder_roles) - set(self.layout))
+            if unknown:
+                errors.append("encoder_roles: roles not in the layout: "
+                              + ", ".join(unknown))
+            if len(set(self.encoder_roles)) != len(self.encoder_roles):
+                errors.append("encoder_roles: duplicate roles")
+        if errors:
+            raise BundleLayoutError("invalid bundle profile: "
+                                    + "; ".join(errors))
+
+    @property
+    def file_count(self) -> int:
+        """Total files pinned by the layout (reviewability guard)."""
+        return sum(len(v) for v in self.layout.values())
+
+    def expectations(self) -> dict[str, str]:
+        """filename -> expected role, from this profile's layout table."""
+        expect: dict[str, str] = {}
+        for role, filenames in self.layout.items():
+            for filename in filenames:
+                expect[filename] = role
+        return expect
+
+    def closed_tree_entries(self) -> dict[str, str]:
+        """relative path -> ``"file"`` or ``"dir"``: the allowlisted files
+        plus the required directory tree leading to them."""
+        entries: dict[str, str] = {}
+        for filenames in self.layout.values():
+            for filename in filenames:
+                entries[filename] = "file"
+                parent = os.path.dirname(filename)
+                while parent:
+                    entries.setdefault(parent, "dir")
+                    parent = os.path.dirname(parent)
+        return entries
+
+
+#: The reviewed base profile (unchanged identity: its fingerprint anchors are
+#: asserted by two committed tests).
+BASE_PROFILE = BundleProfile(
+    name=LOCAL_REFERENCE_PROFILE,
+    label="base full-precision reference",
+    repo=FULL_REFERENCE_REPO,
+    revision=FULL_REFERENCE_REVISION,
+    layout=LOCAL_REFERENCE_LAYOUT,
+    role_directories=ROLE_DIRECTORIES,
+    encoder_roles=ENCODER_ROLES,
+)
+
+#: The reviewed Turbo profile: Turbo DiT + Turbo scheduler over the base
+#: encoder/VAE (honest label: :data:`TURBO_ASSET_LABEL`).
+TURBO_PROFILE = BundleProfile(
+    name=TURBO_REFERENCE_PROFILE,
+    label=TURBO_ASSET_LABEL,
+    repo=TURBO_REFERENCE_REPO,
+    revision=TURBO_REFERENCE_REVISION,
+    layout=TURBO_LAYOUT,
+    role_directories=TURBO_ROLE_DIRECTORIES,
+    encoder_roles=TURBO_ENCODER_ROLES,
+)
+
+#: name -> profile. Every entry is a reviewed table; there is no registry
+#: mutation path and no fallback chain.
+PROFILES: Mapping[str, BundleProfile] = MappingProxyType({
+    BASE_PROFILE.name: BASE_PROFILE,
+    TURBO_PROFILE.name: TURBO_PROFILE,
+})
+
+
+def get_profile(profile: str | BundleProfile) -> BundleProfile:
+    """Return the reviewed profile named ``profile`` (or the profile itself).
+
+    An unknown name is a typed :class:`BundleLayoutError` listing the known
+    profiles — never a fallback: silently loading base assets because a Turbo
+    name was misspelt is exactly the failure this registry exists to stop.
+    """
+    if isinstance(profile, BundleProfile):
+        if PROFILES.get(profile.name) is not profile:
+            raise BundleLayoutError(
+                f"unknown bundle profile {profile.name!r}: only the reviewed "
+                f"registry tables are usable (known: "
+                f"{', '.join(sorted(PROFILES))}); a hand-built profile table "
+                "is new reviewed code, not a runtime argument")
+        return profile
+    try:
+        return PROFILES[profile]
+    except (KeyError, TypeError):
+        raise BundleLayoutError(
+            f"unknown bundle profile {profile!r} (known: "
+            f"{', '.join(sorted(PROFILES))})") from None
+
+
+# ---------------------------------------------------------------------------
 # Layout validation (manifest vs the immutable table — pure data, no disk)
 # ---------------------------------------------------------------------------
 
 
-def _layout_expectations() -> dict[str, str]:
-    """filename -> expected role, from the layout table."""
-    expect: dict[str, str] = {}
-    for role, filenames in LOCAL_REFERENCE_LAYOUT.items():
-        for filename in filenames:
-            expect[filename] = role
-    return expect
+def validate_layout(manifest: ModelManifest,
+                    profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
+                    ) -> tuple[str, str]:
+    """Check the manifest is exactly ``profile``'s set and return the single
+    ``(repo, revision)`` pinned for the whole set.
 
-
-def validate_local_reference_layout(manifest: ModelManifest) -> tuple[str, str]:
-    """Check the manifest is exactly the full-reference set and return the
-    single ``(repo, revision)`` pinned for the whole set.
-
-    Raises :class:`BundleLayoutError` listing *every* deviation: filename-set
-    differences (missing / extra), per-file role mismatches, and repo or
-    revision fragmentation. Pure data — touches no disk, imports no ML.
+    ``profile`` is a reviewed registry name (:data:`PROFILES`), defaulting to
+    the base full-reference profile so every existing caller keeps its
+    behaviour. Raises :class:`BundleLayoutError` listing *every* deviation:
+    filename-set differences (missing / extra), per-file role mismatches, and
+    repo or revision fragmentation. Pure data — touches no disk, imports no
+    ML.
     """
+    spec = get_profile(profile)
     errors: list[str] = []
-    expected = _layout_expectations()
+    expected = spec.expectations()
     seen: dict[str, str] = {}
     for art in manifest.artifacts:
         ident = art.identity
@@ -247,7 +450,7 @@ def validate_local_reference_layout(manifest: ModelManifest) -> tuple[str, str]:
     if missing:
         errors.append("missing from manifest: " + ", ".join(missing))
     if extra:
-        errors.append("unexpected files for the full-reference profile: "
+        errors.append(f"unexpected files for the {spec.name} profile: "
                       + ", ".join(extra))
     for filename, got, want in wrong_role:
         errors.append(f"role mismatch for {filename}: manifest says "
@@ -257,28 +460,44 @@ def validate_local_reference_layout(manifest: ModelManifest) -> tuple[str, str]:
     if len(repos) != 1:
         errors.append(f"the bundle pins ONE repo; manifest mixes: "
                       + ", ".join(repos))
-    elif repos[0] != FULL_REFERENCE_REPO:
+    elif repos[0] != spec.repo:
         errors.append(
-            f"the {LOCAL_REFERENCE_PROFILE} profile is pinned to repo "
-            f"{FULL_REFERENCE_REPO!r}; manifest says {repos[0]!r} — a "
+            f"the {spec.name} profile is pinned to repo "
+            f"{spec.repo!r}; manifest says {repos[0]!r} — a "
             "different repo is a different model identity and needs a new "
             "reviewed profile, not this one")
     if len(revisions) != 1:
         errors.append(f"the bundle pins ONE revision; manifest mixes: "
                       + ", ".join(revisions))
-    elif revisions[0] != FULL_REFERENCE_REVISION:
+    elif revisions[0] != spec.revision:
         errors.append(
-            f"the {LOCAL_REFERENCE_PROFILE} profile is pinned to revision "
-            f"{FULL_REFERENCE_REVISION!r}; manifest says {revisions[0]!r} — "
+            f"the {spec.name} profile is pinned to revision "
+            f"{spec.revision!r}; manifest says {revisions[0]!r} — "
             "a new model revision requires a new reviewed profile (the "
             "interface assumptions behind this profile name were reviewed "
             "against the pinned commit only)")
     if errors:
         raise BundleLayoutError(
-            f"{LOCAL_REFERENCE_PROFILE} layout violation "
-            f"({LAYOUT_FILE_COUNT} files expected across "
-            f"{len(LOCAL_REFERENCE_LAYOUT)} roles): " + "; ".join(errors))
+            f"{spec.name} layout violation "
+            f"({spec.file_count} files expected across "
+            f"{len(spec.layout)} roles): " + "; ".join(errors))
     return repos[0], revisions[0]
+
+
+def validate_local_reference_layout(manifest: ModelManifest) -> tuple[str, str]:
+    """Base-profile spelling of :func:`validate_layout` (unchanged public
+    contract: this name always means the full-reference profile)."""
+    return validate_layout(manifest, LOCAL_REFERENCE_PROFILE)
+
+
+def validate_turbo_layout(manifest: ModelManifest) -> tuple[str, str]:
+    """Turbo-profile spelling of :func:`validate_layout`.
+
+    The Turbo manifest carries **only** the DiT side (model index, scheduler
+    config, transformer config/shards/index): encoder and VAE files are not
+    part of it, by design — they are reused from the base bundle.
+    """
+    return validate_layout(manifest, TURBO_REFERENCE_PROFILE)
 
 
 # ---------------------------------------------------------------------------
@@ -361,39 +580,58 @@ class ArtifactSetFingerprints:
     """
 
     bundle: str  #: all roles — any file's identity change flips it
-    encoder: str  #: ENCODER_ROLES only — the ASSET component of the future
-    #: encoder cache key (never the whole key; see the scope warning above)
+    encoder: str | None  #: ENCODER_ROLES only — the ASSET component of the
+    #: future encoder cache key (never the whole key; see the scope warning
+    #: above). ``None`` for a profile that carries no encoder files (the
+    #: Turbo transformer-only profile): there is no encoder digest to report,
+    #: and inventing one over an empty set would be a lie.
 
     def __post_init__(self) -> None:
+        fields = (("bundle", self.bundle, False),
+                  ("encoder", self.encoder, True))
         errors = [f"{name}: must be a 64-char lowercase hex digest, got "
                   f"{value!r}"
-                  for name, value in (("bundle", self.bundle),
-                                      ("encoder", self.encoder))
-                  if not (isinstance(value, str) and len(value) == 64
-                          and all(c in "0123456789abcdef" for c in value))]
+                  for name, value, optional in fields
+                  if not (optional and value is None)
+                  and not (isinstance(value, str) and len(value) == 64
+                           and all(c in "0123456789abcdef" for c in value))]
         if errors:
             raise BundleLayoutError(
                 "invalid artifact-set fingerprints: " + "; ".join(errors))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "version": ARTIFACT_SET_FINGERPRINT_VERSION,
             "bundle_artifact_set_sha256": self.bundle,
-            "encoder_artifact_set_sha256": self.encoder,
         }
+        if self.encoder is not None:
+            data["encoder_artifact_set_sha256"] = self.encoder
+        return data
 
 
-def reference_bundle_fingerprints(manifest: ModelManifest) -> ArtifactSetFingerprints:
+def reference_bundle_fingerprints(
+        manifest: ModelManifest,
+        profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
+        ) -> ArtifactSetFingerprints:
     """Whole-bundle and encoder+processor fingerprints for a manifest that
-    satisfies the layout table (validated here first, so a mislabelled role
-    can never move a file between the two digests). Disk-free: pure manifest
-    identities — usable for cache-key planning with nothing downloaded."""
-    repo, revision = validate_local_reference_layout(manifest)
+    satisfies ``profile``'s layout table (validated here first, so a
+    mislabelled role can never move a file between the two digests).
+    Disk-free: pure manifest identities — usable for cache-key planning with
+    nothing downloaded.
+
+    For the Turbo profile ``encoder`` is ``None``: that manifest has no
+    encoder files at all, and its encoder cache key must be derived from the
+    base bundle's encoder fingerprint (see :data:`TURBO_PROFILE`).
+    """
+    spec = get_profile(profile)
+    repo, revision = validate_layout(manifest, spec)
     del repo, revision  # validated; artifact_set_fingerprint re-derives them
-    encoder_rows = [a for a in manifest.artifacts if a.role in ENCODER_ROLES]
+    encoder_rows = [a for a in manifest.artifacts
+                    if a.role in spec.encoder_roles]
     return ArtifactSetFingerprints(
         bundle=artifact_set_fingerprint(manifest.artifacts),
-        encoder=artifact_set_fingerprint(encoder_rows),
+        encoder=(artifact_set_fingerprint(encoder_rows)
+                 if spec.encoder_roles else None),
     )
 
 
@@ -404,9 +642,12 @@ def reference_bundle_fingerprints(manifest: ModelManifest) -> ArtifactSetFingerp
 
 @dataclass(frozen=True)
 class LocalReferenceBundle:
-    """Resolver-verified local files of the full-reference set, projected for
+    """Resolver-verified local files of ONE reviewed profile, projected for
     ``GenerationAdapter.load(config, assets)`` and for future
-    ``local_files_only=True`` component probes.
+    ``local_files_only=True`` component probes. ``profile`` names the
+    registry entry (:data:`PROFILES`): the base full-reference bundle
+    (six roles) or the Turbo transformer-only bundle (three roles, over the
+    base encoder/VAE).
 
     Every mapping and path tuple is snapshotted into an immutable copy in
     :meth:`__post_init__` (defensive freeze — mutable dicts or lists handed
@@ -448,11 +689,16 @@ class LocalReferenceBundle:
         # hygiene, NOT resolver verification: nothing here reads disk, a
         # report or a manifest.
         errors: list[str] = []
-        if self.profile != LOCAL_REFERENCE_PROFILE:
-            errors.append(
-                f"profile: this class describes only "
-                f"{LOCAL_REFERENCE_PROFILE!r}, got {self.profile!r} (a new "
-                "profile is new reviewed code, not a string here)")
+        if not isinstance(self.profile, str):
+            spec = None
+            errors.append(f"profile: must be a registry name (str), got "
+                          f"{type(self.profile).__name__}")
+        else:
+            try:
+                spec = get_profile(self.profile)
+            except BundleLayoutError as exc:
+                spec = None
+                errors.append(f"profile: {exc}")
         for name in ("root", "root_resolved"):
             value = getattr(self, name)
             if not isinstance(value, Path):
@@ -466,15 +712,26 @@ class LocalReferenceBundle:
                 f"root {self.root} != root_resolved {self.root_resolved}: "
                 "the bundle publishes the canonical resolved root, and "
                 "records the canonical root as its own resolved form")
-        if self.repo != FULL_REFERENCE_REPO:
-            errors.append(f"repo: profile {LOCAL_REFERENCE_PROFILE} pins "
-                          f"{FULL_REFERENCE_REPO!r}, got {self.repo!r}")
-        if self.revision != FULL_REFERENCE_REVISION:
-            errors.append(f"revision: profile {LOCAL_REFERENCE_PROFILE} pins "
-                          f"{FULL_REFERENCE_REVISION!r}, got {self.revision!r}")
+        if spec is not None:
+            if self.repo != spec.repo:
+                errors.append(f"repo: profile {spec.name} pins "
+                              f"{spec.repo!r}, got {self.repo!r}")
+            if self.revision != spec.revision:
+                errors.append(f"revision: profile {spec.name} pins "
+                              f"{spec.revision!r}, got {self.revision!r}")
         if not isinstance(self.fingerprints, ArtifactSetFingerprints):
             errors.append("fingerprints: must be ArtifactSetFingerprints, "
                           f"got {type(self.fingerprints).__name__}")
+        elif spec is not None:
+            if spec.encoder_roles and self.fingerprints.encoder is None:
+                errors.append(
+                    f"fingerprints.encoder: profile {spec.name} carries "
+                    "encoder files, so an encoder digest is required")
+            if not spec.encoder_roles and self.fingerprints.encoder is not None:
+                errors.append(
+                    f"fingerprints.encoder: profile {spec.name} carries no "
+                    "encoder files, so it has no encoder digest (the base "
+                    "bundle's digest keys the encoder cache)")
         if errors:
             raise BundleLayoutError(
                 "invalid LocalReferenceBundle (scalar invariants of the "
@@ -507,7 +764,7 @@ class LocalReferenceBundle:
         :func:`preflight_closed_tree`). Contents are not read. Never run
         this on a root whose fetch is still in progress — an in-flight
         ``*.partial`` is refused here by design."""
-        return preflight_closed_tree(self.root)
+        return preflight_closed_tree(self.root, self.profile)
 
     def to_dict(self) -> dict[str, Any]:
         """Deterministic, timestamp-free description for status/logging.
@@ -531,35 +788,34 @@ class LocalReferenceBundle:
 # ---------------------------------------------------------------------------
 
 
-def _closed_tree_entries() -> dict[str, str]:
-    """relative path -> ``"file"`` or ``"dir"``, from the layout table: the
-    24 allowlisted files plus the required directory tree leading to them."""
-    entries: dict[str, str] = {}
-    for filenames in LOCAL_REFERENCE_LAYOUT.values():
-        for filename in filenames:
-            entries[filename] = "file"
-            parent = os.path.dirname(filename)
-            while parent:
-                entries.setdefault(parent, "dir")
-                parent = os.path.dirname(parent)
-    return entries
+def _closed_tree_entries(profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
+                         ) -> dict[str, str]:
+    """relative path -> ``"file"`` or ``"dir"``, from the selected profile's
+    layout table: the allowlisted files plus the required directory tree
+    leading to them."""
+    return get_profile(profile).closed_tree_entries()
 
 
-def preflight_closed_tree(root: str | Path) -> tuple[str, ...]:
+def preflight_closed_tree(root: str | Path,
+                          profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
+                          ) -> tuple[str, ...]:
     """Enumerate EVERY entry under the explicit model ``root`` and refuse
-    anything that is not part of the closed profile tree (the 24 allowlisted
+    anything that is not part of the closed ``profile`` tree (its allowlisted
     files, the required component directories, and nothing else).
 
     A future ``from_pretrained(component_dir)`` may open files the manifest
     never listed (leftover ``*.partial`` fetch debris, extra
     config/weight/code files, shadowing ``*.py``); this stdlib preflight is
     what a future local probe calls BEFORE any ML import so the "we load
-    exactly the pinned 24 files" claim stays true of the *directory*, not
-    just of the manifest. Contents are never read or re-hashed — entries
-    are classified by their directory-entry kind only (no symlink
-    following: symlinks are refused even at allowlisted paths, deliberately
-    *stricter* than the resolver's inside-root symlink tolerance, because a
-    link redirects whatever the future loader opens).
+    exactly the pinned files" claim stays true of the *directory*, not just
+    of the manifest. ``profile`` defaults to the base full-reference set, so
+    existing callers keep their behaviour; the Turbo asset root is checked
+    with ``profile=TURBO_REFERENCE_PROFILE`` and therefore refuses the
+    encoder/VAE files that belong to the base root. Contents are never read
+    or re-hashed — entries are classified by their directory-entry kind only
+    (no symlink following: symlinks are refused even at allowlisted paths,
+    deliberately *stricter* than the resolver's inside-root symlink
+    tolerance, because a link redirects whatever the future loader opens).
 
     Do **not** run this on a root with an in-progress fetch: a legitimate
     in-flight ``*.partial`` is refused here by design — the preflight is for
@@ -570,6 +826,7 @@ def preflight_closed_tree(root: str | Path) -> tuple[str, ...]:
     not protection for subsequent loads or hostile simultaneous rewrites.
     Returns the sorted tuple of all checked relative paths.
     """
+    spec = get_profile(profile)
     root_path = Path(root)
     root_resolved, root_fail = _resolve_or_fail(root_path)
     if root_resolved is None:
@@ -578,7 +835,7 @@ def preflight_closed_tree(root: str | Path) -> tuple[str, ...]:
     if not root_resolved.is_dir():
         raise BundleTreeError(
             f"model root is not a directory: {root_resolved}")
-    expected = _closed_tree_entries()
+    expected = _closed_tree_entries(spec)
     seen: set[str] = set()
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
 
@@ -606,7 +863,7 @@ def preflight_closed_tree(root: str | Path) -> tuple[str, ...]:
                             else "another entry type (special file)")
                     raise BundleTreeError(
                         f"{rel}: found {what}, but it is NOT part of the closed "
-                        f"{LOCAL_REFERENCE_PROFILE} tree (the {LAYOUT_FILE_COUNT}"
+                        f"{spec.name} tree (the {spec.file_count}"
                         f"-file allowlist and its required directories only) — "
                         "a future from_pretrained() over this root could open "
                         "it; remove the stray entry (fetch debris like "
@@ -713,8 +970,84 @@ def _probe_regular_file_under_root(expected: Path, role: str,
             "file (unexpected layout)")
 
 
+#: A successful full-bytes verification by :func:`resolve_local_bundle` is
+#: the SAME verification the CLI already ran minutes-to-seconds earlier in
+#: the SAME process: :func:`qwen_engine.cli._verify_assets` and the adapter's
+#: ``load`` reverify hash the identical bytes with the identical trusted
+#: resolver (measured 2026-10-25 on the shipped trees: base 33 GB ≈ 19 s per
+#: pass, turbo 14 GB ≈ 9 s per pass, every pass paid twice per run — the
+#: Turbo model_initialisation surcharge WAS the second turbo-tree hash).
+#: Reusing a verification this recent, keyed on manifest content + profile +
+#: the root's filesystem identity, is not a weaker guarantee than re-hashing:
+#: a fresh hash never protected against bytes changed afterwards either (see
+#: the honest-limits paragraph of :func:`resolve_local_bundle`). Outside the
+#: window, or for any different manifest/root/profile identity, and for every
+#: REFUSAL, nothing is reused — the trusted resolver runs in full.
+RESOLUTION_REUSE_WINDOW_SECONDS = 30.0
+
+#: Clock witness (tests substitute a deterministic one).
+_MONOTONIC = time.monotonic
+_resolution_memo: dict[tuple[Any, ...], tuple[float, LocalReferenceBundle]] = {}
+_resolution_memo_lock = threading.Lock()
+
+
+def clear_resolution_memo() -> None:
+    """Forget every reusable verification (test seam; never needed on a run)."""
+    with _resolution_memo_lock:
+        _resolution_memo.clear()
+
+
+def _resolution_key(manifest: ModelManifest, models_dir: str | Path,
+                    spec: BundleProfile) -> tuple[Any, ...] | None:
+    """Identity under which a full-bytes verification may be reused: profile,
+    manifest CONTENT (the artifact-set digest the bundle publishes from the
+    very rows the resolver verified), and the root directory's filesystem
+    identity (st_dev/st_ino of the fully resolved path — never the lexical
+    string alone). ``None`` means uncacheable: the caller must run the
+    resolver so its own typed errors surface unchanged."""
+    try:
+        root = Path(models_dir).resolve()
+        info = os.stat(root)
+        return (spec.name, artifact_set_fingerprint(manifest.artifacts),
+                str(root), info.st_dev, info.st_ino)
+    except (OSError, LocalBundleError):
+        return None
+
+
+
+def prime_resolution_memo(manifest: ModelManifest,
+                          models_dir: str | Path,
+                          report: ResolutionReport,
+                          profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
+                          ) -> LocalReferenceBundle:
+    """Project a FRESH trusted-resolver report and remember the projection as
+    this process's verification for :data:`RESOLUTION_REUSE_WINDOW_SECONDS`.
+
+    This is the CLI half of the reuse: :func:`qwen_engine.cli._verify_assets`
+    runs the trusted resolver itself, and the adapter's
+    :func:`resolve_local_bundle` in ``load`` would otherwise re-hash the
+    identical bytes seconds later in the same process (measured: 19 s base +
+    9 s turbo, every pass paid twice per run). The projection here runs
+    EVERY check :func:`project_resolution_report` runs — ok/coherence/
+    positional/file probes — so only a full, honest, successful report can
+    ever be remembered; typed refusals propagate and remember nothing. The
+    same key/window/expiry rules as :func:`resolve_local_bundle` apply, so
+    the adapter hit reuses exactly the bytes the resolver just verified.
+    """
+    spec = get_profile(profile)
+    validate_layout(manifest, spec)
+    bundle = project_resolution_report(manifest, report, models_dir, spec)
+    key = _resolution_key(manifest, models_dir, spec)
+    if key is not None:
+        with _resolution_memo_lock:
+            _resolution_memo[key] = (_MONOTONIC(), bundle)
+    return bundle
+
+
 def resolve_local_bundle(manifest: ModelManifest,
-                         models_dir: str | Path) -> LocalReferenceBundle:
+                         models_dir: str | Path,
+                         profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
+                         ) -> LocalReferenceBundle:
     """**The trusted factory**: run the trusted resolver over the real bytes
     under ``models_dir``, then project the resulting report.
 
@@ -724,28 +1057,54 @@ def resolve_local_bundle(manifest: ModelManifest,
     real 33 GB reference set its cost is a full byte re-verification of that
     set (the same cost as any honest resolve). Callers that already hold a
     fresh resolver report use :func:`project_resolution_report` (which
-    *trusts that report*) and avoid the rehash.
+    *trusts that report*) and avoid the rehash. Within ONE process, an
+    identical resolve completed within :data:`RESOLUTION_REUSE_WINDOW_SECONDS`
+    is returned from the freshness memo without rehashing (see that constant:
+    this is the CLI-verify → adapter-reverify handoff, the identical bytes
+    hashed by the identical resolver seconds apart); every other call hashes
+    in full, and refusals are never memoized.
 
     The manifest layout (including the profile's exact pinned repo/revision)
     is validated BEFORE the resolver runs, so an off-profile manifest never
     triggers a 33 GB hash. Refusals are typed and happen before any ML
     import; no network access, no mkdir, no writes.
 
+    ``profile`` selects the reviewed registry table (base by default); the
+    Turbo root is resolved with ``profile=TURBO_REFERENCE_PROFILE`` and must
+    therefore contain the Turbo DiT tree only.
+
     Honest limits: re-hashing happens *now*, at this call — it does not
     protect bytes changed afterwards, and this does not close a hostile
     concurrent-filesystem TOCTOU. Actual component load must reverify
     immediately before the library reopens the files.
     """
-    validate_local_reference_layout(manifest)
+    spec = get_profile(profile)
+    validate_layout(manifest, spec)
+    key = _resolution_key(manifest, models_dir, spec)
+    if key is not None:
+        now = _MONOTONIC()
+        with _resolution_memo_lock:
+            for stale in [entry_key for entry_key, (when, _) in _resolution_memo.items()
+                          if now - when > RESOLUTION_REUSE_WINDOW_SECONDS]:
+                del _resolution_memo[stale]
+            entry = _resolution_memo.get(key)
+            if entry is not None:
+                return entry[1]
     report = resolve_manifest(manifest, models_dir)
     # project_resolution_report re-checks ok/coherence (the resolver's own
     # negative verdict must never project, whoever built the report).
-    return project_resolution_report(manifest, report, models_dir)
+    bundle = project_resolution_report(manifest, report, models_dir, spec)
+    if key is not None:
+        with _resolution_memo_lock:
+            _resolution_memo[key] = (_MONOTONIC(), bundle)
+    return bundle
 
 
 def project_resolution_report(manifest: ModelManifest,
                               report: ResolutionReport,
-                              models_dir: str | Path) -> LocalReferenceBundle:
+                              models_dir: str | Path,
+                              profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
+                              ) -> LocalReferenceBundle:
     """Project a resolver-shaped report into a :class:`LocalReferenceBundle`.
 
     **This lower-level API TRUSTS ITS CALLER.** A public
@@ -763,7 +1122,7 @@ def project_resolution_report(manifest: ModelManifest,
     reopens the files.
 
     What is enforced here: ``manifest`` must satisfy
-    :data:`LOCAL_REFERENCE_LAYOUT` and the profile's exact pinned
+    the selected ``profile``'s layout table and its exact pinned
     repo/revision; ``report`` must be the complete, ``ok``, *internally
     coherent* success claim for that manifest — statuses align positionally,
     every status artifact equals the manifest's, every state is ``present``
@@ -776,7 +1135,8 @@ def project_resolution_report(manifest: ModelManifest,
     typed errors raised before any ML import. No network, no mkdir, no
     writes, no content hashing.
     """
-    repo, revision = validate_local_reference_layout(manifest)
+    spec = get_profile(profile)
+    repo, revision = validate_layout(manifest, spec)
 
     root = Path(models_dir)
     root_resolved, root_fail = _resolve_or_fail(root)
@@ -832,11 +1192,11 @@ def project_resolution_report(manifest: ModelManifest,
     # Role grouping of the statuses in manifest order, compared against the
     # caller's *lexical* root (how resolve_manifest builds report.resolved).
     resolved_grouping: dict[str, tuple[Path, ...]] = {
-        role: () for role in LOCAL_REFERENCE_LAYOUT}
+        role: () for role in spec.layout}
     # Published paths, rooted at the canonical ABSOLUTE root so they stay
     # loadable from any future working directory (relative models_dir safe).
     assets: dict[str, tuple[Path, ...]] = {
-        role: () for role in LOCAL_REFERENCE_LAYOUT}
+        role: () for role in spec.layout}
     for art in artifacts:
         resolved_grouping[art.role] += (root / art.identity,)
         assets[art.role] += (root_resolved / art.identity,)
@@ -856,12 +1216,12 @@ def project_resolution_report(manifest: ModelManifest,
     component_dirs = {
         role: (root_resolved if directory == "."
                else root_resolved.joinpath(*directory.split("/")))
-        for role, directory in ROLE_DIRECTORIES.items()
+        for role, directory in spec.role_directories.items()
     }
-    fingerprints = reference_bundle_fingerprints(manifest)
+    fingerprints = reference_bundle_fingerprints(manifest, spec)
 
     return LocalReferenceBundle(
-        profile=LOCAL_REFERENCE_PROFILE,
+        profile=spec.name,
         root=root_resolved,
         root_resolved=root_resolved,
         repo=repo,
@@ -870,3 +1230,158 @@ def project_resolution_report(manifest: ModelManifest,
         component_dirs=component_dirs,
         fingerprints=fingerprints,
     )
+
+
+#: Default ceiling for :attr:`VerificationReusePolicy.max_age_s` use when a
+#: caller wants "the standard hour": the web server's opt-in
+#: ``--reuse-verified-assets`` flag defaults here.
+VERIFICATION_REUSE_DEFAULT_MAX_AGE_S = 3600.0
+
+
+@dataclass(frozen=True)
+class VerificationReusePolicy:
+    """Opt-in reuse of a recorded **successful** content verification.
+
+    Passing one of these is what turns the fast path on: the default
+    (``reuse_policy=None`` everywhere) keeps hashing every artifact on
+    every call, exactly as before. A later call within ``max_age_s`` of a
+    recorded success may skip the content hash only while every artifact's
+    stat fingerprint is unchanged; anything else runs the full resolver.
+    """
+
+    max_age_s: float = VERIFICATION_REUSE_DEFAULT_MAX_AGE_S
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.max_age_s, bool)
+                or not isinstance(self.max_age_s, (int, float))
+                or not math.isfinite(self.max_age_s) or self.max_age_s <= 0):
+            raise ValueError(
+                "max_age_s must be a positive finite number of seconds, "
+                f"got {self.max_age_s!r}")
+
+
+#: Process-level record of successful verifications: identity key
+#: (same :func:`_resolution_key` as the 30 s memo: profile, manifest
+#: content, resolved root + its st_dev/st_ino) -> (expiry, report,
+#: per-file fingerprints).
+#:
+#: HONEST GUARANTEE CHANGE — stat-unchanged is WEAKER than a content hash.
+#: A fingerprint is ``(st_dev, st_ino, st_size, st_mode, st_mtime_ns,
+#: st_ctime_ns)`` of each fully-resolved artifact plus the manifest's
+#: claimed byte size. Any append, truncate, rewrite-in-place, replace,
+#: file-vs-directory swap or symlink retarget moves at least one field and
+#: forces a full rehash; but a writer that *deliberately* restores both
+#: timestamps (``utimensat``) while writing new bytes through the *same*
+#: inode can keep the fingerprint identical while the content changes. A
+#: fresh content hash would still not protect against bytes changed
+#: *after* verification (nor close a hostile concurrent-filesystem TOCTOU)
+#: — this record additionally trusts stat stability for up to
+#: ``max_age_s``. That is the explicit trade for dropping a ~19 s base +
+#: ~9 s Turbo per-job hash in the long-lived web server. Failed, missing,
+#: escaped or unresolvable verifications are NEVER recorded and NEVER
+#: reused; any fingerprint drift deletes the record and re-hashes.
+_verification_records: dict[Any, tuple[float, ResolutionReport,
+                                       tuple[tuple[int, ...], ...]]] = {}
+_verification_lock = threading.Lock()
+
+
+def clear_verification_records() -> None:
+    """Forget every reusable verification record (test seam; also what a
+    caller invokes after intentionally swapping model trees)."""
+    with _verification_lock:
+        _verification_records.clear()
+
+
+def _artifact_fingerprints(manifest: ModelManifest,
+                           models_dir: str | Path,
+                           ) -> tuple[tuple[int, ...], ...] | None:
+    """Per-artifact stat fingerprints exactly as the reuse record defines
+    them; ``None`` whenever anything cannot be resolved, escapes the root,
+    is not a regular file, or does not match the manifest's byte claim
+    (the caller must then run the full resolver)."""
+    try:
+        root = Path(models_dir).resolve()
+        os.stat(root)
+    except OSError:
+        return None
+    fingerprints: list[tuple[int, ...]] = []
+    try:
+        for artifact in manifest.artifacts:
+            path = (root / artifact.filename).resolve()
+            if path != root and root not in path.parents:
+                return None
+            st = os.stat(path)
+            if not stat_module.S_ISREG(st.st_mode):
+                return None
+            if st.st_size != artifact.bytes:
+                return None
+            fingerprints.append((st.st_dev, st.st_ino, st.st_size,
+                                 st.st_mode, st.st_mtime_ns, st.st_ctime_ns))
+    except OSError:
+        return None
+    return tuple(fingerprints)
+
+
+def remember_verified_resolution(manifest: ModelManifest,
+                                 models_dir: str | Path,
+                                 report: ResolutionReport,
+                                 policy: VerificationReusePolicy,
+                                 profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
+                                 ) -> None:
+    """Record a *successful* resolver report with fingerprints for up to
+    ``policy.max_age_s``. Failed reports, unresolvable roots and
+    un-fingerprintable trees remember nothing (and clear any stale record
+    for the identity, so a bad tree cannot linger)."""
+    spec = get_profile(profile)
+    key = _resolution_key(manifest, models_dir, spec)
+    if key is None:
+        return
+    with _verification_lock:
+        _verification_records.pop(key, None)
+    if not report.ok or report.errors:
+        return
+    fingerprints = _artifact_fingerprints(manifest, models_dir)
+    if fingerprints is None:
+        return
+    with _verification_lock:
+        _verification_records[key] = (
+            _MONOTONIC() + policy.max_age_s, report, fingerprints)
+
+
+def reusable_resolution(manifest: ModelManifest,
+                        models_dir: str | Path,
+                        policy: VerificationReusePolicy,
+                        profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
+                        ) -> ResolutionReport | None:
+    """Return the recorded report when reuse is allowed: a record exists
+    under this identity, it is younger than its own recorded deadline, and
+    every artifact fingerprint is byte-identical to the recorded one.
+    ``None`` (→ caller must run the full resolver) for expiry, any stat
+    drift, vanished/replaced/escaped/non-regular files or unresolvable
+    roots; drifted/expired records are dropped, never refreshed here."""
+    if not isinstance(policy, VerificationReusePolicy):
+        raise ValueError("reuse requires a VerificationReusePolicy")
+    spec = get_profile(profile)
+    key = _resolution_key(manifest, models_dir, spec)
+    if key is None:
+        return None
+    now = _MONOTONIC()
+    with _verification_lock:
+        for stale in [k for k, (expiry, _, _) in _verification_records.items()
+                      if now >= expiry]:
+            del _verification_records[stale]
+        entry = _verification_records.get(key)
+        if entry is None:
+            return None
+    fingerprints = _artifact_fingerprints(manifest, models_dir)
+    with _verification_lock:
+        entry = _verification_records.get(key)
+        if entry is None:
+            return None
+        if now >= entry[0]:
+            del _verification_records[key]
+            return None
+        if fingerprints is None or fingerprints != entry[2]:
+            del _verification_records[key]
+            return None
+        return entry[1]

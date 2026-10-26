@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "artifacts": [
+    {
+      "role": "pipeline",
+      "repo": "Qwen/Qwen-Image-2.1-Turbo",
+      "revision": "fc13ba1986fcb905854dc8de2f52eee395f49b5b",
+      "filename": "model_index.json",
+      "sha256": "97e2febeb19d93cb41fa44807cde8bd42757950b5dffeacdb0331fb2d390cf20",
+      "bytes": 578
+    },
+    {
+      "role": "scheduler",
+      "repo": "Qwen/Qwen-Image-2.1-Turbo",
+      "revision": "fc13ba1986fcb905854dc8de2f52eee395f49b5b",
+      "filename": "scheduler/scheduler_config.json",
+      "sha256": "16c948c71f9152a34cce6e3a2f309e97ad2dca32beecbe5e2fd3a7925b7eb4bb",
+      "bytes": 486
+    },
+    {
+      "role": "dit",
+      "repo": "Qwen/Qwen-Image-2.1-Turbo",
+      "revision": "fc13ba1986fcb905854dc8de2f52eee395f49b5b",
+      "filename": "transformer/config.json",
+      "sha256": "2c567038ca190824728844b8d06d94ae02360e668707afd9734e789a7eb58ce3",
+      "bytes": 370
+    },
+    {
+      "role": "dit",
+      "repo": "Qwen/Qwen-Image-2.1-Turbo",
+      "revision": "fc13ba1986fcb905854dc8de2f52eee395f49b5b",
+      "filename": "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+      "sha256": "6cccd922767f01694461bdcf1f34ea7b771f3442e4d5e338ea9aa55277431cc0",
+      "bytes": 9968332504
+    },
+    {
+      "role": "dit",
+      "repo": "Qwen/Qwen-Image-2.1-Turbo",
+      "revision": "fc13ba1986fcb905854dc8de2f52eee395f49b5b",
+      "filename": "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+      "sha256": "69f53ebb063d2f606bdaff7e22e0e2144f28d978d73dc75e6e4293fc5982eab5",
+      "bytes": 4261951904
+    },
+    {
+      "role": "dit",
+      "repo": "Qwen/Qwen-Image-2.1-Turbo",
+      "revision": "fc13ba1986fcb905854dc8de2f52eee395f49b5b",
+      "filename": "transformer/diffusion_pytorch_model.safetensors.index.json",
+      "sha256": "17987f6623b1c814d0ef55a137d99142b7b3b040eb1bf241b5575dd35af803a2",
+      "bytes": 30283
+    }
+  ]
+}

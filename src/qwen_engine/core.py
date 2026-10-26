@@ -22,6 +22,7 @@ from qwen_engine.adapters.base import (
 from qwen_engine.config import ConfigError, FieldError, GenerationConfig
 from qwen_engine.errors import EngineError, GenerationCancelled
 from qwen_engine.log import PhaseLogger
+from qwen_engine.performance import stage
 
 #: Schema tag of the dry-run document (versioned like the bench schemas, R6).
 DRY_RUN_SCHEMA = "qwen_engine.dry_run.v1"
@@ -135,26 +136,32 @@ def generate(
             raise GenerationCancelled("generation cancelled before verified save")
         return logger.phase(name)
 
-    primary = None
+    # Boolean, never the exception object: storing it in a frame local while
+    # it is being re-raised forms a reference cycle (exception -> traceback ->
+    # this frame -> local -> exception) that only cyclic GC can break, so a
+    # cancelled run's whole adapter frame chain (and its CUDA tensors) would
+    # survive until some later gc.collect().  The raised exception itself is
+    # never inspected here, only its presence.
+    failed = False
     saved = False
     try:
         binder = getattr(adapter, "set_cancel_event", None)
         if binder is not None:
             binder(cancel_event)
-        with phase("load"):
+        with phase("load"), stage("model_initialisation"):
             adapter.load(config, assets)
-        with phase("encode"):
+        with phase("encode"), stage("text_encoder_request"):
             conditioning = adapter.encode(config)
         with phase("denoise"):
             latents = adapter.denoise(config, conditioning)
         with phase("decode"):
             image = adapter.decode(latents)
-        with phase("save"):
+        with phase("save"), stage("output_saving"):
             output = adapter.save(image, config)
             output_path = _validate_output(output, config)
             saved = True
-    except BaseException as exc:
-        primary = exc
+    except BaseException:
+        failed = True
         raise
     finally:
         # Drop intermediates before releasing model references. Production
@@ -163,9 +170,10 @@ def generate(
         try:
             closer = getattr(adapter, "close", None)
             if closer is not None:
-                closer()
+                with stage("adapter_cleanup", cuda=True):
+                    closer()
         except Exception:
-            if primary is None and not saved:
+            if not failed and not saved:
                 raise
             # Preserve the primary failure (including interrupts), and a
             # verified saved result. Cleanup failure is diagnostic only there.

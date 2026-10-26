@@ -47,11 +47,27 @@
   var API_EXPORT = '/api/v1/config/export';
   var API_IMPORT = '/api/v1/config/import';
   var API_JOBS = '/api/v1/jobs';
+  var API_REFERENCES = '/api/v1/references';
+  var API_REWRITE = '/api/v1/rewrite';
   var PLAN_REQUEST_SCHEMA = 'qwen_engine.web_plan_request.v1';
   var STATUS_SCHEMA = 'qwen_engine.web_status.v1';
   var PLAN_SCHEMA = 'qwen_engine.web_plan.v1';
   var ERROR_SCHEMA = 'qwen_engine.web_error.v1';
+  var REFERENCE_SCHEMA = 'qwen_engine.web_reference.v1';
+  var REWRITE_REQUEST_SCHEMA = 'qwen_engine.web_rewrite_request.v1';
+  var REWRITE_SCHEMA = 'qwen_engine.web_rewrite.v1';
   var UI_HEADER = 'X-Qwen-UI';
+
+  // Reference images (design §5). The caps MIRROR the server contract
+  // (config.py REF_MAX = 10, reference_store.MAX_REFERENCE_BYTES = 32 MiB,
+  // MAX_REFERENCE_DIM = 4096) so the page refuses locally with the same
+  // reason the server would give — the server stays authoritative and its
+  // typed error is surfaced verbatim when it refuses anyway.
+  var MAX_REFERENCES = 10;
+  var MAX_REFERENCE_BYTES = 32 * 1024 * 1024;
+  var MAX_REFERENCE_DIM = 4096;
+  var REFERENCE_ID_RE = /^[0-9a-f]{64}$/;
+  var REFERENCE_ACCEPT = 'image/png,image/jpeg,image/webp';
 
   // Closed gate contract: each gate has exactly one truthful state and one
   // stable code (qwen_engine.web/api.py). An arbitrary bounded string is a
@@ -69,6 +85,25 @@
     'manifest_invalid', 'manifest_unreadable'
   ];
 
+  /* Rewrite availability (plan §4.1). CLOSED state/code pairs: the code is the
+     key, the state is the value it must pair with. Rewriting is optional and
+     NEVER a generation gate, so it is deliberately absent from GATE_STATES. */
+  var REWRITE_STATES = {
+    rewrite_available: 'available',
+    rewrite_disabled: 'unavailable'
+  };
+  // Sentinel meaning "present but malformed" — distinct from null
+  // ("absent or legitimately unavailable"), so a bad block rejects the
+  // whole status document instead of silently hiding a feature.
+  var INVALID = { invalid: true };
+
+  var REWRITE_TASKS = ['t2i', 'edit'];
+  // The server's rewrite prompt cap (rewrite.PROMPT_MAX_CHARS). Refused
+  // locally so an over-long draft is never sent; the server re-checks.
+  var PROMPT_MAX_CHARS = 8000;
+  // Local generation of a full paragraph is slow; the short general-purpose
+  // deadline would abort a working rewrite. Still finite.
+  var REWRITE_TIMEOUT_MS = 240000;
   // Manifest failures always block submission. Hardware/assets/calibration
   // evidence stays separate: enabling submission is not a memory-fit claim.
   var MANIFEST_REASON_CODES = [
@@ -92,6 +127,47 @@
 
   // Output formats — the exact OutputFormat enum values of config.py.
   var OUTPUT_FORMATS = ['jpg', 'png', 'webp'];
+
+  // The 15 browser-editable GenerationConfig fields, in wire order (the
+  // server's EDITABLE_FIELDS, web/api.py). Plan and job echoes must carry
+  // EXACTLY this set: the explicit legacy branches in parsePlan/parseJob
+  // fill in the keys OLDER servers never sent, and anything else (an unknown
+  // key, an alias) is a schema rejection — never "any key count".
+  var EDITABLE_KEYS = ['prompt', 'negative_prompt', 'width', 'height', 'steps',
+                       'recipe', 'true_cfg_scale', 'seed', 'quant', 'offload',
+                       'attention_backend', 'vae_tiled_decode', 'output_format',
+                       'transparent_background', 'references'];
+
+  // Recipe enum values (config.py Recipe) and the step count Turbo owns
+  // (config.py TURBO_STEPS). A test pins both against the Python values:
+  // Turbo's shipped sigmas make num_inference_steps inert, so the recipe
+  // owns the step count and the control is LOCKED at exactly this number.
+  var RECIPES = ['base', 'turbo'];
+  var TURBO_STEPS = 8;
+
+  // Formats that can carry an alpha channel (config.py ALPHA_OUTPUT_FORMATS).
+  // JPEG cannot store transparency, so a transparent background REQUIRES one
+  // of these; the UI switches jpg to png and says so rather than silently
+  // flattening the image.
+  var ALPHA_FORMATS = ['png', 'webp'];
+
+  // The EXACT feedback wrapper config.py appends to the model-visible prompt
+  // when transparent_background is true (TRANSPARENCY_PROMPT_PREFIX/SUFFIX,
+  // TRANSPARENCY_WRAPPER_REVISION 'qwen-engine.transparent-wrapper.v1').
+  // Mirrored here only to DISPLAY the text the model reads — the draft's
+  // prompt field itself is never rewritten. tests/test_web_static.py pins
+  // these literals against the Python constants.
+  var TRANSPARENT_PREFIX = 'This is an RGBA image with transparency. ';
+  var TRANSPARENT_SUFFIX =
+    ' The image has alpha channel and the background is transparent.';
+
+  // True when the draft asks for transparency but the chosen format cannot
+  // store it. The change handlers keep this from ever being the submitted
+  // state; it exists so a mismatch is REFUSED locally, never silently saved.
+  function transparencyFormatMismatch() {
+    return $('transparent').checked &&
+           ALPHA_FORMATS.indexOf($('output-format').value) === -1;
+  }
 
   // Closed theme set (the only values ever written to documentElement's
   // data-theme; the ONLY localStorage key the app ever touches).
@@ -291,6 +367,9 @@
       errors.prompt = 'Prompt must not be empty — enter the text you want ' +
                       'used exactly as typed.';
     }
+    // Under Turbo these controls are locked (applyRecipeMode) at values the
+    // server accepts, so the ordinary checks stay as the honest mirror: a
+    // restored OUT-OF-RANGE value from before Turbo still surfaces its error.
     var steps = numberField('steps', true);
     if (steps.error) { errors.steps = steps.error; }
     else if (steps.value < 1 || steps.value > 1000) {
@@ -321,6 +400,15 @@
       errors.dims = 'Width and height must be multiples of 32 between 64 ' +
                     'and 4096.';
     }
+    // config.py refuses transparent_background=True with a format that has
+    // no alpha channel. The change handlers auto-switch jpg -> png so this
+    // is unreachable in normal use; it stays as the honest local mirror of
+    // the server rule (rejected, never silently flattened).
+    if (transparencyFormatMismatch()) {
+      errors.format = 'Transparent background needs PNG or WebP — JPEG ' +
+                      'cannot store transparency. Choose png or webp, or ' +
+                      'untick Transparent background.';
+    }
     return { ok: Object.keys(errors).length === 0, errors: errors };
   }
 
@@ -347,6 +435,14 @@
     setText('seed-error', errors.seed || '');
     setText('cfg-error', errors.cfg || '');
     setText('dims-error', errors.dims || '');
+    setText('format-error', errors.format || '');
+    // Server-side policy refusals for these four fields are rendered inline
+    // by applyServerFieldErrors; any draft edit clears them (they described
+    // the configuration that was sent, not the current one).
+    setText('quant-error', '');
+    setText('recipe-error', '');
+    setAriaInvalid('quant', false);
+    syncTransparency();
     // The prompt error only appears once the user has edited the prompt or
     // attempted to submit — never as a first-load alert.
     var showPrompt = promptTouched && !!errors.prompt;
@@ -355,9 +451,146 @@
     setAriaInvalid('seed', !!errors.seed);
     setAriaInvalid('cfg', !!errors.cfg);
     setAriaInvalid('prompt', showPrompt);
+    setAriaInvalid('output-format', !!errors.format);
     // The dimension error message is shared, so it marks BOTH controls.
     setAriaInvalid('width', !!errors.dims);
     setAriaInvalid('height', !!errors.dims);
+  }
+
+  // Server refusals that describe THIS recipe combination are mapped onto the
+  // controls the user can act on, so "the server said no" becomes "this
+  // control is wrong, and here is why". Every other field stays in the
+  // bounded api-message text (renderApiError). Returns the number applied.
+  var SERVER_FIELD_SLOTS = {
+    steps: 'steps-error',
+    true_cfg_scale: 'cfg-error',
+    quant: 'quant-error',
+    recipe: 'recipe-error'
+  };
+  var SERVER_FIELD_CONTROLS = {
+    steps: 'steps', true_cfg_scale: 'cfg', quant: 'quant', recipe: 'recipe-field'
+  };
+
+  function applyServerFieldErrors(payload) {
+    if (!payload || !Array.isArray(payload.fields)) return 0;
+    var applied = 0;
+    for (var i = 0; i < payload.fields.length; i++) {
+      var f = payload.fields[i];
+      if (!f || typeof f.field !== 'string' ||
+          !Object.prototype.hasOwnProperty.call(SERVER_FIELD_SLOTS, f.field) ||
+          typeof f.message !== 'string') continue;
+      var slot = SERVER_FIELD_SLOTS[f.field];
+      setText(slot, f.message.slice(0, 200));
+      var control = $(SERVER_FIELD_CONTROLS[f.field]);
+      if (control) control.setAttribute('aria-invalid', 'true');
+      applied++;
+    }
+    return applied;
+  }
+
+  // Set only by the jpg -> png auto-switch, so the explanation survives the
+  // validation re-renders that follow (typing in the prompt, etc.) instead
+  // of flashing once. Cleared by an explicit format or checkbox change.
+  var transparencySwitchNote = '';
+
+  // The transparency row's derived state: WHY the format changed (only ever
+  // a visible, explained switch), and the exact text the model will read.
+  // Never rewrites the prompt field itself — the wrapper is display only.
+  function syncTransparency() {
+    var on = $('transparent').checked;
+    var format = $('output-format').value;
+    var why = '';
+    if (on && ALPHA_FORMATS.indexOf(format) === -1) {
+      why = 'JPEG cannot keep transparency — choose PNG or WebP, or untick this option.';
+    } else if (on) {
+      why = transparencySwitchNote ||
+            ('Saving as ' + format.toUpperCase() + ', which keeps the ' +
+             'transparency. The result is not guaranteed to be transparent ' +
+             '— check the image.');
+    }
+    setText('transparency-note', why);
+    $('transparency-note').hidden = why === '';
+    $('effective-prompt-field').hidden = !on;
+    if (on) {
+      setText('effective-prompt',
+        TRANSPARENT_PREFIX + $('prompt').value + TRANSPARENT_SUFFIX);
+    } else {
+      setText('effective-prompt', '');
+    }
+  }
+
+  // Ticking transparency with a non-alpha format switches jpg -> png and
+  // SAYS so (transparency-note). Unticking never rewrites the user's format:
+  // PNG stays PNG, because that is the format the user last had selected.
+  function onTransparencyChange() {
+    transparencySwitchNote = '';
+    if ($('transparent').checked &&
+        ALPHA_FORMATS.indexOf($('output-format').value) === -1) {
+      $('output-format').value = 'png';
+      transparencySwitchNote =
+        'Output format switched from jpg to png: JPEG cannot store a ' +
+        'transparent background. PNG keeps it.';
+    }
+    renderValidation(validateForm().errors);
+    syncPlanStaleness();
+  }
+
+  /* ---------------- Recipe (base / Turbo) ----------------
+   * The server's config.py gates Turbo on three things: exactly
+   * TURBO_STEPS sampling steps, no true-CFG (no negative prompt AND no
+   * scale above 1.0), and FP16 weights. The UI therefore LOCKS those
+   * controls while Turbo is selected and says why — it never silently
+   * submits a combination the server would refuse. Nothing the user typed
+   * is deleted: only a locked, restored-on-switch-back value is replaced,
+   * and the negative prompt TEXT is kept (it is legal at scale 1.0).
+   */
+
+  // Values captured when Turbo is entered, restored when Quality is chosen
+  // again. null means "not in a locked Turbo draft".
+  var recipeSaved = null;
+
+  function currentRecipe() {
+    var el = document.querySelector('input[name="recipe"]:checked');
+    return el && RECIPES.indexOf(el.value) !== -1 ? el.value : 'base';
+  }
+
+  function setRecipeControl(value) {
+    var el = document.getElementById('recipe-' + value);
+    if (el) el.checked = true;
+  }
+
+  // Brings the form in line with the selected recipe: locks the controls the
+  // server will not accept under Turbo, and restores the user's own values
+  // when switching back. Safe to call repeatedly.
+  //
+  // `keepValues` marks an EXTERNALLY supplied Turbo draft (an imported plan):
+  // its steps/guidance/quant already are the recipe's own values, so there is
+  // nothing of the user's to capture — capturing them would later "restore"
+  // numbers the user never chose while in Quality.
+  function applyRecipeMode(keepValues) {
+    var turbo = currentRecipe() === 'turbo';
+    var steps = $('steps'), cfg = $('cfg'), quant = $('quant'), negative = $('negative');
+    if (turbo && recipeSaved === null && !keepValues) {
+      recipeSaved = { steps: steps.value, cfg: cfg.value, quant: quant.value };
+      steps.value = String(TURBO_STEPS);
+      cfg.value = '1.0';
+      quant.value = 'fp16';
+    } else if (!turbo && recipeSaved !== null) {
+      steps.value = recipeSaved.steps;
+      cfg.value = recipeSaved.cfg;
+      quant.value = recipeSaved.quant;
+      recipeSaved = null;
+    }
+    steps.disabled = turbo;
+    cfg.disabled = turbo;
+    negative.disabled = turbo;
+    quant.disabled = turbo;
+    setText('recipe-note', turbo
+      ? 'Turbo is selected: steps are fixed at ' + TURBO_STEPS + ', guidance ' +
+        'is fixed at 1.0 (Turbo has no negative prompt), and quantization ' +
+        'is FP16. These controls are locked until you switch back to Quality.'
+      : '');
+    $('recipe-note').hidden = !turbo;
   }
 
   /* ---------------- UI wire snapshot and request envelope ----------------
@@ -375,13 +608,19 @@
       width: Number($('width').value),
       height: Number($('height').value),
       steps: Number($('steps').value),
+      recipe: currentRecipe(),                 // base | turbo (exact config.py values)
       seed: seedWireString($('seed').value),   // decimal STRING or null (UI-only)
       true_cfg_scale: Number($('cfg').value),
       quant: $('quant').value,                 // fp16 | q8 (exact config.py values)
       offload: $('offload').value,             // resident | streamed | offload
       attention_backend: $('attention').value, // auto | sdpa | efficient | eager
       vae_tiled_decode: $('vae-tiling').checked,
-      output_format: $('output-format').value  // jpg | png | webp (exact config.py enum)
+      output_format: $('output-format').value, // jpg | png | webp (exact config.py enum)
+      transparent_background: $('transparent').checked,
+      // Reference ids in LIST order — the displayed order IS the
+      // conditioning order ("image 1" in the prompt). Ids only: the bytes
+      // live in the server store, keyed by these hashes.
+      references: referenceIds()
     };
   }
 
@@ -402,13 +641,16 @@
           width: snap.width,
           height: snap.height,
           steps: snap.steps,
+          recipe: snap.recipe,
           true_cfg_scale: snap.true_cfg_scale,
           seed: snap.seed,                     // decimal STRING or null — never a Number
           quant: snap.quant,
           offload: snap.offload,
           attention_backend: snap.attention_backend,
           vae_tiled_decode: snap.vae_tiled_decode,
-          output_format: snap.output_format
+          output_format: snap.output_format,
+          transparent_background: snap.transparent_background,
+          references: snap.references
         }
       }
     };
@@ -497,14 +739,20 @@
   function apiRequest(url, opts, mode) {
     var controller = new AbortController();
     var timedOut = false;
+    // Per-call deadline override. Only the rewriter uses it: a local LLM
+    // generating a paragraph legitimately takes minutes, while every other
+    // call must stay bounded by the short default.
+    var budget = (opts && typeof opts.timeoutMs === 'number' &&
+                  opts.timeoutMs > 0) ? opts.timeoutMs : FETCH_TIMEOUT_MS;
     var timer = setTimeout(function () {
       timedOut = true;
       controller.abort();
-    }, FETCH_TIMEOUT_MS);
+    }, budget);
     var requestOpts = {};
     if (opts) {
       for (var k in opts) {
-        if (Object.prototype.hasOwnProperty.call(opts, k)) requestOpts[k] = opts[k];
+        if (k !== 'timeoutMs' &&
+            Object.prototype.hasOwnProperty.call(opts, k)) requestOpts[k] = opts[k];
       }
     }
     requestOpts.signal = controller.signal;
@@ -554,6 +802,8 @@
     $('btn-export').disabled = !available;
     $('btn-import').disabled = !available;
     if (!available) generationConnected = false;
+    if (!available) setRewriterState(null);   // rewriter availability is status-gated
+    updateReferenceControls();   // uploads are writes: status-gated too
     updateGenerate();
   }
 
@@ -584,7 +834,35 @@
     if (!manifest) return null;   // status ALWAYS carries the manifest block
     if (!blockersExact(s.generation_blockers, manifest.blocker)) return null;
     if (s.generation_available !== (s.generation_blockers.length === 0)) return null;
-    return { recognized: true, planning: true, generation: s.generation_available };
+    // The rewrite block is OPTIONAL and additive: an older server omits it,
+    // which simply means "no rewriter". Once present it must be EXACTLY the
+    // four closed keys — a partial or widened block is rejected, and with it
+    // the rewriter (never a guessed backend).
+    var rewrite = parseRewriteBlock(s.rewrite);
+    if (rewrite === INVALID) return null;
+    return { recognized: true, planning: true, generation: s.generation_available,
+             rewrite: rewrite };
+  }
+
+  /* The rewrite availability, strictly. `undefined` (absent) and the disabled
+     pair both mean unavailable; only the exact available pair yields the
+     backend string. Anything else — a fifth key, a missing key, an unknown
+     state/code pair, a non-string backend — is INVALID and rejects the whole
+     status document, exactly like every other closed-set parse here. */
+  function parseRewriteBlock(block) {
+    if (block === undefined) return null;
+    if (!block || typeof block !== 'object' || Array.isArray(block)) return INVALID;
+    if (Object.keys(block).length !== 4) return INVALID;
+    if (typeof block.state !== 'string' || typeof block.code !== 'string' ||
+        typeof block.reason !== 'string') return INVALID;
+    if (block.backend !== null && typeof block.backend !== 'string') return INVALID;
+    var pair = REWRITE_STATES[block.code];
+    if (!pair || pair !== block.state) return INVALID;
+    if (block.state !== 'available') return null;   // disabled / unavailable
+    if (typeof block.backend !== 'string' || !block.backend) return INVALID;
+    if (block.backend.length > 64) return INVALID;
+    if (block.reason !== '') return INVALID;        // available carries no reason
+    return { backend: block.backend };
   }
 
   function statusUnrecognizedText(reason) {
@@ -694,6 +972,7 @@
         setApiAvailable(true);
         generationConnected = status.generation;
         updateGenerate();
+        setRewriterState(status.rewrite);
         renderChip(status.generation ? 'Connected — engine jobs' : 'Connected — planning only',
                    status.generation ? 'Connected — engine jobs' : 'Connected — planning only');
         setText('settings-backend',
@@ -735,6 +1014,323 @@
       }
     }
     setText('api-message', message.slice(0, 600));
+  }
+
+  /* ---------------- Prompt rewriting (plan §3/§4) ----------------
+   * A SUGGESTION, never an edit: the server returns a proposed prompt; the
+   * draft only changes when the user presses Apply. Everything here is
+   * gated on a strictly-parsed `available` rewriter block, and every
+   * reply is checked against the draft it was requested for — a response
+   * for older text is discarded, never applied to newer text.
+   */
+
+  var rewriteBackend = null;      // non-null ONLY when status said available
+  var rewriteInFlight = false;
+  // Monotonic PROMPT revision: bumped by every change to the prompt TEXT,
+  // however it was made (typing, Apply, import). Deliberately NOT the plan
+  // module's draftRevision: that one also moves on width/steps changes, and a
+  // resolution tweak must not throw away a perfectly good prompt suggestion.
+  // The server echoes the value it was given; a reply is only ever accepted
+  // while the prompt has not moved since.
+  var promptRevision = 0;
+  var rewriteSeq = 0;
+  var proposal = null;            // { prompt, original, revision }
+
+  // Whether Rewrite can be pressed right now. An edit rewrite names its
+  // references by number and the server refuses one without them, so the
+  // button is unavailable until at least one image is attached — the task is
+  // derived from the references, so this can never ask for an impossible edit.
+  function rewriteAvailable() {
+    if (!rewriteBackend || rewriteInFlight) return false;
+    return rewriteTask() === 't2i' || referenceIds().length > 0;
+  }
+
+  function refreshRewriteButton() {
+    var button = $('rewrite-btn');
+    if (!button) return;
+    button.hidden = !rewriteBackend;
+    button.disabled = !rewriteAvailable();
+  }
+
+  function setRewriterState(rewriter) {
+    rewriteBackend = rewriter ? rewriter.backend : null;
+    var button = $('rewrite-btn');
+    if (button) {
+      button.hidden = !rewriteBackend;
+      button.disabled = !rewriteAvailable();
+    }
+    var hint = $('rewrite-hint');
+    if (hint) hint.hidden = !!rewriteBackend;
+    if (!rewriteBackend) hideProposal();
+  }
+
+  function bumpPromptRevision() {
+    promptRevision++;
+    // A newer draft invalidates any visible suggestion: it was derived from
+    // text that is no longer on screen.
+    if (proposal) hideProposal();
+    var status = $('rewrite-status');
+    if (status) status.textContent = '';
+  }
+
+  function hideProposal() {
+    proposal = null;
+    var block = $('rewrite-proposal');
+    if (block) block.hidden = true;
+    setText('rewrite-original', '');
+    setText('rewrite-suggested', '');
+    setText('rewrite-ratio', '');
+    var applyRatio = $('rewrite-apply-ratio');
+    if (applyRatio) applyRatio.hidden = true;
+    setText('rewrite-error', '');
+  }
+
+  function rewriteTask() {
+    // Reference images imply editing; the request must never claim a task the
+    // draft's own references contradict.
+    return referenceIds().length ? 'edit' : 't2i';
+  }
+
+  function requestRewrite() {
+    if (!rewriteBackend || rewriteInFlight) return;
+    var draft = $('prompt').value;
+    if (!draft.trim()) {
+      setText('rewrite-error',
+        'Write a draft first — the rewriter improves text, it does not invent a prompt.');
+      return;
+    }
+    if (draft.length > PROMPT_MAX_CHARS) {
+      // The server cap, refused locally: nothing is sent.
+      setText('rewrite-error', 'The draft is ' + draft.length +
+        ' characters; the rewriter accepts at most ' + PROMPT_MAX_CHARS + ' — nothing was sent.');
+      return;
+    }
+    var task = rewriteTask();
+    // The displayed order IS the conditioning order: reference N is <imageN>
+    // in the edit system prompt, so the ids go out exactly as rendered.
+    var imageIds = task === 'edit' ? referenceIds() : [];
+    if (task === 'edit' && !imageIds.length) {
+      setText('rewrite-error', 'An edit rewrite needs at least one reference image.');
+      return;
+    }
+    var revision = promptRevision;
+    var seq = ++rewriteSeq;
+    rewriteInFlight = true;
+    $('rewrite-btn').disabled = true;
+    $('rewrite-btn').setAttribute('aria-busy', 'true');
+    setText('rewrite-status', 'Rewriting…');
+    setText('rewrite-error', '');
+    apiRequest(API_REWRITE, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json',
+                 'X-Qwen-UI': '1' },
+      // The one call that legitimately needs minutes; still finite.
+      timeoutMs: REWRITE_TIMEOUT_MS,
+      body: JSON.stringify({
+        schema: REWRITE_REQUEST_SCHEMA,
+        task: task,
+        prompt: draft,
+        draft_revision: revision,
+        image_ids: imageIds
+      })
+    }, 'json').then(function (r) {
+      if (seq !== rewriteSeq) return;        // a newer attempt superseded this
+      rewriteInFlight = false;
+      var button = $('rewrite-btn');
+      if (button) button.removeAttribute('aria-busy');
+      refreshRewriteButton();
+      setText('rewrite-status', '');
+      if (r.network) {
+        // The draft is untouched: this is a failure to CONSULT, never an edit.
+        setText('rewrite-error', r.timedOut
+          ? 'The rewriter did not answer in time; your draft is unchanged.'
+          : 'The local engine server is unreachable; your draft is unchanged.');
+        return;
+      }
+      if (r.bodyError) {
+        setText('rewrite-error', 'The rewriter reply could not be read (' +
+          (r.bodyError === 'too_large' ? 'response over the size cap' : 'not JSON') +
+          '); your draft is unchanged.');
+        return;
+      }
+      if (!r.res.ok) {
+        renderRewriteError(r.res.status, r.json);
+        return;
+      }
+      var answer = parseRewriteAnswer(r.json);
+      if (!answer) {
+        setText('rewrite-error', 'The rewriter reply did not match the expected ' +
+          'schema; your draft is unchanged.');
+        return;
+      }
+      // Stale discard, twice over: the revision must still be the current
+      // one AND the text the server rewrote must still be the textarea's
+      // content. Either mismatch means the answer is for text the user moved
+      // away from — dropped silently, because it is not an error.
+      if (answer.draft_revision !== promptRevision ||
+          answer.original_prompt !== $('prompt').value) return;
+      showProposal(answer);
+    });
+  }
+
+  function renderRewriteError(status, payload) {
+    var message = 'The rewriter refused the request (HTTP ' + status + ').';
+    if (payload && payload.schema === ERROR_SCHEMA &&
+        typeof payload.code === 'string' && /^[a-z0-9_]{1,64}$/.test(payload.code)) {
+      message = payload.code + ': ' +
+        (typeof payload.message === 'string' ? payload.message.slice(0, 200)
+                                            : 'no message');
+    }
+    setText('rewrite-error', message.slice(0, 400) + ' Your draft is unchanged.');
+  }
+
+  // The answer document, strictly: exact schema, an echoed revision, the
+  // original prompt, and a NON-EMPTY suggestion. A model that produced no
+  // parsable prompt yields parse_ok false with an empty suggestion — that is
+  // a usable diagnostic, rendered as text, never as an applyable proposal.
+  function parseRewriteAnswer(s) {
+    if (!s || typeof s !== 'object') return null;
+    if (s.schema !== REWRITE_SCHEMA) return null;
+    if (REWRITE_TASKS.indexOf(s.task) === -1) return null;
+    if (!Number.isInteger(s.draft_revision) || s.draft_revision < 0) return null;
+    if (typeof s.original_prompt !== 'string') return null;
+    if (typeof s.rewritten_prompt !== 'string') return null;
+    if (typeof s.parse_ok !== 'boolean') return null;
+    if (typeof s.backend !== 'string' || !s.backend) return null;
+    if (!Number.isInteger(s.elapsed_ms) || s.elapsed_ms < 0) return null;
+    var ratio = s.ratio;
+    if (ratio !== null) {
+      if (!ratio || typeof ratio !== 'object') return null;
+      if (ratio.kind === 'wh_ratio') {
+        if (typeof ratio.value !== 'string' || !/^[0-9]{1,4}:[0-9]{1,4}$/.test(ratio.value)) return null;
+      } else if (ratio.kind === 'ratio_follow') {
+        if (!Number.isInteger(ratio.image) || ratio.image < 1 || ratio.image > 10) return null;
+      } else return null;
+    }
+    if (typeof s.ratio_conflict !== 'boolean') return null;
+    if (s.unparsed_answer !== null && typeof s.unparsed_answer !== 'string') return null;
+    if (s.parse_ok && !s.rewritten_prompt.trim()) return null;  // parser invariant
+    return s;
+  }
+
+  function showProposal(answer) {
+    // Only a USABLE answer becomes pending state. An unparsable answer is
+    // diagnostic text rendered in the block; keeping it as `proposal` would
+    // let a forced apply write an empty draft.
+    var usable = answer.parse_ok && !!answer.rewritten_prompt.trim();
+    proposal = usable
+      ? { prompt: answer.rewritten_prompt, original: answer.original_prompt,
+          revision: answer.draft_revision }
+      : null;
+    var block = $('rewrite-proposal');
+    if (!block) return;
+    setText('rewrite-original', answer.original_prompt);
+    setText('rewrite-suggested', answer.rewritten_prompt);
+    setText('rewrite-error', '');
+    var apply = $('rewrite-apply');
+    var edit = $('rewrite-edit');
+    var keep = $('rewrite-keep');
+    if (apply) apply.hidden = !usable;
+    if (edit) edit.hidden = !usable;
+    if (keep) keep.hidden = false;
+    if (!usable) {
+      setText('rewrite-error',
+        'The rewriter did not return a usable prompt' +
+        (answer.unparsed_answer
+          ? ' — its answer was kept below as text, not as a proposal.'
+          : '. Your draft is unchanged.'));
+      setText('rewrite-suggested', answer.unparsed_answer || '');
+    }
+    // Ratio is a HINT: text always; a button ONLY when the value matches a
+    // preset ratio exactly, so the control can never send a ratio the preset
+    // table cannot represent.
+    var ratioText = '';
+    var ratioButton = $('rewrite-apply-ratio');
+    var presetName = null;
+    if (answer.ratio_conflict) {
+      ratioText = 'The rewriter suggested both a ratio and an image to follow; ' +
+                  'neither is offered.';
+    } else if (answer.ratio && answer.ratio.kind === 'wh_ratio') {
+      presetName = presetForRatio(answer.ratio.value);
+      ratioText = 'Suggested aspect ratio: ' + answer.ratio.value +
+        (presetName ? ' (available as a preset)' : ' (no preset matches exactly, so no button)');
+    } else if (answer.ratio && answer.ratio.kind === 'ratio_follow') {
+      ratioText = 'The rewriter suggests following reference image ' +
+                  answer.ratio.image + '; pick a preset yourself.';
+    }
+    setText('rewrite-ratio', ratioText);
+    if (ratioButton) {
+      ratioButton.hidden = !presetName;
+      if (presetName) ratioButton.dataset.preset = presetName;
+    }
+    block.hidden = false;
+    block.focus();
+  }
+
+  // Exact ratio -> preset name, never a nearest match. Prefers the tier the
+  // draft currently uses, so applying a hint does not silently quadruple the
+  // resolution; falls back to 1K.
+  function presetForRatio(ratio) {
+    var currentTier = currentDraftTier();
+    var fallback = null;
+    for (var name in PRESETS) {
+      if (!Object.prototype.hasOwnProperty.call(PRESETS, name)) continue;
+      if (PRESETS[name].ratio !== ratio) continue;
+      if (PRESETS[name].tier === currentTier) return name;
+      if (!fallback) fallback = name;
+    }
+    return fallback;
+  }
+
+  function currentDraftTier() {
+    var w = Number($('width').value);
+    var h = Number($('height').value);
+    for (var name in PRESETS) {
+      if (!Object.prototype.hasOwnProperty.call(PRESETS, name)) continue;
+      var p = PRESETS[name];
+      if (p.width === w && p.height === h) return p.tier;
+    }
+    return '1K';
+  }
+
+  function applyProposal() {
+    // `proposal` is only ever assigned a real, non-empty suggestion (the one
+    // assignment site guards it), so a null here means "nothing pending".
+    if (!proposal) return;
+    $('prompt').value = proposal.prompt;
+    hideProposal();
+    bumpPromptRevision();
+    promptTouched = true;          // a programmatic edit is a real edit
+    renderValidation(validateForm().errors);
+    syncPlanStaleness();
+    $('prompt').focus();
+  }
+
+  function editProposal() {
+    // Edit moves the suggestion INTO the textarea but keeps the user in
+    // control: same as apply, then the caret is theirs.
+    if (!proposal) return;
+    $('prompt').value = proposal.prompt;
+    hideProposal();
+    bumpPromptRevision();
+    promptTouched = true;
+    renderValidation(validateForm().errors);
+    syncPlanStaleness();
+    var area = $('prompt');
+    area.focus();
+    area.setSelectionRange(area.value.length, area.value.length);
+  }
+
+  function keepOriginal() {
+    hideProposal();
+    $('prompt').focus();
+  }
+
+  // Observable state for the browser checks (no server, no model).
+  function rewriteState() {
+    return { backend: rewriteBackend, revision: promptRevision,
+             inFlight: rewriteInFlight, hasProposal: !!proposal,
+             proposal: proposal ? proposal.prompt : null };
   }
 
   function apiErrorPayloadFromBytes(bytes) {
@@ -832,6 +1428,7 @@
       }
       if (!r.res.ok) {
         renderApiError(r.res, r.json === undefined ? null : r.json);
+        applyServerFieldErrors(r.json);
         setText('api-message', $('api-message').textContent +
           ' No planning result received; your draft is unchanged; nothing ' +
           'was generated.');
@@ -908,12 +1505,28 @@
     setText('plan-seed', plan.config.seed === null ? 'null (random at run time)' : plan.config.seed);
     setText('plan-dims', plan.config.width + ' × ' + plan.config.height);
     setText('plan-steps', String(plan.config.steps));
+    setText('plan-recipe', plan.config.recipe === 'turbo'
+      ? 'Turbo — Turbo image model with the same text encoder and decoder ' +
+        'as Quality, fixed ' + TURBO_STEPS + ' sampling steps'
+      : 'Quality — reference model at ' + plan.config.steps + ' steps');
     setText('plan-cfg', plan.cfg_active === true ? 'active (scale ' + plan.config.true_cfg_scale + ')'
                                                  : 'inactive (scale ' + plan.config.true_cfg_scale + ')');
     setText('plan-tokens', String(plan.latent_tokens));
     setText('plan-quant', plan.config.quant + ' · ' + plan.config.offload + ' · ' +
                           plan.config.attention_backend + ' · VAE tiling ' +
                           (plan.config.vae_tiled_decode ? 'on' : 'off'));
+    setText('plan-transparency',
+      plan.config.transparent_background
+        ? 'on — prompts the model for a transparent background; saved as ' +
+          plan.config.output_format + ', which can keep it (not guaranteed)'
+        : 'off — saved as ' + plan.config.output_format);
+    setText('plan-references', plan.config.references.length === 0
+      ? 'none — the prompt is used on its own'
+      : plan.config.references.length + ' image' +
+        (plan.config.references.length === 1 ? '' : 's') +
+        ' (image 1' + (plan.config.references.length > 1
+          ? '…image ' + plan.config.references.length : '') +
+        ') — cited by number in the prompt');
     setText('plan-manifest',
       plan.manifest.ready === false && plan.manifest.verification === 'not_performed'
         ? 'metadata only — verification not performed, fit not evaluated, not ready'
@@ -934,8 +1547,20 @@
     quant: ['fp16', 'q8'],
     offload: ['resident', 'streamed', 'offload'],
     attention_backend: ['auto', 'sdpa', 'efficient', 'eager'],
-    output_format: OUTPUT_FORMATS
+    output_format: OUTPUT_FORMATS,
+    recipe: RECIPES
   };
+
+  // The recipe gates config.py enforces, mirrored so an echo that could not
+  // have come from a validated config is refused rather than rendered:
+  // Turbo owns exactly TURBO_STEPS steps, runs at CFG 1.0 (no usable
+  // negative prompt), and has no reviewed Q8 artifact.
+  function recipeConsistent(c) {
+    if (PLAN_ENUMS.recipe.indexOf(c.recipe) === -1) return false;
+    if (c.recipe !== 'turbo') return true;
+    return c.steps === TURBO_STEPS && c.quant === 'fp16' &&
+           !(pyStrip(c.negative_prompt).length > 0 && c.true_cfg_scale > 1);
+  }
 
   // The WHOLE public plan response is validated before anything renders:
   // exact editable keys, string lengths ALIGNED with the server's 64 KiB
@@ -954,13 +1579,50 @@
     if (!Number.isInteger(raw.latent_tokens) || raw.latent_tokens < 0) return null;
     var c = raw.config;
     if (!c || typeof c !== 'object') return null;
-    var want = ['prompt', 'negative_prompt', 'width', 'height', 'steps',
-                'true_cfg_scale', 'seed', 'quant', 'offload',
-                'attention_backend', 'vae_tiled_decode', 'output_format'];
+    var want = EDITABLE_KEYS;
     var have = Object.keys(c);
-    if (have.length !== want.length) return null;   // no extra runtime fields
-    for (var i = 0; i < want.length; i++) {
-      if (!Object.prototype.hasOwnProperty.call(c, want[i])) return null;
+    var hasKey = function (key) {
+      return Object.prototype.hasOwnProperty.call(c, key);
+    };
+    // Backward compatibility is EXPLICIT, never "any key count": an older
+    // server that predates the recipe sent 14 keys, the one before
+    // references 13, the one before transparency 12, the one before
+    // output_format 11. Each branch fills in exactly what that server
+    // actually did — a pre-recipe server could only run the reference
+    // model, so recipe is "base"; 10 keys, 16 keys or any unknown key is a
+    // schema rejection, never a guess.
+    var legacyNoRecipe = have.length === 14 && !hasKey('recipe');
+    var legacyNoReferences = have.length === 13 &&
+      !hasKey('references') && !hasKey('recipe');
+    var legacyNoTransparency = have.length === 12 &&
+      !hasKey('references') && !hasKey('recipe') &&
+      !hasKey('transparent_background');
+    var legacyNoFormat = have.length === 11 &&
+      !hasKey('references') && !hasKey('recipe') &&
+      !hasKey('transparent_background') &&
+      !hasKey('output_format');
+    var legacyAny = legacyNoRecipe || legacyNoReferences ||
+                    legacyNoTransparency || legacyNoFormat;
+    if (!(have.length === want.length || legacyAny)) return null;
+    var i;
+    // Reference ids: the content-addressed digests the server validates
+    // against (config.py REF_MAX = 10) with one filled-in-per-era rule.
+    if (legacyAny) c.recipe = 'base';
+    if (legacyNoFormat) c.output_format = 'png';
+    if (legacyNoFormat || legacyNoTransparency) c.transparent_background = false;
+    if (legacyNoFormat || legacyNoTransparency || legacyNoReferences) c.references = [];
+    for (i = 0; i < want.length; i++) {
+      if (!hasKey(want[i])) return null;
+    }
+    if (Object.keys(c).length !== want.length) return null;  // no extra runtime fields
+    // Reference ids: the content-addressed digests the server validates
+    // against (config.py REF_MAX = 10; duplicates are LEGAL — the same
+    // image may be cited twice). Any non-hex id or an over-cap list is a
+    // broken echo.
+    if (!Array.isArray(c.references) || c.references.length > MAX_REFERENCES) return null;
+    for (i = 0; i < c.references.length; i++) {
+      if (typeof c.references[i] !== 'string' ||
+          !REFERENCE_ID_RE.test(c.references[i])) return null;
     }
     if (typeof c.prompt !== 'string' || c.prompt.length > MAX_CONFIG_STRING_CHARS) return null;
     // EXACTLY shared GenerationConfig (config.py: `not self.prompt.strip()`):
@@ -989,11 +1651,18 @@
     if (PLAN_ENUMS.attention_backend.indexOf(c.attention_backend) === -1) return null;
     if (typeof c.vae_tiled_decode !== 'boolean') return null;
     if (PLAN_ENUMS.output_format.indexOf(c.output_format) === -1) return null;
+    if (typeof c.transparent_background !== 'boolean') return null;
+    // The server refuses transparency without an alpha-capable format; an
+    // echo claiming both is a broken contract, never a value to render.
+    if (c.transparent_background &&
+        ALPHA_FORMATS.indexOf(c.output_format) === -1) return null;
     // cfg_active must EQUAL the server's single source of truth
     // (config.py): a non-blank negative prompt under PYTHON strip rules
     // AND a scale strictly above 1.0.
     var cfgActive = pyStrip(c.negative_prompt).length > 0 && c.true_cfg_scale > 1;
     if (raw.cfg_active !== cfgActive) return null;
+    // Recipe contract: enum value plus the exact Turbo gates (config.py).
+    if (!recipeConsistent(c)) return null;
     // latent_tokens must equal the /16 compression of the echoed
     // dimensions (config.py C6); multiples-of-32 make this division exact.
     if (raw.latent_tokens !== (c.width / 16) * (c.height / 16)) return null;
@@ -1184,40 +1853,26 @@
    * failure the draft stays exactly as typed and nothing is generated.
    */
 
+  // One bounded read path for every local file (config import and reference
+  // uploads): the SAME size/staleness checks, so neither flow can grow a
+  // second, subtly different reading convention.
   function readFileLimited(file) {
-    return new Promise(function (resolve, reject) {
-      if (!file || typeof file.size !== 'number' ||
-          file.size > MAX_IMPORT_FILE_BYTES) {
-        reject(new Error('too_large'));
-        return;
-      }
-      var reader = new FileReader();
-      reader.onerror = function () { reject(new Error('unreadable')); };
-      reader.onload = function () {
-        var bytes = reader.result;
-        if (!(bytes instanceof ArrayBuffer) ||
-            bytes.byteLength > MAX_IMPORT_FILE_BYTES) {
-          reject(new Error('too_large'));
-          return;
-        }
-        // Re-read the live file size: a file changed on disk between
-        // selection and read must not slip past the bound.
-        if (typeof file.size === 'number' && file.size > MAX_IMPORT_FILE_BYTES) {
-          reject(new Error('too_large'));
-          return;
-        }
-        resolve(new Uint8Array(bytes));
-      };
-      reader.readAsArrayBuffer(file);
-    });
+    return readFileBytes(file, MAX_IMPORT_FILE_BYTES);
   }
 
   function applyImportedPlan(plan) {
     var c = plan.config;
     $('prompt').value = c.prompt;
+    // The draft text changed wholesale: any visible rewrite proposal is for
+    // text that no longer exists.
+    bumpPromptRevision();
     $('negative').value = c.negative_prompt;
     $('width').value = String(c.width);
     $('height').value = String(c.height);
+    // The recipe is applied FIRST (and its lock re-derived LAST) so the
+    // imported steps/cfg/quant land as the file's values instead of being
+    // overwritten by a leftover Turbo lock or restored from a stale capture.
+    recipeSaved = null;
     $('steps').value = String(c.steps);
     $('cfg').value = String(c.true_cfg_scale);
     // Seed stays a decimal STRING end to end — never a Number.
@@ -1227,6 +1882,26 @@
     $('attention').value = c.attention_backend;
     $('vae-tiling').checked = c.vae_tiled_decode;
     $('output-format').value = c.output_format;
+    // Import is an explicit server-validated application: an imported
+    // transparency setting never triggers the jpg -> png auto-switch, so a
+    // stale switch explanation must not survive it either.
+    transparencySwitchNote = '';
+    $('transparent').checked = c.transparent_background;
+    setRecipeControl(c.recipe);
+    applyRecipeMode(true);   // values came from the file: never capture them
+    // Round-trip: the imported ids become the draft's reference list in the
+    // file's order. The export carries ids only, so the display metadata
+    // (dimensions/alpha/bytes) is UNKNOWN until the thumbnails load — shown
+    // honestly as "stored on the server" rather than invented numbers.
+    references = c.references.map(function (id) {
+      return { id: id, width: null, height: null, has_alpha: null, bytes: null };
+    });
+    renderReferences();
+    setReferenceStatus(c.references.length
+      ? 'Imported ' + c.references.length + ' reference image' +
+        (c.references.length === 1 ? '' : 's') + ' in the file\'s order. ' +
+        'Their thumbnails appear if the server still holds them.'
+      : '');
   }
 
   function importConfigFile(file) {
@@ -1333,6 +2008,374 @@
                              'or generated.');
       return false;
     });
+  }
+
+  /* ---------------- Reference images ----------------
+   * Design §5 / §2.4. Uploads carry the RAW file bytes to
+   * POST /api/v1/references with Content-Type: application/octet-stream —
+   * never base64 inside JSON: the JSON routes cap bodies at 64 KiB while one
+   * reference may be 32 MiB. The browser only ever holds ids plus display
+   * metadata; the bytes and the store live on the server. The displayed
+   * order IS the conditioning order, so the list is renumbered and the
+   * envelope rebuilt in the same turn as any change.
+   */
+
+  var references = [];            // [{id, width, height, has_alpha, bytes}]
+  var uploadingReference = false;
+
+  function referenceIds() {
+    return references.map(function (ref) { return ref.id; });
+  }
+
+  function setReferenceStatus(text) { setText('reference-status', text); }
+
+  function formatReferenceBytes(n) {
+    if (typeof n !== 'number' || !isFinite(n) || n < 0) return 'unknown size';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KiB';
+    return (n / (1024 * 1024)).toFixed(1) + ' MiB';
+  }
+
+  // Add is offered only when a RECOGNIZED status has been seen (uploads are
+  // writes), no upload is in flight and the hard cap is not reached. The
+  // disabled state is a courtesy: the handler refuses on the same terms.
+  function updateReferenceControls() {
+    var full = references.length >= MAX_REFERENCES;
+    $('add-reference').disabled = !apiConnected || uploadingReference || full;
+    setText('reference-limit', String(MAX_REFERENCES));
+    setText('reference-count', references.length === 0
+      ? 'No references'
+      : references.length + ' of ' + MAX_REFERENCES + ' references');
+    $('reference-empty').hidden = references.length > 0;
+  }
+
+  function referenceButton(id, action) {
+    return $('reference-list').querySelector(
+      '[data-reference-id="' + id + '"] button[data-action="' + action + '"]');
+  }
+
+  // Focus restore after a re-render. The wanted button may be disabled (an
+  // "up" that reached the top) or gone (a removed card), so fall back to the
+  // nearest ENABLED control rather than dropping focus to <body>.
+  function focusReferenceButton(id, action, index) {
+    var want = referenceButton(id, action);
+    if (!want || want.disabled) {
+      // The acted-on card may be gone (remove): keep focus in the list.
+      var cards = $('reference-list').children;
+      var nearby = cards[index < cards.length ? index : cards.length - 1];
+      want = null;
+      if (nearby) {
+        var buttons = nearby.querySelectorAll('button');
+        for (var i = 0; i < buttons.length && !want; i++) {
+          if (!buttons[i].disabled) want = buttons[i];
+        }
+      }
+    }
+    // No card left with an enabled action: the Add button is the next step.
+    if (!want || want.disabled) want = $('add-reference');
+    if (want) want.focus();
+  }
+
+  // One card. It is its OWN function for a reason: `var` is function-scoped,
+  // so building every card inside renderReferences' loop left all the error
+  // handlers sharing the LAST iteration's item/img/meta — a failed thumbnail
+  // would mark the wrong card (and, with the loop variable, the wrong
+  // ordinal). One call per card gives each handler its own bindings.
+  function referenceCard(ref, index) {
+    var item = document.createElement('li');
+    item.className = 'reference-card';
+    item.dataset.referenceId = ref.id;   // validated 64-hex: safe selector
+    var ordinal = document.createElement('span');
+    ordinal.className = 'reference-ordinal';
+    ordinal.textContent = 'Image ' + (index + 1);
+    var img = document.createElement('img');
+    img.alt = 'Reference image ' + (index + 1);
+    img.loading = 'lazy';
+    // Server-owned thumbnail of stored bytes; the id is a checked hash, so
+    // the URL is built from a validated value only (never a raw string).
+    img.src = API_REFERENCES + '/' + ref.id + '/thumb';
+    var meta = document.createElement('span');
+    meta.className = 'reference-meta';
+    var facts = [];
+    if (Number.isInteger(ref.width) && Number.isInteger(ref.height)) {
+      facts.push(ref.width + '×' + ref.height);
+    }
+    if (typeof ref.bytes === 'number') facts.push(formatReferenceBytes(ref.bytes));
+    if (ref.has_alpha === true) facts.push('alpha');
+    meta.textContent = facts.length ? facts.join(' · ') : 'stored on the server';
+    // A pruned id (an imported plan naming bytes the server no longer holds)
+    // would otherwise render a silent broken-image icon. The card stays in
+    // place — the envelope must keep showing the order the user will submit
+    // — but the missing thumbnail is stated.
+    img.addEventListener('error', function () {
+      // The list is rebuilt on every change, so a discarded card's later
+      // error must not narrate for the CURRENT list.
+      if (!item.isConnected) return;
+      // The ordinal comes from the LIVE DOM position, not a captured value,
+      // so the message always matches the numbering on screen.
+      var pos = Array.prototype.indexOf.call(item.parentNode.children, item);
+      if (pos === -1) return;
+      // A failed thumbnail request does NOT prove the bytes are gone (the
+      // server may be restarting, or the page opened from file://), so the
+      // copy says what was observed. Only a submit-time 422 claims pruning.
+      item.classList.add('reference-missing');
+      meta.textContent = 'thumbnail unavailable — the preview could not be ' +
+                         'loaded';
+      setReferenceStatus('The preview for reference image ' + (pos + 1) +
+        ' could not be loaded. The image may be missing from the server ' +
+        'store — remove it or upload it again before submitting.');
+    });
+    var actions = document.createElement('span');
+    actions.className = 'reference-actions';
+    var buttons = [['up', 'Up', 'Move reference image ' + (index + 1) + ' up'],
+                   ['down', 'Down', 'Move reference image ' + (index + 1) + ' down'],
+                   ['remove', 'Remove', 'Remove reference image ' + (index + 1)]];
+    for (var b = 0; b < buttons.length; b++) {
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.action = buttons[b][0];
+      button.textContent = buttons[b][1];
+      button.setAttribute('aria-label', buttons[b][2]);
+      // Keyboard-only reordering: no drag, and the ends are honestly
+      // unavailable instead of silently doing nothing.
+      if (buttons[b][0] === 'up') button.disabled = index === 0;
+      if (buttons[b][0] === 'down') button.disabled = index === references.length - 1;
+      if (buttons[b][0] === 'remove') button.disabled = uploadingReference;
+      actions.appendChild(button);
+    }
+    item.appendChild(ordinal);
+    item.appendChild(img);
+    item.appendChild(meta);
+    item.appendChild(actions);
+    return item;
+  }
+
+  // Numbering is derived from position on EVERY render — never stored — so a
+  // remove or reorder renumbers immediately and the envelope cannot carry an
+  // order the list does not show.
+  function renderReferences() {
+    var list = $('reference-list');
+    while (list.firstChild) list.removeChild(list.firstChild);
+    for (var i = 0; i < references.length; i++) {
+      list.appendChild(referenceCard(references[i], i));
+    }
+    updateReferenceControls();
+  }
+
+  // Closed shape: exactly the six documented fields, id a lowercase sha256
+  // hex digest, dimensions and byte count inside the server's own caps.
+  function parseReferenceResponse(raw) {
+    if (!raw || typeof raw !== 'object' || raw.schema !== REFERENCE_SCHEMA) return null;
+    if (typeof raw.id !== 'string' || !REFERENCE_ID_RE.test(raw.id)) return null;
+    if (!Number.isInteger(raw.width) || raw.width < 1 || raw.width > MAX_REFERENCE_DIM) return null;
+    if (!Number.isInteger(raw.height) || raw.height < 1 || raw.height > MAX_REFERENCE_DIM) return null;
+    if (typeof raw.has_alpha !== 'boolean') return null;
+    if (!Number.isInteger(raw.bytes) || raw.bytes < 1 || raw.bytes > MAX_REFERENCE_BYTES) return null;
+    if (Object.keys(raw).length !== 6) return null;
+    return { id: raw.id, width: raw.width, height: raw.height,
+             has_alpha: raw.has_alpha, bytes: raw.bytes };
+  }
+
+  function readFileBytes(file, cap) {
+    return new Promise(function (resolve, reject) {
+      if (!file || typeof file.size !== 'number' || file.size > cap) {
+        reject(new Error('too_large'));
+        return;
+      }
+      var reader = new FileReader();
+      reader.onerror = function () { reject(new Error('unreadable')); };
+      reader.onload = function () {
+        var bytes = reader.result;
+        if (!(bytes instanceof ArrayBuffer) || bytes.byteLength > cap) {
+          reject(new Error('too_large'));
+          return;
+        }
+        // Re-read the live file size: a file changed on disk between
+        // selection and read must not slip past the bound.
+        if (typeof file.size === 'number' && file.size > cap) {
+          reject(new Error('too_large'));
+          return;
+        }
+        resolve(new Uint8Array(bytes));
+      };
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  // One reference upload. Resolves true only when the server returned a
+  // schema-valid reference document; every refusal is stated in the
+  // aria-live status line with the server's own typed code, never silently
+  // dropped. The server is authoritative: local checks only mirror its caps.
+  function uploadReference(file) {
+    return readFileBytes(file, MAX_REFERENCE_BYTES).then(function (bytes) {
+      return apiRequest(API_REFERENCES, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream', 'X-Qwen-UI': '1' },
+        body: bytes   // raw bytes, verbatim — never base64, never JSON
+      }, 'json').then(function (r) {
+        if (r.network) {
+          setApiAvailable(false);
+          renderChip('Not connected',
+            r.timedOut ? 'Not connected — the request timed out'
+                       : 'Not connected — request failed');
+          setReferenceStatus('Upload failed: the local server is not ' +
+                             'reachable (or it timed out). The image was not ' +
+                             'added and your draft is otherwise unchanged.');
+          return false;
+        }
+        if (r.bodyError) {
+          // An unusable body (including one over the response cap) is a
+          // broken server contract, exactly like a rejected plan.
+          setApiAvailable(false);
+          renderChip('Status rejected',
+            'Status rejected — server contract broken');
+          setReferenceStatus('Upload response was unusable (' +
+            (r.bodyError === 'too_large' ? 'over the fixed response cap'
+              : r.bodyError === 'unsupported' ? 'unreadable bounded body'
+                                              : 'not decodable JSON') +
+            ') — a schema rejection, not a disconnect. The image was not ' +
+            'added.');
+          return false;
+        }
+        if (!r.res.ok) {
+          var payload = r.json && r.json.schema === ERROR_SCHEMA ? r.json : null;
+          var code = payload && typeof payload.code === 'string' &&
+                     /^[a-z0-9_]{1,64}$/.test(payload.code)
+            ? payload.code : 'HTTP ' + r.res.status;
+          var detail = payload && typeof payload.message === 'string'
+            ? payload.message.slice(0, 200) : '';
+          setReferenceStatus('Upload refused — ' + code +
+            (detail ? ': ' + detail : '') + '. The image was not added.');
+          return false;
+        }
+        var ref = parseReferenceResponse(r.json);
+        if (!ref) {
+          setApiAvailable(false);
+          renderChip('Status rejected',
+            'Status rejected — server contract broken');
+          setReferenceStatus('The upload response did not match the ' +
+                             'expected reference schema — nothing was added.');
+          return false;
+        }
+        // The store is content-addressed: the same bytes are the same id.
+        var existing = referenceIds().indexOf(ref.id);
+        if (existing !== -1) {
+          setReferenceStatus('That image is already reference image ' +
+                             (existing + 1) + ' — it was not added twice.');
+          return true;
+        }
+        references.push(ref);
+        renderReferences();
+        // The reference list is an input to the rewrite too: image N is what
+        // the rewrite calls <imageN>, so adding one changes the question.
+        bumpPromptRevision();
+        refreshRewriteButton();
+        syncPlanStaleness();   // the draft now conditions on more images
+        setReferenceStatus('Added reference image ' + references.length +
+          ' (' + ref.width + '×' + ref.height +
+          (ref.has_alpha ? ', transparency kept' : '') +
+          '). Refer to it as image ' + references.length + ' in your prompt.');
+        return true;
+      });
+    }).catch(function (err) {
+      var why = (err && err.message === 'too_large')
+        ? 'the file exceeds the ' + formatReferenceBytes(MAX_REFERENCE_BYTES) +
+          ' upload limit'
+        : 'the file could not be read';
+      setReferenceStatus('Upload refused: ' + why +
+                         '. The image was not added.');
+      return false;
+    });
+  }
+
+  // Sequential uploads: one request in flight at a time (each is up to
+  // 32 MiB), room for the remainder of the hard cap is computed BEFORE any
+  // bytes are sent, and the cap is a hard stop with a stated reason.
+  function addReferenceFiles(fileList) {
+    var files = Array.prototype.slice.call(fileList || []);
+    if (!files.length) return Promise.resolve(0);
+    if (!apiConnected) {
+      setReferenceStatus('Uploads need a recognized server status — use ' +
+                         '"Check configuration" first. Nothing was uploaded.');
+      return Promise.resolve(0);
+    }
+    if (uploadingReference) return Promise.resolve(0);
+    var room = MAX_REFERENCES - references.length;
+    if (room <= 0) {
+      setReferenceStatus('At most ' + MAX_REFERENCES + ' reference images are ' +
+                         'allowed. Remove an image before adding another — ' +
+                         'nothing was uploaded.');
+      return Promise.resolve(0);
+    }
+    var accepted = files.slice(0, room);
+    var refused = files.length - accepted.length;
+    uploadingReference = true;
+    updateReferenceControls();
+    var added = 0;
+    var index = 0;
+    function step() {
+      if (index >= accepted.length) return Promise.resolve(added);
+      var file = accepted[index];
+      setReferenceStatus('Uploading ' + (file && file.name ? file.name : 'image') +
+        ' — ' + (index + 1) + ' of ' + accepted.length + ' queued…');
+      return uploadReference(file).then(function (ok) {
+        if (ok) added++;
+        index++;
+        return step();
+      });
+    }
+    // The batch end RE-RENDERS the cards, not just the toolbar: each render
+    // during the batch saw uploadingReference === true, so the Remove
+    // buttons were built disabled and would stay that way.
+    return step().then(function (count) {
+      uploadingReference = false;
+      renderReferences();
+      if (refused > 0) {
+        setReferenceStatus('At most ' + MAX_REFERENCES + ' reference images are ' +
+          'allowed — ' + refused + ' more file' + (refused === 1 ? ' was' : 's were') +
+          ' not uploaded. Nothing was silently dropped.');
+      } else if (count === 0 && references.length === 0) {
+        setReferenceStatus('No reference images were added.');
+      }
+      return count;
+    }, function () {
+      uploadingReference = false;
+      renderReferences();   // same reason: re-enable the per-card actions
+      setReferenceStatus('The upload stopped unexpectedly; nothing further ' +
+                         'was added. Check the server and try again.');
+      return added;
+    });
+  }
+
+  function removeReference(index) {
+    if (!(index >= 0 && index < references.length)) return;
+    references.splice(index, 1);
+    renderReferences();
+    bumpPromptRevision();   // every remaining <imageN> was renumbered
+    refreshRewriteButton();
+    syncPlanStaleness();
+    setReferenceStatus('Removed reference image ' + (index + 1) + '. ' +
+      (references.length
+        ? 'The remaining images were renumbered — check that your prompt ' +
+          'still names the right image numbers.'
+        : 'No references remain; the prompt is used on its own.'));
+  }
+
+  function moveReference(index, delta) {
+    var target = index + delta;
+    if (index < 0 || index >= references.length ||
+        target < 0 || target >= references.length) return;
+    var moved = references[index];
+    references[index] = references[target];
+    references[target] = moved;
+    renderReferences();
+    // Same set, different order: the rewrite's <imageN> mapping changed, so a
+    // visible proposal is stale even though the draft text did not move.
+    bumpPromptRevision();
+    syncPlanStaleness();
+    setReferenceStatus('Reference image ' + (index + 1) + ' is now image ' +
+      (target + 1) + '. The prompt refers to images by number, so check your ' +
+      'wording.');
   }
 
   /* ---------------- Presets & preview ---------------- */
@@ -1449,16 +2492,41 @@
         typeof job.cancel_requested !== 'boolean') return null;
     var c = job.config;
     if (!c || typeof c !== 'object') return null;
-    // Current servers echo all 12 editable fields. An older 11-key config
-    // without output_format is accepted ONLY via this explicit
-    // backward-compat branch and defaults to PNG — the format the older
-    // server actually saved. Anything else (10 keys, 13 keys, extra
-    // runtime fields) is a schema rejection, never a guess.
+    // Current servers echo all 15 editable fields. FOUR older shapes are
+    // accepted ONLY via explicit backward-compat branches and default the
+    // missing keys to what those servers actually did: 14 keys without
+    // recipe (always the reference model, so "base"), 13 keys without
+    // references either (no conditioning images), 12 keys without
+    // transparent_background either (never transparent), and 11 keys
+    // without output_format either (saved PNG). Anything else (10 keys,
+    // 16 keys, extra runtime fields) is a schema rejection, never a guess.
     var ckeys = Object.keys(c);
-    var legacyNoFormat = ckeys.length === 11 &&
-      !Object.prototype.hasOwnProperty.call(c, 'output_format');
-    if (!(ckeys.length === 12 || legacyNoFormat)) return null;
+    var hasKey = function (key) {
+      return Object.prototype.hasOwnProperty.call(c, key);
+    };
+    var legacyNoRecipe = ckeys.length === 14 && !hasKey('recipe');
+    var legacyNoReferences = ckeys.length === 13 && !hasKey('references') &&
+      !hasKey('recipe');
+    var legacyNoTransparency = ckeys.length === 12 &&
+      !hasKey('transparent_background') && hasKey('output_format') &&
+      !hasKey('references') && !hasKey('recipe');
+    var legacyNoFormat = ckeys.length === 11 && !hasKey('output_format') &&
+      !hasKey('transparent_background') && !hasKey('references') &&
+      !hasKey('recipe');
+    var legacyAny = legacyNoRecipe || legacyNoReferences ||
+                    legacyNoTransparency || legacyNoFormat;
+    if (!(ckeys.length === 15 || legacyAny)) return null;
+    if (legacyAny) c.recipe = 'base';
     if (legacyNoFormat) c.output_format = 'png';
+    if (legacyNoFormat || legacyNoTransparency) c.transparent_background = false;
+    if (legacyNoFormat || legacyNoTransparency || legacyNoReferences) c.references = [];
+    // Same id contract as parsePlan: an ordered list of at most REF_MAX
+    // content digests, in conditioning order.
+    if (!Array.isArray(c.references) || c.references.length > MAX_REFERENCES) return null;
+    for (var r = 0; r < c.references.length; r++) {
+      if (typeof c.references[r] !== 'string' ||
+          !REFERENCE_ID_RE.test(c.references[r])) return null;
+    }
     if (typeof c.prompt !== 'string' ||
         !pyStrip(c.prompt) || c.prompt.length > MAX_CONFIG_STRING_CHARS ||
         typeof c.negative_prompt !== 'string' || c.negative_prompt.length > MAX_CONFIG_STRING_CHARS ||
@@ -1468,7 +2536,15 @@
         typeof c.vae_tiled_decode !== 'boolean' ||
         PLAN_ENUMS.quant.indexOf(c.quant) === -1 || PLAN_ENUMS.offload.indexOf(c.offload) === -1 ||
         PLAN_ENUMS.attention_backend.indexOf(c.attention_backend) === -1 ||
-        PLAN_ENUMS.output_format.indexOf(c.output_format) === -1) return null;
+        PLAN_ENUMS.output_format.indexOf(c.output_format) === -1 ||
+        typeof c.transparent_background !== 'boolean') return null;
+    // A job config asking for transparency in a format that cannot store it
+    // cannot have come from a validated server config.
+    if (c.transparent_background &&
+        ALPHA_FORMATS.indexOf(c.output_format) === -1) return null;
+    // Same recipe contract as parsePlan: a job config the server would have
+    // refused is a broken echo, not something to display or resubmit.
+    if (!recipeConsistent(c)) return null;
     if (['width', 'height'].some(function (key) {
       return !Number.isInteger(c[key]) || c[key] < 64 || c[key] > 4096 || c[key] % 32 !== 0;
     })) return null;
@@ -1479,7 +2555,8 @@
       var value = job.phase_ms[phase];
       return JOB_PHASES.indexOf(phase) === -1 || typeof value !== 'number' || !isFinite(value) || value < 0;
     })) return null;
-    if ([null, 'execution_failed', 'worker_stopped', 'invalid_cancellation_acknowledgment'].indexOf(job.error_code) === -1) return null;
+    if ([null, 'execution_failed', 'worker_stopped', 'invalid_cancellation_acknowledgment',
+         'out_of_gpu_memory'].indexOf(job.error_code) === -1) return null;
     if (job.image_url !== (job.state === 'succeeded' ? jobUrl(job.job_id) + '/image' : null)) return null;
     // Older servers have no step observations; keep their bar indeterminate.
     if (job.progress !== undefined && (!job.progress ||
@@ -1518,6 +2595,12 @@
     setText('job-status', job.state + (job.phase ? ' · ' + job.phase :
       job.state === 'running' ? ' · verifying model assets' : '') +
       (job.error_code ? ' · ' + job.error_code + ' (see server terminal)' : ''));
+    var failureMessages = {
+      // Plain-language, actionable and prompt-free; unknown codes keep the
+      // generic fixed sentence below (closed list, no server text).
+      out_of_gpu_memory: 'The GPU ran out of memory for this job. Try Q8, ' +
+        'a smaller size, fewer reference images, or Turbo.'
+    };
     var descriptions = {
       queued: 'Queued — waiting for the current generation to finish.',
       running: 'Generating — ' + ({load: 'loading model weights', encode: 'encoding your prompt',
@@ -1525,7 +2608,8 @@
       cancelling: 'Cancellation requested — waiting for the engine to release resources.',
       cancelled: 'Generation cancelled.',
       succeeded: 'Image ready. Use View completed image below.',
-      failed: 'Generation failed — ' + job.error_code + '. See the server terminal for details.'
+      failed: failureMessages[job.error_code] ||
+        ('Generation failed — ' + job.error_code + '. See the server terminal for details.')
     };
     var feedback = descriptions[job.state];
     if (job.elapsed_ms !== null) feedback += ' Elapsed: ' + (job.elapsed_ms / 1000).toFixed(0) + ' s.';
@@ -1580,6 +2664,9 @@
     var grid = $('history-grid');
     grid.replaceChildren();
     $('history-empty').hidden = ids.length > 0;
+    var note = $('history-missing-note');
+    note.hidden = true;
+    note.textContent = '';
     ids.slice().reverse().forEach(function (id) {
       var job = jobCache[id];
       if (!job) return;
@@ -1590,10 +2677,25 @@
         image.src = job.image_url;
         image.alt = job.config.prompt;
         image.loading = 'lazy';
+        image.addEventListener('error', function () {
+          // The grid is rebuilt on every refresh, so a discarded card's later
+          // error must not narrate for the CURRENT grid.
+          if (!card.isConnected) return;
+          // A failed request does not prove the file was tampered with (the
+          // server may be restarting), so state only what was observed.
+          card.classList.add('history-missing');
+          setText('history-missing-note', 'One or more saved images could not ' +
+            'be loaded. Their history entries are kept; open a job to see its ' +
+            'status, or use its "View job" details.');
+          $('history-missing-note').hidden = false;
+        });
         card.appendChild(image);
       }
       var label = document.createElement('p');
-      label.textContent = job.state + ' · seed ' + job.config.seed + ' · ' + job.config.prompt.slice(0, 160);
+      label.textContent = job.state +
+        (job.config.recipe === 'turbo' ? ' · Turbo' : '') +
+        ' · seed ' + job.config.seed + ' · ' +
+        job.config.prompt.slice(0, 160);
       card.appendChild(label);
       var view = document.createElement('button');
       view.type = 'button';
@@ -1606,7 +2708,7 @@
         forget.type = 'button';
         forget.className = 'btn-secondary';
         forget.textContent = 'Forget entry';
-        forget.title = 'Remove session metadata; image files stay on disk';
+        forget.title = 'Remove this saved history entry (job.json); the image file stays on disk';
         forget.addEventListener('click', function () { jobAction(id, 'forget'); });
         card.appendChild(forget);
       }
@@ -1676,6 +2778,16 @@
     });
   }
 
+  // The server's message is untrusted text: extract at most the ordinal
+  // ("reference 3 is not available…") and fall back to a neutral phrase.
+  function referenceNumberFromError(message) {
+    if (typeof message === 'string') {
+      var m = /^reference (\d{1,2}) is not available/.exec(message);
+      if (m && Number(m[1]) >= 1 && Number(m[1]) <= MAX_REFERENCES) return m[1];
+    }
+    return 'listed in the plan';
+  }
+
   function submitGeneration(config) {
     if (submittingJob) return;
     if (!config) {
@@ -1703,6 +2815,16 @@
       if (!job) {
         if (r.res && !r.res.ok && r.json && r.json.schema === ERROR_SCHEMA) {
           renderApiError(r.res, r.json);
+          // Recipe-combination refusals land on the controls they describe.
+          applyServerFieldErrors(r.json);
+          // The server names the ORDINAL, not the id: mirror it in the live
+          // status line so the user knows which thumbnail to re-upload.
+          if (r.json.code === 'reference_unavailable') {
+            setReferenceStatus('The server no longer holds reference image ' +
+              'number ' + referenceNumberFromError(r.json.message) +
+              ' — it was probably pruned. Remove it or upload it again. ' +
+              'Nothing was submitted.');
+          }
           jobFailure('Submission refused. See the configuration message.');
         } else {
           jobFailure('Submission response was lost or rejected. Check History before retrying; the job may have been accepted.');
@@ -1786,6 +2908,45 @@
       input.value = '';   // reset FIRST: the same file can be re-picked
       if (file) importConfigFile(file);
     });
+
+    // Reference images: the visible Add button opens the hidden multi-file
+    // input, and the input resets BEFORE the uploads start so picking the
+    // same file again still fires 'change'. Uploads are sequential and
+    // capacity-checked inside addReferenceFiles.
+    $('add-reference').addEventListener('click', function () {
+      if ($('add-reference').disabled) return;
+      $('reference-file').click();
+    });
+    $('reference-file').addEventListener('change', function (ev) {
+      var input = ev.currentTarget;
+      var files = input.files ? Array.prototype.slice.call(input.files) : [];
+      input.value = '';   // reset FIRST: re-picking the same file must work
+      addReferenceFiles(files);
+    });
+    // One delegated handler for the per-card buttons: the list is rebuilt on
+    // every render, so per-button listeners would need re-attaching.
+    $('reference-list').addEventListener('click', function (ev) {
+      var button = ev.target && ev.target.closest
+        ? ev.target.closest('button[data-action]') : null;
+      if (!button || button.disabled) return;
+      var card = button.closest('.reference-card');
+      if (!card) return;
+      var index = Array.prototype.indexOf.call($('reference-list').children, card);
+      var action = button.dataset.action;
+      if (action === 'remove') {
+        removeReference(index);
+        focusReferenceButton(card.dataset.referenceId, 'remove', index);
+      } else if (action === 'up' || action === 'down') {
+        var delta = action === 'up' ? -1 : 1;
+        moveReference(index, delta);
+        // Focus follows the MOVED card to its new position, so repeated
+        // presses keep moving the same image instead of the neighbour.
+        focusReferenceButton(card.dataset.referenceId, action, index + delta);
+      }
+    });
+    // Drag is never the ONLY way: it is not offered at all, so keyboard and
+    // pointer users get the same buttons.
+    renderReferences();
     $('view-result').addEventListener('click', function () {
       $('preview-frame').scrollIntoView({behavior: 'smooth', block: 'center'});
     });
@@ -1825,13 +2986,31 @@
       syncPlanStaleness();   // a random seed stale any visible result
     });
 
+    // Prompt rewriting: a suggestion flow, never an automatic edit. The
+    // proposal block is focusable so keyboard and screen-reader users land on
+    // it when it appears; Escape abandons it and returns to the prompt.
+    $('rewrite-btn').addEventListener('click', requestRewrite);
+    $('rewrite-apply').addEventListener('click', applyProposal);
+    $('rewrite-edit').addEventListener('click', editProposal);
+    $('rewrite-keep').addEventListener('click', keepOriginal);
+    $('rewrite-apply-ratio').addEventListener('click', function (ev) {
+      var name = ev.currentTarget.dataset.preset;
+      if (name) applyPreset(name);
+    });
+    $('rewrite-proposal').addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        keepOriginal();
+      }
+    });
+
     ['steps', 'seed', 'cfg', 'width', 'height', 'prompt', 'negative'].forEach(function (id) {
       $(id).addEventListener('input', function () {
         if (id === 'width' || id === 'height') {
           setPreviewAspect(Number($('width').value), Number($('height').value));
           syncPresetButtons();
         }
-        if (id === 'prompt') promptTouched = true;
+        if (id === 'prompt') { promptTouched = true; bumpPromptRevision(); }
         renderValidation(validateForm().errors);
         syncPlanStaleness();
       });
@@ -1841,15 +3020,34 @@
     // visible result clearly stale, not leave it looking validated.
     ['quant', 'offload', 'attention', 'vae-tiling', 'output-format'].forEach(function (id) {
       $(id).addEventListener('change', function () {
+        // An explicit format choice replaces any auto-switch explanation.
+        if (id === 'output-format') transparencySwitchNote = '';
         renderValidation(validateForm().errors);
         syncPlanStaleness();
       });
     });
 
+    // Transparency owns the jpg -> png switch, so it is wired separately
+    // from the change-only group above.
+    $('transparent').addEventListener('change', onTransparencyChange);
+
+    // Recipe: every radio in the group shares one handler, so the lock state
+    // is derived from whichever control the user (or an import) selected.
+    Array.prototype.forEach.call(
+      document.querySelectorAll('input[name="recipe"]'),
+      function (radio) {
+        radio.addEventListener('change', function () {
+          applyRecipeMode();
+          renderValidation(validateForm().errors);
+          syncPlanStaleness();
+        });
+      });
+
     window.addEventListener('hashchange', routeOnHashchange);
     initTheme();   // persisted theme applied before first paint of content
     initialRoute();
     syncPresetButtons();
+    applyRecipeMode();   // lock state matches the checked recipe on load
     renderValidation(validateForm().errors);
 
     var generate = $('generate-btn');
@@ -1876,7 +3074,7 @@
   // that shortens the whole-operation timeout so a stalled response BODY
   // can be observed quickly — production code never calls it.
   window.QwenStudio = {
-    version: 'w3-jobs',
+    version: 'w5-rewrite',
     formSnapshot: formSnapshot,
     buildEnvelope: buildEnvelope,
     validateForm: validateForm,
@@ -1890,8 +3088,56 @@
     applyTheme: applyTheme,
     readStoredTheme: readStoredTheme,
     jobDownloadName: jobDownloadName,
+    // Reference surface: the checks (and a curious operator) can assert the
+    // upload path, the ordering contract and the hard cap without a server.
+    referenceIds: referenceIds,
+    addReferenceFiles: addReferenceFiles,
+    removeReference: removeReference,
+    moveReference: moveReference,
+    parseReferenceResponse: parseReferenceResponse,
+    renderReferences: renderReferences,
+    MAX_REFERENCES: MAX_REFERENCES,
+    EDITABLE_KEYS: EDITABLE_KEYS,
+    // Recipe surface: the real-Chrome check drives the lock behaviour and
+    // reads what the draft would submit without a server.
+    RECIPES: RECIPES,
+    TURBO_STEPS: TURBO_STEPS,
+    currentRecipe: currentRecipe,
+    applyRecipeMode: applyRecipeMode,
+    // TEST-ONLY: opens the write gate without a live server so the offline
+    // checks can drive the upload path (production only ever opens it from a
+    // RECOGNIZED status document).
+    setApiAvailableForChecks: function (available) {
+      if (typeof available === 'boolean') setApiAvailable(available);
+    },
     setFetchTimeoutForChecks: function (ms) {
       if (Number.isInteger(ms) && ms > 0 && ms <= 60000) FETCH_TIMEOUT_MS = ms;
-    }
+    },
+    // Rewrite surface: the checks drive the suggestion flow offline (the
+    // rewriter gate, the strict answer parser, stale discard and the
+    // ratio->preset mapping) without a server or a model.
+    parseRewriteBlock: parseRewriteBlock,
+    parseRewriteAnswer: parseRewriteAnswer,
+    setRewriterState: setRewriterState,
+    presetForRatio: presetForRatio,
+    requestRewrite: requestRewrite,
+    applyProposal: applyProposal,
+    editProposal: editProposal,
+    keepOriginal: keepOriginal,
+    rewriteState: rewriteState,
+    // Renders a proposal the caller already validated with parseRewriteAnswer;
+    // the offline render check uses it so the proposal DOM is exercised for real.
+    showProposalForChecks: function (answer) {
+      var parsed = parseRewriteAnswer(answer);
+      if (parsed) showProposal(parsed);
+      return !!parsed;
+    },
+    // The RAW renderer, bypassing the parser: the offline check must be able
+    // to feed showProposal an answer the wire parser would reject, proving the
+    // renderer itself refuses to become an applyable suggestion.
+    showProposalRawForChecks: showProposal,
+    bumpPromptRevisionForChecks: function () { bumpPromptRevision(); },
+    PROMPT_MAX_CHARS: PROMPT_MAX_CHARS,
+    REWRITE_TIMEOUT_MS: REWRITE_TIMEOUT_MS
   };
 })();

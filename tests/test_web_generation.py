@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import base64
+import gc
 import json
 import threading
+import time
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +14,7 @@ import pytest
 
 from qwen_engine import cli
 from qwen_engine.core import GenerationResult
+from qwen_engine.errors import GenerationCancelled
 from qwen_engine.jobs import JobState
 from qwen_engine.web import api, server
 from qwen_engine.web.generation import WebGeneration
@@ -51,7 +55,8 @@ def test_enabled_status_means_submission_only_not_verified_memory(runtime):
     assert status['manifest']['verification'] == 'not_performed'
 
 
-def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, monkeypatch):
+@pytest.mark.parametrize("performance", [False, True])
+def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, monkeypatch, performance):
     events = []
 
     class Adapter:
@@ -72,8 +77,8 @@ def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, 
             return path
         def close(self): events.append('closed')
 
-    def verify(config):
-        events.append('verified')
+    def verify(config, *, reuse_policy=None):
+        events.append(('verified', reuse_policy))
         return SimpleNamespace(resolved={'weights': ()})
 
     def factory(*, trust_unbounded_host):
@@ -83,13 +88,13 @@ def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, 
 
     monkeypatch.setattr(cli, '_verify_assets', verify)
     monkeypatch.setattr(cli, '_make_adapter', factory)
-    service = WebGeneration(runtime, trust_unbounded_host=True)
+    service = WebGeneration(runtime, trust_unbounded_host=True, performance=performance)
     try:
         submitted = service.submit(envelope()).payload
         record = service.controller.wait(submitted['job_id'])
         doc = service.job_response(record.job_id).payload
         assert record.state == JobState.SUCCEEDED
-        assert events == ['verified', 'factory', ('load', {'weights': ()}), 'closed']
+        assert events == [('verified', None), 'factory', ('load', {'weights': ()}), 'closed']
         assert set(doc['phase_ms']) == {'load', 'encode', 'denoise', 'decode', 'save'}
         assert all(value >= 0 for value in doc['phase_ms'].values())
         assert doc['elapsed_ms'] >= sum(doc['phase_ms'].values())
@@ -97,15 +102,23 @@ def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, 
         assert doc['progress'] == {'completed_steps': 40, 'total_steps': 40}
         assert str(Path(runtime.output_dir).parent) not in json.dumps(doc)
         assert service.image(record.job_id) == PNG
+        report = Path(record.config.output_dir) / "performance.json"
+        assert report.exists() is performance
+        if performance:
+            metrics = json.loads(report.read_text())
+            assert metrics["status"] == "succeeded"
+            assert metrics["stages"][-1]["stage"] == "total_job"
+            assert 'red cube' not in report.read_text()
     finally:
         assert service.close()
 
 
-def test_assets_failure_never_creates_adapter_and_error_is_private(runtime, monkeypatch):
-    def fail(config): raise RuntimeError('/private/model/path secret detail')
+@pytest.mark.parametrize("performance", [False, True])
+def test_assets_failure_never_creates_adapter_and_error_is_private(runtime, monkeypatch, performance):
+    def fail(config, *, reuse_policy=None): raise RuntimeError('/private/model/path secret detail')
     monkeypatch.setattr(cli, '_verify_assets', fail)
     monkeypatch.setattr(cli, '_make_adapter', lambda **kw: pytest.fail('adapter loaded'))
-    service = WebGeneration(runtime)
+    service = WebGeneration(runtime, performance=performance)
     try:
         job_id = service.submit(envelope()).payload['job_id']
         service.controller.wait(job_id)
@@ -113,8 +126,91 @@ def test_assets_failure_never_creates_adapter_and_error_is_private(runtime, monk
         assert doc['state'] == 'failed' and doc['error_code'] == 'execution_failed'
         assert '/private' not in json.dumps(doc) and 'secret detail' not in json.dumps(doc)
         assert doc['image_url'] is None
+        report = Path(service.controller.get(job_id).config.output_dir) / "performance.json"
+        assert report.exists() is performance
+        if performance:
+            assert json.loads(report.read_text())["status"] == "failed"
+            assert 'secret detail' not in report.read_text()
     finally:
         assert service.close()
+
+
+def test_reuse_verified_assets_flows_into_job_verification(runtime, monkeypatch):
+    """The opt-in policy is carried verbatim into every job's asset
+    verification; the default (None) keeps the full per-job hash call."""
+    from qwen_engine.local_bundle import VerificationReusePolicy
+    seen = []
+
+    class Adapter:
+        def set_progress_callback(self, callback): pass
+        def load(self, config, assets): pass
+        def encode(self, config): return 'conditioning'
+        def denoise(self, config, conditioning): return 'latents'
+        def decode(self, latents): return PNG
+        def save(self, image, config):
+            path = Path(config.output_dir) / 'reuse.png'
+            path.write_bytes(image)
+            return path
+        def close(self): pass
+
+    def verify(config, *, reuse_policy=None):
+        seen.append(reuse_policy)
+        return SimpleNamespace(resolved={'weights': ()})
+
+    monkeypatch.setattr(cli, '_verify_assets', verify)
+    monkeypatch.setattr(cli, '_make_adapter', lambda **kw: Adapter())
+    policy = VerificationReusePolicy(max_age_s=5)
+    service = WebGeneration(runtime, reuse_verified_assets=policy)
+    try:
+        assert service.reuse_policy is policy  # pass-through, not a rebuild
+        job_id = service.submit(envelope()).payload['job_id']
+        assert service.controller.wait(job_id).state == JobState.SUCCEEDED
+    finally:
+        assert service.close()
+    assert seen == [policy]
+
+
+def test_reuse_age_below_one_second_refuses_the_service(runtime):
+    """The service constructor fail-fasts on the same grammar as the CLI
+    flag: positive, finite seconds only (the server maps this to exit 2)."""
+    for bad in (0, -1, float('nan'), float('inf')):
+        with pytest.raises(ValueError):
+            WebGeneration(runtime, reuse_verified_assets=bad)
+    service = WebGeneration(runtime, reuse_verified_assets=90)
+    try:
+        assert service.reuse_policy.max_age_s == 90
+    finally:
+        assert service.close()
+
+
+@pytest.mark.parametrize("kind", ["torch-identity", "typed-engine"])
+def test_gpu_oom_surfaces_the_typed_public_code(runtime, kind):
+    """End-to-end web contract: a CUDA OOM inside the executor must reach
+    the browser as 'out_of_gpu_memory' (the UI has a plain-language
+    message for it), never as the generic 'execution_failed', and must
+    stay free of exception text."""
+    from qwen_engine.errors import OutOfGpuMemoryError
+    from qwen_engine.web.generation import PUBLIC_ERROR_CODES
+
+    TorchOom = type("OutOfMemoryError", (RuntimeError,), {})
+    TorchOom.__module__ = "torch"
+
+    def execute(context):
+        if kind == "typed-engine":
+            raise OutOfGpuMemoryError("adapter device exhaustion")
+        raise TorchOom("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    service = WebGeneration(runtime, executor=execute)
+    try:
+        doc = service.submit(envelope()).payload
+        service.controller.wait(doc['job_id'])
+        doc = service.job_response(doc['job_id']).payload
+        assert doc['state'] == 'failed' and doc['error_code'] == 'out_of_gpu_memory'
+        assert 'CUDA out of memory' not in json.dumps(doc)
+        assert doc['image_url'] is None
+    finally:
+        assert service.close()
+    assert 'out_of_gpu_memory' in PUBLIC_ERROR_CODES
 
 
 def test_queued_and_running_cancel_keep_the_worker_serial(runtime):
@@ -185,6 +281,65 @@ def test_forget_preserves_files_and_list_is_bounded_ids_only(runtime):
         assert service.close()
 
 
+def test_restart_reloads_history_and_keeps_documents_importable(runtime):
+    service = WebGeneration(runtime, executor=save)
+    try:
+        job_id = service.submit(envelope(prompt='reloaded after restart')).payload['job_id']
+        record = service.controller.wait(job_id)
+        live = service.job_response(job_id).payload
+    finally:
+        assert service.close()
+
+    restarted = WebGeneration(runtime, executor=save)
+    try:
+        assert restarted.list_response().payload['jobs'] == [job_id]
+        doc = restarted.job_response(job_id).payload
+        # Same envelope shape as a live job: only the timing observations that
+        # only a live process can hold are absent/None.
+        assert set(doc) == set(live)
+        assert set(doc['config']) == set(live['config']) and len(doc['config']) == 15
+        assert doc['state'] == 'succeeded' and doc['elapsed_ms'] is None
+        assert doc['phase_ms'] == {} and doc['collect_ms'] is None
+        assert doc['image_url'] == '/api/v1/jobs/%s/image' % job_id
+        assert restarted.image(job_id) == PNG
+        exported = api.export_response(
+            runtime, json.dumps({'schema': api.WEB_PLAN_REQUEST_SCHEMA,
+                                 'config': doc['config']}).encode())
+        assert exported.status == 200
+        document = json.loads(exported.body)
+        assert document['seed'] == record.config.seed
+        imported = api.import_response(runtime, exported.body)
+        assert imported.status == 200
+        assert imported.payload['config']['prompt'] == 'reloaded after restart'
+    finally:
+        assert restarted.close()
+
+
+def test_restored_entry_with_a_damaged_image_stays_listed_and_refuses_the_image(runtime):
+    """The record is the history; only the image is gated. A damaged file must
+    not hide the entry (the UI could then neither show nor forget it) but it
+    must never be served either."""
+    service = WebGeneration(runtime, executor=save)
+    try:
+        job_id = service.submit(envelope(prompt='damaged on disk')).payload['job_id']
+        record = service.controller.wait(job_id)
+        assert service.image(job_id) == PNG
+    finally:
+        assert service.close()
+
+    (Path(record.config.output_dir) / record.artifact.filename).write_bytes(PNG + b'!')
+    restarted = WebGeneration(runtime, executor=save)
+    try:
+        assert restarted.list_response().payload['jobs'] == [job_id]
+        doc = restarted.job_response(job_id).payload
+        assert doc['state'] == 'succeeded' and doc['image_url'] == '/api/v1/jobs/%s/image' % job_id
+        with pytest.raises(api.ApiError) as refused:
+            restarted.image(job_id)
+        assert (refused.value.status, refused.value.code) == (404, 'image_unavailable')
+    finally:
+        assert restarted.close()
+
+
 def test_shutdown_cancels_live_and_queued_jobs_and_releases_executor(runtime):
     started, released = threading.Event(), threading.Event()
     def execute(context):
@@ -249,6 +404,44 @@ def test_bad_submissions_create_no_job_or_output(runtime, values, code):
         assert service.close()
 
 
+@pytest.mark.parametrize('values,field', [
+    ({'recipe': 'turbo'}, 'steps'),
+    ({'recipe': 'turbo', 'steps': 8, 'negative_prompt': 'blurry',
+      'true_cfg_scale': 4.0}, 'true_cfg_scale'),
+    ({'recipe': 'turbo', 'steps': 8, 'quant': 'q8'}, 'quant'),
+])
+def test_turbo_submissions_refuse_the_gated_combination_on_its_own_field(
+        runtime, values, field):
+    service = WebGeneration(runtime, executor=save)
+    try:
+        with pytest.raises(api.ApiError) as caught:
+            service.submit(envelope(**values))
+        # GenerationConfig itself enforces the Turbo gates, so the refusal
+        # arrives from config validation (invalid_config) before the adapter
+        # policy stage is reached.
+        assert caught.value.code == 'invalid_config'
+        # The field must be NAMED so the UI can point at the control; a job
+        # is never enqueued for a combination the adapter will refuse.
+        assert [f for f, _ in caught.value.field_errors] == [field]
+        assert not service.controller.snapshots()
+        assert not list(Path(runtime.output_dir).iterdir())
+    finally:
+        assert service.close()
+
+
+def test_turbo_submission_is_accepted_with_the_gated_defaults(runtime):
+    service = WebGeneration(runtime, executor=save)
+    try:
+        response = service.submit(envelope(recipe='turbo', steps=8))
+        assert response.status == 202
+        config = service.controller.snapshots()[0].config
+        assert (config.recipe.value, config.steps, config.quant.value) == ('turbo', 8, 'fp16')
+        # The public job document carries the recipe so History can label it.
+        assert response.payload['config']['recipe'] == 'turbo'
+    finally:
+        assert service.close()
+
+
 @pytest.mark.parametrize('method,suffix,kind', [
     ('GET', '', 'job'), ('GET', '/image', 'image'),
     ('POST', '/cancel', 'cancel'), ('POST', '/forget', 'forget'),
@@ -261,3 +454,129 @@ def test_exact_job_routes_and_method_policy(method, suffix, kind):
     assert caught.value.status == 405
     with pytest.raises(api.ApiError):
         server.resolve_route(method, '/api/v1/jobs/' + job_id + suffix + '?path=/etc/passwd')
+
+
+class TensorOwner:
+    """Weakref-able stand-in for an object owning CUDA tensors."""
+
+
+@pytest.mark.parametrize('kind', ['cancelled', 'failed'])
+def test_terminal_web_jobs_release_executor_frames_without_gc(runtime, monkeypatch, kind):
+    refs = []
+
+    class Adapter:
+        def set_progress_callback(self, callback):
+            self.progress = callback
+
+        def set_cancel_event(self, event):
+            self.event = event
+
+        def load(self, config, assets):
+            pass
+
+        def encode(self, config):
+            return 'conditioning'
+
+        def denoise(self, config, conditioning):
+            owner = TensorOwner()
+            refs.append(weakref.ref(owner))
+            if kind == 'cancelled':
+                self.event.set()
+                raise GenerationCancelled('fixture mid-denoise cancellation')
+            raise RuntimeError('/private/adapter/failure secret detail')
+
+        def decode(self, latents):
+            raise AssertionError('unreachable')
+
+        def save(self, image, config):
+            raise AssertionError('unreachable')
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli, '_verify_assets',
+                        lambda config, *, reuse_policy=None: SimpleNamespace(resolved={'weights': ()}))
+    monkeypatch.setattr(cli, '_make_adapter', lambda **kw: Adapter())
+    service = WebGeneration(runtime, trust_unbounded_host=True,
+                            memory_release=lambda: None)
+    try:
+        gc.collect()
+        gc.disable()
+        job_id = service.submit(envelope()).payload['job_id']
+        done = service.controller.wait(job_id)
+        # the real serial worker already finished handling the exception, so
+        # refcounting alone (cyclic GC off for the whole window) must have
+        # freed the failing adapter frame and its tensor owner
+        assert refs and all(ref() is None for ref in refs)
+    finally:
+        gc.enable()
+    try:
+        doc = service.job_response(job_id).payload
+        if kind == 'cancelled':
+            assert done.state == JobState.CANCELLED and doc['error_code'] is None
+        else:
+            assert done.state == JobState.FAILED and doc['error_code'] == 'execution_failed'
+            assert 'secret detail' not in json.dumps(doc)
+    finally:
+        assert service.close()
+
+
+def test_job_documents_expose_boundary_release_cost_only_for_non_success(runtime):
+    calls = []
+    collected = threading.Event()
+    started, release = threading.Event(), threading.Event()
+
+    def collect():
+        calls.append(1)
+        collected.set()
+
+    def execute(context):
+        if context.config.prompt == 'boom':
+            raise RuntimeError('fixture web fault')
+        if context.config.prompt == 'cancel':
+            started.set()
+            assert release.wait(5)
+            context.check_cancelled()
+        return save(context)
+
+    def recorded(job_id):
+        # the collect duration is recorded just after the terminal state
+        # becomes visible; bounded wait, the serial worker writes it directly
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            value = service.controller.collect_ms(job_id)
+            if value is not None:
+                return value
+            time.sleep(0.005)
+        raise AssertionError('boundary release duration was never recorded')
+
+    service = WebGeneration(runtime, executor=execute, memory_release=collect)
+    try:
+        failed = service.submit(envelope(prompt='boom')).payload['job_id']
+        assert service.controller.wait(failed).state == JobState.FAILED
+        assert collected.wait(5) and len(calls) == 1
+        value = recorded(failed)
+        doc = service.job_response(failed).payload
+        assert doc['collect_ms'] == value and doc['error_code'] == 'execution_failed'
+        collected.clear()
+
+        cancelled = service.submit(envelope(prompt='cancel')).payload['job_id']
+        assert started.wait(5)
+        assert service.job_response(cancelled, action='cancel').payload['state'] == 'cancelling'
+        release.set()
+        assert service.controller.wait(cancelled).state == JobState.CANCELLED
+        assert collected.wait(5) and len(calls) == 2
+        value = recorded(cancelled)
+        doc = service.job_response(cancelled).payload
+        assert doc['collect_ms'] == value and doc['error_code'] is None
+        assert doc['image_url'] is None
+        collected.clear()
+
+        good = service.submit(envelope(prompt='ok')).payload['job_id']
+        assert service.controller.wait(good).state == JobState.SUCCEEDED
+        doc = service.job_response(good).payload
+        assert doc['collect_ms'] is None and doc['image_url'] is not None
+        assert len(calls) == 2
+    finally:
+        release.set()
+        assert service.close()

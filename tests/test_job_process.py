@@ -215,13 +215,34 @@ def test_unrequested_child_cancel_is_not_accepted(result_context):
         p._result(document, result_context, 130)
 
 
-@pytest.mark.parametrize("code", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("code", [1, 2, 3, 4, 5, 6])
 def test_failure_preserves_fixed_category_without_arbitrary_diagnostics(result_context, code):
     document = result(result_context)
     document.update(status="failed", exit_code=code, output_path=None, error_code=w.ERROR_CODES[code])
     with pytest.raises(p.GenerationProcessError) as caught:
         p._result(document, result_context, code)
     assert str(caught.value) == w.ERROR_CODES[code]
+
+
+def test_worker_oom_cause_is_reclassified_by_the_shared_classifier(result_context):
+    """The controller boundary decides the job error_code with jobs._is_gpu_oom
+    over the raised exception; the mapped worker OOM must carry the typed
+    cause so the web path records out_of_gpu_memory, not execution_failed —
+    while the other codes keep no OOM cause."""
+    from qwen_engine.jobs import _is_gpu_oom
+
+    document = result(result_context)
+    document.update(status="failed", exit_code=6, output_path=None,
+                    error_code=w.ERROR_CODES[6])
+    with pytest.raises(p.GenerationProcessError) as caught:
+        p._result(document, result_context, 6)
+    assert str(caught.value) == "out_of_gpu_memory"
+    assert _is_gpu_oom(caught.value) is True
+
+    document.update(exit_code=1, error_code=w.ERROR_CODES[1])
+    with pytest.raises(p.GenerationProcessError) as plain:
+        p._result(document, result_context, 1)
+    assert _is_gpu_oom(plain.value) is False
 
 
 @pytest.mark.parametrize("kind", ["duplicate", "nonfinite", "deep", "oversize", "empty"])

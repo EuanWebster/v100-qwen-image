@@ -26,6 +26,7 @@ from pathlib import Path
 
 from qwen_engine._jsonsafe import strict_json_loads
 from qwen_engine.core import GenerationResult
+from qwen_engine.errors import OutOfGpuMemoryError
 from qwen_engine.jobs import JobCancelled, JobContext, JobError
 from qwen_engine.config import GenerationConfig
 from qwen_engine.generation_worker import (
@@ -115,6 +116,15 @@ def _result(document, context, exit_code):
     if (status == "failed" and document["output_path"] is None and exit_code in ERROR_CODES
             and (document["error_code"] == ERROR_CODES[exit_code]
                  or exit_code == 1 and document["error_code"] == "invalid_cancellation_acknowledgment")):
+        if exit_code == 6:
+            # The child already classified a CUDA OOM with the shared
+            # jobs.py classifier; carrying the typed OutOfGpuMemoryError as
+            # __cause__ lets that SAME classifier (which follows only
+            # explicit causes) re-recognise it at the controller boundary,
+            # so a worker OOM records out_of_gpu_memory, not execution_failed.
+            raise GenerationProcessError(
+                "out_of_gpu_memory") from OutOfGpuMemoryError(
+                "generation worker reported a CUDA out-of-memory failure")
         raise GenerationProcessError(document["error_code"])
     raise GenerationProcessError("incoherent_result_status")
 
@@ -246,7 +256,7 @@ class GenerationProcessExecutor:
         if not self._lease.acquire(blocking=False):
             raise GenerationProcessError("executor_busy")
         scratch = proc = None
-        primary = None
+        failed = False
         completed = False
         try:
             if (self._closing.is_set() or self._active is not None
@@ -275,8 +285,8 @@ class GenerationProcessExecutor:
             result = self._await(proc, response, context)
             completed = True  # clean worker publication; controller still verifies artifact
             return result
-        except BaseException as exc:
-            primary = exc
+        except BaseException:
+            failed = True
             raise
         finally:
             try:
@@ -287,7 +297,7 @@ class GenerationProcessExecutor:
                 self._closing.set()
                 if self.last_cleanup_error is None:
                     self.last_cleanup_error = "worker_cleanup_pending"
-                if primary is None and not completed:
+                if not failed and not completed:
                     raise
                 # Preserve primary failures/interrupts and a coherent clean
                 # worker result. The controller still freshly verifies files.
