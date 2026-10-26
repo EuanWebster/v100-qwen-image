@@ -6,12 +6,17 @@ is the point: single flight, cancel and deadline are thread behaviour.
 """
 from __future__ import annotations
 
+import base64
+import io
 import json
+import pathlib
 import threading
 import time
 
 import pytest
+from PIL import Image
 
+from qwen_engine import reference_store
 from qwen_engine import rewrite as rw
 from qwen_engine import rewrite_client as rc
 from qwen_engine.web import api
@@ -57,6 +62,33 @@ def request(**overrides) -> dict:
 def code(exc_info) -> str:
     assert isinstance(exc_info.value, api.ApiError)
     return exc_info.value.code
+
+
+def store_image(root, mode="RGB", size=(64, 48), colour=(200, 30, 30),
+                fmt="PNG"):
+    """Store a real image and return its id (the store is the real store)."""
+    pathlib.Path(root).mkdir(parents=True, exist_ok=True)
+    buffer = io.BytesIO()
+    Image.new(mode, size, colour).save(buffer, fmt)
+    return reference_store.put_bytes(root, buffer.getvalue())
+
+
+def user_parts(log_entry: dict) -> list:
+    return log_entry["messages"][-1]["content"]
+
+
+def edit_service(tmp_path, transport, **overrides) -> tuple:
+    """A service with a REAL store and the edit request that names one image.
+
+    An edit rewrite legally requires at least one reference, so every edit-path
+    test starts from a stored image rather than a request the server refuses.
+    """
+    root = tmp_path / "store"
+    ref = store_image(root)
+    body = transport if callable(transport) else (lambda _raw, _b=transport: _b)
+    svc = rs.RewriteService(settings(references_dir=str(root), **overrides),
+                            transport=body)
+    return svc, request(task="edit", image_ids=[ref])
 
 
 # ---------------------------------------------------------------------------
@@ -171,14 +203,15 @@ def test_prompt_survives_verbatim_including_unicode_and_newlines():
     assert payload["original_prompt"] == draft
 
 
-def test_the_system_prompt_selected_matches_the_task():
+def test_the_system_prompt_selected_matches_the_task(tmp_path):
     seen = {}
 
     def transport(body):
         seen["doc"] = json.loads(body)
         return answer()
 
-    service(transport).submit(request(task="edit", prompt="recolour it"))
+    svc, edit = edit_service(tmp_path, transport)
+    svc.submit(dict(edit, prompt="recolour it"))
     assert seen["doc"]["messages"][0]["content"] == PROMPTS["edit"]
 
 
@@ -211,14 +244,15 @@ def test_the_production_path_sends_the_whole_trained_profile():
     }
 
 
-def test_the_edit_path_sends_penalty_zero_and_its_own_budget():
+def test_the_edit_path_sends_penalty_zero_and_its_own_budget(tmp_path):
     seen = {}
 
     def transport(body):
         seen["doc"] = json.loads(body)
         return answer()
 
-    service(transport).submit(request(task="edit", prompt="recolour it"))
+    svc, edit = edit_service(tmp_path, transport)
+    svc.submit(dict(edit, prompt="recolour it"))
     document = seen["doc"]
     assert document["presence_penalty"] == 0.0
     assert document["max_tokens"] == 24000
@@ -226,14 +260,15 @@ def test_the_edit_path_sends_penalty_zero_and_its_own_budget():
     assert document["min_p"] == 0.0
 
 
-def test_sampling_comes_from_the_r1_profile_not_the_service():
+def test_sampling_comes_from_the_r1_profile_not_the_service(tmp_path):
     seen = {}
 
     def transport(body):
         seen["max_tokens"] = json.loads(body)["max_tokens"]
         return answer()
 
-    service(transport).submit(request(task="edit", prompt="x"))
+    svc, edit = edit_service(tmp_path, transport)
+    svc.submit(dict(edit, prompt="x"))
     assert seen["max_tokens"] == rw.sampling("edit")["max_new_tokens"]
 
 
@@ -251,11 +286,11 @@ def test_unparsed_answer_is_200_with_no_prompt_to_apply():
     assert payload["ratio"] is None and payload["ratio_conflict"] is False
 
 
-def test_a_ratio_conflict_offers_neither_ratio():
+def test_a_ratio_conflict_offers_neither_ratio(tmp_path):
     body = reply(json.dumps({"rewritten_prompt": "Kept.",
                              "wh_ratio": "16:9", "ratio_follow": "<image1>"}))
-    payload = service(body).submit(request(task="edit", prompt="x",
-                                           draft_revision=1)).payload
+    svc, edit = edit_service(tmp_path, body)
+    payload = svc.submit(dict(edit, prompt="x", draft_revision=1)).payload
     assert payload["ratio"] is None and payload["ratio_conflict"] is True
     assert payload["rewritten_prompt"] == "Kept."
 
@@ -590,10 +625,16 @@ def test_prompt_at_exactly_the_cap_is_accepted():
     assert len(payload["original_prompt"]) == rw.PROMPT_MAX_CHARS
 
 
-def test_non_empty_image_ids_are_422_until_reference_support_lands():
+def test_an_edit_rewrite_without_references_is_refused_not_downgraded():
+    with pytest.raises(api.ApiError) as exc:
+        service(lambda body: answer()).submit(request(task="edit"))
+    assert (exc.value.status, exc.value.code) == (422, "reference_required")
+
+
+def test_malformed_image_ids_are_an_envelope_refusal():
     with pytest.raises(api.ApiError) as exc:
         service(lambda body: answer()).submit(request(image_ids=[1]))
-    assert (exc.value.status, exc.value.code) == (422, "task_unsupported")
+    assert (exc.value.status, exc.value.code) == (400, "invalid_envelope")
 
 
 def test_validation_happens_before_the_slot_is_claimed():
@@ -723,3 +764,181 @@ def test_status_block_refuses_a_backend_name_that_would_leak_a_location():
                   "backend": "http://127.0.0.1:8079/v1", "reason": ""}
     with pytest.raises(ValueError):
         web_api.validate_rewrite_block(configured)
+
+
+# ---------------------------------------------------------------------------
+# Edit rewriting with reference images (d3): the images the backend receives
+#
+# The store is the REAL store (tmp dirs, real Pillow); the backend is a fake
+# transport that records the request it was handed, so every assertion below is
+# about the bytes that would have left the server.
+# ---------------------------------------------------------------------------
+
+
+def test_edit_rewrite_sends_the_references_first_and_in_the_given_order(tmp_path):
+    first = store_image(tmp_path / "store", colour=(255, 0, 0))
+    second = store_image(tmp_path / "store", colour=(0, 0, 255))
+    log: list = []
+    svc = rs.RewriteService(
+        rs.RewriteSettings(backend="local-llm", endpoint=ENDPOINT, model=MODEL,
+                           prompts=dict(PROMPTS), timeout=30.0,
+                           references_dir=str(tmp_path / "store")),
+        transport=lambda raw: log.append(json.loads(raw)) or answer())
+    payload = svc.submit(request(task="edit", prompt="make it night",
+                                 image_ids=[second, first])).payload
+    assert payload["task"] == "edit"
+    parts = user_parts(log[0])
+    assert [p["type"] for p in parts] == ["image_url", "image_url", "text"]
+    assert parts[2]["text"] == "make it night"
+    # The ORDER is the argument order, not the store's or a sorted one: image 1
+    # is <image1> in the edit system prompt.
+    assert parts[0]["image_url"]["url"] != parts[1]["image_url"]["url"]
+    assert parts[0]["image_url"]["url"] == rs._reference_image_uri(
+        str(tmp_path / "store"), second, 1)
+
+
+def test_reference_images_are_png_data_uris_never_paths_or_urls(tmp_path):
+    root = tmp_path / "store"
+    ref = store_image(root, fmt="JPEG", mode="RGB")
+    log: list = []
+    svc = rs.RewriteService(
+        rs.RewriteSettings(backend="local-llm", endpoint=ENDPOINT, model=MODEL,
+                           prompts=dict(PROMPTS), timeout=30.0,
+                           references_dir=str(root)),
+        transport=lambda raw: log.append(json.loads(raw)) or answer())
+    svc.submit(request(task="edit", image_ids=[ref]))
+    url = user_parts(log[0])[0]["image_url"]["url"]
+    assert url.startswith("data:image/png;base64,")
+    # The source was a JPEG; the wire copy is normalised to PNG data.
+    assert base64.b64decode(url.split(",", 1)[1])[:8] == b"\x89PNG\r\n\x1a\n"
+    # Nothing locatable travels: no store path, no filesystem path, no scheme.
+    wire = json.dumps(log[0])
+    assert str(root) not in wire and ref not in wire
+    assert "file:" not in wire and "http://127.0.0.1:8079/v1" not in url
+
+
+def wire_size(uri: str) -> tuple[int, int]:
+    return Image.open(io.BytesIO(base64.b64decode(uri.split(",", 1)[1]))).size
+
+
+def test_references_are_downscaled_but_never_enlarged(tmp_path):
+    root = tmp_path / "store"
+    big = store_image(root, size=(1600, 800), fmt="JPEG")
+    small = store_image(root, size=(40, 20))
+    # The stored ORIGINAL is untouched: only the wire copy is shrunk.
+    assert Image.open(io.BytesIO(reference_store.read_blob(root, big))).size == (1600, 800)
+    assert wire_size(rs._reference_image_uri(str(root), big, 1)) == (768, 384)
+    # And a small reference is sent at its own size, not blown up.
+    assert wire_size(rs._reference_image_uri(str(root), small, 1)) == (40, 20)
+
+
+def test_the_downscale_bound_preserves_aspect_and_stays_within_the_cap(tmp_path):
+    root = tmp_path / "store"
+    # A non-power-of-two portrait: the longest side lands exactly on the cap,
+    # the short side is rounded, and the aspect ratio survives.
+    ref = store_image(root, size=(500, 999))
+    width, height = wire_size(rs._reference_image_uri(str(root), ref, 1))
+    assert max(width, height) == rs.REWRITE_IMAGE_MAX_DIM
+    assert width < height
+    assert width / height == pytest.approx(500 / 999, abs=0.005)
+
+
+def test_no_image_is_sent_before_the_store_is_configured_for_a_t2i_rewrite(tmp_path):
+    """A t2i rewrite stays text-only and must not touch the store at all."""
+    root = tmp_path / "store"
+    store_image(root)
+    log: list = []
+    svc = rs.RewriteService(
+        rs.RewriteSettings(backend="local-llm", endpoint=ENDPOINT, model=MODEL,
+                           prompts=dict(PROMPTS), timeout=30.0,
+                           references_dir=str(root)),
+        transport=lambda raw: log.append(json.loads(raw)) or answer())
+    svc.submit(request())
+    assert user_parts(log[0]) == "a cat"
+
+
+def test_alpha_is_flattened_onto_white_not_dropped(tmp_path):
+    """A half-transparent red pixel over white must arrive PINK-ish, not the
+    arbitrary RGB that Pillow leaves under an alpha pixel, and never black."""
+    root = tmp_path / "store"
+    ref = store_image(root, mode="RGBA", size=(8, 8), colour=(255, 0, 0, 0))
+    uri = rs._reference_image_uri(str(root), ref, 1)
+    image = Image.open(io.BytesIO(base64.b64decode(uri.split(",", 1)[1])))
+    assert image.mode == "RGB"
+    assert image.getpixel((4, 4)) == (255, 255, 255)
+    # Half alpha of pure red composites to a pink, not to (255,0,0) or (0,0,0).
+    assert rs._flatten_alpha(Image.new("RGBA", (2, 2), (255, 0, 0, 128))).getpixel((0, 0)) == (255, 127, 127)
+
+
+def test_an_unknown_reference_id_is_404_without_a_path(tmp_path):
+    root = tmp_path / "store"
+    store_image(root)  # the store exists and holds something else
+    svc = rs.RewriteService(
+        rs.RewriteSettings(backend="local-llm", endpoint=ENDPOINT, model=MODEL,
+                           prompts=dict(PROMPTS), timeout=30.0,
+                           references_dir=str(root)),
+        transport=lambda raw: answer())
+    with pytest.raises(api.ApiError) as exc:
+        svc.submit(request(task="edit", image_ids=["b" * 64]))
+    assert (exc.value.status, exc.value.code) == (404, "reference_unknown")
+    assert str(root) not in exc.value.message and "b" * 64 not in exc.value.message
+    assert "reference 1" in exc.value.message
+
+
+def test_an_unconfigured_store_refuses_an_edit_rewrite():
+    with pytest.raises(api.ApiError) as exc:
+        service(answer()).submit(request(task="edit", image_ids=["a" * 64]))
+    assert (exc.value.status, exc.value.code) == (422, "reference_unavailable")
+
+
+def test_a_blocked_decode_holds_no_lock_and_never_deadlocks(tmp_path):
+    """The decode runs on the worker thread, outside the Condition.
+
+    Proven by parking a decode and showing that, meanwhile, a status read and a
+    competing submit both answer at once — the second refused by the SLOT rule
+    (503 busy), which is only reachable while the lock is free. If the decode
+    held the lock, both would hang and the whole test would time out.
+    """
+    root = tmp_path / "store"
+    ref = store_image(root)
+    release = threading.Event()
+    entered = threading.Event()
+    from qwen_engine.web import rewrite_service as module
+
+    original = module._reference_image_uri
+
+    def slow(root_arg, reference_id, ordinal):
+        entered.set()
+        assert release.wait(10.0)
+        return original(root_arg, reference_id, ordinal)
+
+    module._reference_image_uri = slow
+    try:
+        svc = rs.RewriteService(
+            rs.RewriteSettings(backend="local-llm", endpoint=ENDPOINT, model=MODEL,
+                               prompts=dict(PROMPTS), timeout=30.0,
+                               references_dir=str(root)),
+            transport=lambda raw: answer())
+        done: list = []
+
+        def first():
+            try:
+                done.append(svc.submit(request(task="edit", image_ids=[ref]))
+                            .payload["task"])
+            except BaseException as exc:  # pragma: no cover - failure detail
+                done.append(exc)
+
+        thread = threading.Thread(target=first)
+        thread.start()
+        assert entered.wait(10.0)
+        assert svc.status_block()["code"] == "rewrite_available"
+        with pytest.raises(api.ApiError) as exc:
+            svc.submit(request(task="edit", image_ids=[ref]))
+        assert (exc.value.status, exc.value.code) == (503, "rewrite_busy")
+        release.set()
+        thread.join(10.0)
+        assert not thread.is_alive()
+        assert done == ["edit"]
+    finally:
+        module._reference_image_uri = original
+        release.set()

@@ -15,6 +15,11 @@ from qwen_engine.web import api
 
 ENVELOPE = api.WEB_PLAN_REQUEST_SCHEMA
 
+#: Two syntactically valid reference ids. The api layer checks identity only;
+#: whether they resolve to a stored blob is the service's question.
+ID_A = "a" * 64
+ID_B = "b" * 64
+
 
 def runtime(**overrides) -> api.WebRuntime:
     summary = overrides.pop("manifest_summary", None)
@@ -544,8 +549,15 @@ def test_rewrite_request_accepts_the_exact_five_key_envelope():
     (lambda d: d.update(extra=1), 400, "invalid_envelope"),
     (lambda d: d.update(schema="qwen_engine.web_rewrite.v1"), 400, "invalid_envelope"),
     (lambda d: d.update(task="video"), 422, "task_unsupported"),
-    (lambda d: d.update(image_ids=[1]), 422, "task_unsupported"),
+    # image_ids is an ordered list of stored reference ids: the id GRAMMAR is
+    # an envelope question (400), while a task that cannot use images is a
+    # 422. An int or short hex is not an id at all.
+    (lambda d: d.update(image_ids=[1]), 400, "invalid_envelope"),
     (lambda d: d.update(image_ids=["abc"]), 400, "invalid_envelope"),
+    (lambda d: d.update(image_ids=["A" * 64]), 400, "invalid_envelope"),
+    (lambda d: d.update(image_ids=[ID_A]), 422, "task_unsupported"),
+    (lambda d: d.update(image_ids="x"), 400, "invalid_envelope"),
+    (lambda d: d.update(image_ids=[ID_A] * 11), 422, "too_many_references"),
     (lambda d: d.update(draft_revision=-1), 400, "invalid_envelope"),
     (lambda d: d.update(draft_revision=True), 400, "invalid_envelope"),
     (lambda d: d.update(draft_revision=1.5), 400, "invalid_envelope"),
@@ -643,17 +655,32 @@ def test_validate_rewrite_fields_is_the_same_rule_the_builder_applies():
     good = {"task": "t2i", "prompt": "a red bicycle",
             "draft_revision": 0, "image_ids": []}
     assert api.validate_rewrite_fields(good) == good
-    assert api.validate_rewrite_fields(dict(good, task="edit"))["task"] == "edit"
+    # An edit rewrite is only legal WITH references, and the builder must agree.
+    edit = dict(good, task="edit", image_ids=[ID_A])
+    assert api.validate_rewrite_fields(edit) == edit
+    assert api.build_rewrite_request(rewrite_bytes(
+        task="edit", image_ids=[ID_A])) == edit
     assert api.build_rewrite_request(rewrite_bytes()) == good
     for bad, status, code in [
         ({"task": "t2i", "prompt": "x", "draft_revision": 0}, 400, "invalid_envelope"),
         (dict(good, prompt="  "), 400, "invalid_envelope"),
         (dict(good, task="video"), 422, "task_unsupported"),
-        # `edit` with NO references is legal (that is what the UI sends when
-        # the draft is edit-shaped but no image is attached); with references
-        # it is announced-unsupported, never silently downgraded to t2i.
-        (dict(good, task="edit", image_ids=[4]), 422, "task_unsupported"),
+        # An edit rewrite NEEDS its references: the edit system prompt names
+        # them <imageN>, so a text-only edit rewrite is refused rather than
+        # sent as a question the model would invent answers to. t2i is the
+        # reverse: it has no <imageN> to point at, so images are refused
+        # there instead of being silently dropped.
+        (dict(good, task="edit"), 422, "reference_required"),
+        (dict(good, task="edit", image_ids=[ID_A]), 200, None),
+        (dict(good, task="edit", image_ids=[ID_A, ID_B]), 200, None),
+        # Duplicates follow edit-job validation, which caps the count and
+        # checks the grammar but does not forbid repeating one.
+        (dict(good, task="edit", image_ids=[ID_A, ID_A]), 200, None),
+        (dict(good, task="edit", image_ids=[ID_A] * 11), 422, "too_many_references"),
     ]:
+        if status == 200:
+            assert api.validate_rewrite_fields(bad)["image_ids"] == bad["image_ids"]
+            continue
         with pytest.raises(api.ApiError) as caught:
             api.validate_rewrite_fields(bad)
         assert (caught.value.status, caught.value.code) == (status, code), bad

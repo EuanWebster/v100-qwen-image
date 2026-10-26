@@ -1462,6 +1462,31 @@ def test_w5_rewrite_ui_is_a_suggestion_flow_not_an_automatic_edit():
     assert "draftRevision++" in staleness
     assert "promptRevision" not in staleness
 
+    # -- an edit rewrite sends its references, in the displayed order -----
+    # The request must carry the ids the list shows, in that order: reference N
+    # is <imageN> in the edit system prompt. A hardcoded empty list would send
+    # an edit draft with no pictures, and a sorted list would silently
+    # re-point every <imageN>.
+    assert "image_ids: []" not in req, \
+        "the request must not hardcode an empty image_ids"
+    assert "image_ids: imageIds" in req
+    assert "var imageIds = task === 'edit' ? referenceIds() : [];" in req
+    assert "var task = rewriteTask();" in req
+    # The button is availability-gated on the task it would send.
+    available = _js_function(js, "rewriteAvailable")
+    assert "referenceIds().length > 0" in available
+    assert "rewriteTask() === 't2i'" in available
+    assert "disabled = !rewriteAvailable()" in _js_function(js, "setRewriterState")
+    # A reference change is a rewrite input: it must bump the PROMPT revision
+    # (which kills a visible proposal), not only the plan's draftRevision.
+    for fn in ("removeReference", "moveReference"):
+        body = _js_function(js, fn)
+        assert "bumpPromptRevision();" in body, \
+            f"{fn} must stale a visible rewrite proposal"
+    add = _js_function(js, "addReferenceFiles")
+    assert "bumpPromptRevision();" in add or "bumpPromptRevision();" in \
+        js[js.index("references.push(ref)"):js.index("references.push(ref)") + 600]
+
     # -- no model-generated text is ever treated as HTML ------------------
     for fn in ("showProposal", "renderRewriteError", "setRewriterState",
                "requestRewrite", "bumpPromptRevision"):

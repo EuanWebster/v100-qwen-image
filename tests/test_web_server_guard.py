@@ -7,6 +7,7 @@ functions that the handler delegates to, plus the CLI contract.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tomllib
@@ -754,10 +755,27 @@ def test_main_returns_2_for_a_rewrite_configuration_error(monkeypatch, capsys):
     # main() must fail BEFORE any bind, so no socket is created here.
     args = ["--rewrite-backend", "local-llm"]
     monkeypatch.setattr(server, "build_rewrite_service",
-                        lambda _args: (_ for _ in ()).throw(
+                        lambda _args, _refs=None: (_ for _ in ()).throw(
                             __import__("qwen_engine.rewrite_client",
                                        fromlist=["x"]).RewriteConfigError(
                                 "operator misconfiguration")))
     assert server.main(args) == 2
     err = capsys.readouterr().err
     assert "rewrite error:" in err and "operator misconfiguration" in err
+
+
+def test_main_hands_the_reference_store_to_the_rewriter(monkeypatch, tmp_path):
+    # Edit rewrites read their images from the server's reference store, so
+    # main() must pass the resolved store path, not leave it unset.
+    from qwen_engine import rewrite_client as rc
+    seen = []
+
+    def fake(args, references_dir=None):
+        seen.append(references_dir)
+        raise rc.RewriteConfigError("stop before bind")
+
+    monkeypatch.setattr(server, "build_rewrite_service", fake)
+    refs = tmp_path / "refs"
+    assert server.main(["--rewrite-backend", "local-llm",
+                        "--references-dir", str(refs)]) == 2
+    assert seen == [os.path.realpath(str(refs))]

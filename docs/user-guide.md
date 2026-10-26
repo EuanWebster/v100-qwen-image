@@ -309,7 +309,19 @@ prompt — not applied"* with your draft, the suggestion, and **Apply** / **Edit
 matches exactly). It never changes your draft unless you press Apply. Failed
 rewrites are typed: 503 disabled/busy/cancelled, 504 timeout, 502
 backend-unavailable or an invalid answer, 422 prompt too long (> 8000
-characters) or unsupported task.
+characters), unsupported task, or a reference count/set the task cannot use,
+and 404 for a reference id the server no longer holds.
+
+With reference images attached the rewrite is an **edit** rewrite, and it sends
+the references with the draft: each stored image is read on the server,
+alpha-flattened onto white, downscaled so no side exceeds 768 px, and sent as a
+PNG data URI with your draft to the same local LLM — in the order the images
+are listed, because the edit prompt refers to them as *image 1*, *image 2* and
+so on. Only those downscaled copies leave the server (as inline data, never as
+a URL or a path); the stored originals are unchanged. Without references the
+rewrite is text-only, and the button is unavailable in edit mode until one is
+attached. Changing, reordering or removing a reference makes any visible
+suggestion stale, exactly as editing the draft does.
 
 **Quality is only spot-checked** (7 requests, one prompt each, 19–191 s
 latency, from before the sampling-parameter fix that made the profile's full

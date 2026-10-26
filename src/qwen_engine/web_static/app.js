@@ -1036,12 +1036,28 @@
   var rewriteSeq = 0;
   var proposal = null;            // { prompt, original, revision }
 
+  // Whether Rewrite can be pressed right now. An edit rewrite names its
+  // references by number and the server refuses one without them, so the
+  // button is unavailable until at least one image is attached — the task is
+  // derived from the references, so this can never ask for an impossible edit.
+  function rewriteAvailable() {
+    if (!rewriteBackend || rewriteInFlight) return false;
+    return rewriteTask() === 't2i' || referenceIds().length > 0;
+  }
+
+  function refreshRewriteButton() {
+    var button = $('rewrite-btn');
+    if (!button) return;
+    button.hidden = !rewriteBackend;
+    button.disabled = !rewriteAvailable();
+  }
+
   function setRewriterState(rewriter) {
     rewriteBackend = rewriter ? rewriter.backend : null;
     var button = $('rewrite-btn');
     if (button) {
       button.hidden = !rewriteBackend;
-      button.disabled = !rewriteBackend || rewriteInFlight;
+      button.disabled = !rewriteAvailable();
     }
     var hint = $('rewrite-hint');
     if (hint) hint.hidden = !!rewriteBackend;
@@ -1089,6 +1105,14 @@
         ' characters; the rewriter accepts at most ' + PROMPT_MAX_CHARS + ' — nothing was sent.');
       return;
     }
+    var task = rewriteTask();
+    // The displayed order IS the conditioning order: reference N is <imageN>
+    // in the edit system prompt, so the ids go out exactly as rendered.
+    var imageIds = task === 'edit' ? referenceIds() : [];
+    if (task === 'edit' && !imageIds.length) {
+      setText('rewrite-error', 'An edit rewrite needs at least one reference image.');
+      return;
+    }
     var revision = promptRevision;
     var seq = ++rewriteSeq;
     rewriteInFlight = true;
@@ -1104,19 +1128,17 @@
       timeoutMs: REWRITE_TIMEOUT_MS,
       body: JSON.stringify({
         schema: REWRITE_REQUEST_SCHEMA,
-        task: rewriteTask(),
+        task: task,
         prompt: draft,
         draft_revision: revision,
-        image_ids: []
+        image_ids: imageIds
       })
     }, 'json').then(function (r) {
       if (seq !== rewriteSeq) return;        // a newer attempt superseded this
       rewriteInFlight = false;
       var button = $('rewrite-btn');
-      if (button) {
-        button.disabled = !rewriteBackend;
-        button.removeAttribute('aria-busy');
-      }
+      if (button) button.removeAttribute('aria-busy');
+      refreshRewriteButton();
       setText('rewrite-status', '');
       if (r.network) {
         // The draft is untouched: this is a failure to CONSULT, never an edit.
@@ -2244,6 +2266,10 @@
         }
         references.push(ref);
         renderReferences();
+        // The reference list is an input to the rewrite too: image N is what
+        // the rewrite calls <imageN>, so adding one changes the question.
+        bumpPromptRevision();
+        refreshRewriteButton();
         syncPlanStaleness();   // the draft now conditions on more images
         setReferenceStatus('Added reference image ' + references.length +
           ' (' + ref.width + '×' + ref.height +
@@ -2325,6 +2351,8 @@
     if (!(index >= 0 && index < references.length)) return;
     references.splice(index, 1);
     renderReferences();
+    bumpPromptRevision();   // every remaining <imageN> was renumbered
+    refreshRewriteButton();
     syncPlanStaleness();
     setReferenceStatus('Removed reference image ' + (index + 1) + '. ' +
       (references.length
@@ -2341,6 +2369,9 @@
     references[index] = references[target];
     references[target] = moved;
     renderReferences();
+    // Same set, different order: the rewrite's <imageN> mapping changed, so a
+    // visible proposal is stale even though the draft text did not move.
+    bumpPromptRevision();
     syncPlanStaleness();
     setReferenceStatus('Reference image ' + (index + 1) + ' is now image ' +
       (target + 1) + '. The prompt refers to images by number, so check your ' +

@@ -1034,7 +1034,9 @@ def _startup_config_or_exit(paths: dict[str, str | None]) -> int:
     return 0
 
 
-def build_rewrite_service(args: argparse.Namespace) -> _rewrite_service.RewriteService:
+def build_rewrite_service(args: argparse.Namespace,
+                          references_dir: str | None = None,
+                          ) -> _rewrite_service.RewriteService:
     """Construct the rewriter from the CLI flags, or refuse at startup.
 
     Operator errors are startup errors: a bad endpoint, a missing prompt or a
@@ -1043,7 +1045,8 @@ def build_rewrite_service(args: argparse.Namespace) -> _rewrite_service.RewriteS
     of this (its status block is four fixed keys).
 
     ``off`` still yields a real service (holding no client) so the status block
-    and the typed 503 exist uniformly.
+    and the typed 503 exist uniformly. ``references_dir`` is the server's
+    reference store, which edit rewrites read their images from.
     """
     if args.rewrite_backend == "off":
         return _rewrite_service.RewriteService(_rewrite_service.RewriteSettings.disabled())
@@ -1062,6 +1065,7 @@ def build_rewrite_service(args: argparse.Namespace) -> _rewrite_service.RewriteS
         model=args.rewrite_model,
         prompts=prompts,
         timeout=args.rewrite_timeout,
+        references_dir=references_dir,
     )
     return _rewrite_service.RewriteService(settings)
 
@@ -1121,7 +1125,7 @@ def main(argv: list[str] | None = None) -> int:
         return status
 
     try:
-        rewrite = build_rewrite_service(args)
+        rewrite = build_rewrite_service(args, paths["references_dir"])
     except (rc.RewriteConfigError, rw.RewriteError) as exc:
         # Bounded operator diagnostic: the message may name a path, which is
         # fine on a local console and MUST NOT reach the browser (it does not:

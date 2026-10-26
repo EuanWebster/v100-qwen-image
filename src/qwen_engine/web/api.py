@@ -36,7 +36,7 @@ from typing import Any
 from qwen_engine import _jsonsafe
 from qwen_engine import reference_store as _reference_store
 from qwen_engine import rewrite as _rewrite
-from qwen_engine.config import SEED_MAX, ConfigError, GenerationConfig
+from qwen_engine.config import REF_MAX, SEED_MAX, ConfigError, GenerationConfig
 from qwen_engine.core import plan as core_plan
 
 #: Wire schema tags (versioned like every other qwen_engine document).
@@ -819,6 +819,39 @@ def build_rewrite_request(raw: bytes) -> dict[str, Any]:
     return validate_rewrite_fields({k: v for k, v in data.items() if k != "schema"})
 
 
+#: At most this many reference images in one edit rewrite. DERIVED from the
+#: edit-job cap (``config.REF_MAX``) rather than chosen here: a rewrite that
+#: accepted more references than the job it describes could not be generated.
+MAX_REWRITE_IMAGES = REF_MAX
+
+
+def _check_rewrite_image_ids(value: Any) -> list[str]:
+    """Validate ``image_ids`` as an ORDERED list of stored reference ids.
+
+    Order is the whole point: the edit system prompt addresses references as
+    ``<imageN>``, so the Nth id must stay the Nth image. Duplicates are
+    allowed, matching edit-job validation (``config`` caps the count and
+    checks the id grammar; it does not forbid repeating one).
+
+    Identity, not existence: whether an id resolves to a readable blob is the
+    service's question (it owns the store directory), and it answers 404.
+    """
+    if not isinstance(value, list):
+        raise ApiError(400, "invalid_envelope",
+                       "image_ids must be a list of reference ids")
+    for ordinal, entry in enumerate(value, start=1):
+        if not _reference_store.is_reference_id(entry):
+            raise ApiError(
+                400, "invalid_envelope",
+                f"image_ids[{ordinal - 1}] must be a 64-character lowercase "
+                "hex reference id")
+    if len(value) > MAX_REWRITE_IMAGES:
+        raise ApiError(422, "too_many_references",
+                       f"at most {MAX_REWRITE_IMAGES} reference images are "
+                       f"allowed, got {len(value)}")
+    return list(value)
+
+
 def validate_rewrite_fields(request: Mapping[str, Any]) -> dict[str, Any]:
     """Semantic validation of the four request fields, pure.
 
@@ -843,15 +876,18 @@ def validate_rewrite_fields(request: Mapping[str, Any]) -> dict[str, Any]:
         task = _rewrite.check_task(request["task"])
     except _rewrite.RewriteError as exc:
         raise ApiError(422, "task_unsupported", str(exc)) from None
-    image_ids = request["image_ids"]
-    if not isinstance(image_ids, list) or any(
-            isinstance(i, bool) or not isinstance(i, int) for i in image_ids):
-        raise ApiError(400, "invalid_envelope",
-                       "image_ids must be a list of integers")
-    if image_ids:
-        # Reference-image rewriting is gated on edit support landing.
+    image_ids = _check_rewrite_image_ids(request["image_ids"])
+    if task == "t2i" and image_ids:
+        # Never silently downgrade: a t2i draft has no <imageN> to point at, so
+        # sending the pictures would change what the rewrite means.
         raise ApiError(422, "task_unsupported",
-                       "rewriting with reference images is not supported yet")
+                       "a t2i rewrite takes no reference images; use task 'edit'")
+    if task == "edit" and not image_ids:
+        # The edit system prompt addresses references as <imageN>; with none,
+        # the model would invent them, and validation must not pretend a
+        # text-only edit rewrite is the same request.
+        raise ApiError(422, "reference_required",
+                       "an edit rewrite needs at least one reference image id")
     revision = request["draft_revision"]
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
         raise ApiError(400, "invalid_envelope",
@@ -867,7 +903,7 @@ def validate_rewrite_fields(request: Mapping[str, Any]) -> dict[str, Any]:
     if not prompt.strip():
         raise ApiError(400, "invalid_envelope", "prompt must be non-empty")
     return {"task": task, "prompt": prompt, "draft_revision": revision,
-            "image_ids": []}
+            "image_ids": image_ids}
 
 
 #: The canonical "no rewriter here" block. One source of truth: an

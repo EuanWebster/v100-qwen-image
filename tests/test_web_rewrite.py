@@ -18,6 +18,8 @@ from qwen_engine.web import rewrite_service as rs
 from qwen_engine.web import server
 
 ENDPOINT = "http://127.0.0.1:8079/v1/chat/completions"
+#: A syntactically valid reference id (the store resolves identities).
+ID_A = "a" * 64
 
 
 def answer(prompt: str = "A red bicycle.", **extra) -> bytes:
@@ -185,8 +187,14 @@ def test_unparsed_answer_keeps_the_draft_out_of_the_response():
     (request_object(draft_revision=-1), "invalid_envelope", 400),
     (request_object(draft_revision="7"), "invalid_envelope", 400),
     (request_object(draft_revision=True), "invalid_envelope", 400),
-    (request_object(image_ids=[1]), "task_unsupported", 422),
+    (request_object(image_ids=[1]), "invalid_envelope", 400),
     (request_object(image_ids=["a"]), "invalid_envelope", 400),
+    # A t2i draft has no <imageN> for the rewriter to name.
+    (request_object(image_ids=[ID_A]), "task_unsupported", 422),
+    # An edit rewrite without references is refused, not downgraded to t2i.
+    (request_object(task="edit"), "reference_required", 422),
+    (request_object(task="edit", image_ids=[ID_A] * 11),
+     "too_many_references", 422),
 ])
 def test_bad_requests_are_typed_and_never_reach_the_backend(obj, code, status):
     called = []

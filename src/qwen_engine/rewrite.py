@@ -211,15 +211,19 @@ def build_messages(system_prompt: str, user_prompt: str,
                    images: Sequence[str] | None = None) -> list[dict[str, Any]]:
     """Build the two-turn conversation for the rewriter.
 
-    Text-only (t2i, and edit before reference support lands) produces plain
+    Text-only (t2i, and any edit rewrite with no references) produces plain
     string content — the shape the probe against the shared service verified.
     With `images` the user turn becomes a parts list, image parts first and in
     order, because the system prompt addresses them as ``<imageN>``: reordering
     silently re-points every reference in the rewrite. Each entry must be a
     ``data:image/...`` URI, so a draft can never make the backend fetch a URL.
-    That image path is unverified against the shared service (edit rewriting is
-    gated on reference-image support) and is built now only so the wire shape
-    needs no later change.
+
+    The parts shape is the one Root verified against the shared service on
+    2026-10-26: a user turn of ``image_url`` parts followed by one ``text``
+    part returned 200 and a correctly described image (0.6 s for a PNG
+    downscaled to 512 px). Callers pass ``data:image/png;base64,`` URIs built
+    from the reference store by ``web.rewrite_service``; this function does no
+    encoding of its own and never touches the filesystem.
     """
     if not isinstance(system_prompt, str) or not system_prompt.strip():
         raise RewriteError("system prompt must be a non-empty string")

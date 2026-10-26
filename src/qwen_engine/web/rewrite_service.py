@@ -24,8 +24,19 @@ this module re-validates, cheaply and defensively): ::
 
 Body keys are exactly ``task``/``prompt``/``draft_revision``/``image_ids``; any
 other key is refused rather than ignored. ``draft_revision`` is echoed verbatim
-so the UI can discard a stale suggestion; ``image_ids`` must be ``[]`` until
-reference-image support lands (non-empty is ``422 task_unsupported``).
+so the UI can discard a stale suggestion.
+
+``image_ids`` is the ORDERED list of reference-store ids the rewrite is about:
+``[]`` for a t2i rewrite, and at least one for an ``edit`` rewrite. The edit
+system prompt addresses references as ``<imageN>``, so the order is the
+conditioning order and reordering changes the request's meaning. Each id is
+read from the server reference store, decoded through the store's own gates,
+alpha-flattened onto white, downscaled so no side exceeds
+``REWRITE_IMAGE_MAX_DIM``, and sent as a PNG data URI — the backend is never
+given a path or a URL. Forcing this work keeps a t2i draft from carrying
+pictures it has no ``<imageN>`` to name (``422 task_unsupported``), and an edit
+rewrite with no pictures from silently becoming a text-only rewrite
+(``422 reference_required``).
 
 Response payload (``WEB_REWRITE_SCHEMA``): ``schema``, ``task``,
 ``draft_revision``, ``original_prompt`` (exactly what was sent, bounded by the
@@ -43,7 +54,10 @@ to width/height — ``PRESETS`` in ``app.js`` is the single source of truth.
     502 rewrite_unavailable      transport failure / non-2xx from the backend
     502 rewrite_invalid_answer   transport violation (not a chat completion)
     422 prompt_too_long          over ``PROMPT_MAX_CHARS``
-    422 task_unsupported         unknown task, or non-empty ``image_ids``
+    422 task_unsupported         unknown task, or a t2i rewrite with images
+    422 reference_required       an edit rewrite with no reference images
+    422 too_many_references      more ids than the edit-job cap (``REF_MAX``)
+    404 reference_unknown        an id is unknown or its blob is unreadable
     400 invalid_envelope         malformed body: unknown/missing key, bad types
     503 rewrite_cancelled        cancelled by shutdown or operator; see below
 
@@ -67,7 +81,7 @@ a rewrite must not queue behind, or stall, an image job.
 *No prompt in logs or errors.* Nothing here logs. :meth:`RewriteService.event`
 returns the only fields the caller may log — ``task``, ``backend``,
 ``elapsed_ms``, ``prompt_chars``, ``parse_ok``, ``outcome`` — deliberately no
-prompt, no endpoint, no path.
+prompt, no endpoint, no path, and no reference id.
 """
 from __future__ import annotations
 
@@ -77,6 +91,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import base64
+import io
+
+from qwen_engine import reference_store as _reference_store
 from qwen_engine import rewrite as rw
 from qwen_engine import rewrite_client as rc
 from qwen_engine.web import api as web_api
@@ -99,6 +117,18 @@ BACKENDS = ("local-llm",)
 #: 38 s; a slower backend needs this raised explicitly, as a flag decision.
 DEFAULT_TIMEOUT_SECONDS = rc.DEFAULT_TIMEOUT_SECONDS
 
+#: Longest side of a reference image as sent to the rewriter, in pixels.
+#: The rewriter only has to SEE the references to describe them, and a
+#: downscaled copy keeps the request small enough for a local service; 768 was
+#: chosen to stay above the 512 px Root verified landing in 0.6 s while keeping
+#: fine text legible. The ORIGINAL is never sent: only these copies leave the
+#: server, as data URIs, so the backend can never fetch a URL or read a path.
+REWRITE_IMAGE_MAX_DIM = 768
+
+#: PNG, because it is lossless for the flat art and text the rewriter reasons
+#: about and needs no quality knob.
+_IMAGE_URI_PREFIX = "data:image/png;base64,"
+
 
 class _Cancelled(Exception):
     """Internal: the answer arrived but was cancelled before it could be used."""
@@ -113,6 +143,10 @@ class RewriteSettings:
     model: str | None = None
     prompts: Mapping[str, str] = field(default_factory=dict)
     timeout: float = DEFAULT_TIMEOUT_SECONDS
+    #: The server-owned reference store, so an edit rewrite can read the
+    #: user's reference images. ``None`` means the store is not configured, and
+    #: an edit rewrite is then refused rather than sent without its pictures.
+    references_dir: str | None = None
 
     @classmethod
     def disabled(cls) -> "RewriteSettings":
@@ -129,6 +163,10 @@ class RewriteSettings:
                     "a disabled rewriter must not carry an endpoint, model or "
                     "system prompt: an operator who set those meant to enable it")
             return
+        if self.references_dir is not None:
+            if not isinstance(self.references_dir, str) or not self.references_dir.strip():
+                raise rc.RewriteConfigError(
+                    "rewrite references_dir must be a non-empty path or None")
         # Validate eagerly: a bad endpoint is a startup refusal, not a 503.
         rc.parse_endpoint(self.endpoint)
         if not isinstance(self.model, str) or not self.model.strip():
@@ -166,6 +204,77 @@ class _Job:
         self.payload: dict[str, Any] | None = None
         self.error: BaseException | None = None
         self.elapsed_ms: int | None = None
+
+
+def _flatten_alpha(image):
+    """RGB copy of `image` with any transparency composited onto WHITE.
+
+    The edit system prompt describes the references as they appear in the
+    rendered image, and a generated image has no transparency, so alpha must be
+    resolved rather than dropped: pasting onto black would turn any cut-out
+    subject into a different-looking picture, and discarding the channel
+    outright makes Pillow leave the RGB values of transparent pixels as-is —
+    usually arbitrary and often a colour that was never visible.
+    """
+    pil = _reference_store._load_pil()
+    if image.mode == "RGB":
+        return image
+    has_alpha = image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info
+    if not has_alpha:
+        return image.convert("RGB")
+    rgba = image.convert("RGBA")
+    canvas = pil.new("RGB", rgba.size, (255, 255, 255))
+    canvas.paste(rgba, mask=rgba.getchannel("A"))
+    return canvas
+
+
+def _reference_image_uri(root: str | None, reference_id: str, ordinal: int) -> str:
+    """One reference as a downscaled PNG data URI, ready for the user turn.
+
+    Reads the stored blob (hash-verified), applies the store's own decode
+    gates, flattens alpha onto white, and shrinks the longest side to
+    :data:`REWRITE_IMAGE_MAX_DIM`. Returns ``data:image/png;base64,...`` —
+    never a path and never a URL, so the backend cannot be made to fetch
+    anything.
+
+    Every failure names the reference by ORDINAL only: the store's own errors
+    quote paths and (truncated) ids, and neither belongs in a browser-visible
+    message.
+    """
+    if root is None:
+        raise ApiError(422, "reference_unavailable",
+                       "the server reference store is not configured")
+    try:
+        raw = _reference_store.read_blob(root, reference_id)
+        image = _reference_store._decode_checks(raw)
+    except _reference_store.ReferenceStoreError:
+        raise ApiError(404, "reference_unknown",
+                       f"reference {ordinal} is not available in the server "
+                       "reference store") from None
+    pil = _reference_store._load_pil()
+    image = _flatten_alpha(image)
+    if max(image.size) > REWRITE_IMAGE_MAX_DIM:
+        image.thumbnail((REWRITE_IMAGE_MAX_DIM, REWRITE_IMAGE_MAX_DIM),
+                        pil.LANCZOS)
+    buffer = io.BytesIO()
+    try:
+        image.save(buffer, format="PNG")
+    except Exception:  # noqa: BLE001 - any encoder failure is the same refusal
+        raise ApiError(404, "reference_unknown",
+                       f"reference {ordinal} cannot be prepared for the "
+                       "rewriter") from None
+    return _IMAGE_URI_PREFIX + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _reference_image_uris(root: str | None, reference_ids: list[str]) -> list[str]:
+    """The ordered data URIs for `reference_ids`, in the user's order.
+
+    Order is load-bearing: ``build_messages`` puts image N first and the edit
+    system prompt refers to it as ``<imageN>``, so reordering here would
+    silently re-point every reference in the rewrite.
+    """
+    return [_reference_image_uri(root, reference_id, ordinal)
+            for ordinal, reference_id in enumerate(reference_ids, start=1)]
 
 
 class RewriteService:
@@ -261,8 +370,17 @@ class RewriteService:
             task = fields["task"]
             if job.cancel.is_set():
                 raise _Cancelled
+            # Decode and re-encode the references HERE, on the worker thread:
+            # _claim() took the slot under ``self._cond`` and released the lock
+            # before this thread existed, so no imaging work runs while the
+            # service holds its Condition, and a slow decode cannot block
+            # status reads or the next caller's refusal.
+            images = _reference_image_uris(self.settings.references_dir,
+                                           fields["image_ids"])
+            if job.cancel.is_set():
+                raise _Cancelled
             messages = rw.build_messages(self.settings.prompts[task],
-                                         fields["prompt"])
+                                         fields["prompt"], images=images)
             content = self._client.complete(messages, task)
             if job.cancel.is_set():
                 raise _Cancelled
