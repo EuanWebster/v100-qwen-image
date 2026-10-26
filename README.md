@@ -26,11 +26,12 @@ Working today on a real V100:
 - **Transparent backgrounds** (`--transparent`, or the web checkbox): a
   see-through background saved with a real alpha channel in PNG or WebP.
 - **Reference-image editing** (up to 10 ordered images, web or
-  `--reference`): **experimental** — it works end to end, but an output whose
-  latent grid matches a reference's comes out over-processed: references are
-  resized to a 1024² area, so a 1024×1024 output collides with every square
-  reference. Measured clean at 512², 768² and 1024×960; use a non-square or
-  non-1024 size until the fix lands.
+  `--reference`): **experimental** — it works end to end, but an edit whose
+  output is exactly 1024×1024 comes out over-processed and over-sharpened.
+  That is the only size that shows it: 1024×960, 1024×1088, 1088×1024, 960²,
+  768² and 512² were measured clean, and 1152² and larger run out of GPU memory
+  in FP16. Cause still under investigation; pick any size other than exactly
+  1024×1024 until the fix lands.
 - **Optional prompt rewriting** through a local OpenAI-compatible service,
   off by default and never applied without an explicit **Apply**.
 - Output as JPG (default), PNG or lossless WebP, named
@@ -56,11 +57,9 @@ that are pessimistic; [`docs/user-guide.md`](docs/user-guide.md) has the
 per-stage numbers.
 
 Not done yet: memory preflight before generation (submitting a job is **not**
-a guarantee it fits), 2K VAE-decode headroom, and the fix for edits whose
-output grid matches a reference's (cause identified and measured — a same-size
-target shares every RoPE position with the reference; workaround: non-square or
-non-1024 output, see
-[`docs/user-guide.md`](docs/user-guide.md)). See
+a guarantee it fits), 2K VAE-decode headroom, and the cause of the edit
+artifact at exactly 1024×1024 (measured, not explained — workaround: any other
+output size, see [`docs/user-guide.md`](docs/user-guide.md)). See
 [`docs/next-features-plan-2026-10-25.md`](docs/next-features-plan-2026-10-25.md)
 and [`PLAN.md`](PLAN.md).
 

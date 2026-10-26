@@ -146,48 +146,65 @@ See [`transparency.md`](transparency.md) for the contract.
 
 ## Reference-image editing — **experimental**
 
-**Status: works end to end, with a known visual defect that has a measured
-cause.** One reference produces a genuine edit (a red cube became a blue cube
-with the table, lighting and camera preserved — see `output/gpu/batch5` and
-`batch9`), but at 1024×1024 the output looks over-processed and over-sharpened.
+**Status: works end to end, with a known visual defect whose cause is still
+under investigation.** One reference produces a genuine edit (a red cube became
+a blue cube with the table, lighting and camera preserved — see
+`output/gpu/batch5` and `batch9`), but when the output is exactly 1024×1024 it
+looks over-processed and over-sharpened.
 
-**Cause** (root, V100, `output/gpu/FINDINGS-edit-grid.md`, snapshot `df5d2a3`):
-the defect appears exactly when the output latent grid equals a *reference's*
-latent grid. References are always resized to a 1024² area
-(`REFERENCE_TARGET_AREA`, `src/qwen_engine/encoder_production.py:166`), so a
-square 1024×1024 output collides with any square reference. The rule is about
-the grid, not the number 1024: an output that happens to match *any*
-reference's resized grid collides too. Measured via
-`_pinned_reference_helpers().calculate_dimensions` at
-`REFERENCE_TARGET_AREA`: a square reference becomes 1024×1024, 4:3 becomes
-1184×896, 3:2 becomes 1248×832, and 1024×960 becomes 1056×992 — so a 1024×960
-output cannot collide with a square reference. Same settings
-(FP16, seed 42, 40 steps, same cube reference and prompt) throughout:
+**What is measured.** The defect appears when — and only when — the edit's
+output is **exactly 1024×1024**, and it goes away at every other size tested.
+Source: root, V100, `output/gpu/FINDINGS-edit-grid.md` including its UPDATE
+sections (snapshot `df5d2a3`); seed 42, same cube reference and prompt
+throughout.
 
-| Output size | Result | Evidence |
-|---|---|---|
-| 1024×1024 | artifact | `batch5`, `batch6`, `batch9` (Turbo), `batch10`, `batch11` (2 refs) |
-| 512×512 | clean | `output/gpu/batch12/edit-fp16-512` |
-| 768×768 | clean | `output/gpu/batch12/edit-fp16-768` |
-| 1024×960 | clean | `output/gpu/batch12/edit-fp16-1024x960` |
-| 1024×960, 2 references | clean, correct composition | `output/gpu/batch12/edit2-fp16-1024x960` |
+| Output size | Result | Configuration | Evidence |
+|---|---|---|---|
+| 1024×1024 | artifact | base FP16, 40 steps | `batch5`, `batch6`, `batch13` |
+| 1024×1024 | artifact | Turbo, 8 steps | `batch9`, `batch13`, `batch15` |
+| 1024×1024 | artifact | Q8 | `batch11/edit2-q8` |
+| 1024×1024, 2 references | artifact | base FP16 | `batch11/edit2-fp16`, `batch13/edit2-fp16-1024` |
+| 1024×960 | clean | base FP16 | `batch12/edit-fp16-1024x960` |
+| 1024×960, 2 references | clean, correct composition | base FP16 | `batch12/edit2-fp16-1024x960` |
+| 1024×1088 | clean | Turbo | `batch15/1024x1088` |
+| 1088×1024 | clean | base FP16 | `batch14/fp16-1088x1024` |
+| 960×960 | clean | Turbo | `batch15/960x960` |
+| 768×768 | clean | base FP16 | `batch12/edit-fp16-768` |
+| 512×512 | clean | base FP16 | `batch12/edit-fp16-512` |
+| 1152×1152, 1280×1280, 1536×1024 | out of GPU memory | FP16, Turbo, KV off | `batch15` |
 
-Two references of equal size are fine — only *target == reference* collides.
-Likely mechanism: the RoPE centres each image block's grid on zero, so a
-same-size target shares every spatial position with the reference.
+Two things follow from the table. First, the trigger is the *output* being
+1024×1024, not a match between output and reference: the references were
+re-encoded at 992² (`reference_geometry`'s step-down rule) so that no reference
+grid equals the target grid, and the 1024×1024 output still showed the artifact
+(`batch13`). The artifact shows up whether the KV cache is on (Q8,
+`batch11/edit2-q8`) or off (every FP16 and Turbo run above), and with the
+reference at 1024² (`batch5`) or 992² (`batch13`). Second, it is not an SDPA
+kernel shape effect — replacing fused attention with per-query chunked attention
+reproduced the artifact image byte for byte (`batch16`).
 
-**Workaround until the fix lands** (in progress — re-area the references rather
-than change your output): for edits, avoid 1024×1024. Use a non-square size
-(`--width 1024 --height 960`) or a different square (512, 768); all four were
-measured clean. Note that the `square` preset *is* 1024×1024, so pass
-`--width/--height` (web: the size fields) rather than the preset.
+Ruled out so far: preprocessing, VAE encode precision, FP16 overflow (probe),
+embedding range, KV cache on/off, Q8 vs FP16, base vs Turbo, CFG, prompt length,
+MLP chunking, RoPE dtype. `FINDINGS-edit-grid.md` lists the next suspects
+(differential trace of 1024×1024 against a clean 1024×1088 run, and code
+reading).
 
-A plain 3×3 Laplacian variance does **not** detect this defect — it tracks
-resolution, not the artifact: 1024² edit outputs score 458.6 (`batch5`) and
-427.6 (`batch9`), the clean 1024×960 output scores 235.8, but the equally clean
-512² output scores 440.5 and the equally artifacted `batch10` scores 254.5. Size
-is the discriminator, so judge edits by eye, not by a sharpness number. Do not
-treat editing as a production feature yet.
+**Workaround until the fix lands:** choose any edit size **other than exactly
+1024×1024** — for example 1024×1088 or 1024×960, both measured clean. Note that
+the `square` preset *is* 1024×1024, so pass `--width/--height` (web: the size
+fields) rather than the preset. Sizes of 1152×1152 and above do not fit in
+FP16 on a 16 GB card with a reference, so stay near one megapixel.
+
+A plain 3×3 Laplacian variance of the full frame happens to separate the two
+sets on these runs by roughly 9× — artifacted 1024×1024 outputs score 483–780
+(`batch5` 779.9, `batch9` 680.1, `batch11/edit2-q8` 646.6, `batch13` 543.7,
+`batch10` 482.6) against 37–56 for the clean ones (`batch12` 1024×960 52.0, 768²
+56.2, 512² 42.7; `batch15` 960² 45.1, 1024×1088 37.3; `batch14` 1088×1024
+44.7), and a resolution-matched 512² centre crop separates the same way (805–1610
+vs 43–99). That is one scene, one seed and one prompt, and the metric rises with
+any sharp-edged content, so treat it as a hint at most: the size rule above is
+the reliable discriminator. Judge edits by eye. Do not treat editing as a
+production feature yet.
 
 How to use it:
 
@@ -211,8 +228,9 @@ python cli_gen.py --run \
 ```
 
 The `--width 1024 --height 960` pair is the workaround above, not a preference:
-`--preset square` alone is 1024×1024 and hits the grid artifact. Verified with
-`--dry-run`, which resolves to `width: 1024, height: 960`.
+`--preset square` alone is exactly 1024×1024, the size that shows the artifact;
+1024×960 was measured clean (`batch12`). Verified with `--dry-run`, which
+resolves to `width: 1024, height: 960`.
 
 Limits and automatic behaviour (each measured, none silent):
 
@@ -223,7 +241,7 @@ Limits and automatic behaviour (each measured, none silent):
 | File caps | 32 MiB per file, sides ≤ 4096 px, ≤ 4096² pixels, at most 10 references. Larger images are accepted, then resized to about one megapixel for the model. |
 | Transparency in a reference | The alpha channel is kept in the stored bytes, but the vision encoder sees the image composited over white. |
 | First encode cost | The text+vision encoder runs on CPU: an uncached 1024² reference costs ~66–73 s to encode; two references ~107–116 s (measured 116.0 s on one 2-reference job). Repeats hit the embedding cache. |
-| Turbo + references | Allowed and **run**: `output/gpu/batch9/turbo-edit` (1024², 1 reference, denoise 19.2 s, whole job 33.0 s) and `output/gpu/batch10/turbo-fisher-hat`. Both are unmeasured-quality runs — the adapter still records `turbo_reference_run_unmeasured` — and both are 1024×1024, so both show the grid artifact described above rather than saying anything about Turbo's edit quality. |
+| Turbo + references | Allowed and **run**: `output/gpu/batch9/turbo-edit` (1024², 1 reference, denoise 19.2 s, whole job 33.0 s) and `output/gpu/batch10/turbo-fisher-hat`. Both are unmeasured-quality runs — the adapter still records `turbo_reference_run_unmeasured` — and both are exactly 1024×1024, so both show the artifact described above rather than saying anything about Turbo's edit quality. |
 
 Measured timings, 1024², 40 steps, seed 42 (denoise / whole job). Every row is
 a 1024×1024 run, so these measure the artifacted configuration — treat them as
@@ -327,9 +345,10 @@ See [`encoder-cpu-performance.md`](encoder-cpu-performance.md).
   profile refuses an F16 GGUF despite one being advertised alongside it.
 - **Layer offload modes are unavailable.** Only `resident` works; `streamed`
   and `offload` are listed in the UI as not available.
-- **Reference editing quality is the open problem** — a same-size target and
-  reference collide, so 1024×1024 edits show the artifact; 512², 768² and
-  1024×960 are clean, and the fix is in progress — see above.
+- **Reference editing quality is the open problem** — an edit whose output is
+  exactly 1024×1024 shows an over-processed artifact; every other measured size
+  is clean (512², 768², 960², 1024×960, 1024×1088, 1088×1024). The cause is still
+  under investigation — see above.
 - **Single-user by design.** One shared job queue, no authentication; it is
   meant for localhost, a trusted LAN and a Tailscale network.
 
