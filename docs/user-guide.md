@@ -1,4 +1,4 @@
-# User guide — Qwen Image Studio on the V100
+# User guide — Lightseed Studio on the V100
 
 How to run the app day to day, what the newer options actually do, and what is
 measured versus still unknown. Design contracts and raw measurements live in

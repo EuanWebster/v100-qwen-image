@@ -28,7 +28,14 @@ namespaces = false
 [tool.setuptools.package-data]
 # Fixed static web workspace shipped inside the qwen_engine package and
 # served via a fixed importlib.resources allowlist map (W2 server).
-qwen_engine = ["web_static/index.html", "web_static/app.css", "web_static/app.js"]
+qwen_engine = [
+  "web_static/index.html", "web_static/app.css", "web_static/app.js",
+  "web_static/brand/lightseed-logo-on-dark.svg",
+  "web_static/brand/lightseed-logo-on-light.svg",
+  "web_static/brand/favicon.svg",
+  "web_static/brand/favicon.ico",
+  "web_static/brand/favicon-180.png",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
