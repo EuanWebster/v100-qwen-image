@@ -478,6 +478,17 @@ details.advanced > .help { margin-top: 10px; }
 
 /* ---------- History & Settings ---------- */
 
+.history-note {
+  margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+  border: 1px solid var(--error); color: var(--text); max-width: 640px;
+}
+.history-card.history-missing img { display: none; }
+.history-card.history-missing::before {
+  content: "Image unavailable"; display: block; padding: 10px;
+  border: 1px dashed var(--border); border-radius: 6px;
+  color: var(--text-muted); font-size: 12px;
+}
+
 .history-empty, .settings-list { color: var(--text); }
 .history-empty {
   background: var(--bg-panel); border: 1px solid var(--border-soft);

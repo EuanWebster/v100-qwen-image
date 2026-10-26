@@ -2633,6 +2633,9 @@
     var grid = $('history-grid');
     grid.replaceChildren();
     $('history-empty').hidden = ids.length > 0;
+    var note = $('history-missing-note');
+    note.hidden = true;
+    note.textContent = '';
     ids.slice().reverse().forEach(function (id) {
       var job = jobCache[id];
       if (!job) return;
@@ -2643,6 +2646,18 @@
         image.src = job.image_url;
         image.alt = job.config.prompt;
         image.loading = 'lazy';
+        image.addEventListener('error', function () {
+          // The grid is rebuilt on every refresh, so a discarded card's later
+          // error must not narrate for the CURRENT grid.
+          if (!card.isConnected) return;
+          // A failed request does not prove the file was tampered with (the
+          // server may be restarting), so state only what was observed.
+          card.classList.add('history-missing');
+          setText('history-missing-note', 'One or more saved images could not ' +
+            'be loaded. Their history entries are kept; open a job to see its ' +
+            'status, or use its "View job" details.');
+          $('history-missing-note').hidden = false;
+        });
         card.appendChild(image);
       }
       var label = document.createElement('p');
@@ -2662,7 +2677,7 @@
         forget.type = 'button';
         forget.className = 'btn-secondary';
         forget.textContent = 'Forget entry';
-        forget.title = 'Remove session metadata; image files stay on disk';
+        forget.title = 'Remove this saved history entry (job.json); the image file stays on disk';
         forget.addEventListener('click', function () { jobAction(id, 'forget'); });
         card.appendChild(forget);
       }

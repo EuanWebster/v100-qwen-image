@@ -26,9 +26,27 @@ line says otherwise. Numbers are single runs, not a benchmark suite.
 | `QWEN_ATTEST_UNBOUNDED_HOST=0` | do not attest "no cgroup RAM cap" (set this in a memory-capped container) |
 
 The page is prompt-first: type a prompt, pick a preset, press **Generate**.
-Progress, cancellation, session history, config import/export, three themes
+Progress, cancellation, history, config import/export, three themes
 and in-UI help for every option are all in the page. Nothing is written to
 your browser except the theme choice.
+
+History survives server restarts. Each finished job writes one small
+`job.json` inside its own `output/web/<job-id>/` folder recording the request,
+the terminal state, the error code (fixed literals only; never exception text)
+and the image's filename, size and sha256. At startup the server rebuilds
+history from those files, loading at most the newest record-cap entries and
+listing nothing that fails validation — a corrupt or unknown record is skipped
+with one log line and a job that was still running when the server stopped is
+never resurrected. Restored entries count against the same cap as live ones, so
+a rebuilt history that already fills it must be trimmed with **Forget entry**
+before new jobs are accepted. The image endpoint re-hashes the bytes it returns,
+so an image that was changed, resized or deleted on disk is never served; its
+history entry stays listed with the thumbnail marked unavailable, so the job's
+settings remain readable and it can still be forgotten.
+**Forget entry** deletes only that `job.json`: the image file stays where it is,
+and the entry stays gone after a restart. Per-phase timings are measurements of
+a running job, so a restored entry reports no elapsed time — everything else it
+shows (settings, state, image) is what the stopped server recorded.
 
 ### CLI
 
@@ -53,6 +71,10 @@ existing file — a repeat of the same seed in the same directory appends `-2`,
 
 Exit codes: `0` ok, `1` unexpected, `2` config, `3` memory refusal, `4` asset,
 `5` hardware. Full flag list: `python cli_gen.py --help`.
+
+The generation worker child (used by the web/job runner) adds exit `6` =
+`out_of_gpu_memory`: a CUDA out-of-memory crash is reported with that code —
+the same classification the web API surfaces — instead of a generic failure.
 
 ## Quality vs Turbo
 

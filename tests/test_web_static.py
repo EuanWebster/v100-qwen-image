@@ -1003,6 +1003,28 @@ def test_alpha_results_are_previewed_on_a_checkerboard_only():
     assert ".transparency-field" in css and ".effective-prompt-text" in css
 
 
+def test_a_history_entry_whose_image_fails_to_load_stays_listed_and_is_stated():
+    js, css, html = _read("app.js"), _read("app.css"), _read("index.html")
+    assert 'id="history-missing-note"' in html and 'role="status"' in html
+    body = _js_function(js, "renderHistory")
+    assert "image.addEventListener('error'" in body
+    # The observer states only what it saw: a failed request does not prove
+    # the file changed, and it must not claim the entry was dropped — the
+    # server keeps the record and refuses only the image.
+    assert 'history-missing-note' in body and "hidden = false" in body
+    assert "isConnected" in body, "a rebuilt grid must not be narrated for"
+    spoken = body[body.index("setText('history-missing-note'"):]
+    spoken = spoken[:spoken.index(");")]
+    assert "could not" in spoken
+    for claim in ("tampered", "deleted", "changed", "removed", "missing from"):
+        assert claim not in spoken, f"unobserved claim shown to the user: {claim}"
+    # The failure is visible, not a silent icon: the rule hides the broken
+    # image and states unavailability instead.
+    rule = re.search(r"\.history-card\.history-missing::before \{([^}]*)\}", css)
+    assert rule and "Image unavailable" in rule.group(1)
+    assert "history-missing img { display: none; }" in css.replace("\n", " ")
+
+
 # ---------------------------------------------------------------------------
 # W4 — reference images (design §2.4 / §5)
 #

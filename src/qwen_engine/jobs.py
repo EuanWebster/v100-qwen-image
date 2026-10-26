@@ -20,6 +20,7 @@ import math
 import os
 import re
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -29,12 +30,27 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 
-from qwen_engine.config import GenerationConfig
+from qwen_engine._jsonsafe import strict_json_loads
+from qwen_engine.config import ConfigError, GenerationConfig
 from qwen_engine.core import GenerationResult
 from qwen_engine.errors import GenerationCancelled, OutOfGpuMemoryError
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
+#: Terminal-state history record written inside each job's own directory
+#: (the user's own prompt-bearing data on the user's own disk). The request
+#: document already fits MAX_REQUEST_BYTES, so the record only needs room for
+#: its own bounded envelope around it.
+JOB_RECORD_NAME = "job.json"
+JOB_RECORD_SCHEMA = "qwen_engine.job_record.v1"
+MAX_RECORD_BYTES = MAX_REQUEST_BYTES + 8 * 1024
+_RECORD_KEYS = frozenset({"schema", "job_id", "state", "error_code", "cancel_requested",
+                          "created_ns", "finished_ns", "config", "artifact"})
+_ARTIFACT_KEYS = frozenset({"filename", "bytes", "sha256"})
+#: Closed set of fixed, prompt-free failure codes a record may carry.
+_ERROR_CODES = frozenset({"execution_failed", "worker_stopped",
+                          "invalid_cancellation_acknowledgment", "out_of_gpu_memory"})
+_ARTIFACT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 _PHASES = ("load", "encode", "denoise", "decode", "save")
 _STAT_FIELDS = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
 
@@ -166,6 +182,128 @@ def _request(config):
     return config
 
 
+def _signature(info) -> tuple[int, ...]:
+    """Identity/state fields that must not change under an open file."""
+    return tuple(getattr(info, name) for name in _STAT_FIELDS)
+
+
+def job_record_document(record: JobSnapshot, *, created_ns: int, finished_ns: int) -> dict:
+    """The exact terminal-state record stored in a job's own directory.
+
+    Written only for a terminal snapshot; the builder refuses anything the
+    loader would later reject, so the writer and the reader share one
+    contract instead of drifting apart.
+    """
+    if record.state not in _TERMINAL:
+        raise JobError("job record requires a terminal state")
+    if record.error_code is not None and record.error_code not in _ERROR_CODES:
+        raise JobError("job record error code is not a fixed known code")
+    if record.error_code is not None and record.state != JobState.FAILED:
+        raise JobError("only a failed job records an error code")
+    if (record.artifact is None) != (record.state != JobState.SUCCEEDED):
+        raise JobError("only a succeeded job records an artifact")
+    for name, value in (("created_ns", created_ns), ("finished_ns", finished_ns)):
+        if type(value) is not int or value < 0:
+            raise JobError(f"job record {name} must be a nonnegative integer")
+    if finished_ns < created_ns:
+        raise JobError("job record finished_ns precedes created_ns")
+    artifact = record.artifact
+    return {
+        "schema": JOB_RECORD_SCHEMA,
+        "job_id": record.job_id,
+        "state": record.state.value,
+        "error_code": record.error_code,
+        "cancel_requested": bool(record.cancel_requested),
+        "created_ns": created_ns,
+        "finished_ns": finished_ns,
+        "config": record.config.to_dict(),
+        "artifact": None if artifact is None else {
+            "filename": artifact.filename,
+            "bytes": artifact.bytes,
+            "sha256": artifact.sha256,
+        },
+    }
+
+
+def load_job_record(raw: bytes, *, job_id: str, output_dir: str) -> tuple[JobSnapshot, int, int]:
+    """Strictly parse one stored record; ``(snapshot, created_ns, finished_ns)``.
+
+    Every rejection is a fixed diagnostic: the stored document may hold
+    arbitrary text, so no offending value is echoed into a log line. The
+    recorded config is revalidated by ``GenerationConfig`` itself (the same
+    validator a submitted request passes) with the job's directory bound to
+    the current root, never to the path the old process happened to use.
+    """
+    if type(raw) is not bytes or not 1 <= len(raw) <= MAX_RECORD_BYTES:
+        raise JobError("job record size is out of bounds")
+    try:
+        document = strict_json_loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise JobError("job record is not strict UTF-8 JSON") from None
+    if type(document) is not dict or set(document) != _RECORD_KEYS:
+        raise JobError("job record has an unexpected field set")
+    if document["schema"] != JOB_RECORD_SCHEMA:
+        raise JobError("job record schema is unknown")
+    if document["job_id"] != job_id:
+        raise JobError("job record belongs to another job")
+    state = document["state"]
+    try:
+        if not isinstance(state, str):
+            raise ValueError
+        state = JobState(state)
+    except ValueError:
+        raise JobError("job record state is not terminal") from None
+    if state not in _TERMINAL:
+        raise JobError("job record state is not terminal")
+    error_code = document["error_code"]
+    if state == JobState.FAILED:
+        if error_code not in _ERROR_CODES:
+            raise JobError("job record error code is not a fixed known code")
+    elif error_code is not None:
+        raise JobError("job record carries an error code for a non-failed job")
+    cancel_requested = document["cancel_requested"]
+    if type(cancel_requested) is not bool:
+        raise JobError("job record cancel flag is not a boolean")
+    created_ns, finished_ns = document["created_ns"], document["finished_ns"]
+    for name, value in (("created_ns", created_ns), ("finished_ns", finished_ns)):
+        if type(value) is not int or value < 0:
+            raise JobError(f"job record {name} must be a nonnegative integer")
+    if finished_ns < created_ns:
+        raise JobError("job record finished_ns precedes created_ns")
+    config = document["config"]
+    if type(config) is not dict:
+        raise JobError("job record config is not an object")
+    config = {**config, "output_dir": output_dir}
+    try:
+        parsed = GenerationConfig.from_dict(config)
+    except ConfigError:
+        raise JobError("job record config is invalid") from None
+    # GenerationConfig accepts a partial map and fills the rest with defaults,
+    # so a truncated or hand-edited record would otherwise reload as a job
+    # whose stored settings silently differ from the ones that ran. A record
+    # must carry the complete normalized document this build writes.
+    if set(config) != set(parsed.to_dict()):
+        raise JobError("job record config is not the complete document")
+    config = parsed
+    stored_artifact = document["artifact"]
+    artifact = None
+    if stored_artifact is not None:
+        if type(stored_artifact) is not dict or set(stored_artifact) != _ARTIFACT_KEYS:
+            raise JobError("job record artifact has an unexpected field set")
+        filename, size, digest = (stored_artifact["filename"], stored_artifact["bytes"],
+                                 stored_artifact["sha256"])
+        if (type(filename) is not str or _ARTIFACT_NAME.fullmatch(filename) is None
+                or type(size) is not int or not 1 <= size <= MAX_ARTIFACT_BYTES
+                or type(digest) is not str or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)):
+            raise JobError("job record artifact is invalid")
+        artifact = JobArtifact(filename, size, digest)
+    if (artifact is None) != (state != JobState.SUCCEEDED):
+        raise JobError("job record artifact does not match its state")
+    return (JobSnapshot(job_id, config, state=state, cancel_requested=cancel_requested,
+                        artifact=artifact, error_code=error_code), created_ns, finished_ns)
+
+
 def release_cyclic_references() -> None:
     """Default queue-boundary reference release: one cyclic GC pass.
 
@@ -212,9 +350,14 @@ class JobController:
         self._cancels: dict[str, threading.Event] = {}
         self._collect_ms: dict[str, float] = {}
         self._directories: dict[str, tuple[int, int]] = {}
+        self._created_ns: dict[str, int] = {}
         self._pending: deque[str] = deque()
         self._closing = False
         self._active: str | None = None
+        # Rebuild the terminal history from the job directories themselves
+        # before the worker exists: nothing else can touch the maps yet, so
+        # no lock is needed and a later submit/snapshot sees a stable set.
+        self._restore_history()
         self._thread = threading.Thread(target=self._work, name="qwen-owned-job-worker", daemon=True)
         try:
             self._thread.start()
@@ -252,6 +395,7 @@ class JobController:
             self._directories[job_id] = (directory.st_dev, directory.st_ino)
             record = JobSnapshot(job_id, config)
             self._records[job_id] = record
+            self._created_ns[job_id] = time.time_ns()
             self._cancels[job_id] = threading.Event()
             self._pending.append(job_id)
             self._condition.notify_all()
@@ -284,35 +428,54 @@ class JobController:
             if record.state != JobState.SUCCEEDED or artifact is None:
                 raise JobError("job has no completed artifact")
             self._check_root()
-            directory_fd = os.open(job_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                   dir_fd=self._root_fd)
+            directory_fd = self._open_job_directory(job_id)
             try:
-                info = os.fstat(directory_fd)
-                if (info.st_dev, info.st_ino) != self._directories[job_id]:
-                    raise JobError("job directory replaced")
-                fd = os.open(artifact.filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                             dir_fd=directory_fd)
-                try:
-                    info = os.fstat(fd)
-                    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                            or info.st_size != artifact.bytes):
-                        raise JobError("artifact changed")
-                    parts, count = [], 0
-                    while count <= artifact.bytes:
-                        block = os.read(fd, min(65536, artifact.bytes + 1 - count))
-                        if not block:
-                            break
-                        parts.append(block)
-                        count += len(block)
-                    data = b"".join(parts)
-                    if count != artifact.bytes or hashlib.sha256(data).hexdigest() != artifact.sha256:
-                        raise JobError("artifact changed")
-                    self._check_root()
-                    return data
-                finally:
-                    os.close(fd)
+                return self._verified_artifact_bytes(directory_fd, artifact)
             finally:
                 os.close(directory_fd)
+
+    def _open_job_directory(self, job_id: str) -> int:
+        """Open a recorded job directory without following links and require
+        the identity captured when this controller first saw it."""
+        directory_fd = os.open(job_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                               dir_fd=self._root_fd)
+        try:
+            info = os.fstat(directory_fd)
+            if (info.st_dev, info.st_ino) != self._directories[job_id]:
+                raise JobError("job directory replaced")
+            return directory_fd
+        except BaseException:
+            os.close(directory_fd)
+            raise
+
+    @staticmethod
+    def _verified_artifact_bytes(directory_fd: int, artifact: JobArtifact) -> bytes:
+        """Read one artifact file and verify size + sha256 on the very bytes
+        returned. Shared by the image endpoint and the startup rebuild, so a
+        reloaded history entry can only be served from bytes that still match
+        the record it was rebuilt from."""
+        fd = os.open(artifact.filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=directory_fd)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_size != artifact.bytes):
+                raise JobError("artifact changed")
+            parts, count = [], 0
+            while count <= artifact.bytes:
+                block = os.read(fd, min(65536, artifact.bytes + 1 - count))
+                if not block:
+                    break
+                parts.append(block)
+                count += len(block)
+            data = b"".join(parts)
+            if count != artifact.bytes or hashlib.sha256(data).hexdigest() != artifact.sha256:
+                raise JobError("artifact changed")
+            if _signature(info) != _signature(os.fstat(fd)):
+                raise JobError("artifact changed")
+            return data
+        finally:
+            os.close(fd)
 
     def cancel(self, job_id: str) -> JobSnapshot:
         with self._condition:
@@ -328,6 +491,10 @@ class JobController:
                 state = JobState.CANCELLING
             record = replace(record, state=state, cancel_requested=True)
             self._records[job_id] = record
+            if state == JobState.CANCELLED:
+                # A queued cancellation is terminal here: no worker phase will
+                # follow, so this is the one place its own record is written.
+                self._write_job_record(job_id, record)
             self._condition.notify_all()
             return record
 
@@ -335,8 +502,12 @@ class JobController:
         with self._condition:
             if not self._record(job_id).terminal:
                 raise JobError("cannot forget live job")
+            # Removing the stored record is what makes a forget survive a
+            # restart; the image file itself is never deleted.
+            self._discard_job_record(job_id)
             del self._records[job_id]  # never delete partials or completed artifacts
             del self._directories[job_id]
+            self._created_ns.pop(job_id, None)
             self._collect_ms.pop(job_id, None)  # evicted with the metadata
 
     def wait(self, job_id: str, *, timeout_s: float = 5) -> JobSnapshot:
@@ -368,6 +539,198 @@ class JobController:
         if threading.current_thread() is not self._thread:
             self._thread.join(timeout_s)
         return not self._thread.is_alive()
+
+    def _job_directory_fd(self, job_id: str) -> int | None:
+        """Open a job directory for record bookkeeping; never follows links.
+
+        Bookkeeping is best-effort: a directory that has been replaced or
+        removed since it was recorded simply gets no record written to it.
+        """
+        try:
+            return self._open_job_directory(job_id)
+        except (OSError, JobError):
+            return None
+
+    def _write_job_record(self, job_id: str, record: JobSnapshot) -> None:
+        """Atomically replace this job's own ``job.json`` with its terminal state.
+
+        Called while the controller lock is held, so a concurrent ``forget``
+        cannot delete the record and then have it resurrected by this write.
+        The document is built and bounded BEFORE any file is touched; any
+        failure keeps the in-memory history authoritative and never kills the
+        worker.
+        """
+        created_ns = self._created_ns.get(job_id)
+        if created_ns is None:
+            return
+        try:
+            document = job_record_document(record, created_ns=created_ns, finished_ns=time.time_ns())
+            raw = json.dumps(document, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (JobError, TypeError, ValueError):
+            return
+        if not 1 <= len(raw) <= MAX_RECORD_BYTES:
+            return
+        directory_fd = self._job_directory_fd(job_id)
+        if directory_fd is None:
+            return
+        temporary = f".{JOB_RECORD_NAME}.{uuid.uuid4().hex}.tmp"
+        # /proc/self/fd keeps every step tied to the directory FD we verified
+        # while also naming an absolute path (a relative name would be resolved
+        # against the process CWD, which is not this job's directory).
+        anchored = Path("/proc/self/fd") / str(directory_fd)
+        try:
+            fd = os.open(anchored / temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600)
+            try:
+                written = 0
+                while written < len(raw):
+                    written += os.write(fd, raw[written:])
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            # Replace, never truncate-in-place: a crash leaves either the old
+            # record or the new one, never a half-written document.
+            os.replace(anchored / temporary, anchored / JOB_RECORD_NAME)
+            os.fsync(directory_fd)
+        except OSError as exc:
+            try:
+                os.unlink(anchored / temporary)
+            except OSError:
+                pass
+            print(f"qwen-history: job {job_id} history record not written "
+                  f"({exc.strerror or 'storage error'})", file=sys.stderr)
+        finally:
+            os.close(directory_fd)
+
+    def _discard_job_record(self, job_id: str) -> None:
+        """Remove only this job's history record; the image file is untouched."""
+        directory_fd = self._job_directory_fd(job_id)
+        if directory_fd is None:
+            return
+        try:
+            os.unlink(JOB_RECORD_NAME, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"qwen-history: job {job_id} history record not removed "
+                  f"({exc.strerror or 'storage error'})", file=sys.stderr)
+        finally:
+            os.close(directory_fd)
+
+    def _restore_history(self) -> None:
+        """Rebuild terminal history from the job directories on disk.
+
+        Runs before the worker thread exists, so the maps are touched without
+        the lock. Only directories holding a strictly valid ``job.json`` come
+        back: a job that was running when the process died has no record and
+        is deliberately not resurrected. Nothing is ever deleted here; entries
+        beyond ``max_records`` are simply not loaded.
+        """
+        try:
+            names = os.listdir(self._root_fd)
+        except OSError:
+            return
+        stored = []
+        for job_id in names:
+            if len(job_id) != 32 or any(c not in "0123456789abcdef" for c in job_id):
+                continue
+            restored = self._load_stored_job(job_id)
+            if restored is not None:
+                stored.append(restored)
+        # Newest by SUBMISSION time: that is exactly the order a live
+        # controller accumulates its records in, so selecting and re-inserting
+        # on the same key makes a rebuilt History list identical to the one the
+        # previous process had (the UI shows it newest-last).
+        stored.sort(key=lambda item: (item[3], item[2]), reverse=True)
+        for job_id, record, _finished_ns, created_ns, identity in reversed(
+                stored[: self._max_records]):
+            self._records[job_id] = record
+            self._directories[job_id] = identity
+            self._created_ns[job_id] = created_ns
+
+    @staticmethod
+    def _read_stored_record(directory_fd: int) -> bytes | None:
+        """Read one bounded ``job.json`` through an owned directory FD."""
+        try:
+            fd = os.open(JOB_RECORD_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory_fd)
+        except FileNotFoundError:
+            return None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 \
+                    or not 1 <= info.st_size <= MAX_RECORD_BYTES:
+                raise JobError("job record is not a bounded regular file")
+            parts, count = [], 0
+            while count <= MAX_RECORD_BYTES:
+                block = os.read(fd, min(65536, MAX_RECORD_BYTES + 1 - count))
+                if not block:
+                    break
+                parts.append(block)
+                count += len(block)
+            data = b"".join(parts)
+            if count != info.st_size or _signature(info) != _signature(os.fstat(fd)):
+                raise JobError("job record changed while being read")
+            return data
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _check_stored_artifact(directory_fd: int, artifact: JobArtifact) -> None:
+        """Prove at startup that the recorded image is still there at its
+        recorded size and link count. This is advisory only: the sha256 is
+        re-checked on the exact bytes every time the image is served
+        (``read_artifact``), so a restarted server can never hand out a file
+        that no longer matches its record even when this cheap check passes."""
+        fd = os.open(artifact.filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=directory_fd)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_size != artifact.bytes):
+                raise JobError("artifact changed")
+        finally:
+            os.close(fd)
+
+    def _load_stored_job(self, job_id: str):
+        """Strictly parse one directory's record; ``None`` when it is absent
+        (normal for a job that never reached a terminal state) or unusable."""
+        try:
+            directory_fd = os.open(job_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                   dir_fd=self._root_fd)
+        except OSError:
+            return None
+        try:
+            directory = os.fstat(directory_fd)
+            identity = (directory.st_dev, directory.st_ino)
+            raw = self._read_stored_record(directory_fd)
+            if raw is None:
+                return None
+            record, created_ns, finished_ns = load_job_record(
+                raw, job_id=job_id, output_dir=str(self.root / job_id))
+            if record.artifact is not None:
+                try:
+                    self._check_stored_artifact(directory_fd, record.artifact)
+                except (JobError, OSError):
+                    # The RECORD is what history is rebuilt from; the image is
+                    # only ever served through the digest gate in
+                    # ``read_artifact``. Dropping the entry here would hide it
+                    # from the UI entirely (no way to see it, no way to forget
+                    # it) while leaving its job.json on disk, so a job whose
+                    # image moved or changed reloads exactly like a live job
+                    # whose image changed after completion: visible, with an
+                    # unavailable image.
+                    print(f"qwen-history: job {job_id} image no longer matches "
+                          f"its record", file=sys.stderr)
+            return (job_id, record, finished_ns, created_ns, identity)
+        except JobError as exc:
+            print(f"qwen-history: skipped job {job_id}: {exc}", file=sys.stderr)
+            return None
+        except OSError:
+            print(f"qwen-history: skipped job {job_id}: directory is unreadable", file=sys.stderr)
+            return None
+        finally:
+            os.close(directory_fd)
 
     def _phase(self, job_id, phase):
         with self._condition:
@@ -466,6 +829,9 @@ class JobController:
                     self._records[job_id] = replace(self._records[job_id], state=state, artifact=artifact, error_code=error)
                     del self._cancels[job_id]
                     self._active = None
+                    # Written while the lock is held so a concurrent forget
+                    # cannot delete the record and then see it resurrected.
+                    self._write_job_record(job_id, self._records[job_id])
                     self._condition.notify_all()
                 # Deterministic queue-boundary memory release, only for
                 # FAILED/CANCELLED jobs: the executor exception has now been

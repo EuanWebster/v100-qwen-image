@@ -377,10 +377,12 @@
     <h2 id="history-heading" tabindex="-1">History</h2>
     <p class="history-empty" id="history-empty">
       No saved generations yet. Completed images from this machine will appear
-      here as thumbnails. History lasts until the server restarts; image files
+      here as thumbnails, including ones from earlier server runs; image files
       stay on disk when entries are forgotten.
     </p>
     <div class="history-grid" id="history-grid" aria-live="polite"></div>
+    <p class="history-note" id="history-missing-note" role="status"
+       aria-live="polite" hidden></p>
     <p><a class="back-link" href="#create">← Back to Create</a></p>
   </section>
 
@@ -419,6 +421,16 @@
         enforces nothing by itself — locality is controlled by the qwen-web
         server's explicit bind addresses. Remote access uses the LAN or
         Tailscale address selected by the operator.</dd></div>
+      <div><dt>History</dt><dd>Each finished job stores one small
+        <code>job.json</code> file inside its own output folder holding its
+        settings, state and image checksum. History is rebuilt from those
+        files at server start, so completed images reappear after a restart.
+        An image whose file no longer matches its checksum is never served:
+        the entry stays listed with its image marked unavailable, so you can
+        still read its settings and forget it.
+        "Forget entry" deletes that one <code>job.json</code> and nothing
+        else, so the image file stays on disk and the entry stays gone after
+        a restart.</dd></div>
       <div><dt>Drafts</dt><dd>Nothing is saved by the browser automatically
         except the theme choice above. Prompts, seeds and form values are
         never stored; an opt-in draft store for validated form values may

@@ -233,6 +233,65 @@ def test_forget_preserves_files_and_list_is_bounded_ids_only(runtime):
         assert service.close()
 
 
+def test_restart_reloads_history_and_keeps_documents_importable(runtime):
+    service = WebGeneration(runtime, executor=save)
+    try:
+        job_id = service.submit(envelope(prompt='reloaded after restart')).payload['job_id']
+        record = service.controller.wait(job_id)
+        live = service.job_response(job_id).payload
+    finally:
+        assert service.close()
+
+    restarted = WebGeneration(runtime, executor=save)
+    try:
+        assert restarted.list_response().payload['jobs'] == [job_id]
+        doc = restarted.job_response(job_id).payload
+        # Same envelope shape as a live job: only the timing observations that
+        # only a live process can hold are absent/None.
+        assert set(doc) == set(live)
+        assert set(doc['config']) == set(live['config']) and len(doc['config']) == 15
+        assert doc['state'] == 'succeeded' and doc['elapsed_ms'] is None
+        assert doc['phase_ms'] == {} and doc['collect_ms'] is None
+        assert doc['image_url'] == '/api/v1/jobs/%s/image' % job_id
+        assert restarted.image(job_id) == PNG
+        exported = api.export_response(
+            runtime, json.dumps({'schema': api.WEB_PLAN_REQUEST_SCHEMA,
+                                 'config': doc['config']}).encode())
+        assert exported.status == 200
+        document = json.loads(exported.body)
+        assert document['seed'] == record.config.seed
+        imported = api.import_response(runtime, exported.body)
+        assert imported.status == 200
+        assert imported.payload['config']['prompt'] == 'reloaded after restart'
+    finally:
+        assert restarted.close()
+
+
+def test_restored_entry_with_a_damaged_image_stays_listed_and_refuses_the_image(runtime):
+    """The record is the history; only the image is gated. A damaged file must
+    not hide the entry (the UI could then neither show nor forget it) but it
+    must never be served either."""
+    service = WebGeneration(runtime, executor=save)
+    try:
+        job_id = service.submit(envelope(prompt='damaged on disk')).payload['job_id']
+        record = service.controller.wait(job_id)
+        assert service.image(job_id) == PNG
+    finally:
+        assert service.close()
+
+    (Path(record.config.output_dir) / record.artifact.filename).write_bytes(PNG + b'!')
+    restarted = WebGeneration(runtime, executor=save)
+    try:
+        assert restarted.list_response().payload['jobs'] == [job_id]
+        doc = restarted.job_response(job_id).payload
+        assert doc['state'] == 'succeeded' and doc['image_url'] == '/api/v1/jobs/%s/image' % job_id
+        with pytest.raises(api.ApiError) as refused:
+            restarted.image(job_id)
+        assert (refused.value.status, refused.value.code) == (404, 'image_unavailable')
+    finally:
+        assert restarted.close()
+
+
 def test_shutdown_cancels_live_and_queued_jobs_and_releases_executor(runtime):
     started, released = threading.Event(), threading.Event()
     def execute(context):

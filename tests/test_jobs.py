@@ -98,7 +98,7 @@ def test_queue_cancel_never_executes_and_active_cancel_waits(harness):
     assert controller.wait(active.job_id).state == jobs.JobState.CANCELLED
     assert controller.close()
     assert controller.cancel(queued.job_id) == cancelled
-    assert not list(Path(queued.config.output_dir).iterdir())
+    assert sorted(p.name for p in Path(queued.config.output_dir).iterdir()) == [jobs.JOB_RECORD_NAME]
 
 
 def test_verified_completion_wins_late_cancellation(harness):
