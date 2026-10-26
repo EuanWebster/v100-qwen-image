@@ -311,8 +311,20 @@ def _require_v100(torch) -> Any:
 
 
 def _fp32_decode(config: GenerationConfig) -> bool:
-    """Decode precision policy: fp32 for tiled decode and transparent output."""
-    return config.vae_tiled_decode or config.transparent_background
+    """Decode precision policy: fp32 for tiled decode, transparent output,
+    and reference edits.
+
+    Tiled decode and RGBA (af37930) are the two measured fp16 failures; the
+    third is the V100 Q8 2-reference edit (batch4), which sampled cleanly
+    and died at ``vae_decoding`` with exactly af37930's non-finite
+    attestation — an edit through the joint sequence can land latents the
+    fp16 VAE cannot carry even when the output is opaque. Cost is nil by
+    construction: the VAE is the only resident component at decode time
+    (the transformer is long released) and fp32 1K decode is measured fine
+    everywhere fp16 was.
+    """
+    return (config.vae_tiled_decode or config.transparent_background
+            or bool(getattr(config, "references", ())))
 
 
 def _validate_policy(config: GenerationConfig) -> None:

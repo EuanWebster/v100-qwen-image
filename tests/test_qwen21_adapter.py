@@ -354,7 +354,7 @@ def test_untiled_decode_restores_the_vae_in_fp16():
     assert pipeline.vae.tiling is False
 
 
-def test_transparent_output_decodes_untiled_in_fp32():
+def test_transparent_output_decodes_untiled_in_fp32(tmp_path):
     # Measured on the V100: fp16 decode of transparent (RGBA) latents was
     # non-finite at 1024², fp32 decode was finite with a real alpha channel.
     from types import SimpleNamespace
@@ -365,6 +365,12 @@ def test_transparent_output_decodes_untiled_in_fp32():
     assert _fp32_decode(GenerationConfig(vae_tiled_decode=True)) is True
     assert _fp32_decode(GenerationConfig(transparent_background=True,
                                          output_format="png")) is True
+    # Reference edits (batch4 on the V100): the Q8 2-reference run sampled
+    # cleanly and died at vae_decoding with af37930's exact non-finite
+    # attestation even though the output was opaque — any non-empty
+    # references forces fp32 decode; an empty tuple is not a reference run.
+    assert _fp32_decode(GenerationConfig(references=())) is False
+    assert _fp32_decode(_reference_config(tmp_path)) is True
     order = []
     adapter = cli._make_adapter()
     pipeline = SimpleNamespace(vae=None)
