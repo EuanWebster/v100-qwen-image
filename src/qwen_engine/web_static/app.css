@@ -583,8 +583,13 @@ details.advanced > .help { margin-top: 10px; }
     height: 100%; min-height: 0;
     display: grid; grid-template-rows: auto minmax(0, 1fr);
   }
+  /* Tall enough to show the whole panel (~600px with a finished job) when
+     the window leaves ~200px for the settings below; never shorter than the
+     old min(65svh, 520px) cap on small windows. 340px = header, page padding
+     and that settings allowance. */
   .prompt-panel {
-    position: static; max-height: min(65svh, 520px); margin-bottom: 12px;
+    position: static; margin-bottom: 12px;
+    max-height: max(min(65svh, 520px), calc(100svh - 340px));
   }
   .settings-scroll {
     min-height: 0; overflow-y: auto; overscroll-behavior-y: contain;
