@@ -421,9 +421,10 @@
   <!-- ===================== Settings view =====================
        The rewriter choice is SERVER-side: one JSON document in the server's
        cache dir, shared by every browser pointed at this server. The page
-       sends a backend, an address, a model name and a timeout — never a file
-       path, a binary or a model file: those stay launch flags the operator
-       owns, and the server refuses anything shaped like one. -->
+       sends a rewriter for EACH draft kind, one on/off switch, an address, a
+       model name and a timeout — never a file path, a binary or a model file:
+       those stay launch flags the operator owns, and the server refuses
+       anything shaped like one. -->
   <section id="view-settings" class="view" hidden aria-labelledby="settings-heading">
     <h2 id="settings-heading" tabindex="-1">Settings</h2>
     <p class="help settings-shared">These settings are stored by the server
@@ -436,22 +437,36 @@
         before a generation. It only ever <em>suggests</em>: nothing is written
         into your draft until you press Apply.</p>
       <fieldset class="settings-radios">
-        <legend>Which rewriter to use</legend>
-        <label class="settings-radio" for="rewrite-backend-pe">
-          <input type="radio" name="rewrite-backend" id="rewrite-backend-pe"
+        <legend id="rewrite-group-t2i">Prompt enhance (text-to-image)</legend>
+        <label class="settings-radio" for="rewrite-t2i-pe">
+          <input type="radio" name="rewrite-t2i" id="rewrite-t2i-pe"
                  value="pe-llamacpp">
-          <span>Official enhancer (Q8, uses GPU)</span>
+          <span id="rewrite-t2i-pe-label">Official enhancer (Q8, uses GPU)</span>
         </label>
-        <p class="help settings-reason" id="rewrite-backend-pe-reason"
-           role="status"></p>
-        <label class="settings-radio" for="rewrite-backend-local">
-          <input type="radio" name="rewrite-backend" id="rewrite-backend-local"
+        <p class="help settings-reason" id="rewrite-t2i-pe-reason" role="status"></p>
+        <label class="settings-radio" for="rewrite-t2i-local">
+          <input type="radio" name="rewrite-t2i" id="rewrite-t2i-local"
                  value="local-llm">
-          <span>Local LLM service</span>
+          <span id="rewrite-t2i-local-label">OpenAI-compatible endpoint</span>
         </label>
-        <p class="help settings-reason" id="rewrite-backend-local-reason"
-           role="status"></p>
-        <div class="settings-fields" id="rewrite-local-fields">
+        <p class="help settings-reason" id="rewrite-t2i-local-reason" role="status"></p>
+      </fieldset>
+      <fieldset class="settings-radios">
+        <legend id="rewrite-group-edit">Edit prompt enhance</legend>
+        <label class="settings-radio" for="rewrite-edit-pe">
+          <input type="radio" name="rewrite-edit" id="rewrite-edit-pe"
+                 value="pe-llamacpp">
+          <span id="rewrite-edit-pe-label">Official enhancer (Q8, uses GPU)</span>
+        </label>
+        <p class="help settings-reason" id="rewrite-edit-pe-reason" role="status"></p>
+        <label class="settings-radio" for="rewrite-edit-local">
+          <input type="radio" name="rewrite-edit" id="rewrite-edit-local"
+                 value="local-llm">
+          <span id="rewrite-edit-local-label">OpenAI-compatible endpoint</span>
+        </label>
+        <p class="help settings-reason" id="rewrite-edit-local-reason" role="status"></p>
+      </fieldset>
+      <div class="settings-fields" id="rewrite-local-fields">
           <div class="field">
             <label for="rewrite-endpoint">Endpoint URL</label>
             <input type="text" id="rewrite-endpoint" autocomplete="off"
@@ -483,19 +498,20 @@
             <p class="help" id="rewrite-test-status" role="status"
                aria-live="polite"></p>
           </div>
-        </div>
-        <label class="settings-radio" for="rewrite-backend-off">
-          <input type="radio" name="rewrite-backend" id="rewrite-backend-off"
-                 value="off">
-          <span>Off</span>
+      </div>
+      <fieldset class="settings-radios">
+        <legend>Switch</legend>
+        <label class="settings-radio" for="rewrite-off">
+          <input type="checkbox" id="rewrite-off">
+          <span>Off — leave both kinds of draft exactly as you wrote them</span>
         </label>
-        <p class="help settings-reason" id="rewrite-backend-off-reason"
-           role="status"></p>
+        <p class="help settings-reason" id="rewrite-off-reason" role="status"></p>
       </fieldset>
-      <p class="help settings-gpu" id="rewrite-gpu-note">The official enhancer
-        loads a Q8 model onto the graphics card for each rewrite (about 15–40 s).
-        It is unavailable while an image is generating; an image started during a
-        rewrite waits for it.</p>
+      <p class="help settings-gpu" id="rewrite-gpu-note">An official enhancer
+        loads a Q8 model onto the graphics card for each rewrite — roughly 15–40 s
+        for a text draft, 20–50 s for an edit one, since it reads the reference
+        too. It is unavailable while an image is generating; an image started
+        during a rewrite waits for it.</p>
       <div class="settings-actions">
         <button type="button" id="rewrite-save" class="btn-primary"
                 disabled>Save</button>

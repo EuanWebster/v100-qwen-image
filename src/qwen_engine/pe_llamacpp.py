@@ -100,6 +100,18 @@ SERVER_HOST = "127.0.0.1"
 NGL = 99
 CONTEXT_TOKENS = 24576
 
+#: The edit enhancer's context, verified by Root with PE-I2I on the V100
+#: (2026-10-26): vision tokens are large — a 1 MP reference costs a few
+#: thousand prompt tokens on top of a ~24 k thinking budget, so 24 576 does not
+#: reliably hold one edit rewrite and 32 768 does. Measured with the mmproj
+#: loaded: 10.8 GiB of the 16 GiB card, ~5 s to load.
+I2I_CONTEXT_TOKENS = 32768
+
+#: Cap on the vision tokens ONE image may occupy, passed to llama.cpp as
+#: ``--image-max-tokens``. Root verified PE-I2I with this value; without it the
+#: default token budget for a 1 MP image exceeds what the edit profile leaves.
+IMAGE_MAX_TOKENS = 1280
+
 #: The enhancer writes its own stdout/stderr here. Bounded so a chatty or
 #: looping model cannot fill the disk: once the cap is hit the tail is dropped
 #: rather than rotated (this is a diagnostic, not a record).
@@ -117,7 +129,10 @@ CANCEL_POLL_SECONDS = 0.25
 #: lock longer than the kill needs, and ``_terminate`` is safe to call twice.
 CANCEL_JOIN_SECONDS = 0.5
 
-#: The only task these weights were trained for.
+#: The tasks the text-to-image weights were trained for. The edit enhancer is a
+#: SEPARATE checkpoint (with its own vision projector), so a client's task list
+#: is decided at construction from the files it was handed — see
+#: :attr:`PELlamaCppClient.supported_tasks`.
 SUPPORTED_TASKS: tuple[str, ...] = ("t2i",)
 
 #: Response ``content`` starts INSIDE the thinking block and closes it; the
@@ -128,6 +143,20 @@ SUPPORTED_TASKS: tuple[str, ...] = ("t2i",)
 _IM_START = "<|" + "im_start" + "|>"
 _IM_END = "<|" + "im_end" + "|>"
 _THINK_OPEN = "<" + "think" + ">"
+
+#: The only URI scheme an image part may carry. An inline image, never a URL:
+#: a rewrite request carries user text, and a child server that is handed a URL
+#: would fetch it.
+_DATA_IMAGE = "data:image/"
+
+#: The multimodal server's own description of itself. ``media_marker`` — the
+#: string that stands for one image inside the prompt — is RANDOMISED per
+#: process, so it is read from here after every spawn rather than written here.
+PROPS_PATH = "/props"
+
+#: Shape limits for that marker: it is embedded in the prompt, so a control
+#: character in it would be a template injection, not a marker.
+MEDIA_MARKER_MAX = 128
 
 
 class RewriteGpuBusy(RewriteUnavailable):
@@ -143,9 +172,109 @@ class RewriteTaskUnsupported(RewriteClientError):
 # ---------------------------------------------------------------------------
 
 
+def _turn_media(content: Any, index: int) -> tuple[list[str], str]:
+    """``(base64 images in order, text)`` for one message content.
+
+    A plain string is a text turn with no media. A parts list is the shape
+    :func:`qwen_engine.rewrite.build_messages` builds for an edit draft:
+    ``image_url`` parts first, in reference order, then exactly one ``text``
+    part. Order is load-bearing — the edit system prompt addresses the
+    references as ``<imageN>`` — so a text part before an image part is
+    refused rather than silently reordered, and only inline
+    ``data:image/...`` URIs are accepted. The base64 after the comma is what
+    llama.cpp's ``multimodal_data`` takes.
+    """
+    if isinstance(content, str):
+        return [], content
+    if isinstance(content, (str, bytes)) or not isinstance(content, Sequence):
+        raise RewriteConfigError(
+            f"message {index + 1} content must be a string: the official "
+            "enhancer takes text only")
+    payloads: list[str] = []
+    texts: list[str] = []
+    for part in content:
+        if not isinstance(part, Mapping):
+            raise RewriteConfigError(
+                f"message {index + 1} has a part that is not a mapping")
+        kind = part.get("type")
+        if kind == "text":
+            text = part.get("text")
+            if not isinstance(text, str):
+                raise RewriteConfigError(
+                    f"message {index + 1} has a text part without string text")
+            texts.append(text)
+            continue
+        if kind != "image_url":
+            raise RewriteConfigError(
+                f"message {index + 1} has a part of unknown type {kind!r}")
+        if texts:
+            raise RewriteConfigError(
+                f"message {index + 1} puts an image after its text: the "
+                "reference order would not survive the rewrite")
+        image = part.get("image_url")
+        url = image.get("url") if isinstance(image, Mapping) else None
+        if (not isinstance(url, str) or not url.startswith(_DATA_IMAGE)
+                or "," not in url or not url.split(",", 1)[1]):
+            raise RewriteConfigError(
+                f"message {index + 1} image must be a non-empty "
+                "data:image/... URI — the enhancer is never given a URL to "
+                "fetch")
+        payloads.append(url.split(",", 1)[1])
+    if len(texts) != 1:
+        raise RewriteConfigError(
+            f"message {index + 1} needs exactly one text part, found "
+            f"{len(texts)}")
+    return payloads, texts[0]
+
+
+def _turns(messages: Any) -> list[tuple[str, list[str], str]]:
+    """The validated conversation: ``[(role, images, text), ...]``."""
+    if isinstance(messages, (str, bytes)) or not isinstance(messages, Sequence):
+        raise RewriteConfigError(
+            "messages must be a sequence of message mappings")
+    if not messages:
+        raise RewriteConfigError("messages must not be empty")
+    turns: list[tuple[str, list[str], str]] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            raise RewriteConfigError(
+                f"message {index + 1} must be a mapping, not "
+                f"{type(message).__name__}")
+        role = message.get("role")
+        if not isinstance(role, str) or not role:
+            raise RewriteConfigError(f"message {index + 1} needs a string role")
+        images, text = _turn_media(message.get("content"), index)
+        turns.append((role, images, text))
+    if turns[0][0] != "system":
+        raise RewriteConfigError(
+            "the enhancer prompt must start with the system turn (the digest-"
+            "pinned task prompt)")
+    if turns[-1][0] != "user":
+        raise RewriteConfigError(
+            "the enhancer prompt must end with the user turn to be answered")
+    for role, images, _ in turns[:-1]:
+        if images:
+            raise RewriteConfigError(
+                f"the {role} turn carries images: only the user turn to be "
+                "answered may")
+    return turns
+
+
+def _join(turns: Sequence[tuple[str, list[str], str]], marker: str,
+          *, enable_thinking: bool) -> str:
+    """The template bytes for validated turns."""
+    rendered = []
+    for role, images, text in turns:
+        body = (marker * len(images)) + text.strip() if images else text.strip()
+        rendered.append(f"{_IM_START}{role}\n{body}{_IM_END}\n")
+    prompt = "".join(rendered) + f"{_IM_START}assistant\n"
+    return prompt + (f"{_THINK_OPEN}\n" if enable_thinking else "")
+
+
 def render_chat_template(messages: Sequence[Mapping[str, Any]], *,
                          enable_thinking: bool = True) -> str:
-    """The raw prompt for the enhancer, byte-for-byte the official template.
+    """The raw prompt for a text-only enhancer call, byte-for-byte the official
+    template.
 
     Root captured both golden cases from the official processor with
     ``enable_thinking=True`` (pinned in ``tests/test_pe_llamacpp.py``):
@@ -153,7 +282,7 @@ def render_chat_template(messages: Sequence[Mapping[str, Any]], *,
     * every turn is ``{role}\\n{content}
 </think>
 
-<|im_end|>\n`;
+    <tool_call>\n`;
     * system and user contents are **trimmed** (`"Line one\\nLine two  "`
       → ``Line one\\nLine two``, ``"  spaced prompt \\n"`` → ``spaced
       prompt``), while newlines INSIDE a content are kept;
@@ -162,41 +291,77 @@ def render_chat_template(messages: Sequence[Mapping[str, Any]], *,
       ``enable_thinking`` — the generation starts inside the thinking block.
 
     Refused with :class:`RewriteConfigError`: an empty message list, a
-    non-mapping entry, a missing/non-string role or content (a parts list is a
-    vision request, which this backend does not implement), a conversation that
-    does not start with ``system`` or ends anywhere but ``user``.
+    non-mapping entry, a missing/non-string role, a content that is a parts
+    list (a vision request belongs to :func:`render_prompt`, which needs the
+    server's media marker), or a conversation that does not start with
+    ``system`` or ends anywhere but ``user``.
     """
-    if isinstance(messages, (str, bytes)) or not isinstance(messages, Sequence):
-        raise RewriteConfigError(
-            "messages must be a sequence of message mappings")
-    if not messages:
-        raise RewriteConfigError("messages must not be empty")
-    rendered: list[str] = []
-    roles: list[str] = []
-    for index, message in enumerate(messages):
-        if not isinstance(message, Mapping):
+    turns = _turns(messages)
+    for role, images, _ in turns:
+        if images:
             raise RewriteConfigError(
-                f"message {index + 1} must be a mapping, not "
-                f"{type(message).__name__}")
-        role = message.get("role")
-        content = message.get("content")
-        if not isinstance(role, str) or not role:
-            raise RewriteConfigError(f"message {index + 1} needs a string role")
-        if not isinstance(content, str):
-            raise RewriteConfigError(
-                f"message {index + 1} content must be a string: the official "
-                "enhancer takes text only")
-        roles.append(role)
-        rendered.append(f"{_IM_START}{role}\n{content.strip()}{_IM_END}\n")
-    if roles[0] != "system":
+                f"the {role} turn carries images: render_prompt() takes a "
+                "media marker and renders them")
+    return _join(turns, "", enable_thinking=enable_thinking)
+
+
+def check_media_marker(marker: Any) -> str:
+    """The server's own media marker, or a refusal.
+
+    llama.cpp's multimodal server invents a marker per process and matches the
+    count of markers in the prompt against the count of images handed to it, so
+    this value is only ever read from ``GET /props`` (:func:`media_marker`);
+    the literal ``<__media__>`` fails with "Failed to tokenize prompt". It is
+    embedded in the prompt verbatim, so whitespace is refused — a marker
+    carrying a newline could close the user turn early.
+    """
+    if (not isinstance(marker, str) or not marker
+            or len(marker) > MEDIA_MARKER_MAX
+            or any(char in marker for char in ("\n", "\r", "\t", " "))):
         raise RewriteConfigError(
-            "the enhancer prompt must start with the system turn (the digest-"
-            "pinned task prompt)")
-    if roles[-1] != "user":
+            "the enhancer server's media marker is unusable")
+    return marker
+
+
+def media_marker(document: Any) -> str:
+    """``media_marker`` from one ``GET /props`` body."""
+    if not isinstance(document, Mapping):
+        raise RewriteInvalidAnswer("the enhancer server's /props is not JSON")
+    return check_media_marker(document.get("media_marker"))
+
+
+def render_prompt(messages: Sequence[Mapping[str, Any]], *,
+                  enable_thinking: bool = True,
+                  media_marker: str | None = None) -> tuple[str, list[str]]:
+    """``(prompt_string, [base64 image, ...])`` for one enhancer call.
+
+    With no images this is exactly :func:`render_chat_template`. With them it
+    is the edit enhancer's layout: ONE ``media_marker`` per image, in reference
+    order, immediately after ``user\\n``, then the trimmed draft, and the base64
+    payloads go in ``multimodal_data`` in the same order — the server counts
+    both and refuses a mismatch. A turn with images therefore cannot be
+    rendered without the marker this server was started with.
+    """
+    turns = _turns(messages)
+    images = [payload for _, payloads, _ in turns for payload in payloads]
+    if not images:
+        return _join(turns, "", enable_thinking=enable_thinking), []
+    if media_marker is None:
         raise RewriteConfigError(
-            "the enhancer prompt must end with the user turn to be answered")
-    prompt = "".join(rendered) + f"{_IM_START}assistant\n"
-    return prompt + (f"{_THINK_OPEN}\n" if enable_thinking else "")
+            "an image rewrite needs the media marker this server reported on "
+            f"{PROPS_PATH}")
+    return (_join(turns, check_media_marker(media_marker),
+                  enable_thinking=enable_thinking), images)
+
+
+def media_payloads(messages: Any) -> list[str]:
+    """The base64 images this conversation would send, in reference order.
+
+    Asked BEFORE the prompt is rendered — the caller needs to know whether the
+    server has to be asked for its media marker at all, and a text draft must
+    never pay for a ``GET /props``.
+    """
+    return [payload for _, payloads, _ in _turns(messages) for payload in payloads]
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +378,9 @@ def _json_bytes(body: Mapping[str, Any]) -> bytes:
             "the enhancer request is not JSON-serialisable") from None
 
 
-def build_completion_body(prompt: str, *, task: str = "t2i",
-                          seed: int | None = None) -> bytes:
+def build_completion_body(prompt: str | Mapping[str, Any], *, task: str = "t2i",
+                          seed: int | None = None,
+                          images: Sequence[str] | None = None) -> bytes:
     """The exact ``POST /completion`` bytes for one enhancer call.
 
     The sampling numbers are :func:`qwen_engine.rewrite.sampling` for the task
@@ -224,12 +390,25 @@ def build_completion_body(prompt: str, *, task: str = "t2i",
     verified against this server; ``seed`` is a fresh 63-bit integer unless one
     is given, because a rewrite is not reproducible-by-request in the UI and a
     fixed seed would make every attempt for one draft identical.
+
+    With `images` the ``prompt`` field becomes the object the multimodal server
+    takes — ``{"prompt_string": …, "multimodal_data": [base64, …]}`` — carrying
+    the payload of a :func:`render_prompt` call unchanged, so the marker count
+    in the string and the number of images cannot disagree.
     """
     profile = rw.sampling(task)
     if seed is None:
         seed = secrets.randbits(63)
+    wire: str | dict[str, Any] = prompt
+    if images:
+        if not isinstance(prompt, str):
+            raise RewriteConfigError(
+                "an image request takes the prompt string from render_prompt()")
+        wire = {"prompt_string": prompt, "multimodal_data": list(images)}
+    elif not isinstance(prompt, str):
+        raise RewriteConfigError("the enhancer prompt must be a string")
     return _json_bytes({
-        "prompt": prompt,
+        "prompt": wire,
         "n_predict": profile["max_new_tokens"],
         "temperature": profile["temperature"],
         "top_p": profile["top_p"],
@@ -489,6 +668,25 @@ class LoopbackClient:
                 "enhancer response is not JSON") from None
         return content_from_document(document)
 
+    def get_media_marker(self, path: str = PROPS_PATH) -> str:
+        """The marker this server wants for one image, from ``GET /props``.
+
+        Read AFTER the health check passes and never cached across calls: the
+        value is invented per process, and this module starts a fresh server for
+        every rewrite. A server that answers with something unusable is a typed
+        refusal — the prompt cannot be built without it.
+        """
+        status, payload = self._request("GET", path)
+        if not 200 <= status < 300:
+            raise RewriteUnavailable(
+                f"the enhancer server answered HTTP {status} on {path}")
+        try:
+            document = json.loads(payload)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise RewriteInvalidAnswer(
+                f"the enhancer server's {path} is not JSON") from None
+        return media_marker(document)
+
 
 def _free_port() -> int:
     """An ephemeral loopback port, released immediately before the child binds
@@ -579,6 +777,9 @@ class PELlamaCppClient:
                  health_timeout: float = HEALTH_TIMEOUT_SECONDS,
                  host: str = SERVER_HOST, context: int = CONTEXT_TOKENS,
                  ngl: int = NGL,
+                 mmproj_path: str | os.PathLike[str] | None = None,
+                 image_max_tokens: int | None = None,
+                 supported_tasks: Sequence[str] = SUPPORTED_TASKS,
                  spawn: Callable[..., Any] | None = None,
                  transport_factory: Callable[[int, float], Any] | None = None,
                  port_picker: Callable[[], int] | None = None,
@@ -590,6 +791,13 @@ class PELlamaCppClient:
         SAME lock the web generation executor takes: without it the two
         backends would sit on the GPU at once.
 
+        `supported_tasks` is what THESE weights answer — the edit enhancer is a
+        different checkpoint, so the task list belongs to the instance, not to
+        the module. An edit-capable client must have been handed its vision
+        projector (`mmproj_path`) and, with it, an `image_max_tokens` cap:
+        without the projector there is no image path at all, and without the cap
+        a 1 MP reference can crowd out the thinking budget in the context.
+
         ``spawn``, ``transport_factory``, ``port_picker`` and ``sleep`` are the
         test seams; production leaves them unset. ``cancel`` is the rewrite
         job's cancel flag, polled so an operator cancel still kills the child.
@@ -597,12 +805,23 @@ class PELlamaCppClient:
         self.server_binary = self._checked_executable(server_binary,
                                                      "llama-server binary")
         self.model_path = self._checked_file(model_path, "enhancer model file")
+        self.mmproj_path = (None if mmproj_path is None else
+                            self._checked_file(mmproj_path,
+                                               "enhancer vision projector"))
         self.log_path = os.fspath(log_path)
         self.timeout = self._check_timeout(timeout)
         self.health_timeout = self._check_timeout(health_timeout)
         self.host = host
         self.context = self._check_positive_int(context, "context tokens")
         self.ngl = self._check_positive_int(ngl, "GPU offload layer count")
+        self.image_max_tokens = (None if image_max_tokens is None else
+                                 self._check_positive_int(image_max_tokens,
+                                                          "image token cap"))
+        self.supported_tasks = self._check_tasks(supported_tasks)
+        if "edit" in self.supported_tasks and self.mmproj_path is None:
+            raise RewriteConfigError(
+                "the edit enhancer needs its vision projector: "
+                "--mmproj is what lets these weights see a reference image")
         self._gpu_lock = gpu_lock if gpu_lock is not None else threading.Lock()
         self._spawn = spawn if spawn is not None else self._default_spawn
         self._transport_factory = (transport_factory
@@ -654,20 +873,45 @@ class PELlamaCppClient:
                 f"{what} is not a readable file: {text}")
         return text
 
+    @staticmethod
+    def _check_tasks(value: Any) -> tuple[str, ...]:
+        """The task list these weights answer, validated once.
+
+        Vision is not optional for the edit task, so a client that claims
+        ``edit`` without a projector is refused here rather than discovered
+        halfway through a user's rewrite.
+        """
+        if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+            raise RewriteConfigError("supported tasks must be a list of task "
+                                     "names")
+        tasks = tuple(value)
+        if not tasks or len(set(tasks)) != len(tasks) \
+                or any(task not in rw.TASKS for task in tasks):
+            raise RewriteConfigError(
+                f"supported tasks must be a unique non-empty subset of "
+                f"{list(rw.TASKS)}, got {list(value)!r}")
+        return tasks
+
     # -- argv / spawn -------------------------------------------------------
 
     def build_argv(self, port: int) -> list[str]:
         """The explicit argv list for one server: no shell, no string to
         escape, and the exact flags Root verified on the V100 with the sm_70
-        build (full GPU offload, 24576-token context, no web UI routes on a
-        port a browser could reach)."""
-        return [self.server_binary,
+        build (full GPU offload, a context sized for the weights, no web UI
+        routes on a port a browser could reach). The edit weights add their
+        vision projector and a cap on the vision tokens one image may take."""
+        argv = [self.server_binary,
                 "-m", self.model_path,
                 "-ngl", str(self.ngl),
                 "-c", str(self.context),
                 "--host", self.host,
                 "--port", str(port),
                 "--no-webui"]
+        if self.mmproj_path is not None:
+            argv += ["--mmproj", self.mmproj_path]
+        if self.image_max_tokens is not None:
+            argv += ["--image-max-tokens", str(self.image_max_tokens)]
+        return argv
 
     def _default_spawn(self, argv: list[str], log: _BoundedLog) -> Any:
         """The real spawn: own process group (so the kill reaches a forked
@@ -682,10 +926,12 @@ class PELlamaCppClient:
     @property
     def available(self) -> bool:
         """The files are present; availability is decided at startup."""
-        return not self._closed and os.path.isfile(self.model_path)
+        return (not self._closed and os.path.isfile(self.model_path)
+                and (self.mmproj_path is None
+                     or os.path.isfile(self.mmproj_path)))
 
     def uses_task(self, task: str) -> bool:
-        return task in SUPPORTED_TASKS
+        return task in self.supported_tasks
 
     def close(self) -> bool:
         """Terminate any live child. True when nothing is running afterwards."""
@@ -721,9 +967,11 @@ class PELlamaCppClient:
         rw.check_task(task)
         if not self.uses_task(task):
             raise RewriteTaskUnsupported(
-                "the official enhancer supports text-to-image rewrites only; "
-                "the image-edit enhancer model is not installed — use the "
-                "Quick rewriter for an edit draft")
+                "the official enhancer cannot rewrite this draft: " + (
+                    "the image-edit enhancer model is not installed — choose "
+                    "the OpenAI-compatible endpoint for an edit draft"
+                    if task == "edit" else
+                    "these weights rewrite text-to-image drafts only"))
         if extra_sampling is not None:
             raise RewriteConfigError(
                 "the enhancer backend does not accept sampling overrides: it "
@@ -767,8 +1015,17 @@ class PELlamaCppClient:
             watcher.start()
             transport = self._transport_factory(port, self.timeout)
             self._wait_healthy(process, transport, deadline)
-            prompt = render_chat_template(messages)
-            body = build_completion_body(prompt, task=task, seed=seed)
+            # A reference image is only addressable with the marker THIS server
+            # invented for it, and that marker exists only after the server is
+            # listening — so the prompt for an edit draft cannot be rendered
+            # before this point. A text draft never asks /props.
+            if media_payloads(messages):
+                marker = transport.get_media_marker()
+            else:
+                marker = None
+            prompt, images = render_prompt(messages, media_marker=marker)
+            body = build_completion_body(prompt, task=task, seed=seed,
+                                         images=images)
             remaining = deadline - time.monotonic()
             if remaining <= 0 or self._cancel():
                 raise RewriteTimeout(

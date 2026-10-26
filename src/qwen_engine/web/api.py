@@ -110,11 +110,15 @@ MAX_MESSAGE_CHARS = 200
 _REWRITE_BLOCK_KEYS = frozenset({"state", "code", "backend", "reason"})
 
 #: OPTIONAL additions. A server that predates the two-backend rewriter sends
-#: neither, and the new UI must parse that block unchanged:
+#: none of them, and the new UI must parse such a block unchanged:
 #: ``backends`` — which rewriters exist here and what each can do;
 #: ``settings`` — the route the Settings page writes its choice to, and whether
-#: a saved document is on disk. A ROUTE, never a filesystem path.
-_REWRITE_BLOCK_KEYS_OPTIONAL = frozenset({"backends", "settings"})
+#: a saved document is on disk. A ROUTE, never a filesystem path;
+#: ``active_by_task`` — which rewriter answers EACH draft kind, so a page can
+#: say "text drafts use the official enhancer, edit drafts the endpoint". The
+#: single ``backend`` stays for readers that predate per-task choices.
+_REWRITE_BLOCK_KEYS_OPTIONAL = frozenset({"backends", "settings",
+                                          "active_by_task"})
 
 #: The CLOSED state/code pairs, mirroring ``REWRITE_STATES`` in app.js: the
 #: code is the key, the state is the value it must pair with. Rewriting is
@@ -172,8 +176,22 @@ REWRITE_SETTINGS_BACKENDS: tuple[str, ...] = REWRITE_BACKENDS + ("off",)
 #: called. A label is display text: never a path, an address or a model id.
 REWRITE_BACKEND_LABELS: Mapping[str, str] = {
     "pe-llamacpp": "Official enhancer (Q8, uses GPU)",
-    "local-llm": "Local LLM service",
+    "local-llm": "OpenAI-compatible endpoint",
     "off": "Off",
+}
+
+#: Which rewriter takes the V100. The Settings page says so plainly next to the
+#: radio, because choosing it means an image job may wait.
+REWRITE_BACKEND_USES_GPU: Mapping[str, bool] = {"pe-llamacpp": True,
+                                                "local-llm": False}
+
+#: The two draft kinds the Settings page offers a rewriter for, in the order
+#: the page lists them, with the words the user sees. ONE definition, because
+#: the radio groups, the server's own fallback messages and the suggestion box
+#: must call "Edit prompt enhance" the same thing.
+REWRITE_TASK_LABELS: Mapping[str, str] = {
+    "t2i": "Prompt enhance (text-to-image)",
+    "edit": "Edit prompt enhance",
 }
 
 #: The closed shape of one ``backends`` row. ``tasks`` is what that backend can
@@ -182,6 +200,31 @@ REWRITE_BACKEND_LABELS: Mapping[str, str] = {
 #: Settings form a row also carries whether it is usable here and why not.
 _BACKEND_ROW_KEYS = frozenset({"id", "label", "tasks", "uses_gpu"})
 _BACKEND_ROW_KEYS_SETTINGS = _BACKEND_ROW_KEYS | {"available", "reason"}
+
+
+def _check_availability(available: Any, reason: Any, what: str) -> None:
+    """The `available`/`reason` pair every greyed-out option carries, pure.
+
+    ONE rule for the Settings page's backend rows and its per-task choice rows:
+    an option that works explains nothing, an option that does not must say why,
+    and that sentence is rendered in a browser — so it may never contain a path,
+    a URL or an address. Refusing here is what keeps the rule checkable instead
+    of a convention nobody follows.
+    """
+    if type(available) is not bool or not isinstance(reason, str):
+        raise ValueError(f"a {what} needs a boolean available and a string reason")
+    if available:
+        if reason != "":
+            raise ValueError(f"an available {what} carries no reason")
+        return
+    if not reason.strip():
+        raise ValueError(f"an unavailable {what} needs a reason")
+    for marker in _LOCATION_MARKERS:
+        if marker in reason:
+            raise ValueError("a rewrite availability reason must not disclose a "
+                             "location (URL or path)")
+    if _IPV4_RE.search(reason):
+        raise ValueError("a rewrite availability reason must not disclose an address")
 
 
 def validate_rewrite_backend_row(row: Any, *, settings_form: bool = False) -> dict[str, Any]:
@@ -208,34 +251,23 @@ def validate_rewrite_backend_row(row: Any, *, settings_form: bool = False) -> di
     # every list into a tuple. Both shapes are legal input; what comes back is
     # always the plain JSON form, because ``json.dumps`` cannot serialize a
     # mappingproxy and a status payload must never 500 on its own shape.
-    if (not isinstance(tasks, (list, tuple)) or not tasks
+    if (not isinstance(tasks, (list, tuple))
             or len(set(tasks)) != len(tasks)
             or any(task not in _rewrite.TASKS for task in tasks)):
         raise ValueError(
-            f"a rewrite backend row needs a non-empty unique subset of "
+            f"a rewrite backend row needs a unique subset of "
             f"{list(_rewrite.TASKS)} as tasks")
+    # A row published in the status block always answers something; a row on the
+    # settings page may answer NOTHING, which is how "started with this
+    # checkpoint, but not one that can read your picture" reaches the page
+    # instead of the option quietly vanishing from it.
+    if not tasks and not settings_form:
+        raise ValueError("a rewrite backend row must answer at least one draft kind")
     if type(row["uses_gpu"]) is not bool:
         raise ValueError("a rewrite backend row needs a boolean uses_gpu")
     if settings_form:
-        if type(row["available"]) is not bool or not isinstance(row["reason"], str):
-            raise ValueError("a settings rewrite backend row needs a boolean "
-                             "available and a string reason")
-        if row["available"]:
-            if row["reason"] != "":
-                raise ValueError("an available settings rewrite backend carries "
-                                 "no reason")
-        else:
-            if not row["reason"].strip():
-                raise ValueError("an unavailable settings rewrite backend needs "
-                                 "a reason")
-            for marker in _LOCATION_MARKERS:
-                if marker in row["reason"]:
-                    raise ValueError(
-                        "a rewrite availability reason must not disclose a "
-                        "location (URL or path)")
-            if _IPV4_RE.search(row["reason"]):
-                raise ValueError(
-                    "a rewrite availability reason must not disclose an address")
+        _check_availability(row["available"], row["reason"],
+                            "settings rewrite backend row")
     out = {"id": backend, "label": row["label"], "tasks": list(tasks),
            "uses_gpu": row["uses_gpu"]}
     if settings_form:
@@ -324,6 +356,10 @@ def validate_rewrite_block(block: Any) -> dict[str, Any]:
     if "settings" in block:
         block = {**block, "settings": validate_rewrite_settings_pointer(
             block["settings"])}
+    if "active_by_task" in block:
+        block = {**block, "active_by_task": validate_rewrite_active_by_task(
+            block["active_by_task"],
+            rows=block.get("backends"), state=state)}
     return dict(block)
 
 
@@ -341,6 +377,53 @@ def validate_rewrite_settings_pointer(pointer: Any) -> dict[str, Any]:
             "a rewrite settings pointer must be exactly "
             f'{{"href": {REWRITE_SETTINGS_HREF!r}, "saved": <bool>}}')
     return {"href": REWRITE_SETTINGS_HREF, "saved": pointer["saved"]}
+
+
+def validate_rewrite_active_by_task(active: Any, *, rows: Any = None,
+                                    state: str = "available") -> dict[str, Any]:
+    """The ``active_by_task`` key: which rewriter answers EACH draft kind.
+
+    One entry per task in :data:`qwen_engine.rewrite.TASKS`, each either a
+    backend id or null (nothing answers that kind right now). A name must be a
+    rewriter the SAME block advertises and that can handle that task — a block
+    claiming the enhancer answers an edit draft while its own row says the
+    enhancer does text only is a contradiction, not a status.
+
+    Accepts the frozen form (a mapping) and always returns a plain dict, so a
+    status payload cannot 500 on its own shape.
+    """
+    if not isinstance(active, Mapping) or set(active) != set(_rewrite.TASKS):
+        raise ValueError(
+            "rewrite active_by_task must carry exactly "
+            f"{list(_rewrite.TASKS)}; got "
+            f"{sorted(map(str, active)) if isinstance(active, Mapping) else type(active).__name__}")
+    by_row = {row["id"]: row for row in rows} if rows else {}
+    checked: dict[str, Any] = {}
+    for task in _rewrite.TASKS:
+        backend = active[task]
+        if backend is not None:
+            if not isinstance(backend, str) or backend not in REWRITE_BACKENDS:
+                raise ValueError(
+                    f"rewrite active_by_task[{task!r}] must be one of "
+                    f"{list(REWRITE_BACKENDS)} or null")
+            if by_row:
+                row = by_row.get(backend)
+                if row is None:
+                    raise ValueError(
+                        f"rewrite active_by_task names {backend!r}, which the "
+                        "block does not list among its backends")
+                if task not in row["tasks"]:
+                    raise ValueError(
+                        f"rewrite active_by_task says {backend!r} answers "
+                        f"{task!r}, but that rewriter handles {row['tasks']}")
+        checked[task] = backend
+    if state == "available" and not any(checked.values()):
+        raise ValueError(
+            "an available rewrite block must have at least one task answered")
+    if state != "available" and any(checked.values()):
+        raise ValueError(
+            "an unavailable rewrite block answers no task")
+    return checked
 
 
 def _safe(text: Any, limit: int = MAX_MESSAGE_CHARS) -> str:
@@ -1113,12 +1196,15 @@ REWRITE_SETTINGS_SCHEMA = "qwen_engine.web_rewrite_settings.v1"
 REWRITE_TEST_REQUEST_SCHEMA = "qwen_engine.web_rewrite_test_request.v1"
 REWRITE_TEST_SCHEMA = "qwen_engine.web_rewrite_test.v1"
 
-#: The closed key set of the saved/POSTed choice. Four keys, and NONE of them
-#: is a path. The llama-server binary, the GGUF, the system-prompt files and
-#: the enhancer timeout stay launch flags: a browser that may name a file can
-#: name any file on this machine, so the rule is absolute rather than scoped to
-#: a few field names.
-_REWRITE_SETTINGS_KEYS = ("backend", "endpoint", "model", "timeout_s")
+#: The closed key set of the saved/POSTed choice. Six keys and NONE of them is
+#: a path. The llama-server binary, the GGUFs, the system-prompt files and the
+#: enhancer timeout stay launch flags: a browser that may name a file can name
+#: any file on this machine, so the rule is absolute rather than scoped to a few
+#: field names. The choice itself is PER TASK (`t2i`, `edit`) plus one `enabled`
+#: switch; the old single ``backend`` key is not accepted here — a file that
+#: still carries it is migrated before it reaches this validator.
+_REWRITE_SETTINGS_KEYS = ("t2i", "edit", "enabled", "endpoint", "model",
+                          "timeout_s")
 
 #: The probe's own request keys (it always tests the LOCAL service: the
 #: enhancer cannot be probed without loading 9.5 GiB onto the GPU).
@@ -1131,22 +1217,33 @@ _PATH_SHAPED_KEY_RE = re.compile(
 
 
 def validate_rewrite_settings(payload: Any, *,
-                              allow_unset_backend: bool = False) -> dict[str, Any]:
+                              allow_unset_choice: bool = False,
+                              require_endpoint: bool = True) -> dict[str, Any]:
     """The ONE definition of a legal rewriter choice, pure.
 
-    Shared by ``POST /api/v1/settings/rewrite`` and by the loader of the saved
-    document, so a file that was written by an older version, hand-edited, or
-    produced by the route cannot disagree with the route about what is legal.
+    Shared by ``POST /api/v1/settings/rewrite``, the saved document on disk and
+    the settings state validator, so a file written by an older version,
+    hand-edited, or produced by the route cannot disagree with the route about
+    what is legal.
 
-    ``backend`` is CLOSED (``pe-llamacpp`` / ``local-llm`` / ``off``);
-    ``endpoint``, when present, must pass
-    :func:`qwen_engine.rewrite_client.parse_endpoint` — loopback, explicit
-    port, no credentials — because a prompt draft is user text; ``timeout_s``
-    is in ``(0, 3600]``. ``endpoint``/``model``/``timeout_s`` describe the
-    LOCAL service and may be saved while another backend is active (an edit
-    draft falls back to them); they are required only when the local service
-    itself is chosen. ``allow_unset_backend`` is for the saved document, where
-    a null backend means "not chosen: use the start-up default".
+    ``require_endpoint`` is off ONLY for the saved record, whose endpoint and
+    model are overrides: a record saying "the endpoint for edits, address from
+    the launch flags" is half-empty by design, and demanding an address there
+    made a server refuse to publish its own Settings page. The rule that an
+    enabled endpoint choice needs an address and a model name applies to the
+    EFFECTIVE document — what the page posts and what the server acts on.
+
+    ``t2i`` and ``edit`` are CLOSED per task (``pe-llamacpp`` / ``local-llm``)
+    and ``enabled`` is the single Off switch — ``off`` is deliberately NOT a
+    choice value any more, because "both tasks off" and "the switch is off" are
+    one fact that must be stated once. ``endpoint``, when present, must pass
+    :func:`qwen_engine.rewrite_client.parse_endpoint` (loopback, explicit port,
+    no credentials), since a prompt draft is user text; ``timeout_s`` is in
+    ``(0, 3600]``. The three endpoint fields describe the SHARED service and may
+    be saved while neither task uses it; they are required only when a task
+    chooses it. ``allow_unset_choice`` is for a saved document (and the ``saved``
+    view inside the settings state), where a null choice means "not chosen: use
+    the default"; it is never accepted from the browser.
     """
     if not isinstance(payload, Mapping):
         raise ApiError(400, "invalid_envelope",
@@ -1156,32 +1253,45 @@ def validate_rewrite_settings(payload: Any, *,
     unknown = sorted(set(payload) - set(_REWRITE_SETTINGS_KEYS))
     if unknown:
         message = "unknown rewrite setting(s): " + ", ".join(map(str, unknown))
+        if "backend" in unknown:
+            message += (" — the rewriter is now chosen per draft kind (t2i, "
+                        "edit); a file that still carries a single backend is "
+                        "migrated when the server reads it")
         if any(_PATH_SHAPED_KEY_RE.search(key) for key in unknown):
             message += (" — this server takes no filesystem path from the "
                         "browser")
         raise ApiError(400, "invalid_envelope", message)
-    # ``allow_unset_backend`` means the key may be ABSENT, not merely null: a
-    # saved document (and the ``local`` view of the settings state) carries the
-    # three service values only, and the state validator runs on its own
-    # output — so the rules must be idempotent or the server refuses to send
-    # what it just built.
+    # ``allow_unset_choice`` means a choice key may be ABSENT, not merely null:
+    # a saved document carries what the user actually picked, and the state
+    # validator runs on output this module built — so the rules must be
+    # idempotent, or the server refuses to send what it just made.
     required = set(_REWRITE_SETTINGS_KEYS)
-    if allow_unset_backend:
-        required.discard("backend")
+    if allow_unset_choice:
+        required -= {"t2i", "edit", "enabled"}
     missing = sorted(required - set(payload))
     if missing:
         raise ApiError(400, "invalid_envelope",
                        "missing rewrite setting(s): " + ", ".join(missing))
-    backend = payload.get("backend")
-    if backend is None:
-        if not allow_unset_backend:
+    choices: dict[str, Any] = {}
+    for task in _rewrite.TASKS:
+        choice = payload.get(task)
+        if choice is None:
+            if not allow_unset_choice:
+                raise ApiError(400, "invalid_envelope",
+                               f"{task} must be one of {list(REWRITE_BACKENDS)}")
+        elif choice not in REWRITE_BACKENDS:
+            raise ApiError(422, "backend_unknown",
+                           f"the rewriter for a {task} draft must be one of "
+                           f"{list(REWRITE_BACKENDS)}, got {choice!r}")
+        choices[task] = choice
+    enabled = payload.get("enabled")
+    if enabled is None:
+        if not allow_unset_choice:
             raise ApiError(400, "invalid_envelope",
-                           "backend must be one of "
-                           f"{list(REWRITE_SETTINGS_BACKENDS)}")
-    elif backend not in REWRITE_SETTINGS_BACKENDS:
-        raise ApiError(422, "backend_unknown",
-                       f"the rewriter must be one of "
-                       f"{list(REWRITE_SETTINGS_BACKENDS)}, got {backend!r}")
+                           "enabled must be true or false")
+    elif not isinstance(enabled, bool):
+        raise ApiError(400, "invalid_envelope", "enabled must be true or false",
+                       (("enabled", "choose a rewriter or switch rewriting off"),))
     values: dict[str, Any] = {}
     for name in ("endpoint", "model"):
         value = payload[name]
@@ -1217,13 +1327,20 @@ def validate_rewrite_settings(payload: Any, *,
                              "use http on a loopback address with an explicit "
                              "port, for example "
                              "http://127.0.0.1:8079/v1/chat/completions"),)) from None
-    if backend == "local-llm" and not (values["endpoint"] and values["model"]):
+    if (require_endpoint and enabled
+            and any(choices[task] == "local-llm" for task in _rewrite.TASKS)
+            and not (values["endpoint"] and values["model"])):
+        # The endpoint is shared, so ONE sentence covers either task choosing
+        # it: without an address and a model name there is nothing to call.
         raise ApiError(422, "backend_incomplete",
-                       "the local LLM service needs both an endpoint URL and a "
-                       "model name",
-                       (("endpoint", "required for the local LLM service"),
-                        ("model", "required for the local LLM service")))
-    return {"backend": backend, "endpoint": values["endpoint"],
+                       "the OpenAI-compatible endpoint needs both an endpoint "
+                       "URL and a model name",
+                       (("endpoint", "required for the OpenAI-compatible "
+                                     "endpoint"),
+                        ("model", "required for the OpenAI-compatible "
+                                  "endpoint")))
+    return {"t2i": choices["t2i"], "edit": choices["edit"],
+            "enabled": enabled, "endpoint": values["endpoint"],
             "model": values["model"], "timeout_s": values["timeout_s"]}
 
 
@@ -1264,18 +1381,92 @@ def build_rewrite_settings_request(raw: bytes) -> dict[str, Any]:
 
 
 def build_rewrite_test_request(raw: bytes) -> dict[str, Any]:
-    """``POST /api/v1/settings/rewrite/test`` body -> the local service to probe.
+    """``POST /api/v1/settings/rewrite/test`` body -> the endpoint to probe.
 
-    The probe is always the local service: the same field rules apply, with the
-    backend pinned, so a probe cannot ask the server to load the enhancer.
+    The probe is always the SHARED OpenAI-compatible service: the same field
+    rules apply and no choice keys are accepted, so a Test button press cannot
+    ask the server to load an enhancer checkpoint onto the GPU. It does need an
+    address and a model name, which is the one thing a probe is for.
     """
     fields = _rewrite_envelope(raw, ("schema",) + _REWRITE_TEST_KEYS,
                                REWRITE_TEST_REQUEST_SCHEMA,
                                "rewrite connection test request")
-    checked = validate_rewrite_settings({"backend": "local-llm",
+    checked = validate_rewrite_settings({"enabled": True,
                                          "endpoint": fields.get("endpoint"),
                                          "model": fields.get("model"),
-                                         "timeout_s": fields.get("timeout_s")})
+                                         "timeout_s": fields.get("timeout_s")},
+                                        allow_unset_choice=True)
+    if not checked["endpoint"] or not checked["model"]:
+        raise ApiError(422, "backend_incomplete",
+                       "the connection test needs both an endpoint URL and a "
+                       "model name",
+                       (("endpoint", "required for the connection test"),
+                        ("model", "required for the connection test")))
+    return {key: checked[key] for key in _REWRITE_TEST_KEYS}
+
+
+#: The Settings page's per-task groups: one row per draft kind, each listing
+#: every rewriter with `available`/`reason` already resolved.
+_TASK_ROW_KEYS = frozenset({"task", "label", "choices"})
+_TASK_CHOICE_KEYS = frozenset({"id", "label", "available", "uses_gpu", "reason"})
+
+
+def validate_rewrite_task_rows(rows: Any) -> list[dict[str, Any]]:
+    """The ``tasks`` list of the Settings payload, pure. Raises ValueError.
+
+    The page must not have to know WHICH launch flag gates an option: the server
+    answers, per draft kind, whether each rewriter can be chosen here and why not.
+    Labels and order are pinned to this module's, so "Edit prompt enhance" is one
+    string everywhere and a stale group heading cannot survive a save.
+
+    Like the other row validators this accepts the frozen form and returns plain
+    JSON, because ``json.dumps`` cannot serialize a mappingproxy.
+    """
+    if (not isinstance(rows, (list, tuple))
+            or len(rows) != len(_rewrite.TASKS)):
+        raise ValueError("the rewrite settings tasks must hold exactly one row "
+                         f"per draft kind ({list(_rewrite.TASKS)})")
+    checked = []
+    for want, row in zip(_rewrite.TASKS, rows):
+        if not isinstance(row, Mapping) or set(row) != _TASK_ROW_KEYS:
+            raise ValueError(
+                f"a rewrite settings task row must carry exactly "
+                f"{sorted(_TASK_ROW_KEYS)}; got "
+                f"{sorted(map(str, row)) if isinstance(row, Mapping) else type(row).__name__}")
+        if row["task"] != want:
+            raise ValueError("the rewrite settings tasks must be in the order "
+                             f"{list(_rewrite.TASKS)}")
+        if row["label"] != REWRITE_TASK_LABELS[want]:
+            raise ValueError(f"the label for task {want!r} must be "
+                             f"{REWRITE_TASK_LABELS[want]!r}")
+        choices = row["choices"]
+        if (not isinstance(choices, (list, tuple))
+                or [choice["id"] for choice in choices
+                    if isinstance(choice, Mapping)] != list(REWRITE_BACKENDS)):
+            raise ValueError(
+                "a rewrite settings task row needs one choice per rewriter, in "
+                f"the order {list(REWRITE_BACKENDS)}")
+        out_choices = []
+        for choice in choices:
+            if set(choice) != _TASK_CHOICE_KEYS:
+                raise ValueError(
+                    f"a rewrite task choice must carry exactly "
+                    f"{sorted(_TASK_CHOICE_KEYS)}")
+            backend = choice["id"]
+            if choice["label"] != REWRITE_BACKEND_LABELS[backend]:
+                raise ValueError(f"the label for {backend!r} must be "
+                                 f"{REWRITE_BACKEND_LABELS[backend]!r}")
+            if choice["uses_gpu"] is not REWRITE_BACKEND_USES_GPU[backend]:
+                raise ValueError(f"{backend!r} uses_gpu must be "
+                                 f"{REWRITE_BACKEND_USES_GPU[backend]}")
+            _check_availability(choice["available"], choice["reason"],
+                                f"{want} rewrite choice")
+            out_choices.append({"id": backend, "label": choice["label"],
+                                "available": choice["available"],
+                                "uses_gpu": choice["uses_gpu"],
+                                "reason": choice["reason"]})
+        checked.append({"task": want, "label": row["label"],
+                        "choices": out_choices})
     return checked
 
 
@@ -1287,8 +1478,8 @@ def validate_rewrite_settings_state(payload: Any) -> dict[str, Any]:
     no GGUF, no prompt file, no log file — and the closed key set is what makes
     that checkable rather than hoped for.
     """
-    allowed = {"schema", "backend", "saved", "local", "backends", "off",
-               "persistent", "note"}
+    allowed = {"schema", "enabled", "choices", "saved", "local", "backends",
+               "tasks", "off", "persistent", "note"}
     if not isinstance(payload, Mapping):
         raise ValueError("the rewrite settings state must be a JSON mapping")
     if set(payload) - allowed:
@@ -1297,16 +1488,30 @@ def validate_rewrite_settings_state(payload: Any) -> dict[str, Any]:
     if payload["schema"] != REWRITE_SETTINGS_SCHEMA:
         raise ValueError("rewrite settings state schema must be "
                          f"{REWRITE_SETTINGS_SCHEMA!r}")
-    if payload["backend"] is not None and payload["backend"] not in REWRITE_BACKENDS:
-        raise ValueError("the active rewrite backend is unknown")
-    saved = validate_rewrite_settings(payload["saved"],
-                                     allow_unset_backend=True)
-    local = validate_rewrite_settings(payload["local"],
-                                      allow_unset_backend=True)
+    if not isinstance(payload["enabled"], bool):
+        raise ValueError("the rewrite settings enabled flag must be a boolean")
+    choices = payload["choices"]
+    if (not isinstance(choices, Mapping)
+            or set(choices) != set(_rewrite.TASKS)):
+        raise ValueError("the rewrite settings choices must carry exactly "
+                         f"{list(_rewrite.TASKS)}")
+    for task in _rewrite.TASKS:
+        if choices[task] not in REWRITE_BACKENDS:
+            raise ValueError(
+                f"the effective rewriter choice for {task!r} must be one of "
+                f"{list(REWRITE_BACKENDS)} — the page needs a checked radio, "
+                "never a null")
+    # The saved record is what the last save chose, overrides and all: its
+    # endpoint may legitimately be empty because the launch flags supply one.
+    # The address rule belongs to the effective document on the next line.
+    saved = validate_rewrite_settings(payload["saved"], allow_unset_choice=True,
+                                      require_endpoint=False)
+    local = validate_rewrite_settings(payload["local"], allow_unset_choice=True)
     rows = validate_rewrite_backend_rows(payload["backends"], settings_form=True)
     if [row["id"] for row in rows] != list(REWRITE_BACKENDS):
         raise ValueError("the settings backends must be "
                          f"{list(REWRITE_BACKENDS)}, in that order")
+    task_rows = validate_rewrite_task_rows(payload["tasks"])
     off = payload["off"]
     if (not isinstance(off, Mapping) or set(off) != {"id", "label", "available", "reason"}
             or off["id"] != "off" or off["label"] != REWRITE_BACKEND_LABELS["off"]
@@ -1317,15 +1522,17 @@ def validate_rewrite_settings_state(payload: Any) -> dict[str, Any]:
     note = payload.get("note")
     if note is not None and (not isinstance(note, str) or not note.strip()):
         raise ValueError("the rewrite settings note must be a non-empty string")
-    checked = {"schema": REWRITE_SETTINGS_SCHEMA, "backend": payload["backend"],
+    checked = {"schema": REWRITE_SETTINGS_SCHEMA,
+               "enabled": payload["enabled"],
+               "choices": {task: choices[task] for task in _rewrite.TASKS},
                "saved": saved,
-               # What the LOCAL service would be reached as RIGHT NOW: the
+               # What the SHARED endpoint would be reached as RIGHT NOW: the
                # saved override where there is one, else the launch flags. The
                # page prefills from this, so it never shows a field the server
                # is not actually using.
                "local": {key: local[key] for key in ("endpoint", "model",
                                                      "timeout_s")},
-               "backends": rows, "off": dict(off),
+               "backends": rows, "tasks": task_rows, "off": dict(off),
                "persistent": payload["persistent"]}
     if note is not None:
         checked["note"] = note
@@ -1372,10 +1579,11 @@ __all__ = [
     # Two backends plus the server-side Settings choice (schema tags, closed
     # rows, and the one validator each document goes through).
     "REWRITE_BACKENDS", "REWRITE_SETTINGS_BACKENDS", "REWRITE_BACKEND_LABELS",
-    "REWRITE_SETTINGS_HREF",
+    "REWRITE_BACKEND_USES_GPU", "REWRITE_TASK_LABELS", "REWRITE_SETTINGS_HREF",
     "REWRITE_SETTINGS_SCHEMA", "REWRITE_TEST_REQUEST_SCHEMA",
     "REWRITE_TEST_SCHEMA", "validate_rewrite_backend_row",
-    "validate_rewrite_backend_rows", "validate_rewrite_settings",
+    "validate_rewrite_backend_rows", "validate_rewrite_task_rows",
+    "validate_rewrite_active_by_task", "validate_rewrite_settings",
     "validate_rewrite_settings_state", "build_rewrite_settings_request",
     "build_rewrite_test_request", "rewrite_test_result", "strip_command",
 ]

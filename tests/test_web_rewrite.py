@@ -122,28 +122,46 @@ def test_default_status_block_is_the_canonical_disabled_block():
     assert set(block) == {"state", "code", "backend", "reason", "settings"}
 
 
-def test_disabled_service_is_a_real_service_without_a_client():
+def test_disabled_service_refuses_each_draft_kind_with_the_missing_fact():
+    """Nothing is configured on this server, so a draft of either kind is
+    refused with the thing the user could act on (422, not 503: there is no
+    rewriter here to be switched off). The Off SWITCH is the 503 answer."""
     svc = rs.RewriteService(rs.RewriteSettings.disabled())
     assert svc.available is False
+    assert svc.active_by_task() == {"t2i": None, "edit": None}
     assert svc.status_block()["code"] == "rewrite_disabled"
-    out = post(request_object(), rewrite=svc)
-    assert " 503 " in status_line(out)
-    assert body_of(out)["code"] == "rewrite_disabled"
+    for task, words, images in (("t2i", "text-to-image", []),
+                                ("edit", "image-edit", [ID_A])):
+        out = post(request_object(task=task, image_ids=images), rewrite=svc)
+        assert " 422 " in status_line(out), task
+        assert body_of(out)["code"] == "task_unsupported"
+        assert words in body_of(out)["message"]
+    switched_off = rs.RewriteService(
+        rs.RewriteSettings.disabled(),
+        preferences=rs.RewritePreferences(
+            choices={"t2i": "local-llm", "edit": "local-llm"}, enabled=False))
+    for task, images in (("t2i", []), ("edit", [ID_A])):
+        out = post(request_object(task=task, image_ids=images),
+                   rewrite=switched_off)
+        assert " 503 " in status_line(out), task
+        assert body_of(out)["code"] == "rewrite_disabled"
 
 
 def test_enabled_status_block_names_only_the_backend():
     svc = service(answer())
     runtime = api.WebRuntime(rewrite_block=svc.status_block())
     block = api.status_response(runtime).payload["rewrite"]
-    # Which rewriter is live, which ones this server can run, and where the
-    # choice is changed: a route plus two labels — never an address, never a
-    # path, never a model identifier.
+    # Which rewriter answers EACH draft kind, which ones this server can run,
+    # and where the choice is changed: a route plus two labels — never an
+    # address, never a path, never a model identifier.
     assert block == {"state": "available", "code": "rewrite_available",
                      "backend": "local-llm", "reason": "",
                      "backends": [{"id": "local-llm",
-                                   "label": "Local LLM service",
+                                   "label": "OpenAI-compatible endpoint",
                                    "tasks": ["t2i", "edit"],
                                    "uses_gpu": False}],
+                     "active_by_task": {"t2i": "local-llm",
+                                        "edit": "local-llm"},
                      "settings": {"href": api.REWRITE_SETTINGS_HREF,
                                   "saved": False}}
     # The endpoint is operator-private and must never reach the browser.
@@ -348,3 +366,32 @@ def test_status_block_wider_than_four_keys_is_refused_at_construction():
                                       "backend": "local-llm",
                                       "reason": "",
                                       "endpoint": ENDPOINT})
+
+
+def test_a_block_naming_a_rewriter_for_a_draft_it_cannot_answer_is_refused():
+    """``active_by_task`` is a capability claim, and it is checked when the
+    runtime is BUILT: a status page saying the enhancer answers an edit draft
+    while its own row lists only ``t2i`` would offer the user a choice this
+    server cannot honour, and the browser has no way to notice."""
+    official = {"id": "pe-llamacpp",
+                "label": api.REWRITE_BACKEND_LABELS["pe-llamacpp"],
+                "tasks": ["t2i"], "uses_gpu": True}
+    with pytest.raises(ValueError):
+        api.WebRuntime(rewrite_block={
+            "state": "available", "code": "rewrite_available",
+            "backend": "pe-llamacpp", "reason": "", "backends": [official],
+            "active_by_task": {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"}})
+    # A real split — official for the text draft, endpoint for the edit draft —
+    # is legal and reaches the browser unchanged.
+    runtime = api.WebRuntime(rewrite_block={
+        "state": "available", "code": "rewrite_available",
+        "backend": "pe-llamacpp", "reason": "",
+        "backends": [official,
+                     {"id": "local-llm",
+                      "label": api.REWRITE_BACKEND_LABELS["local-llm"],
+                      "tasks": ["t2i", "edit"], "uses_gpu": False}],
+        "active_by_task": {"t2i": "pe-llamacpp", "edit": "local-llm"}})
+    block = api.status_response(runtime).payload["rewrite"]
+    assert block["active_by_task"] == {"t2i": "pe-llamacpp",
+                                       "edit": "local-llm"}
+    assert block["backend"] == "pe-llamacpp"

@@ -1,18 +1,24 @@
 """Guarded tests for the server-side **Prompt rewriter** settings page.
 
-The amendment to the two-rewriter plan: there is no per-request rewriter pick
-in the Create view any more. One server-side choice — saved by the server,
-shared by every browser pointed at it — says which rewriter answers, and a
-loopback-only Settings route changes it. Three properties carry the design and
-are what these tests pin:
+There is no per-request rewriter pick in the Create view: the choice is
+server-side, saved by the server, shared by every browser pointed at it, and it
+is made **per draft kind** — one rewriter for a text-to-image draft, one for an
+edit draft — plus ONE Off switch. A loopback-only Settings route reads and
+changes it. Four properties carry the design and are what these tests pin:
 
-* the POST form is CLOSED, and nothing in it is a filesystem path or an
-  executable (the binary, the GGUF and the system prompts stay launch flags);
+* the POST form is CLOSED and FLAT (``t2i``, ``edit``, ``enabled`` plus the
+  shared endpoint fields), and nothing in it is a filesystem path or an
+  executable (the binary, both GGUFs and the system prompts stay launch flags);
 * a request is validated, and refused, BEFORE any client is built or any file
   is written — a refusal leaves the server exactly as it was;
-* no response names a path, a command or an endpoint the user did not type.
+* a choice is honoured PER TASK: what the enhancer can answer here comes from
+  the checkpoints that are installed, and a task nothing can answer is refused,
+  never silently handed to the other task's rewriter;
+* an old saved file with the single ``backend`` key still means something, and
+  reading it never rewrites it.
 
-No sockets, no torch, no GPU: the local service is an injected transport.
+No sockets, no torch, no GPU: the local service is an injected transport and
+both enhancer clients are fakes.
 """
 from __future__ import annotations
 
@@ -39,6 +45,12 @@ MODEL = "Qwen3.8"
 PROMPTS = {"t2i": "system prompt for t2i", "edit": "system prompt for edit"}
 BINARY = "/opt/llama/llama-server"
 GGUF = "/models/pe/PE-T2I-Q8_0.gguf"
+I2I_GGUF = "/models/pe/PE-I2I-Q8_0.gguf"
+MMPROJ = "/models/pe/mmproj-PE-I2I-BF16.gguf"
+
+#: The six keys the saved/POSTed choice carries: two per-task choices, one
+#: switch, and the three fields of the SHARED OpenAI-compatible endpoint.
+CHOICE_KEYS = {"t2i", "edit", "enabled", "endpoint", "model", "timeout_s"}
 
 
 def reply(content: str = '{"rewritten_prompt": "x"}') -> bytes:
@@ -47,13 +59,19 @@ def reply(content: str = '{"rewritten_prompt": "x"}') -> bytes:
 
 
 class FakeClient:
-    """Stands in for a backend client; records that it was ever built."""
+    """Stands in for a backend client; records which drafts it was asked about.
 
-    def __init__(self, name, built, timeout=30.0):
+    One instance is built per ``(task, backend)`` the service can run, except
+    for the endpoint, which the service builds once and keys by both tasks — so
+    ``requests`` shows exactly which draft kinds reached which rewriter.
+    """
+
+    def __init__(self, name, built=None, timeout=30.0):
         self.name = name
-        self.built = built
+        self.built = [] if built is None else built
         self.timeout = timeout
         self.requests = []
+        self.closes = 0
 
     def complete(self, messages, task, sampling=None):
         """The client contract: messages in, the raw answer text out."""
@@ -61,14 +79,15 @@ class FakeClient:
         return json.dumps({"rewritten_prompt": f"rewritten by {self.name}"})
 
     def close(self):
-        return None
+        self.closes += 1
+        return True
 
 
 class BrokenClient(FakeClient):
     """A backend that fails the way a failed spawn does: quoting its own
     command line, which is exactly what must never reach the browser."""
 
-    def __init__(self, name, built, detail):
+    def __init__(self, name, built=None, detail=""):
         super().__init__(name, built)
         self.detail = detail
 
@@ -76,43 +95,55 @@ class BrokenClient(FakeClient):
         raise rc.RewriteClientError(self.detail)
 
 
-@pytest.fixture
-def built():
-    """Records every client the service builds, by backend id."""
-    return []
+def pe_settings(**overrides) -> rs.PESettings:
+    """The enhancer's launch-flag configuration.
+
+    ``model_path`` is the text checkpoint; the ``i2i_*`` pair is the edit
+    checkpoint and its vision projector, and is what makes an edit draft
+    offerable to the official enhancer at all.
+    """
+    base = dict(llama_server=BINARY, model_path=GGUF,
+                system_prompts=dict(PROMPTS), timeout=300.0)
+    base.update(overrides)
+    return rs.PESettings(**base)
 
 
-def make_service(tmp_path, *, local=True, pe=False, built=None, clients=None,
-                 transport=None, preferences=None, client=None,
+def make_service(tmp_path, *, local=True, pe=False, i2i=False, built=None,
+                 clients=None, transport=None, preferences=None, client=None,
                  **overrides) -> rs.RewriteService:
     """A service with the given backends possible, writing settings in tmp.
 
-    ``built`` records every build in order and ``clients`` ends up holding the
-    live client per backend id, so a test can see which backend was asked.
+    ``built`` records every build in order as ``(task, backend)`` and
+    ``clients`` ends up holding the live client per built key, so a test can see
+    which rewriter was asked about which draft kind.
     """
     local_settings = (rs.RewriteSettings(
         backend="local-llm", endpoint=ENDPOINT, model=MODEL, prompts=dict(PROMPTS),
         timeout=30.0, **overrides) if local else rs.RewriteSettings.disabled())
-    pe_settings = (rs.PESettings(llama_server=BINARY, model_path=GGUF,
-                                 system_prompt="pe system prompt",
-                                 timeout=300.0) if pe else None)
+    pe_settings_value = None
+    if pe:
+        pe_settings_value = pe_settings(
+            **({"i2i_model_path": I2I_GGUF, "i2i_mmproj_path": MMPROJ}
+               if i2i else {}))
     made = built if built is not None else []
 
-    def factory(backend, settings, pe_cfg, prefs):
-        made.append(backend)
-        instance = client if client is not None else FakeClient(backend, made)
+    def factory(task, backend, settings, pe_cfg, prefs):
+        made.append((task, backend))
+        instance = client if client is not None else FakeClient(
+            f"{backend} for {task}", made)
         if clients is not None:
-            clients[backend] = instance
+            clients[(task, backend)] = instance
         return instance
 
     return rs.RewriteService(local_settings, transport=transport,
-                             pe=pe_settings, cache_dir=str(tmp_path),
+                             pe=pe_settings_value, cache_dir=str(tmp_path),
                              preferences=preferences, client_factory=factory)
 
 
 def body(**overrides) -> bytes:
-    doc = {"schema": api.REWRITE_SETTINGS_SCHEMA, "backend": "local-llm",
-           "endpoint": ENDPOINT, "model": MODEL, "timeout_s": 180.0}
+    doc = {"schema": api.REWRITE_SETTINGS_SCHEMA, "t2i": "pe-llamacpp",
+           "edit": "pe-llamacpp", "enabled": True, "endpoint": ENDPOINT,
+           "model": MODEL, "timeout_s": 180.0}
     doc.update(overrides)
     return json.dumps(doc).encode()
 
@@ -121,38 +152,63 @@ def form(raw: bytes) -> dict:
     return api.build_rewrite_settings_request(raw)
 
 
+def choices_of(service) -> dict:
+    return service.active_by_task()
+
+
 # --------------------------------------------------------------------------
-# the posted form: closed, and never a path
+# the posted form: closed, per task, and never a path
 
 
 def test_the_canonical_form_is_accepted_and_normalised():
     checked = form(body(endpoint="  " + ENDPOINT + "  ", model="  Qwen3.8 "))
-    assert checked == {"backend": "local-llm", "endpoint": ENDPOINT,
-                       "model": MODEL, "timeout_s": 180.0}
-    # An empty box means "no override", not "an empty address".
-    blank = form(body(backend="pe-llamacpp", endpoint="", model="",
-                      timeout_s=None))
-    assert blank == {"backend": "pe-llamacpp", "endpoint": None,
-                     "model": None, "timeout_s": None}
+    assert checked == {"t2i": "pe-llamacpp", "edit": "pe-llamacpp",
+                       "enabled": True, "endpoint": ENDPOINT, "model": MODEL,
+                       "timeout_s": 180.0}
+    # The two groups are independent: one draft on the enhancer, the other on
+    # the shared endpoint, in a single save.
+    split = form(body(t2i="pe-llamacpp", edit="local-llm"))
+    assert (split["t2i"], split["edit"]) == ("pe-llamacpp", "local-llm")
+    # An empty box means "no override", not "an empty address" — and the
+    # shared fields may be left empty while no draft kind uses them.
+    blank = form(body(endpoint="", model="", timeout_s=None))
+    assert blank == {"t2i": "pe-llamacpp", "edit": "pe-llamacpp",
+                     "enabled": True, "endpoint": None, "model": None,
+                     "timeout_s": None}
 
 
-def test_the_form_has_exactly_five_keys_and_a_schema_tag():
-    for dropped in ("schema", "backend", "endpoint", "model", "timeout_s"):
+def test_the_form_has_exactly_six_keys_and_a_schema_tag():
+    for dropped in ("schema", "t2i", "edit", "enabled", "endpoint", "model",
+                    "timeout_s"):
         doc = json.loads(body())
         del doc[dropped]
         with pytest.raises(api.ApiError) as exc:
             form(json.dumps(doc).encode())
-        assert exc.value.status == 400
+        assert exc.value.status == 400, dropped
         assert exc.value.code == "invalid_envelope"
 
 
-def test_a_sixth_key_is_refused_rather_than_dropped():
+def test_a_seventh_key_is_refused_rather_than_dropped():
     doc = json.loads(body())
     doc["temperature"] = 0.5
     with pytest.raises(api.ApiError) as exc:
         form(json.dumps(doc).encode())
     assert exc.value.code == "invalid_envelope"
     assert "temperature" in exc.value.message
+
+
+def test_the_old_single_backend_key_is_no_longer_a_wire_key():
+    """The POST route never migrates: a client that still sends ``backend`` is
+    told the rule, not quietly translated (only a FILE already on disk is)."""
+    with pytest.raises(api.ApiError) as exc:
+        api.validate_rewrite_settings({"backend": "local-llm",
+                                       "t2i": "pe-llamacpp",
+                                       "edit": "pe-llamacpp",
+                                       "enabled": True, "endpoint": ENDPOINT,
+                                       "model": MODEL, "timeout_s": None})
+    assert exc.value.status == 400 and exc.value.code == "invalid_envelope"
+    assert "backend" in exc.value.message
+    assert "per draft kind" in exc.value.message
 
 
 @pytest.mark.parametrize("key", [
@@ -163,8 +219,8 @@ def test_a_sixth_key_is_refused_rather_than_dropped():
 def test_a_path_shaped_key_is_refused_and_the_rule_is_named(key):
     """The absolute rule, not a denylist: a browser that may name one file can
     name any file on this machine, so NO key that looks like a location — by
-    name or by shape — is ever accepted."""
-    doc = json.loads(body(backend="pe-llamacpp"))
+    name or by shape — is ever accepted. That covers the edit checkpoint too."""
+    doc = json.loads(body(t2i="pe-llamacpp", edit="pe-llamacpp"))
     doc[key] = BINARY
     with pytest.raises(api.ApiError) as exc:
         form(json.dumps(doc).encode())
@@ -178,8 +234,9 @@ def test_the_saved_document_rejects_a_path_key_too():
     cannot be wider than a request."""
     with pytest.raises(api.ApiError):
         rs.RewritePreferences.from_dict(
-            {"backend": "pe-llamacpp", "endpoint": None, "model": None,
-             "timeout_s": None, "binary": BINARY})
+            {"t2i": "pe-llamacpp", "edit": "pe-llamacpp", "enabled": True,
+             "endpoint": None, "model": None, "timeout_s": None,
+             "binary": BINARY})
 
 
 @pytest.mark.parametrize("endpoint", [
@@ -191,11 +248,14 @@ def test_the_saved_document_rejects_a_path_key_too():
     "http://127.0.0.1:8079/v1?q=http://evil.test",   # not a URL
 ])
 def test_an_endpoint_that_is_not_a_plain_loopback_url_is_refused(endpoint):
-    with pytest.raises(api.ApiError) as exc:
-        form(body(endpoint=endpoint))
-    assert exc.value.status == 422
-    assert exc.value.code == "endpoint_unsupported"
-    assert any(name == "endpoint" for name, _ in exc.value.field_errors)
+    # The endpoint is shared by both groups, so the rule is checked once for
+    # whichever draft kind chose it.
+    for task in ("t2i", "edit"):
+        with pytest.raises(api.ApiError) as exc:
+            form(body(**{task: "local-llm", "endpoint": endpoint}))
+        assert exc.value.status == 422, (task, endpoint)
+        assert exc.value.code == "endpoint_unsupported"
+        assert any(name == "endpoint" for name, _ in exc.value.field_errors)
 
 
 def test_a_path_IN_THE_URL_IS_fine_but_a_path_on_DISK_is_not():
@@ -205,25 +265,109 @@ def test_a_path_IN_THE_URL_IS_fine_but_a_path_on_DISK_is_not():
         "http://localhost:1234/a/b/c.json"
 
 
-@pytest.mark.parametrize("backend", ["gpt-4", "pe_llamacpp", "PE-LLAMACPP",
-                                     "local", "", "off "])
-def test_the_backend_is_closed(backend):
+@pytest.mark.parametrize("task", ["t2i", "edit"])
+@pytest.mark.parametrize("choice", ["gpt-4", "pe_llamacpp", "PE-LLAMACPP",
+                                    "local", "", "off ", "off", True, 4])
+def test_the_choice_is_closed_separately_for_each_draft_kind(task, choice):
     with pytest.raises(api.ApiError) as exc:
-        form(body(backend=backend))
+        form(body(**{task: choice}))
     assert exc.value.status == 422
     assert exc.value.code == "backend_unknown"
+    # The sentence names WHICH group was asked, because the page shows two.
+    assert task in exc.value.message
 
 
-def test_off_is_a_legal_choice():
-    assert form(body(backend="off", endpoint=None, model=None))["backend"] == "off"
-
-
-def test_choosing_the_local_service_without_an_address_is_refused():
+def test_off_is_a_switch_and_not_a_choice():
+    """``off`` used to be a third value of one key; it is now the ``enabled``
+    boolean, because "both tasks off" and "the switch is off" are one fact."""
+    assert form(body(enabled=False))["enabled"] is False
+    for bad in ("off", "true", 1, 0):
+        with pytest.raises(api.ApiError) as exc:
+            form(body(enabled=bad))
+        assert exc.value.status == 400, bad
+        assert exc.value.code == "invalid_envelope"
+        assert any(name == "enabled" for name, _ in exc.value.field_errors)
+    # A POST may leave nothing unset, not even the switch.
     with pytest.raises(api.ApiError) as exc:
-        form(body(endpoint=None))
-    assert exc.value.status == 422
-    assert exc.value.code == "backend_incomplete"
-    assert sorted(name for name, _ in exc.value.field_errors) == ["endpoint", "model"]
+        form(body(enabled=None))
+    assert exc.value.status == 400 and exc.value.code == "invalid_envelope"
+
+
+@pytest.mark.parametrize("task", ["t2i", "edit"])
+def test_a_posted_choice_may_not_be_null_even_though_a_saved_one_may(task):
+    with pytest.raises(api.ApiError) as exc:
+        form(body(**{task: None}))
+    assert exc.value.status == 400 and exc.value.code == "invalid_envelope"
+    assert task in exc.value.message
+    # A saved document, by contrast, may say "not chosen yet: use the default".
+    unset = rs.RewritePreferences.from_dict(
+        {"t2i": None, "edit": None, "enabled": None, "endpoint": None,
+         "model": None, "timeout_s": None})
+    assert unset.choice_for(task) is None and unset.off is False
+
+
+def test_choosing_the_endpoint_for_either_task_without_an_address_is_refused():
+    for task in ("t2i", "edit"):
+        with pytest.raises(api.ApiError) as exc:
+            form(body(**{task: "local-llm", "endpoint": None, "model": None}))
+        assert exc.value.status == 422, task
+        assert exc.value.code == "backend_incomplete"
+        assert sorted(name for name, _ in exc.value.field_errors) == \
+            ["endpoint", "model"]
+
+
+def test_the_shared_endpoint_fields_may_be_saved_while_no_task_uses_them():
+    """The address and model describe ONE service; filling them in while both
+    groups use the official enhancer is how the page saves a draft of them."""
+    filled = form(body(endpoint=ENDPOINT, model=MODEL))
+    assert (filled["endpoint"], filled["model"]) == (ENDPOINT, MODEL)
+    assert form(body(endpoint=None, model=None, timeout_s=None))["t2i"] == \
+        "pe-llamacpp"
+
+
+def test_a_half_empty_choice_is_completed_by_the_launch_flags(tmp_path):
+    """An endpoint choice needs an address to be reachable, and the address may
+    come from the flags rather than from the record. The rule therefore applies
+    to the EFFECTIVE document the page posts, while the record the server holds
+    (and republishes on the Settings page) may legitimately be half empty."""
+    document = {"t2i": "local-llm", "edit": "pe-llamacpp", "enabled": True,
+                "endpoint": None, "model": None, "timeout_s": None}
+    service = make_service(tmp_path, local=True, pe=True, i2i=True,
+                           preferences=rs.RewritePreferences(
+                               choices={"t2i": "local-llm",
+                                        "edit": "pe-llamacpp"}, enabled=True))
+    assert service.active_by_task() == {"t2i": "local-llm",
+                                        "edit": "pe-llamacpp"}
+    # The page is publishable, and prefills the address it is really using.
+    state = state_of(service)
+    assert state["saved"] == document
+    assert state["local"] == {"endpoint": ENDPOINT, "model": MODEL,
+                              "timeout_s": 30.0}
+    # The browser, by contrast, is the only place an address could come from:
+    # the same six keys POSTed are a refusal, not a silent read of the flags.
+    with pytest.raises(api.ApiError) as exc:
+        form(json.dumps({**document,
+                         "schema": api.REWRITE_SETTINGS_SCHEMA}).encode())
+    assert exc.value.status == 422 and exc.value.code == "backend_incomplete"
+
+
+def test_a_saved_file_may_choose_the_endpoint_without_naming_the_address(tmp_path):
+    """The same record ON DISK must load: ``api.validate_rewrite_settings``
+    documents that a saved record's endpoint and model are OVERRIDES, and a
+    reader that demanded them would throw away a user's whole choice — and warn
+    about a file that is legal by that rule."""
+    document = {"t2i": "local-llm", "edit": "pe-llamacpp", "enabled": True,
+                "endpoint": None, "model": None, "timeout_s": None}
+    path = rs.preferences_path(str(tmp_path))
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle)
+    loaded, warning = rs.load_preferences(path)
+    assert warning == "" and loaded is not None
+    assert loaded.choice_for("t2i") == "local-llm" and loaded.endpoint is None
+    service = make_service(tmp_path, local=True, pe=True, i2i=True,
+                           preferences=loaded)
+    assert service.active_by_task() == {"t2i": "local-llm",
+                                        "edit": "pe-llamacpp"}
 
 
 @pytest.mark.parametrize("timeout", [0, -1, 3601, "180", True])
@@ -237,20 +381,32 @@ def test_the_timeout_is_a_bounded_number_of_seconds(timeout):
     assert any(name == "timeout_s" for name, _ in exc.value.field_errors)
 
 
-def test_the_probe_request_pins_the_backend_and_keeps_the_rules():
+def test_the_probe_carries_only_the_endpoint_fields():
+    """A Test click always probes the SHARED service, so the probe cannot even
+    name a draft kind, let alone ask for 9.5 GiB of enhancer on the GPU."""
     fields = api.build_rewrite_test_request(json.dumps(
         {"schema": api.REWRITE_TEST_REQUEST_SCHEMA, "endpoint": ENDPOINT,
          "model": MODEL, "timeout_s": 5.0}).encode())
-    assert fields["backend"] == "local-llm"
-    # A probe may not ask for the enhancer: that would load 9.5 GiB on a click.
-    with pytest.raises(api.ApiError):
-        api.build_rewrite_test_request(json.dumps(
-            {"schema": api.REWRITE_TEST_REQUEST_SCHEMA, "backend": "pe-llamacpp",
-             "endpoint": ENDPOINT, "model": MODEL, "timeout_s": 5.0}).encode())
-    with pytest.raises(api.ApiError):
+    assert fields == {"endpoint": ENDPOINT, "model": MODEL, "timeout_s": 5.0}
+    for extra in ({"t2i": "pe-llamacpp"}, {"enabled": True},
+                  {"backend": "pe-llamacpp"}):
+        with pytest.raises(api.ApiError) as exc:
+            api.build_rewrite_test_request(json.dumps(
+                {"schema": api.REWRITE_TEST_REQUEST_SCHEMA, "endpoint": ENDPOINT,
+                 "model": MODEL, "timeout_s": 5.0, **extra}).encode())
+        assert exc.value.status == 400 and exc.value.code == "invalid_envelope"
+    for missing in ("endpoint", "model"):
+        doc = {"schema": api.REWRITE_TEST_REQUEST_SCHEMA, "endpoint": ENDPOINT,
+               "model": MODEL, "timeout_s": 5.0}
+        doc[missing] = None
+        with pytest.raises(api.ApiError) as exc:
+            api.build_rewrite_test_request(json.dumps(doc).encode())
+        assert exc.value.status == 422 and exc.value.code == "backend_incomplete"
+    with pytest.raises(api.ApiError) as exc:
         api.build_rewrite_test_request(json.dumps(
             {"schema": api.REWRITE_TEST_REQUEST_SCHEMA, "endpoint": "http://x:1/",
              "model": MODEL, "timeout_s": 5.0}).encode())
+    assert exc.value.status == 422 and exc.value.code == "endpoint_unsupported"
 
 
 # --------------------------------------------------------------------------
@@ -262,54 +418,124 @@ def state_of(service):
         json.dumps(service.settings_state())))
 
 
-def test_the_state_names_every_rewriter_and_where_the_choice_lives(tmp_path):
-    service = make_service(tmp_path, local=True, pe=True)
+def task_choice(state, task, backend):
+    row = [row for row in state["tasks"] if row["task"] == task][0]
+    return [choice for choice in row["choices"] if choice["id"] == backend][0]
+
+
+def test_the_state_offers_a_rewriter_per_draft_kind(tmp_path):
+    service = make_service(tmp_path, local=True, pe=True, i2i=True)
     state = state_of(service)
     assert state["schema"] == api.REWRITE_SETTINGS_SCHEMA
-    # Both rows always, in the server's order, with the GPU one saying so.
+    # One row per draft kind, in the server's order, each labelled with the
+    # words this module publishes — the page never invents a heading.
+    assert [(row["task"], row["label"]) for row in state["tasks"]] == [
+        ("t2i", api.REWRITE_TASK_LABELS["t2i"]),
+        ("edit", api.REWRITE_TASK_LABELS["edit"])]
+    assert api.REWRITE_TASK_LABELS["edit"] == "Edit prompt enhance"
+    for row in state["tasks"]:
+        assert [choice["id"] for choice in row["choices"]] == \
+            list(api.REWRITE_BACKENDS)
+    # Every rewriter here is usable for both kinds, so nothing is greyed.
+    for row in state["tasks"]:
+        for choice in row["choices"]:
+            assert choice["available"] is True and choice["reason"] == "", row
+    assert task_choice(state, "edit", "local-llm")["label"] == \
+        "OpenAI-compatible endpoint"
+    assert task_choice(state, "t2i", "pe-llamacpp")["uses_gpu"] is True
+    assert task_choice(state, "t2i", "local-llm")["uses_gpu"] is False
+    # The backend rows too, in the server's order, with the GPU one saying so.
     assert [(row["id"], row["available"], row["uses_gpu"], row["tasks"])
             for row in state["backends"]] == [
-        ("pe-llamacpp", True, True, ["t2i"]),
+        ("pe-llamacpp", True, True, ["t2i", "edit"]),
         ("local-llm", True, False, ["t2i", "edit"]),
     ]
     assert state["off"] == {"id": "off", "label": "Off", "available": True,
                             "reason": ""}
     assert state["persistent"] is True and "note" not in state
-    # Prefill: what the LOCAL service is reached as RIGHT NOW (flags here).
+    # Which radio is checked in EACH group: a choice, never a null.
+    assert state["choices"] == {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"}
+    assert state["enabled"] is True
+    # Prefill: what the LOCAL service is reached as RIGHT NOW (flags here), and
+    # it is one shared service, so it names no rewriter at all.
     assert state["local"] == {"endpoint": ENDPOINT, "model": MODEL,
                               "timeout_s": 30.0}
-    assert state["backend"] == "pe-llamacpp"       # the enhancer is standard
-    assert state["saved"] == {"backend": None, "endpoint": None, "model": None,
+    assert state["saved"] == {"t2i": None, "edit": None, "enabled": None,
+                              "endpoint": None, "model": None,
                               "timeout_s": None}
 
 
-def test_a_rewriter_the_flags_cannot_run_is_offered_greyed_with_a_reason(tmp_path):
+def test_the_official_choice_is_greyed_for_edit_only_without_the_i2i_pair(tmp_path):
+    """PE-T2I and PE-I2I are installed independently, so "no official rewriter"
+    is a per-draft-kind fact and the page must be able to show exactly that."""
+    service = make_service(tmp_path, local=True, pe=True)
+    state = state_of(service)
+    official_for_edit = task_choice(state, "edit", "pe-llamacpp")
+    assert official_for_edit["available"] is False
+    assert official_for_edit["reason"] and "image-edit" in official_for_edit["reason"]
+    # The text group is untouched: same rewriter, still offered, no excuse.
+    assert task_choice(state, "t2i", "pe-llamacpp")["available"] is True
+    # A greyed-out choice still explains itself; the page never hides options.
+    assert task_choice(state, "edit", "local-llm")["available"] is True
+    # Capability is not choice: the group still shows the official radio
+    # checked, and `active_by_task` is what says the endpoint answers edit.
+    assert state["choices"] == {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"}
+    assert service.active_by_task() == {"t2i": "pe-llamacpp",
+                                        "edit": "local-llm"}
+    # The reason renders in a browser, so it names no path — the closed
+    # validator enforces that on the whole document.
+    assert "/" not in official_for_edit["reason"]
+    assert [row["tasks"] for row in state["backends"]] == [["t2i"],
+                                                           ["t2i", "edit"]]
+
+
+def test_a_rewriter_the_flags_cannot_run_is_greyed_for_every_draft_kind(tmp_path):
     service = make_service(tmp_path, local=True, pe=False)
     state = state_of(service)
     pe_row = state["backends"][0]
     assert pe_row["available"] is False
     assert pe_row["reason"] and "flags" in pe_row["reason"]
-    # A greyed-out choice still explains itself; the page never hides options.
-    assert state["backend"] == "local-llm"
+    for task in ("t2i", "edit"):
+        choice = task_choice(state, task, "pe-llamacpp")
+        assert choice["available"] is False and choice["reason"]
+    assert service.active_by_task() == {"t2i": "local-llm",
+                                        "edit": "local-llm"}
+
+
+def test_a_server_with_no_rewriter_at_all_still_answers_the_page(tmp_path):
+    service = make_service(tmp_path, local=False, pe=False)
+    state = state_of(service)
+    assert [row["available"] for row in state["backends"]] == [False, False]
+    for task in ("t2i", "edit"):
+        for backend in api.REWRITE_BACKENDS:
+            assert task_choice(state, task, backend)["available"] is False
+    # The page still needs a checked radio in both groups, so the default is
+    # shown even where it cannot be honoured.
+    assert state["choices"] == {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"}
+    assert service.active_by_task() == {"t2i": None, "edit": None}
 
 
 def test_the_state_never_carries_a_path_even_when_every_path_is_configured(tmp_path):
-    """The binary, the GGUF, the system prompts and the enhancer log all live
-    on disk; none of those names may cross the wire, because the page would
-    otherwise tell a browser where the operator's files are."""
-    service = make_service(tmp_path, local=True, pe=True)
-    for document in (service.settings_state(), service.status_block()):
-        text = json.dumps(document)
-        for secret in (BINARY, GGUF, str(tmp_path), "system_prompt", ".log"):
-            assert secret not in text, (secret, sorted(document))
-    assert state_of(service)["backends"][0]["available"] is True
+    """The binary, both GGUFs, the vision projector, the system prompts and the
+    enhancer log all live on disk; none of those names may cross the wire,
+    because the page would otherwise tell a browser where the operator's files
+    are."""
+    for service in (make_service(tmp_path, local=True, pe=True, i2i=True),
+                    make_service(tmp_path, local=True, pe=True)):
+        for document in (service.settings_state(), service.status_block()):
+            text = json.dumps(document)
+            for secret in (BINARY, GGUF, I2I_GGUF, MMPROJ, str(tmp_path),
+                           "system_prompt", ".log"):
+                assert secret not in text, (secret, sorted(document))
+    assert state_of(make_service(tmp_path, local=True, pe=True,
+                                 i2i=True))["backends"][0]["available"] is True
 
 
 def test_a_state_with_an_extra_key_is_refused_before_it_is_sent(tmp_path):
     service = make_service(tmp_path)
     doc = dict(service.settings_state())
     for extra in ({"binary": BINARY}, {"log_path": "/tmp/x.log"},
-                  {"backend_extra": 1}):
+                  {"backend": "local-llm"}, {"backend_extra": 1}):
         with pytest.raises(ValueError):
             api.validate_rewrite_settings_state({**doc, **extra})
 
@@ -325,124 +551,326 @@ def test_the_state_rows_must_be_the_two_backends_in_order(tmp_path):
         api.validate_rewrite_settings_state(doc)
 
 
+def test_the_task_rows_are_closed_too(tmp_path):
+    """The per-task groups are validated by the same closed-shape rule as the
+    backend rows: a page that had to guess which flag gates which option could
+    not be checked, so the server answers and the validator pins the answer."""
+    base = dict(make_service(tmp_path, local=True, pe=True,
+                             i2i=True).settings_state())
+    for mutate in (
+            lambda rows: list(reversed(rows)),                       # order
+            lambda rows: rows[:1],                                   # one group
+            lambda rows: [{**rows[0], "task": "edit"}, rows[1]],     # wrong kind
+            lambda rows: [{**rows[0], "label": "Rewriter?"}, rows[1]],
+            lambda rows: [{**rows[0], "choices": [rows[0]["choices"][0]]},
+                          rows[1]],                                  # one option
+            lambda rows: [{**rows[0], "choices": list(
+                reversed(rows[0]["choices"]))}, rows[1]],            # option order
+            lambda rows: [{**rows[0], "choices": [
+                {**rows[0]["choices"][0], "available": False, "reason": ""},
+                rows[0]["choices"][1]]}, rows[1]],                   # no excuse
+            lambda rows: [{**rows[0], "choices": [
+                {**rows[0]["choices"][0], "uses_gpu": False},
+                rows[0]["choices"][1]]}, rows[1]],                   # lies about GPU
+    ):
+        doc = dict(base)
+        doc["tasks"] = mutate([dict(row) for row in base["tasks"]])
+        with pytest.raises(ValueError):
+            api.validate_rewrite_settings_state(doc)
+    for task in ("t2i", "edit"):
+        doc = dict(base)
+        doc["choices"] = {**base["choices"], task: None}
+        with pytest.raises(ValueError):
+            api.validate_rewrite_settings_state(doc)
+
+
 def test_an_unpersistent_server_says_so():
     service = rs.RewriteService(rs.RewriteSettings(
         backend="local-llm", endpoint=ENDPOINT, model=MODEL,
         prompts=dict(PROMPTS), timeout=30.0),
         transport=lambda r: reply(),
-        client_factory=lambda b, s, p, prefs: FakeClient(b, []))
+        client_factory=lambda task, backend, s, p, pr: FakeClient(backend, []))
     state = service.settings_state()
     assert state["persistent"] is False
     assert "no cache directory" in state["note"]
     # And a save here is a refusal, not a silent in-memory lie.
     with pytest.raises(OSError):
-        rs.save_preferences(None, rs.RewritePreferences(backend="off"))
+        rs.save_preferences(None, rs.RewritePreferences(
+            choices={"t2i": "pe-llamacpp", "edit": "pe-llamacpp"},
+            enabled=False))
 
 
 # --------------------------------------------------------------------------
-# the saved document
+# the saved document, and the old single-backend file it grew out of
 
 
 def test_a_saved_choice_round_trips_and_is_written_private(tmp_path):
     service = make_service(tmp_path)
-    prefs = rs.RewritePreferences(backend="pe-llamacpp", endpoint=ENDPOINT,
+    saved = rs.RewritePreferences(choices={"t2i": "pe-llamacpp",
+                                           "edit": "local-llm"},
+                                  enabled=True, endpoint=ENDPOINT,
                                   model="Qwen3.8", timeout_s=42.5)
-    service.apply_preferences(prefs)
+    service.apply_preferences(saved)
     path = rs.preferences_path(str(tmp_path))
     assert path.endswith(rs.SETTINGS_FILENAME)
     mode = stat.S_IMODE(os.stat(path).st_mode)
     assert mode == 0o600, oct(mode)
     loaded, warning = rs.load_preferences(path)
-    assert warning == "" and loaded == prefs
-    assert json.loads(open(path, encoding="utf-8").read())["backend"] == \
-        "pe-llamacpp"
-    # The file holds four values and no location.
-    assert set(json.loads(open(path, encoding="utf-8").read())) == \
-        set(rs.RewritePreferences.KEYS)
+    assert warning == "" and loaded == saved
+    assert loaded.choice_for("t2i") == "pe-llamacpp"
+    assert loaded.choice_for("edit") == "local-llm"
+    on_disk = json.loads(open(path, encoding="utf-8").read())
+    # The file we write is a file this server accepts with no translation step:
+    # six values, and no legacy ``backend`` key.
+    assert set(on_disk) == CHOICE_KEYS
+    assert rs.LEGACY_BACKEND_KEY not in on_disk
     assert BINARY not in open(path, encoding="utf-8").read()
 
 
+@pytest.mark.parametrize("legacy,chosen,enabled", [
+    ("local-llm", ("local-llm", "local-llm"), True),
+    ("pe-llamacpp", ("pe-llamacpp", "pe-llamacpp"), True),
+    ("off", (None, None), False),
+    (None, (None, None), None),
+])
+def test_an_old_single_backend_file_becomes_a_choice_for_both_tasks(
+        tmp_path, legacy, chosen, enabled):
+    """The old key meant one thing; per-task choices mean two. The migration is
+    a pure key translation: the old value applies to BOTH kinds, ``off`` was a
+    switch rather than a rewriter, and "not chosen" stays not chosen."""
+    document = {"backend": legacy, "endpoint": ENDPOINT, "model": MODEL,
+                "timeout_s": 60.0}
+    migrated = rs.migrate_saved(document)
+    assert rs.LEGACY_BACKEND_KEY not in migrated
+    assert (migrated["t2i"], migrated["edit"]) == chosen
+    assert migrated["enabled"] is enabled
+    assert (migrated["endpoint"], migrated["model"], migrated["timeout_s"]) == \
+        (ENDPOINT, MODEL, 60.0)
+    loaded = rs.RewritePreferences.from_dict(migrated)
+    assert (loaded.choice_for("t2i"), loaded.choice_for("edit")) == chosen
+    assert loaded.off is (enabled is False)
+    # And through the file loader, which is where a real server meets it.
+    path = rs.preferences_path(str(tmp_path))
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle)
+    from_disk, warning = rs.load_preferences(path)
+    assert warning == "" and from_disk == loaded
+
+
+def test_an_old_off_file_switches_the_restarted_server_off(tmp_path):
+    path = rs.preferences_path(str(tmp_path))
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"backend": "off", "endpoint": ENDPOINT, "model": MODEL,
+                   "timeout_s": None}, handle)
+    loaded, warning = rs.load_preferences(path)
+    assert warning == "" and loaded.off is True
+    service = make_service(tmp_path, local=True, pe=True, i2i=True,
+                           preferences=loaded)
+    assert service.active_by_task() == {"t2i": None, "edit": None}
+    assert service.status_block()["state"] == "unavailable"
+    # A switch, not a choice: the groups still show the official radios ready
+    # for whenever the switch comes back on.
+    assert service.settings_state()["choices"] == {"t2i": "pe-llamacpp",
+                                                   "edit": "pe-llamacpp"}
+
+
+def test_a_leftover_backend_key_beside_per_task_choices_is_dropped_not_obeyed(tmp_path):
+    """A hand-merged file must not have the old key win over the new ones."""
+    document = {"backend": "local-llm", "t2i": "pe-llamacpp",
+                "edit": "local-llm", "enabled": True, "endpoint": ENDPOINT,
+                "model": MODEL, "timeout_s": None}
+    assert rs.migrate_saved(document) == {key: value for key, value
+                                          in document.items()
+                                          if key != rs.LEGACY_BACKEND_KEY}
+    path = rs.preferences_path(str(tmp_path))
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle)
+    loaded, warning = rs.load_preferences(path)
+    assert warning == ""
+    assert (loaded.choice_for("t2i"), loaded.choice_for("edit")) == \
+        ("pe-llamacpp", "local-llm")
+
+
+def test_reading_an_old_file_never_rewrites_it(tmp_path):
+    """Migration runs on READ. The operator's file keeps its shape until the
+    USER saves again: starting a server must not have write side effects."""
+    path = rs.preferences_path(str(tmp_path))
+    legacy = json.dumps({"backend": "local-llm", "endpoint": ENDPOINT,
+                         "model": MODEL, "timeout_s": 60.0}, sort_keys=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(legacy)
+    service = make_service(tmp_path, local=True, pe=True)
+    assert server.load_saved_preferences(service, cache_dir=str(tmp_path))
+    assert open(path, encoding="utf-8").read() == legacy
+    assert service.active_by_task() == {"t2i": "local-llm", "edit": "local-llm"}
+    # Saving from Settings is what converts it, and then the old key is gone.
+    service.apply_preferences(service.preferences())
+    assert rs.LEGACY_BACKEND_KEY not in open(path, encoding="utf-8").read()
+
+
+def test_migration_is_a_no_op_for_anything_that_is_not_an_old_choice():
+    for document in (None, [], "off", {"endpoint": ENDPOINT},
+                     {"t2i": "pe-llamacpp", "edit": "pe-llamacpp",
+                      "enabled": True, "endpoint": None, "model": None,
+                      "timeout_s": None}):
+        assert rs.migrate_saved(document) == document
+
+
 def test_a_saved_choice_changes_which_rewriter_answers(tmp_path):
-    built: list[str] = []
-    service = make_service(tmp_path, local=True, pe=True, built=built)
-    assert service.active_backend == "pe-llamacpp"
-    service.apply_preferences(rs.RewritePreferences(backend="local-llm",
-                                                    endpoint=ENDPOINT,
-                                                    model=MODEL))
-    assert service.active_backend == "local-llm"
-    # Every change rebuilds BOTH available clients; the choice only decides
-    # which one answers, so switching back never needs the operator.
-    assert built == ["pe-llamacpp", "local-llm"] * 2
-    service.apply_preferences(rs.RewritePreferences(backend="off"))
+    built: list[tuple[str, str]] = []
+    service = make_service(tmp_path, local=True, pe=True, i2i=True, built=built)
+    assert choices_of(service) == {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"}
+    # Every change rebuilds every client this server can run; the choice only
+    # decides which one answers, so switching back never needs the operator.
+    per_rebuild = [("t2i", "pe-llamacpp"), ("t2i", "local-llm"),
+                   ("edit", "pe-llamacpp")]
+    assert built == per_rebuild
+    service.apply_preferences(rs.RewritePreferences(
+        choices={"t2i": "local-llm", "edit": "local-llm"}, enabled=True,
+        endpoint=ENDPOINT, model=MODEL))
+    assert choices_of(service) == {"t2i": "local-llm", "edit": "local-llm"}
+    assert built == per_rebuild * 2
+    service.apply_preferences(rs.RewritePreferences(
+        choices={"t2i": "pe-llamacpp", "edit": "pe-llamacpp"}, enabled=False))
+    assert choices_of(service) == {"t2i": None, "edit": None}
     assert service.active_backend is None
     assert service.status_block()["code"] == "rewrite_disabled"
     assert "Settings" in service.status_block()["reason"]
 
 
+def test_the_endpoint_service_is_built_once_and_shared_by_both_groups(tmp_path):
+    """One OpenAI-compatible service, two groups: a second client would mean a
+    second connection pool for the same address."""
+    built: list[tuple[str, str]] = []
+    live: dict = {}
+    service = make_service(tmp_path, local=True, pe=True, i2i=True, built=built,
+                           clients=live)
+    assert built == [("t2i", "pe-llamacpp"), ("t2i", "local-llm"),
+                     ("edit", "pe-llamacpp")]
+    assert service._clients[("t2i", "local-llm")] is \
+        service._clients[("edit", "local-llm")]
+    # Two checkpoints are two llama-server processes, so they are two clients.
+    assert service._clients[("t2i", "pe-llamacpp")] is not \
+        service._clients[("edit", "pe-llamacpp")]
+
+
 def test_an_unavailable_choice_is_refused_before_anything_is_built(tmp_path):
-    """The amendment's ordering rule: check, then build, then write. A browser
-    may not select the enhancer on a server that was started without it, and
-    the attempt must leave no trace behind."""
-    built: list[str] = []
+    """The ordering rule: check, then build, then write. A browser may not
+    select the enhancer on a server that was started without it, and the
+    attempt must leave no trace behind."""
+    built: list[tuple[str, str]] = []
     service = make_service(tmp_path, local=True, pe=False, built=built)
     built.clear()
     with pytest.raises(api.ApiError) as exc:
-        service.check_preferences(rs.RewritePreferences(backend="pe-llamacpp"))
+        service.check_preferences(rs.RewritePreferences(
+            choices={"t2i": "pe-llamacpp", "edit": "local-llm"}, enabled=True,
+            endpoint=ENDPOINT, model=MODEL))
     assert exc.value.status == 422 and exc.value.code == "backend_unavailable"
     assert "flags" in exc.value.message
+    # The refusal says the same thing the greyed-out radio says.
+    assert exc.value.message == service.unavailable_reason("pe-llamacpp", "t2i")
     assert built == [], "a refused choice must build nothing"
-    with pytest.raises(api.ApiError):
-        service.check_preferences(rs.RewritePreferences(backend="nonsense"))
-    assert built == []
-    # "off" is always allowed, and nothing is written by a refusal.
-    service.check_preferences(rs.RewritePreferences(backend="off"))
+    # Switched off is always allowed: nothing is being asked of any rewriter.
+    service.check_preferences(rs.RewritePreferences(
+        choices={"t2i": "pe-llamacpp", "edit": "pe-llamacpp"}, enabled=False))
+    # The endpoint answer is available here, so that save passes.
+    service.check_preferences(rs.RewritePreferences(
+        choices={"t2i": "local-llm", "edit": "local-llm"}, enabled=True,
+        endpoint=ENDPOINT, model=MODEL))
     assert not os.path.exists(rs.preferences_path(str(tmp_path)))
+
+
+def test_a_choice_the_server_cannot_honour_falls_back_and_says_so(tmp_path):
+    """A SAVED choice is different from a POST: nobody is waiting for a reply,
+    so startup keeps the choice, uses what works, and reports it."""
+    path = rs.preferences_path(str(tmp_path))
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"t2i": "pe-llamacpp", "edit": "pe-llamacpp",
+                   "enabled": True, "endpoint": ENDPOINT, "model": MODEL,
+                   "timeout_s": None}, handle)
+    loaded, warning = rs.load_preferences(path)
+    assert warning == ""
+    service = make_service(tmp_path, local=True, pe=True, preferences=loaded)
+    # t2i is honoured; edit has no official checkpoint here, so the endpoint
+    # answers it — and the saved choice is left alone.
+    assert service.active_by_task() == {"t2i": "pe-llamacpp",
+                                        "edit": "local-llm"}
+    assert service.preferences().choice_for("edit") == "pe-llamacpp"
+    assert service.effective_choices() == {"t2i": "pe-llamacpp",
+                                           "edit": "pe-llamacpp"}
+    assert service.backend_tasks("pe-llamacpp") == ["t2i"]
+    assert service.backend_tasks("local-llm") == ["t2i", "edit"]
 
 
 def test_a_choice_of_off_survives_a_server_restart(tmp_path):
     """Off is a setting, not the absence of one: the flags must not silently
     re-enable a rewriter the user switched off."""
-    service = make_service(tmp_path, local=True, pe=True)
-    service.apply_preferences(rs.RewritePreferences(backend="off"))
-    prefs, warning = rs.load_preferences(rs.preferences_path(str(tmp_path)))
-    assert warning == "" and prefs is not None
-    restarted = make_service(tmp_path, local=True, pe=True, preferences=prefs)
-    assert restarted.active_backend is None
-    assert restarted.status_block()["state"] == "unavailable"
+    service = make_service(tmp_path, local=True, pe=True, i2i=True)
+    service.apply_preferences(rs.RewritePreferences(
+        choices={"t2i": "pe-llamacpp", "edit": "pe-llamacpp"}, enabled=False,
+        endpoint=ENDPOINT, model=MODEL))
+    loaded, warning = rs.load_preferences(rs.preferences_path(str(tmp_path)))
+    assert warning == "" and loaded is not None and loaded.off is True
+    restarted = make_service(tmp_path, local=True, pe=True, i2i=True,
+                             preferences=loaded)
+    assert restarted.active_by_task() == {"t2i": None, "edit": None}
+    assert restarted.available is False
+    block = restarted.status_block()
+    assert block["state"] == "unavailable" and "switched off" in block["reason"]
+    # One switch means BOTH drafts go quiet, with the off reason, not a
+    # per-task refusal.
+    with pytest.raises(api.ApiError) as exc:
+        restarted.submit({"task": "t2i", "prompt": "a cat",
+                          "draft_revision": 1, "image_ids": []})
+    assert (exc.value.status, exc.value.code) == (503, "rewrite_disabled")
 
 
 def test_a_broken_saved_document_falls_back_and_warns(tmp_path, capsys):
     path = rs.preferences_path(str(tmp_path))
-    for garbage in (b"", b"{", b'{"backend": 4}', b'{"backend": "gpt"}',
-                    json.dumps({"backend": "local-llm", "endpoint": "http://x:1/",
+    for garbage in (b"", b"{",
+                    b'{"t2i": 4}',
+                    json.dumps({"t2i": "gpt-4", "edit": "local-llm",
+                                "enabled": True, "endpoint": ENDPOINT,
                                 "model": "m", "timeout_s": None}).encode(),
-                    json.dumps({"backend": "local-llm", "endpoint": ENDPOINT,
+                    json.dumps({"t2i": "local-llm", "edit": "local-llm",
+                                "enabled": True, "endpoint": "http://x:1/",
+                                "model": "m", "timeout_s": None}).encode(),
+                    json.dumps({"t2i": "local-llm", "edit": "local-llm",
+                                "enabled": True, "endpoint": ENDPOINT,
                                 "model": "m", "timeout_s": None,
-                                "binary": BINARY}).encode()):
+                                "binary": BINARY}).encode(),
+                    json.dumps({"t2i": "pe-llamacpp", "edit": "pe-llamacpp",
+                                "enabled": "off", "endpoint": None,
+                                "model": None, "timeout_s": None}).encode(),
+                    # Migration must not launder an old file that is also bad.
+                    json.dumps({"backend": "local-llm",
+                                "endpoint": "http://x:1/", "model": "m",
+                                "timeout_s": None}).encode()):
         with open(path, "wb") as handle:
             handle.write(garbage)
-        prefs, warning = rs.load_preferences(path)
-        assert prefs is None, garbage
+        loaded, warning = rs.load_preferences(path)
+        assert loaded is None, garbage
         assert warning and "start-up defaults" in warning
         # One bounded line, never a traceback and never a path.
         assert "\n" not in warning.strip() and str(tmp_path) not in warning
         service = make_service(tmp_path)
         server.load_saved_preferences(service, cache_dir=str(tmp_path))
-        assert service.active_backend == "local-llm", garbage
+        assert service.active_by_task() == {"t2i": "local-llm",
+                                            "edit": "local-llm"}, garbage
     assert "rewrite settings" in capsys.readouterr().err
 
 
 def test_an_oversized_saved_document_is_ignored(tmp_path):
     path = rs.preferences_path(str(tmp_path))
     with open(path, "wb") as handle:
-        handle.write(b'{"backend":"off",' + b"x" * rs.MAX_SETTINGS_BYTES)
-    prefs, warning = rs.load_preferences(path)
-    assert prefs is None and str(rs.MAX_SETTINGS_BYTES) in warning
+        handle.write(b'{"enabled":true,' + b"x" * rs.MAX_SETTINGS_BYTES)
+    loaded, warning = rs.load_preferences(path)
+    assert loaded is None and str(rs.MAX_SETTINGS_BYTES) in warning
 
 
 def test_a_missing_file_is_not_a_warning(tmp_path):
-    prefs, warning = rs.load_preferences(rs.preferences_path(str(tmp_path)))
-    assert prefs is None and warning == ""
+    loaded, warning = rs.load_preferences(rs.preferences_path(str(tmp_path)))
+    assert loaded is None and warning == ""
     assert rs.load_preferences(None) == (None, "")
 
 
@@ -572,7 +1000,12 @@ def test_get_settings_reads_the_choice_without_a_rewriter_enabled(tmp_path):
                                        service))
     assert status == 200
     assert [row["available"] for row in payload["backends"]] == [False, False]
-    assert payload["backend"] is None
+    assert payload["choices"] == {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"}
+    assert payload["enabled"] is True
+    # Both groups are greyed everywhere, with a reason each.
+    for row in payload["tasks"]:
+        for choice in row["choices"]:
+            assert choice["available"] is False and choice["reason"]
 
 
 def test_get_settings_without_a_service_at_all_is_a_typed_503():
@@ -600,57 +1033,85 @@ def test_a_foreign_origin_may_not_change_the_rewriter():
     policy that guards uploads guards it too."""
     status, payload = responded(request(
         "POST", server.SETTINGS_ROUTE,
-        json.loads(body()), origin="http://evil.test"))
+        json.loads(body(t2i="local-llm", edit="local-llm")),
+        origin="http://evil.test"))
     assert status == 403 and payload["code"] == "foreign_origin_denied"
 
 
 def test_post_settings_switches_the_rewriter_and_answers_with_the_new_state(tmp_path):
-    service = make_service(tmp_path, local=True, pe=True)
+    service = make_service(tmp_path, local=True, pe=True, i2i=True)
     status, payload = responded(request(
         "POST", server.SETTINGS_ROUTE,
-        json.loads(body(backend="local-llm", endpoint=OTHER_ENDPOINT,
-                        model="Other", timeout_s=240.0)), service))
+        json.loads(body(t2i="local-llm", edit="local-llm",
+                        endpoint=OTHER_ENDPOINT, model="Other",
+                        timeout_s=240.0)), service))
     assert status == 200
-    assert payload["backend"] == "local-llm"
-    assert payload["saved"] == {"backend": "local-llm",
-                                "endpoint": OTHER_ENDPOINT, "model": "Other",
-                                "timeout_s": 240.0}
+    assert payload["choices"] == {"t2i": "local-llm", "edit": "local-llm"}
+    assert payload["saved"] == {"t2i": "local-llm", "edit": "local-llm",
+                                "enabled": True, "endpoint": OTHER_ENDPOINT,
+                                "model": "Other", "timeout_s": 240.0}
     # The override wins over the flags, for the page AND for the next start.
     assert payload["local"] == {"endpoint": OTHER_ENDPOINT, "model": "Other",
                                 "timeout_s": 240.0}
-    assert service.active_backend == "local-llm"
+    assert service.active_by_task() == {"t2i": "local-llm", "edit": "local-llm"}
     saved, warning = rs.load_preferences(rs.preferences_path(str(tmp_path)))
-    assert warning == "" and saved.backend == "local-llm"
+    assert warning == "" and saved.choice_for("edit") == "local-llm"
     assert saved.endpoint == OTHER_ENDPOINT
 
 
+def test_post_settings_can_split_the_two_draft_kinds(tmp_path):
+    """The whole point of the change: one save, two answers, each named."""
+    service = make_service(tmp_path, local=True, pe=True, i2i=True)
+    status, payload = responded(request(
+        "POST", server.SETTINGS_ROUTE,
+        json.loads(body(t2i="pe-llamacpp", edit="local-llm")), service))
+    assert status == 200
+    assert payload["choices"] == {"t2i": "pe-llamacpp", "edit": "local-llm"}
+    assert service.active_by_task() == {"t2i": "pe-llamacpp",
+                                        "edit": "local-llm"}
+    assert service.status_block()["active_by_task"] == {
+        "t2i": "pe-llamacpp", "edit": "local-llm"}
+
+
 def test_a_refused_post_leaves_the_server_exactly_as_it_was(tmp_path):
-    """Every way the page can ask wrongly must be a NO-OP: the active rewriter,
-    the choice in force and the file on disk all stay untouched, so a refused
-    save can never half-apply."""
-    service = make_service(tmp_path, local=True, pe=False)
+    """Every way the page can ask wrongly must be a NO-OP: the rewriter
+    answering each draft kind, the choice in force and the file on disk all
+    stay untouched, so a refused save can never half-apply."""
+    built: list[tuple[str, str]] = []
+    service = make_service(tmp_path, local=True, pe=False, built=built)
+    built.clear()                 # only what a REFUSAL builds is of interest
     path = rs.preferences_path(str(tmp_path))
     before = service.preferences()
     for payload, code, status in (
-            # The enhancer is not configured here: asking for it is a question
-            # about files only the operator can place.
-            (json.loads(body(backend="pe-llamacpp")), "backend_unavailable", 422),
+            # The enhancer is not configured here: asking for it, for either
+            # draft kind, is a question about files only the operator can place.
+            (json.loads(body(t2i="pe-llamacpp", edit="local-llm")),
+             "backend_unavailable", 422),
+            (json.loads(body(t2i="local-llm", edit="pe-llamacpp")),
+             "backend_unavailable", 422),
+            # The legacy key is not a wire key any more.
+            (json.loads(body(backend="local-llm")), "invalid_envelope", 400),
             ({"binary": BINARY}, "invalid_envelope", 400),
-            (json.loads(body(endpoint="http://0.0.0.0:1/v1")),
+            (json.loads(body(enabled="off")), "invalid_envelope", 400),
+            (json.loads(body(t2i="local-llm",
+                             endpoint="http://0.0.0.0:1/v1")),
              "endpoint_unsupported", 422),
-            (json.loads(body(model=None)), "backend_incomplete", 422),
+            (json.loads(body(edit="local-llm", model=None, endpoint=None)),
+             "backend_incomplete", 422),
             (json.loads(body(timeout_s=99999)), "invalid_envelope", 400)):
         got, answered = responded(request("POST", server.SETTINGS_ROUTE, payload,
                                           service))
         assert got == status, (payload, answered)
         assert answered["code"] == code, answered
-        assert service.active_backend == "local-llm", code
+        assert service.active_by_task() == {"t2i": "local-llm",
+                                            "edit": "local-llm"}, code
         assert service.preferences() == before, code
+        assert built == [], f"a refused save must build no client: {code}"
         assert not os.path.exists(path), code
 
 
 def test_a_save_the_cache_dir_refuses_is_reported_and_undone(tmp_path, monkeypatch):
-    service = make_service(tmp_path, local=True, pe=True)
+    service = make_service(tmp_path, local=True, pe=True, i2i=True)
 
     def refuse(*args, **kwargs):
         raise OSError("read-only file system")
@@ -658,12 +1119,15 @@ def test_a_save_the_cache_dir_refuses_is_reported_and_undone(tmp_path, monkeypat
     monkeypatch.setattr(rs, "save_preferences", refuse)
     got, answered = responded(request(
         "POST", server.SETTINGS_ROUTE,
-        json.loads(body(backend="local-llm")), service))
+        json.loads(body(t2i="local-llm", edit="local-llm")), service))
     assert got == 503 and answered["code"] == "settings_unavailable"
     # The page must not show a choice the file does not hold: the previous one
-    # is back in force, so the NEXT start-up agrees with what was displayed.
-    assert service.active_backend == "pe-llamacpp"
-    assert service.preferences().backend is None
+    # is back in force for BOTH groups, so the NEXT start-up agrees with what
+    # was displayed.
+    assert service.active_by_task() == {"t2i": "pe-llamacpp",
+                                        "edit": "pe-llamacpp"}
+    assert service.preferences().choice_for("t2i") is None
+    assert service.preferences().choice_for("edit") is None
     assert not os.path.exists(rs.preferences_path(str(tmp_path)))
 
 
@@ -680,6 +1144,11 @@ def test_post_test_reports_the_probe_result(tmp_path):
         {"schema": api.REWRITE_TEST_REQUEST_SCHEMA, "endpoint": "http://x:1/",
          "model": MODEL, "timeout_s": 5.0}, service))
     assert got == 422 and answered["code"] == "endpoint_unsupported"
+    got, answered = responded(request(
+        "POST", server.SETTINGS_TEST_ROUTE,
+        {"schema": api.REWRITE_TEST_REQUEST_SCHEMA, "endpoint": ENDPOINT,
+         "model": None, "timeout_s": 5.0}, service))
+    assert got == 422 and answered["code"] == "backend_incomplete"
 
 
 # --------------------------------------------------------------------------
@@ -691,29 +1160,34 @@ def test_no_response_names_a_path_a_command_or_the_enhancer_binary(tmp_path):
     paths, which are the ones that quote an exception's text. The backend here
     fails the way a failed spawn does: naming its binary, its model and the
     options it was started with."""
-    command = f"could not exec {BINARY} --no-webui -m {GGUF}: no such file"
-    service = make_service(tmp_path, local=True, pe=True,
+    command = (f"could not exec {BINARY} --no-webui -m {GGUF} "
+               f"--mmproj {I2I_GGUF}: no such file")
+    service = make_service(tmp_path, local=True, pe=True, i2i=True,
                            transport=lambda r: reply("pong"),
                            client=BrokenClient("pe-llamacpp", [], command))
     documents = [service.settings_state(), service.status_block(),
                  service.test_connection(ENDPOINT, MODEL, 5.0),
                  api.rewrite_test_result(False, command, 1)]
-    try:
-        service.submit({"task": "t2i", "prompt": "a cat", "draft_revision": 1,
-                        "image_ids": []})
-        raise AssertionError("the broken backend must fail the rewrite")
-    except api.ApiError as exc:
-        documents.append(exc.to_payload())
+    # A server with only the text checkpoint explains itself per draft kind;
+    # that sentence is rendered in a browser, so it must be path-free too.
+    documents.append(make_service(tmp_path / "other", local=True,
+                                  pe=True).settings_state())
+    for task, images in (("t2i", []), ("edit", [store_image(tmp_path / "store")])):
+        try:
+            service.submit({"task": task, "prompt": "a cat",
+                            "draft_revision": 1, "image_ids": images})
+            raise AssertionError("the broken backend must fail the rewrite")
+        except api.ApiError as exc:
+            documents.append(exc.to_payload())
     for document in documents:
         text = json.dumps(document)
         # The PROGRAM NAME may appear (a greyed-out choice explains itself in
         # words) and so may the settings ROUTE; what may never appear is a
         # location on this machine or a fragment of the command line.
-        for secret in (BINARY, GGUF, str(tmp_path), "--no-webui", "--",
-                       "subprocess", "Popen", "llama_server", "model_path"):
+        for secret in (BINARY, GGUF, I2I_GGUF, MMPROJ, str(tmp_path),
+                       "--no-webui", "--", "subprocess", "Popen",
+                       "llama_server", "model_path", "i2i_model_path"):
             assert secret not in text, (secret, text[:400])
-
-
 
 
 def test_the_status_block_points_at_the_route_not_at_a_file(tmp_path):
@@ -721,12 +1195,13 @@ def test_the_status_block_points_at_the_route_not_at_a_file(tmp_path):
     assert block["settings"]["href"] == "/api/v1/settings/rewrite"
     assert block["settings"]["saved"] is False
     service = make_service(tmp_path)
-    service.apply_preferences(rs.RewritePreferences(backend="off"))
+    service.apply_preferences(rs.RewritePreferences(
+        choices={"t2i": "pe-llamacpp", "edit": "pe-llamacpp"}, enabled=False))
     assert service.status_block()["settings"]["saved"] is True
 
 
 # --------------------------------------------------------------------------
-# which rewriter answers, once the choice is saved
+# which rewriter answers each draft kind, once the choice is saved
 
 
 def store_image(root, colour=(200, 30, 30)):
@@ -742,52 +1217,127 @@ def rewrite(service, task="t2i", prompt="a cat", image_ids=()):
                            "image_ids": list(image_ids)}).payload
 
 
-def test_an_edit_draft_uses_the_local_service_while_the_enhancer_is_active(tmp_path):
-    """The enhancer has no edit weights, and the amendment refuses to answer an
-    edit draft with the wrong model: the local service takes it and the answer
-    says which one did. The saved choice is untouched — the text draft right
-    afterwards still goes to the enhancer."""
+def test_each_draft_kind_is_answered_by_its_own_rewriter(tmp_path):
+    """The split actually routes: a t2i draft goes to the official text
+    checkpoint, an edit draft to the endpoint, and neither sees the other's
+    draft — a different rewriter is a different prompt contract."""
     root = tmp_path / "store"
     ref = store_image(root)
-    live: dict[str, FakeClient] = {}
+    live: dict = {}
+    service = make_service(tmp_path, local=True, pe=True, i2i=True, clients=live,
+                           references_dir=str(root),
+                           preferences=rs.RewritePreferences(
+                               choices={"t2i": "pe-llamacpp",
+                                        "edit": "local-llm"},
+                               enabled=True, endpoint=ENDPOINT, model=MODEL))
+    assert rewrite(service)["backend"] == "pe-llamacpp"
+    edit = rewrite(service, "edit", "make it night", [ref])
+    assert edit["backend"] == "local-llm"
+    # ONE endpoint object keyed by both draft kinds: it was built for the text
+    # group, and it is the same object that answered the edit draft.
+    assert service._clients[("edit", "local-llm")] is \
+        service._clients[("t2i", "local-llm")]
+    assert edit["rewritten_prompt"] == "rewritten by local-llm for t2i"
+    assert live[("t2i", "pe-llamacpp")].requests == ["t2i"]
+    assert live[("edit", "pe-llamacpp")].requests == [], \
+        "the edit weights must not see a draft the choice sent elsewhere"
+    assert live[("t2i", "local-llm")].requests == ["edit"], \
+        "the shared endpoint client saw the edit draft once"
+    # The choice is unchanged by any of this.
+    assert service.preferences().choice_for("edit") == "local-llm"
+
+
+def test_an_edit_draft_can_be_answered_by_the_official_edit_checkpoint(tmp_path):
+    """With both files installed, the edit group's official radio is real work:
+    the edit client answers, the text client stays untouched."""
+    root = tmp_path / "store"
+    ref = store_image(root)
+    live: dict = {}
+    service = make_service(tmp_path, local=True, pe=True, i2i=True, clients=live,
+                           references_dir=str(root))
+    payload = rewrite(service, "edit", "make it night", [ref])
+    assert payload["backend"] == "pe-llamacpp"
+    assert payload["rewritten_prompt"] == "rewritten by pe-llamacpp for edit"
+    assert live[("edit", "pe-llamacpp")].requests == ["edit"]
+    assert live[("t2i", "pe-llamacpp")].requests == []
+
+
+def test_a_server_without_the_official_edit_checkpoint_routes_edit_to_the_endpoint(tmp_path):
+    """PE-T2I only: the edit group's official radio is greyed, the choice still
+    says official, and the endpoint answers — loudly, in the status block."""
+    root = tmp_path / "store"
+    ref = store_image(root)
+    live: dict = {}
     service = make_service(tmp_path, local=True, pe=True, clients=live,
                            references_dir=str(root))
-    assert service.active_backend == "pe-llamacpp"
-    payload = rewrite(service, "edit", "make it night", [ref])
-    assert payload["backend"] == "local-llm"
-    assert payload["rewritten_prompt"] == "rewritten by local-llm"
-    assert live["pe-llamacpp"].requests == [], "the enhancer must not see an edit"
-    assert live["local-llm"].requests == ["edit"]
-    # A text draft still goes to the enhancer: the fallback is per task, not a
-    # change of the saved choice.
+    state = state_of(service)
+    assert task_choice(state, "edit", "pe-llamacpp")["available"] is False
+    assert task_choice(state, "edit", "local-llm")["available"] is True
+    edit = rewrite(service, "edit", "make it night", [ref])
+    assert edit["backend"] == "local-llm"
+    assert live[("t2i", "pe-llamacpp")].requests == [], \
+        "an edit draft must never be handed to the text checkpoint"
     assert rewrite(service)["backend"] == "pe-llamacpp"
-    assert service.preferences().backend is None
+    block = service.status_block()
+    assert api.validate_rewrite_block(block) == block
+    assert block["active_by_task"] == {"t2i": "pe-llamacpp",
+                                       "edit": "local-llm"}
+    assert block["backend"] == "pe-llamacpp"
+    # The saved choice is untouched: putting the missing file in place fixes
+    # the edit group without a second visit to Settings.
+    assert service.preferences().choices is None
 
 
-def test_an_edit_draft_is_refused_when_only_the_enhancer_exists(tmp_path):
-    """No local service means no edit rewriter. Falling back to the enhancer
-    would send reference images to weights that were never trained on them, so
-    the refusal names what is missing instead of quietly guessing."""
+def test_asking_for_the_official_edit_enhancer_without_its_files_is_refused(tmp_path):
+    """A POST is a question with an answer waiting, so it is refused rather
+    than fallen back on — and the refusal is the task-specific sentence."""
+    service = make_service(tmp_path, local=True, pe=True)
+    got, answered = responded(request(
+        "POST", server.SETTINGS_ROUTE,
+        json.loads(body(t2i="pe-llamacpp", edit="pe-llamacpp")), service))
+    assert got == 422 and answered["code"] == "backend_unavailable"
+    assert "image-edit" in answered["message"]
+    assert service.unavailable_reason("pe-llamacpp", "edit") == \
+        answered["message"]
+    # The same server happily accepts official t2i plus endpoint edit.
+    got, answered = responded(request(
+        "POST", server.SETTINGS_ROUTE,
+        json.loads(body(t2i="pe-llamacpp", edit="local-llm")), service))
+    assert got == 200
+    assert service.active_by_task() == {"t2i": "pe-llamacpp",
+                                        "edit": "local-llm"}
+
+
+def test_a_draft_kind_no_rewriter_can_answer_is_refused_never_swapped(tmp_path):
+    """No endpoint and no edit checkpoint means an edit draft has no rewriter.
+    Falling back to the text weights would send references to a model that was
+    never trained on them, so the refusal names what is missing."""
     root = tmp_path / "store"
     ref = store_image(root)
-    live: dict[str, FakeClient] = {}
-    service = rs.RewriteService(
-        rs.RewriteSettings.disabled(),
-        pe=rs.PESettings(llama_server=BINARY, model_path=GGUF,
-                         system_prompt="pe system prompt", timeout=300.0),
-        cache_dir=str(tmp_path),
-        client_factory=lambda b, s, p, prefs: live.setdefault(
-            b, FakeClient(b, [])))
+    live: dict = {}
+    service = make_service(tmp_path, local=False, pe=True, clients=live,
+                           references_dir=str(root))
     assert service.available_backends() == ["pe-llamacpp"]
-    assert service.active_backend == "pe-llamacpp"
+    assert service.active_by_task() == {"t2i": "pe-llamacpp", "edit": None}
     with pytest.raises(api.ApiError) as exc:
         rewrite(service, "edit", "make it night", [ref])
     assert exc.value.status == 422 and exc.value.code == "task_unsupported"
-    assert "text-to-image" in exc.value.message
-    assert "local LLM service" in exc.value.message
-    assert live["pe-llamacpp"].requests == []
+    assert "image-edit" in exc.value.message
+    assert "OpenAI-compatible endpoint" in exc.value.message
+    assert live[("t2i", "pe-llamacpp")].requests == []
     # A text draft is untouched by that refusal.
     assert rewrite(service)["backend"] == "pe-llamacpp"
+
+
+def test_close_closes_each_distinct_client_exactly_once(tmp_path):
+    """Two checkpoints mean two llama-server children; the endpoint is one
+    object keyed by two tasks. Identity, not the key, is what dedupes."""
+    live: dict = {}
+    service = make_service(tmp_path, local=True, pe=True, i2i=True, clients=live)
+    assert service.close(timeout_s=5) is True
+    assert [client.closes for client in (
+        live[("t2i", "pe-llamacpp")], live[("edit", "pe-llamacpp")],
+        live[("t2i", "local-llm")])] == [1, 1, 1]
 
 
 def test_a_settings_change_takes_effect_on_the_next_rewrite(tmp_path):
@@ -804,24 +1354,25 @@ def test_a_settings_change_takes_effect_on_the_next_rewrite(tmp_path):
             assert gate.wait(10.0), "the rewrite was never released"
             return json.dumps({"rewritten_prompt": f"rewritten by {self.name}"})
 
-    slow = SlowClient("pe-llamacpp", [])
-    service = make_service(tmp_path, local=True, pe=True, clients={},
+    slow = SlowClient("pe-llamacpp for t2i")
+    service = make_service(tmp_path, local=True, pe=True, i2i=True, clients={},
                            client=slow)
-    assert service.active_backend == "pe-llamacpp"
+    assert service.active_by_task() == {"t2i": "pe-llamacpp",
+                                        "edit": "pe-llamacpp"}
     answers: list[dict] = []
     worker = threading.Thread(target=lambda: answers.append(rewrite(service)),
                               name="rewrite-under-test")
     worker.start()
     assert inside.wait(10.0), "the rewrite never reached its client"
-    service.apply_preferences(rs.RewritePreferences(backend="local-llm",
-                                                   endpoint=ENDPOINT,
-                                                   model=MODEL))
+    service.apply_preferences(rs.RewritePreferences(
+        choices={"t2i": "local-llm", "edit": "local-llm"}, enabled=True,
+        endpoint=ENDPOINT, model=MODEL))
     gate.set()
     worker.join(10.0)
     assert not worker.is_alive(), "the rewrite never finished"
     assert answers[0]["backend"] == "pe-llamacpp", "the running rewrite moved"
     # From here on the change is real, and what status reports agrees with it.
-    assert service.active_backend == "local-llm"
+    assert service.active_by_task() == {"t2i": "local-llm", "edit": "local-llm"}
     assert service.status_block()["backend"] == "local-llm"
 
 
@@ -838,8 +1389,8 @@ def test_a_cancel_that_killed_the_backend_is_reported_as_a_cancel(tmp_path):
             assert self.subject.cancel() is True, "the job was not in flight"
             raise rc.RewriteTimeout("the rewrite was cancelled")
 
-    client = CancelledMidGeneration("pe-llamacpp", [])
-    subject = make_service(tmp_path, local=True, pe=True, client=client)
+    client = CancelledMidGeneration("pe-llamacpp for t2i")
+    subject = make_service(tmp_path, local=True, pe=True, i2i=True, client=client)
     client.subject = subject
     with pytest.raises(api.ApiError) as caught:
         rewrite(subject)
