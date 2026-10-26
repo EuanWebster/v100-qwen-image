@@ -394,6 +394,20 @@ def _validate_policy(config: GenerationConfig) -> None:
             errors.append(FieldError(
                 "references_dir",
                 "reference ids require the store directory (references_dir)"))
+    # Measured fp32-decode envelope (FINDINGS-edit-grid: a Q8 1088x1088
+    # reference edit sampled 40/40 and died at vae_decoding; clean with
+    # --tiled-decode). The web API already refuses these jobs with
+    # tiled_decode_required; the CLI must fail the same way, as a typed
+    # config error before any model load — never by silently tiling on.
+    # Plain T2I stays out of scope: its fp16 untiled limits are measured
+    # separately.
+    if (_fp32_decode(config) and not config.vae_tiled_decode
+            and config.latent_tokens > 4096):
+        errors.append(FieldError(
+            "vae_tiled_decode",
+            "an fp32-decode run (references or transparent_background) OOMs "
+            f"untiled above 4096 latent tokens ({config.latent_tokens} here); "
+            "enable --tiled-decode or lower the output size"))
     if errors:
         raise ConfigError(errors)
 

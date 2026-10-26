@@ -512,6 +512,35 @@ def test_reference_policy_refuses_before_any_ml(tmp_path):
         assert "references" not in exc.fields and "references_dir" not in exc.fields
 
 
+@needs_references
+def test_fp32_decode_refuses_untiled_runs_above_the_token_ceiling(tmp_path):
+    """Measured envelope: an fp32 decode (references or transparent) above
+    4096 latent tokens OOMs untiled — the Q8 1088x1088 edit died at
+    vae_decoding after 40/40 steps, clean with --tiled-decode. Refuse as a
+    typed config error naming the flag, exactly like the web API's 422."""
+    from qwen_engine.adapters import qwen21_diffusers as qd
+    big = dict(height=1088, width=1088)  # 4624 latent tokens
+    cases = [
+        _reference_config(tmp_path, **big),
+        _config(tmp_path, transparent_background=True, output_format="png", **big),
+    ]
+    for config in cases:
+        with pytest.raises(ConfigError) as excinfo:
+            qd._validate_policy(config)
+        assert "vae_tiled_decode" in excinfo.value.fields
+        assert "--tiled-decode" in str(excinfo.value)
+    # Tiling satisfies the gate; 1024² is exactly 4096 tokens and stays free.
+    qd._validate_policy(_reference_config(tmp_path, **big, vae_tiled_decode=True))
+    qd._validate_policy(_reference_config(tmp_path))
+    qd._validate_policy(_config(tmp_path, transparent_background=True, output_format="png",
+                                vae_tiled_decode=True))
+    # Plain T2I (fp16 untiled decode) is untouched by this gate.
+    try:
+        qd._validate_policy(_config(tmp_path, **big))
+    except ConfigError as exc:
+        assert "vae_tiled_decode" not in exc.fields
+
+
 def test_joint_chunking_is_decided_after_encode_once(monkeypatch):
     from types import SimpleNamespace
     from qwen_engine.adapters import qwen21_diffusers as qd

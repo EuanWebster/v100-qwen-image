@@ -667,6 +667,28 @@ def test_verified_assets_no_output_dir_never_creates_adapter_exits_2(
     assert not (tmp_path / "output").exists()
 
 
+def test_untiled_fp32_decode_run_exits_2_before_model_load(tmp_path, capsys):
+    """THE real CLI ordering for the measured decode envelope: a reference
+    run above 4096 latent tokens without --tiled-decode must die as a typed
+    config error 2 naming the flag — never a silent tiling switch, and on a
+    CPU-only box a clean exit 2 proves nothing model-side was touched."""
+    mpath = write_manifest(tmp_path)
+    (tmp_path / "models" / "dit").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "models" / "dit" / "model.bin").write_bytes(b"payload")
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps({
+        "prompt": "a red cube", "manifest_path": str(mpath),
+        "models_dir": str(tmp_path / "models"),
+        "output_dir": str(tmp_path / "out"), "cache_dir": str(tmp_path / "cache"),
+        "height": 1088, "width": 1088,  # 4624 latent tokens
+        "references": ["a" * 64], "references_dir": str(tmp_path / "store"),
+    }))
+    assert run_cli(tmp_path, ["--config", cfg_path, "--run"]) == 2
+    err = capsys.readouterr().err
+    assert "vae_tiled_decode" in err and "--tiled-decode" in err
+    assert "Traceback" not in err
+
+
 def test_config_file_true_cfg_scale_overflow_exits_2(tmp_path, capsys):
     """A 10**1000 int literal in the config file: OverflowError from
     math.isfinite would exit 1 with a generic unexpected-error line; the
