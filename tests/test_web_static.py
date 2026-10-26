@@ -1161,6 +1161,43 @@ def test_w4_hard_cap_is_a_stated_stop_not_a_silent_drop():
     assert "$('add-reference').disabled" in controls
 
 
+def test_w4_edit_mode_checkbox_gates_the_reference_controls():
+    # The reference controls sit behind an "Edit with reference images" box,
+    # unticked and hidden by default, so a plain text-to-image page stays short.
+    html = _read("index.html")
+    box = re.search(r'<input id="edit-mode"[^>]*>', html)
+    assert box, "edit-mode checkbox missing"
+    assert 'type="checkbox"' in box.group(0)
+    assert "checked" not in box.group(0), "edit mode must start unticked"
+    # Browsers restore checkbox state on reload; the hidden fieldset would not
+    # follow, so restoring is switched off.
+    assert 'autocomplete="off"' in box.group(0)
+    assert 'aria-controls="reference-field"' in box.group(0)
+    assert '<label for="edit-mode">Edit with reference images</label>' in html
+    assert re.search(r'<fieldset[^>]*id="reference-field"[^>]*\shidden[^>]*>', html), \
+        "the reference fieldset must start hidden"
+    assert html.index('id="edit-mode"') < html.index('id="reference-field"')
+
+    js = _read("app.js")
+    # Unticked, nothing reference-related reaches a job, plan or rewrite: every
+    # wire use goes through activeReferenceIds(), never the raw list.
+    active = _js_function(js, "activeReferenceIds")
+    assert "$('edit-mode').checked ? referenceIds() : []" in active
+    assert "references: activeReferenceIds()" in _js_function(js, "formSnapshot")
+    assert "activeReferenceIds().length ? 'edit' : 't2i'" in _js_function(js, "rewriteTask")
+    # Toggling shows/hides the controls and stales the proposal and the plan.
+    apply = _js_function(js, "applyEditMode")
+    assert "$('reference-field').hidden = !$('edit-mode').checked" in apply
+    assert "bumpPromptRevision()" in apply
+    assert "refreshRewriteButton()" in apply
+    assert "syncPlanStaleness()" in apply
+    assert "$('edit-mode').addEventListener('change', applyEditMode)" in js
+    # Import ticks the box exactly when the imported draft has references.
+    imported = _js_function(js, "applyImportedPlan")
+    assert "$('edit-mode').checked = c.references.length > 0;" in imported
+    assert imported.index("$('edit-mode').checked") < imported.index("applyEditMode()")
+
+
 def test_w4_parse_reference_response_is_a_closed_shape():
     js = _read("app.js")
     body = _js_function(js, "parseReferenceResponse")
@@ -1234,7 +1271,7 @@ def test_w4_plan_panel_shows_the_reference_count():
 def test_w4_envelope_and_render_agree_on_order():
     js = _read("app.js")
     snapshot = _js_function(js, "formSnapshot")
-    assert "references: referenceIds()" in snapshot
+    assert "references: activeReferenceIds()" in snapshot
     envelope = re.search(r"buildEnvelope\(\)[\s\S]*?transparent_background: snap\."
                          r"transparent_background,\s*\n\s*references: snap\.references",
                          js)
@@ -1470,11 +1507,11 @@ def test_w5_rewrite_ui_is_a_suggestion_flow_not_an_automatic_edit():
     assert "image_ids: []" not in req, \
         "the request must not hardcode an empty image_ids"
     assert "image_ids: imageIds" in req
-    assert "var imageIds = task === 'edit' ? referenceIds() : [];" in req
+    assert "var imageIds = task === 'edit' ? activeReferenceIds() : [];" in req
     assert "var task = rewriteTask();" in req
     # The button is availability-gated on the task it would send.
     available = _js_function(js, "rewriteAvailable")
-    assert "referenceIds().length > 0" in available
+    assert "activeReferenceIds().length > 0" in available
     assert "rewriteTask() === 't2i'" in available
     assert "disabled = !rewriteAvailable()" in _js_function(js, "setRewriterState")
     # A reference change is a rewrite input: it must bump the PROMPT revision

@@ -215,13 +215,15 @@ judge edits by eye.
 
 How to use it:
 
-1. **Web:** under *Reference images*, press **Add reference** and pick up to 10
+1. **Web:** tick **Edit with reference images** (below the prompt) to show the
+   *Reference images* section, then press **Add reference** and pick up to 10
    PNG/JPEG/WebP files. They are numbered in the order shown (reorder with the
    per-card **Up**/**Down** buttons, remove with **Remove**) and you refer to
    them as "image 1", "image 2" … in the prompt. The prompt is sent after the
    images. Output size comes from the preset, not from the images; for an edit
    above 4096 latent tokens (e.g. 1088×1088) also tick **VAE tiling** — the
-   server refuses an untiled config that large.
+   server refuses an untiled config that large. Unticking the box keeps your
+   references in the list but stops using them; tick it again to bring them back.
 2. **CLI:** `--reference PATH` (repeatable, ordered, at most 10) plus
    `--references-dir DIR` (default `<cache_dir>/references`). The bytes are
    copied verbatim into a content-addressed store; the run carries only ids.
