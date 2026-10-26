@@ -8,7 +8,8 @@ import pytest
 from qwen_engine import generation_worker as w
 from qwen_engine.config import GenerationConfig, ConfigError
 from qwen_engine.core import GenerationResult
-from qwen_engine.errors import GenerationCancelled, MemoryGuardError, HardwareAbsentError
+from qwen_engine.errors import (GenerationCancelled, MemoryGuardError,
+                                HardwareAbsentError, OutOfGpuMemoryError)
 from qwen_engine.manifest import ManifestError
 
 
@@ -56,6 +57,65 @@ def test_worker_failures_emit_only_fixed_codes_and_restore_signal(worker_inputs,
     assert actual["status"] == "failed" and actual["exit_code"] == code
     assert actual["error_code"] == w.ERROR_CODES[code] and actual["output_path"] is None
     assert "private" not in response.read_text() and signal.getsignal(signal.SIGTERM) == previous
+
+
+def _torch_named_oom(message):
+    """A class shaped like torch's own OutOfMemoryError (name + top-level
+    module), which the shared jobs.py classifier recognises by identity."""
+    kind = type("OutOfMemoryError", (RuntimeError,), {})
+    kind.__module__ = "torch.cuda.oom"
+    return kind(message)
+
+
+@pytest.mark.parametrize("error", [
+    OutOfGpuMemoryError("private gpu exhaustion"),
+    RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB"),
+    _torch_named_oom("private torch exhaustion"),
+])
+def test_worker_reports_cuda_oom_as_its_own_code(worker_inputs, monkeypatch, error):
+    """Parity with the in-process controller: a CUDA OOM is never a plain
+    execution_failed; the fixed code carries no exception text."""
+    path, response, doc = worker_inputs
+    monkeypatch.setattr(w, "install_offline_guard", lambda: None)
+
+    def fail(*args):
+        raise error
+
+    monkeypatch.setattr(w, "run_generation", fail)
+    previous = signal.getsignal(signal.SIGTERM)
+    assert w.execute(path, response) == 6
+    body = response.read_text()
+    actual = json.loads(body)
+    assert (actual["status"], actual["exit_code"]) == ("failed", 6)
+    assert actual["error_code"] == "out_of_gpu_memory" and actual["output_path"] is None
+    assert "private" not in body and signal.getsignal(signal.SIGTERM) == previous
+
+
+def test_worker_oom_classification_follows_only_explicit_cause(worker_inputs, monkeypatch):
+    """Same chain rules as jobs.py: a __cause__ OOM classifies as OOM; an
+    implicit context (e.g. an OOM handled while something else raised) does
+    NOT, so an unrelated failure keeps code 1."""
+    path, response, doc = worker_inputs
+    monkeypatch.setattr(w, "install_offline_guard", lambda: None)
+
+    def chained(*args):
+        try:
+            raise RuntimeError("CUDA out of memory: harness detail")
+        except RuntimeError:
+            raise RuntimeError("wrapper text")
+
+    monkeypatch.setattr(w, "run_generation", chained)
+    assert w.execute(path, response) == 1  # implicit context only
+
+    def explicit(*args):
+        try:
+            raise OutOfGpuMemoryError("typed cause")
+        except OutOfGpuMemoryError as cause:
+            raise RuntimeError("wrapper text") from cause
+
+    monkeypatch.setattr(w, "run_generation", explicit)
+    response.unlink(missing_ok=True)  # second execute republishes the result
+    assert w.execute(path, response) == 6
 
 
 def test_worker_refuses_unrequested_cancellation_ack(worker_inputs, monkeypatch):

@@ -26,6 +26,7 @@ from pathlib import Path
 
 from qwen_engine._jsonsafe import strict_json_loads
 from qwen_engine.core import GenerationResult
+from qwen_engine.errors import OutOfGpuMemoryError
 from qwen_engine.jobs import JobCancelled, JobContext, JobError
 from qwen_engine.config import GenerationConfig
 from qwen_engine.generation_worker import (
@@ -115,6 +116,15 @@ def _result(document, context, exit_code):
     if (status == "failed" and document["output_path"] is None and exit_code in ERROR_CODES
             and (document["error_code"] == ERROR_CODES[exit_code]
                  or exit_code == 1 and document["error_code"] == "invalid_cancellation_acknowledgment")):
+        if exit_code == 6:
+            # The child already classified a CUDA OOM with the shared
+            # jobs.py classifier; carrying the typed OutOfGpuMemoryError as
+            # __cause__ lets that SAME classifier (which follows only
+            # explicit causes) re-recognise it at the controller boundary,
+            # so a worker OOM records out_of_gpu_memory, not execution_failed.
+            raise GenerationProcessError(
+                "out_of_gpu_memory") from OutOfGpuMemoryError(
+                "generation worker reported a CUDA out-of-memory failure")
         raise GenerationProcessError(document["error_code"])
     raise GenerationProcessError("incoherent_result_status")
 

@@ -2,6 +2,12 @@
 
 The real adapter factory still refuses until its separate milestone exists.
 No fixture backend/command override, profile bypass or GPU-readiness flag.
+
+Failure exit codes mirror :data:`ERROR_CODES` (1 execution, 2 config, 3
+memory guard, 4 assets, 5 hardware, 6 CUDA out of memory — classified by
+the SAME stdlib-only :func:`qwen_engine.jobs._is_gpu_oom` the in-process
+job controller uses, so worker and web report ``out_of_gpu_memory``
+identically; torch is never imported here); cancellation exits 130.
 """
 from __future__ import annotations
 
@@ -20,6 +26,7 @@ from qwen_engine.encoder_worker import (
 )
 from qwen_engine.encoder import EncoderRequestError
 from qwen_engine.errors import EngineError, GenerationCancelled, MemoryGuardError, HardwareAbsentError
+from qwen_engine.jobs import _is_gpu_oom
 from qwen_engine.manifest import ManifestError, load_manifest, resolve_manifest
 
 REQUEST_SCHEMA = "qwen_engine.generation_request.v1"
@@ -30,7 +37,9 @@ MAX_REQUEST_BYTES = 256 * 1024 + 1024
 MAX_RESULT_BYTES = 64 * 1024
 MAX_EVENT_BYTES = 16 * 1024
 PHASES = ("load", "encode", "denoise", "decode", "save")
-ERROR_CODES = {1: "execution_failed", 2: "config_refused", 3: "memory_refused", 4: "assets_refused", 5: "hardware_refused"}
+ERROR_CODES = {1: "execution_failed", 2: "config_refused", 3: "memory_refused",
+               4: "assets_refused", 5: "hardware_refused",
+               6: "out_of_gpu_memory"}
 
 
 def valid_request_id(value):
@@ -101,8 +110,10 @@ def execute(request_path, response_path):
                 status, code = "failed", 3
             except HardwareAbsentError:
                 status, code = "failed", 5
-            except Exception:
-                status, code = "failed", 1
+            except Exception as exc:
+                # Same classifier as jobs.py (bool only; the exception text
+                # never reaches the published result envelope).
+                status, code = "failed", 6 if _is_gpu_oom(exc) else 1
             error = error or (ERROR_CODES[code] if status == "failed" else None)
             document = dict(schema=RESULT_SCHEMA, request_id=rid, status=status,
                             exit_code=code, output_path=output, error_code=error)
