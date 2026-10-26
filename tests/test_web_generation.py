@@ -580,3 +580,66 @@ def test_job_documents_expose_boundary_release_cost_only_for_non_success(runtime
     finally:
         release.set()
         assert service.close()
+
+
+@pytest.mark.parametrize('outcome', ['succeeded', 'failed', 'cancelled'])
+def test_gpu_cache_is_released_after_every_job_outcome(runtime, outcome):
+    # Jobs run in the server process, so PyTorch's cache would otherwise hold
+    # ~9-15 GiB of idle GPU memory between jobs. The release follows every
+    # outcome, after the job's elapsed time is recorded.
+    releases = []
+    started, go = threading.Event(), threading.Event()
+
+    def execute(context):
+        assert releases == [], 'released before the job finished'
+        if outcome == 'failed':
+            raise RuntimeError('boom')
+        if outcome == 'cancelled':
+            context.report_phase('load')
+            started.set()
+            assert go.wait(5)
+            context.check_cancelled()
+        return save(context)
+
+    def release():
+        releases.append(service._metrics[job_id]['elapsed_ms'])
+
+    service = WebGeneration(runtime, executor=execute, gpu_cache_release=release)
+    try:
+        job_id = service.submit(envelope()).payload['job_id']
+        if outcome == 'cancelled':
+            assert started.wait(5)
+            service.job_response(job_id, action='cancel')
+            go.set()
+        record = service.controller.wait(job_id)
+        assert record.state.value == outcome
+        assert len(releases) == 1 and releases[0] is not None
+    finally:
+        assert service.close()
+
+
+def test_a_failed_gpu_cache_release_never_changes_the_job_result(runtime, capsys):
+    def release():
+        raise RuntimeError('driver hiccup')
+
+    service = WebGeneration(runtime, executor=save, gpu_cache_release=release)
+    try:
+        job_id = service.submit(envelope()).payload['job_id']
+        assert service.controller.wait(job_id).state == JobState.SUCCEEDED
+        assert service.image(job_id) == PNG
+        assert 'GPU cache release failed' in capsys.readouterr().err
+    finally:
+        assert service.close()
+
+
+def test_release_gpu_cache_is_a_no_op_without_initialised_cuda(monkeypatch):
+    from qwen_engine.web import generation
+    calls = []
+    fake_cuda = SimpleNamespace(is_initialized=lambda: False,
+                                empty_cache=lambda: calls.append('empty'))
+    monkeypatch.setitem(__import__('sys').modules, 'torch', SimpleNamespace(cuda=fake_cuda))
+    generation.release_gpu_cache()
+    assert calls == []
+    fake_cuda.is_initialized = lambda: True
+    generation.release_gpu_cache()
+    assert calls == ['empty']
