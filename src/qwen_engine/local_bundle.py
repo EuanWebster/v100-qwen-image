@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import stat as stat_module
 import threading
@@ -1229,3 +1230,158 @@ def project_resolution_report(manifest: ModelManifest,
         component_dirs=component_dirs,
         fingerprints=fingerprints,
     )
+
+
+#: Default ceiling for :attr:`VerificationReusePolicy.max_age_s` use when a
+#: caller wants "the standard hour": the web server's opt-in
+#: ``--reuse-verified-assets`` flag defaults here.
+VERIFICATION_REUSE_DEFAULT_MAX_AGE_S = 3600.0
+
+
+@dataclass(frozen=True)
+class VerificationReusePolicy:
+    """Opt-in reuse of a recorded **successful** content verification.
+
+    Passing one of these is what turns the fast path on: the default
+    (``reuse_policy=None`` everywhere) keeps hashing every artifact on
+    every call, exactly as before. A later call within ``max_age_s`` of a
+    recorded success may skip the content hash only while every artifact's
+    stat fingerprint is unchanged; anything else runs the full resolver.
+    """
+
+    max_age_s: float = VERIFICATION_REUSE_DEFAULT_MAX_AGE_S
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.max_age_s, bool)
+                or not isinstance(self.max_age_s, (int, float))
+                or not math.isfinite(self.max_age_s) or self.max_age_s <= 0):
+            raise ValueError(
+                "max_age_s must be a positive finite number of seconds, "
+                f"got {self.max_age_s!r}")
+
+
+#: Process-level record of successful verifications: identity key
+#: (same :func:`_resolution_key` as the 30 s memo: profile, manifest
+#: content, resolved root + its st_dev/st_ino) -> (expiry, report,
+#: per-file fingerprints).
+#:
+#: HONEST GUARANTEE CHANGE — stat-unchanged is WEAKER than a content hash.
+#: A fingerprint is ``(st_dev, st_ino, st_size, st_mode, st_mtime_ns,
+#: st_ctime_ns)`` of each fully-resolved artifact plus the manifest's
+#: claimed byte size. Any append, truncate, rewrite-in-place, replace,
+#: file-vs-directory swap or symlink retarget moves at least one field and
+#: forces a full rehash; but a writer that *deliberately* restores both
+#: timestamps (``utimensat``) while writing new bytes through the *same*
+#: inode can keep the fingerprint identical while the content changes. A
+#: fresh content hash would still not protect against bytes changed
+#: *after* verification (nor close a hostile concurrent-filesystem TOCTOU)
+#: — this record additionally trusts stat stability for up to
+#: ``max_age_s``. That is the explicit trade for dropping a ~19 s base +
+#: ~9 s Turbo per-job hash in the long-lived web server. Failed, missing,
+#: escaped or unresolvable verifications are NEVER recorded and NEVER
+#: reused; any fingerprint drift deletes the record and re-hashes.
+_verification_records: dict[Any, tuple[float, ResolutionReport,
+                                       tuple[tuple[int, ...], ...]]] = {}
+_verification_lock = threading.Lock()
+
+
+def clear_verification_records() -> None:
+    """Forget every reusable verification record (test seam; also what a
+    caller invokes after intentionally swapping model trees)."""
+    with _verification_lock:
+        _verification_records.clear()
+
+
+def _artifact_fingerprints(manifest: ModelManifest,
+                           models_dir: str | Path,
+                           ) -> tuple[tuple[int, ...], ...] | None:
+    """Per-artifact stat fingerprints exactly as the reuse record defines
+    them; ``None`` whenever anything cannot be resolved, escapes the root,
+    is not a regular file, or does not match the manifest's byte claim
+    (the caller must then run the full resolver)."""
+    try:
+        root = Path(models_dir).resolve()
+        os.stat(root)
+    except OSError:
+        return None
+    fingerprints: list[tuple[int, ...]] = []
+    try:
+        for artifact in manifest.artifacts:
+            path = (root / artifact.filename).resolve()
+            if path != root and root not in path.parents:
+                return None
+            st = os.stat(path)
+            if not stat_module.S_ISREG(st.st_mode):
+                return None
+            if st.st_size != artifact.bytes:
+                return None
+            fingerprints.append((st.st_dev, st.st_ino, st.st_size,
+                                 st.st_mode, st.st_mtime_ns, st.st_ctime_ns))
+    except OSError:
+        return None
+    return tuple(fingerprints)
+
+
+def remember_verified_resolution(manifest: ModelManifest,
+                                 models_dir: str | Path,
+                                 report: ResolutionReport,
+                                 policy: VerificationReusePolicy,
+                                 profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
+                                 ) -> None:
+    """Record a *successful* resolver report with fingerprints for up to
+    ``policy.max_age_s``. Failed reports, unresolvable roots and
+    un-fingerprintable trees remember nothing (and clear any stale record
+    for the identity, so a bad tree cannot linger)."""
+    spec = get_profile(profile)
+    key = _resolution_key(manifest, models_dir, spec)
+    if key is None:
+        return
+    with _verification_lock:
+        _verification_records.pop(key, None)
+    if not report.ok or report.errors:
+        return
+    fingerprints = _artifact_fingerprints(manifest, models_dir)
+    if fingerprints is None:
+        return
+    with _verification_lock:
+        _verification_records[key] = (
+            _MONOTONIC() + policy.max_age_s, report, fingerprints)
+
+
+def reusable_resolution(manifest: ModelManifest,
+                        models_dir: str | Path,
+                        policy: VerificationReusePolicy,
+                        profile: str | BundleProfile = LOCAL_REFERENCE_PROFILE,
+                        ) -> ResolutionReport | None:
+    """Return the recorded report when reuse is allowed: a record exists
+    under this identity, it is younger than its own recorded deadline, and
+    every artifact fingerprint is byte-identical to the recorded one.
+    ``None`` (→ caller must run the full resolver) for expiry, any stat
+    drift, vanished/replaced/escaped/non-regular files or unresolvable
+    roots; drifted/expired records are dropped, never refreshed here."""
+    if not isinstance(policy, VerificationReusePolicy):
+        raise ValueError("reuse requires a VerificationReusePolicy")
+    spec = get_profile(profile)
+    key = _resolution_key(manifest, models_dir, spec)
+    if key is None:
+        return None
+    now = _MONOTONIC()
+    with _verification_lock:
+        for stale in [k for k, (expiry, _, _) in _verification_records.items()
+                      if now >= expiry]:
+            del _verification_records[stale]
+        entry = _verification_records.get(key)
+        if entry is None:
+            return None
+    fingerprints = _artifact_fingerprints(manifest, models_dir)
+    with _verification_lock:
+        entry = _verification_records.get(key)
+        if entry is None:
+            return None
+        if now >= entry[0]:
+            del _verification_records[key]
+            return None
+        if fingerprints is None or fingerprints != entry[2]:
+            del _verification_records[key]
+            return None
+        return entry[1]

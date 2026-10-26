@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1715,3 +1716,130 @@ def test_direct_construction_accepts_the_turbo_identity():
             fingerprints=lb.ArtifactSetFingerprints(bundle="a" * 64,
                                                     encoder=None),
             **common)
+
+
+# ---------------------------------------------------------------------------
+# Opt-in verification-reuse record (stat fingerprint vs content hash)
+# ---------------------------------------------------------------------------
+
+
+def _frozen_clock(monkeypatch, start=1000.0):
+    clock = {"now": start}
+    monkeypatch.setattr(lb, "_MONOTONIC", lambda: clock["now"])
+    return clock
+
+
+def test_policy_rejects_useless_ages():
+    for bad in (0, -1, True, float("inf"), float("nan"), "60", None):
+        with pytest.raises(ValueError):
+            lb.VerificationReusePolicy(max_age_s=bad)
+    assert lb.VerificationReusePolicy().max_age_s == 3600.0
+
+
+def test_record_reuses_only_when_untouched_and_fresh(tmp_path, monkeypatch):
+    _frozen_clock(monkeypatch)
+    lb.clear_verification_records()
+    manifest = build_tiny_tree(tmp_path)
+    report = resolve_manifest(manifest, tmp_path)
+    assert report.ok
+    policy = lb.VerificationReusePolicy(max_age_s=60)
+    assert lb.reusable_resolution(manifest, tmp_path, policy) is None
+    lb.remember_verified_resolution(manifest, tmp_path, report, policy)
+    assert lb.reusable_resolution(manifest, tmp_path, policy) is report
+    # default-off: a call without any policy records nothing, so the SAME
+    # tree verified through the plain path starts no reuse either.
+    lb.clear_verification_records()
+    resolve_manifest(manifest, tmp_path)
+    assert lb.reusable_resolution(manifest, tmp_path, policy) is None
+
+
+def test_any_stat_drift_forces_full_rehash(tmp_path, monkeypatch):
+    _frozen_clock(monkeypatch)
+    lb.clear_verification_records()
+    manifest = build_tiny_tree(tmp_path)
+    report = resolve_manifest(manifest, tmp_path)
+    policy = lb.VerificationReusePolicy(max_age_s=60)
+    lb.remember_verified_resolution(manifest, tmp_path, report, policy)
+    victim = tmp_path / "vae" / "diffusion_pytorch_model.safetensors"
+    # same bytes rewritten -> mtime_ns/ctime_ns move -> fingerprint differs
+    victim.write_bytes(victim.read_bytes())
+    assert lb.reusable_resolution(manifest, tmp_path, policy) is None
+    # the drifted record is gone, not refreshed: even restoring the exact
+    # bytes needs a NEW remembered report before reuse is allowed again.
+    assert lb.reusable_resolution(manifest, tmp_path, policy) is None
+    fresh = resolve_manifest(manifest, tmp_path)
+    lb.remember_verified_resolution(manifest, tmp_path, fresh, policy)
+    assert lb.reusable_resolution(manifest, tmp_path, policy) is fresh
+    # size drift (append) is caught too
+    victim.write_bytes(victim.read_bytes() + b"x")
+    assert lb.reusable_resolution(manifest, tmp_path, policy) is None
+    # a vanished file is caught
+    rebuilt = build_tiny_tree(tmp_path)
+    fresh2 = resolve_manifest(rebuilt, tmp_path)
+    lb.remember_verified_resolution(rebuilt, tmp_path, fresh2, policy)
+    (tmp_path / "model_index.json").unlink()
+    assert lb.reusable_resolution(rebuilt, tmp_path, policy) is None
+
+
+def test_record_expires_at_policy_max_age(tmp_path, monkeypatch):
+    clock = _frozen_clock(monkeypatch)
+    lb.clear_verification_records()
+    manifest = build_tiny_tree(tmp_path)
+    report = resolve_manifest(manifest, tmp_path)
+    policy = lb.VerificationReusePolicy(max_age_s=30)
+    lb.remember_verified_resolution(manifest, tmp_path, report, policy)
+    clock["now"] += 29
+    assert lb.reusable_resolution(manifest, tmp_path, policy) is report
+    clock["now"] += 2
+    assert lb.reusable_resolution(manifest, tmp_path, policy) is None
+    # expiry deletes: rewinding the clock must not resurrect the record
+    clock["now"] -= 5
+    assert lb.reusable_resolution(manifest, tmp_path, policy) is None
+
+
+def test_failures_are_never_recorded_and_erase_stale_records(tmp_path, monkeypatch):
+    _frozen_clock(monkeypatch)
+    lb.clear_verification_records()
+    manifest = build_tiny_tree(tmp_path)
+    report = resolve_manifest(manifest, tmp_path)
+    policy = lb.VerificationReusePolicy(max_age_s=60)
+    lb.remember_verified_resolution(manifest, tmp_path, report, policy)
+    (tmp_path / "model_index.json").unlink()
+    failed = resolve_manifest(manifest, tmp_path)
+    assert not failed.ok
+    lb.remember_verified_resolution(manifest, tmp_path, failed, policy)
+    # the missing file alone already blocks reuse...
+    assert lb.reusable_resolution(manifest, tmp_path, policy) is None
+    # ...and the failed remember erased the record outright: restoring the
+    # exact bytes must NOT make the OLD report reusable.
+    build_tiny_tree(tmp_path)
+    assert lb.reusable_resolution(manifest, tmp_path, policy) is None
+
+
+def test_record_is_bound_to_root_and_manifest_identity(tmp_path, monkeypatch):
+    _frozen_clock(monkeypatch)
+    lb.clear_verification_records()
+    root = tmp_path / "models"
+    manifest = build_tiny_tree(root)
+    report = resolve_manifest(manifest, root)
+    policy = lb.VerificationReusePolicy(max_age_s=60)
+    lb.remember_verified_resolution(manifest, root, report, policy)
+    assert lb.reusable_resolution(manifest, root, policy) is report
+    # same path, SAME content, different directory inode (tree swapped in):
+    # the key carries the root's st_dev/st_ino, so this is a full rehash.
+    old = tmp_path / "old"
+    root.rename(old)
+    shutil.copytree(old, root)
+    assert lb.reusable_resolution(manifest, root, policy) is None
+    # a manifest whose artifact rows differ also misses: manifest content
+    # (the artifact-set fingerprint) is part of the key.
+    fresh_root_report = resolve_manifest(manifest, root)
+    lb.remember_verified_resolution(manifest, root, fresh_root_report, policy)
+    other = ModelManifest(schema_version=1, artifacts=manifest.artifacts[:-1])
+    assert lb.reusable_resolution(other, root, policy) is None
+
+
+def test_reusable_requires_a_policy(tmp_path):
+    manifest = build_tiny_tree(tmp_path)
+    with pytest.raises(ValueError):
+        lb.reusable_resolution(manifest, tmp_path, 60)

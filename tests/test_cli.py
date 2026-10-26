@@ -847,3 +847,138 @@ def test_verify_assets_refuses_hash_drifted_turbo_artifact(tmp_path):
                              recipe="turbo", steps=8)
     with pytest.raises(ManifestError, match="turbo artifact"):
         cli._verify_assets(turbo)
+
+
+# ---------------------------------------------------------------------------
+# _verify_assets(reuse_policy=...): opt-in, default-OFF hash reuse
+# ---------------------------------------------------------------------------
+
+
+def _hash_counter(monkeypatch):
+    """Count full content-hashing resolver calls made through cli."""
+    calls = []
+    real = cli.resolve_manifest
+
+    def spy(manifest, root):
+        calls.append(str(root))
+        return real(manifest, root)
+
+    monkeypatch.setattr(cli, "resolve_manifest", spy)
+    return calls
+
+
+def test_verify_assets_default_path_rehashes_every_call(tmp_path, monkeypatch):
+    from qwen_engine.local_bundle import clear_verification_records
+
+    clear_verification_records()
+    calls = _hash_counter(monkeypatch)
+    mpath = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    cfg = GenerationConfig(manifest_path=str(mpath),
+                           models_dir=str(tmp_path / "models"))
+    first = cli._verify_assets(cfg)
+    second = cli._verify_assets(cfg)
+    assert len(calls) == 2 and first is not second
+
+
+def test_verify_assets_reuse_skips_second_hash_until_drift(tmp_path, monkeypatch):
+    from qwen_engine.local_bundle import (VerificationReusePolicy,
+                                          clear_verification_records)
+
+    clear_verification_records()
+    calls = _hash_counter(monkeypatch)
+    mpath = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    cfg = GenerationConfig(manifest_path=str(mpath),
+                           models_dir=str(tmp_path / "models"))
+    policy = VerificationReusePolicy(max_age_s=60)
+    first = cli._verify_assets(cfg, reuse_policy=policy)
+    second = cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 1 and second is first
+    # a rewrite with identical bytes still moves mtime/ctime -> rehash
+    model_file = tmp_path / "models" / "dit" / "model.bin"
+    model_file.write_bytes(model_file.read_bytes())  # identical bytes rewrite
+    third = cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 2 and third is not first
+    # the rehash repopulated the record: the next job is cached again
+    fourth = cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 2 and fourth is third
+
+
+def test_verify_assets_reuse_expires(tmp_path, monkeypatch):
+    from qwen_engine import local_bundle as lb
+    from qwen_engine.local_bundle import VerificationReusePolicy, clear_verification_records
+
+    clear_verification_records()
+    clock = {"now": 500.0}
+    monkeypatch.setattr(lb, "_MONOTONIC", lambda: clock["now"])
+    calls = _hash_counter(monkeypatch)
+    mpath = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    cfg = GenerationConfig(manifest_path=str(mpath),
+                           models_dir=str(tmp_path / "models"))
+    policy = VerificationReusePolicy(max_age_s=30)
+    cli._verify_assets(cfg, reuse_policy=policy)
+    clock["now"] += 29
+    cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 1
+    clock["now"] += 2
+    cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 2
+
+
+def test_verify_assets_never_reuses_a_failed_verification(tmp_path, monkeypatch):
+    from qwen_engine.manifest import ManifestError
+    from qwen_engine.local_bundle import VerificationReusePolicy, clear_verification_records
+
+    clear_verification_records()
+    calls = _hash_counter(monkeypatch)
+    mpath = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    cfg = GenerationConfig(manifest_path=str(mpath),
+                           models_dir=str(tmp_path / "models"))
+    policy = VerificationReusePolicy(max_age_s=60)
+    cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 1
+    victim = tmp_path / "models" / "dit" / "model.bin"
+    victim.write_bytes(b"corrupted")
+    with pytest.raises(ManifestError):
+        cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 2
+    # restoring the exact original bytes must NOT resurrect the old record:
+    # the failed run left nothing behind, so this call hashes again.
+    victim.write_bytes(f"{REPO}:dit".encode())
+    cli._verify_assets(cfg, reuse_policy=policy)
+    assert len(calls) == 3
+
+
+def test_verify_assets_reuse_covers_both_turbo_trees(tmp_path, monkeypatch):
+    from qwen_engine.local_bundle import VerificationReusePolicy, clear_verification_records
+
+    clear_verification_records()
+    calls = _hash_counter(monkeypatch)
+    base_manifest = _asset_tree(tmp_path / "models",
+                                ["text_encoder", "dit", "vae"], REPO)
+    _asset_tree(tmp_path / "models" / "turbo" / "assets", ["dit"],
+                "Qwen/Qwen-Image-2.1-Turbo",
+                manifest=tmp_path / "models" / "turbo" / "manifest.json")
+    turbo = GenerationConfig(manifest_path=str(base_manifest),
+                             models_dir=str(tmp_path / "models"),
+                             recipe="turbo", steps=8)
+    policy = VerificationReusePolicy(max_age_s=60)
+    cli._verify_assets(turbo, reuse_policy=policy)
+    assert sorted(calls) == sorted([str(tmp_path / "models"),
+                                    str(tmp_path / "models" / "turbo" / "assets")])
+    cli._verify_assets(turbo, reuse_policy=policy)
+    assert len(calls) == 2  # neither tree re-hashed
+    # touching ONLY the turbo tree rehashes only that tree
+    (tmp_path / "models" / "turbo" / "assets" / "dit" / "model.bin").write_bytes(b"x" * 13)
+    with pytest.raises(Exception):
+        # content now contradicts the turbo manifest -> refusal, but the
+        # BASE tree must not have been re-hashed on the way there
+        cli._verify_assets(turbo, reuse_policy=policy)
+    assert len([c for c in calls if c.endswith("models")]) == 1
+
+
+def test_verify_assets_reuse_policy_type_is_enforced(tmp_path):
+    mpath = _asset_tree(tmp_path / "models", ["dit"], REPO)
+    cfg = GenerationConfig(manifest_path=str(mpath),
+                           models_dir=str(tmp_path / "models"))
+    with pytest.raises(ValueError):
+        cli._verify_assets(cfg, reuse_policy=60)

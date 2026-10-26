@@ -42,7 +42,10 @@ from qwen_engine.errors import (
 )
 from qwen_engine.log import PhaseLogger, file_sink
 from qwen_engine.local_bundle import (TURBO_REFERENCE_PROFILE, LocalBundleError,
-                                      prime_resolution_memo)
+                                      VerificationReusePolicy,
+                                      prime_resolution_memo,
+                                      remember_verified_resolution,
+                                      reusable_resolution)
 from qwen_engine.manifest import ManifestError, load_manifest, manifest_status, resolve_manifest
 
 _OVERRIDES = {
@@ -267,10 +270,43 @@ def _logger_for(config: GenerationConfig) -> PhaseLogger:
     return PhaseLogger()  # nothing configured -> nothing written
 
 
-def _verify_assets(config: GenerationConfig):
+def _verified_report(manifest, root, reuse_policy, *, profile=None):
+    """One tree's verification, honoring the optional reuse policy; the
+    returned report is always a *this-process-successful* resolver result —
+    either freshly hashed or the recorded identical-bytes report. On a
+    fresh full hash that came out OK under a policy, the record is written;
+    failures are recorded as "nothing" (and erase any stale record)."""
+    if reuse_policy is None:
+        return resolve_manifest(manifest, root)
+    kwargs = {} if profile is None else {"profile": profile}
+    recorded = reusable_resolution(manifest, root, reuse_policy, **kwargs)
+    if recorded is not None:
+        return recorded
+    report = resolve_manifest(manifest, root)
+    remember_verified_resolution(manifest, root, report, reuse_policy,
+                                 **kwargs)
+    return report
+
+
+def _verify_assets(config: GenerationConfig, *, reuse_policy=None):
     """No-download contract (R3): refuse to run on any unresolved asset.
     Returns the :class:`ResolutionReport` so the caller can hand the verified,
-    role-grouped paths to the adapter."""
+    role-grouped paths to the adapter.
+
+    ``reuse_policy`` (default ``None`` = today's behaviour: content-hash
+    every artifact on every call) opts a long-lived process into the
+    stat-fingerprint record of :mod:`qwen_engine.local_bundle`: a cached
+    Turbo tree is re-used, not re-hashed, while the policy is on, every
+    file's (dev, ino, size, mode, mtime_ns, ctime_ns) is unchanged, and the
+    record is inside ``max_age_s``. Read
+    :class:`~qwen_engine.local_bundle.VerificationReusePolicy` before
+    enabling: stat-unchanged is a WEAKER guarantee than the content hash.
+    Failed verifications are never recorded and never reused."""
+    if reuse_policy is not None and not isinstance(reuse_policy,
+                                                   VerificationReusePolicy):
+        raise ValueError(
+            "reuse_policy must be None or a VerificationReusePolicy, got "
+            f"{reuse_policy!r}")
     if config.manifest_path is None:
         raise ManifestError(
             "no model manifest configured (manifest_path is null): assets are "
@@ -280,7 +316,7 @@ def _verify_assets(config: GenerationConfig):
     manifest = load_manifest(config.manifest_path)
     root = (Path(config.models_dir) if config.models_dir is not None
             else Path(config.manifest_path).parent)
-    report = resolve_manifest(manifest, root)
+    report = _verified_report(manifest, root, reuse_policy)
     if not report.ok:
         for err in report.errors:
             print(f"asset error: {err}", file=sys.stderr)
@@ -314,7 +350,9 @@ def _verify_assets(config: GenerationConfig):
         except ManifestError as exc:
             raise ManifestError(
                 f"recipe 'turbo' needs the separate turbo manifest: {exc}") from None
-        turbo_report = resolve_manifest(turbo_manifest, turbo_root)
+        turbo_report = _verified_report(turbo_manifest, turbo_root,
+                                        reuse_policy,
+                                        profile=TURBO_REFERENCE_PROFILE)
         if not turbo_report.ok:
             for err in turbo_report.errors:
                 print(f"turbo asset error: {err}", file=sys.stderr)
