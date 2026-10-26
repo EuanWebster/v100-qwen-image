@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="Lightseed symbol"><defs>
+<linearGradient id="cyan" x1="0%" y1="0%" x2="100%" y2="100%"><stop stop-color="#13D5EE"/><stop offset="100%" stop-color="#00BCEB"/></linearGradient>
+<linearGradient id="blue" x1="0%" y1="0%" x2="100%" y2="100%"><stop stop-color="#00C9EE"/><stop offset="100%" stop-color="#00AAE7"/></linearGradient>
+<linearGradient id="peri" x1="0%" y1="0%" x2="100%" y2="100%"><stop stop-color="#6879FF"/><stop offset="100%" stop-color="#5361F1"/></linearGradient>
+<linearGradient id="violet" x1="0%" y1="0%" x2="100%" y2="100%"><stop stop-color="#A447FF"/><stop offset="100%" stop-color="#7C2AF5"/></linearGradient>
+</defs><g transform="translate(18 3.28) scale(0.92)"><path fill="url(#cyan)" d="M50 4 Q48 4 46 7 L8 49 Q4 53 8 57 L36 73 L50 39 Z"/>
+<path fill="url(#blue)" d="M50 4 Q52 4 54 7 L92 49 Q96 53 92 57 L64 73 L50 39 Z"/>
+<path fill="url(#peri)" d="M4 60 L36 79 Q42 82 43 91 L50 128 L12 105 Q4 100 4 91 Z"/>
+<path fill="url(#violet)" d="M96 60 L64 79 Q58 82 57 91 L50 128 L88 105 Q96 100 96 91 Z"/></g></svg>

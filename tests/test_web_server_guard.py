@@ -334,8 +334,15 @@ def test_static_map_is_exact_allowlist_over_assets():
     assert served == set(server.STATIC_ASSETS)
     assert not any(route.endswith("/") and route != "/"
                    for route in server.STATIC_ROUTES)
+    # Text responses must declare their charset. The brand images carry their
+    # exact image type and NOTHING else: a charset on an SVG/ICO/PNG describes
+    # bytes that are not text, and the browser's own icon decoding is the thing
+    # that would suffer.
     for route, (_, ctype) in server.STATIC_ROUTES.items():
-        assert "charset=utf-8" in ctype, route
+        if ctype.startswith("image/"):
+            assert ctype in ("image/svg+xml", "image/png", "image/x-icon"), route
+        else:
+            assert "charset=utf-8" in ctype, route
 
 
 def test_defensive_headers_present_and_no_cors_ever():
@@ -473,7 +480,14 @@ def test_module_entrypoint_and_script_declared():
     assert pyproject["project"]["scripts"]["qwen-web"] == "qwen_engine.web.server:main"
     data = pyproject["tool"]["setuptools"]["package-data"]["qwen_engine"]
     for asset in server.STATIC_ASSETS:
-        assert f"web_static/{asset}" in data
+        entry = f"web_static/{asset}"
+        assert entry in data, entry
+        # Listed AND present on disk: a typo (or a glob matching nothing) would
+        # ship an install that fails the moment that file is requested.
+        # web/server.py -> qwen_engine/ is the package that holds web_static/.
+        assert (Path(server.__file__).resolve().parents[1] / entry).is_file(), entry
+    assert not any("*" in entry for entry in data), \
+        "package data is an explicit list, so a missing brand file cannot pass silently"
     find = pyproject["tool"]["setuptools"]["packages"]["find"]
     assert find["namespaces"] is False
 
@@ -534,10 +548,11 @@ def test_raw_http_framing_selfcheck_pure():
 
 # ------------------------------------------- root-follow-up regressions
 
-def _memory_handler(raw: bytes):
+def _memory_response(raw: bytes, assets: dict[str, bytes] | None = None) -> bytes:
     """Drive _Handler.handle_one_request over an in-memory socket adapter —
     NO real socket is created (the guarded suite forbids them), while the
-    FULL stdlib request-line path runs verbatim."""
+    FULL stdlib request-line path runs verbatim. Returns the RAW response
+    bytes, so a body can be compared byte for byte."""
     import io
     import types
 
@@ -547,14 +562,19 @@ def _memory_handler(raw: bytes):
     h.connection = types.SimpleNamespace(
         getsockname=lambda: ("127.0.0.1", 8765))
     h.server = types.SimpleNamespace(bound_ip="127.0.0.1", bound_port=8765,
-                                     assets={"app.js": b"console.log('fixed asset')"},
+                                     assets=assets if assets is not None else
+                                     {"app.js": b"console.log('fixed asset')"},
                                      web_runtime=api.WebRuntime())
     h.close_connection = False
     h.request_version = "HTTP/1.1"
     h.address_string = lambda: "127.0.0.1"
     h.log_message = lambda *a, **k: None
     h.handle_one_request()
-    return h.wfile.getvalue().decode("latin-1")
+    return h.wfile.getvalue()
+
+
+def _memory_handler(raw: bytes) -> str:
+    return _memory_response(raw).decode("latin-1")
 
 
 def test_overlong_request_line_gets_typed_414_not_silent_close():
@@ -779,3 +799,84 @@ def test_main_hands_the_reference_store_to_the_rewriter(monkeypatch, tmp_path):
     assert server.main(["--rewrite-backend", "local-llm",
                         "--references-dir", str(refs)]) == 2
     assert seen == [os.path.realpath(str(refs))]
+
+
+# ------------------------------------------------------------- brand assets
+
+#: route -> (packaged asset, exact content type, the magic the bytes start with)
+_BRAND_ROUTES = (
+    ("/brand/lightseed-logo-on-dark.svg", "brand/lightseed-logo-on-dark.svg",
+     "image/svg+xml", b"<svg"),
+    ("/brand/lightseed-logo-on-light.svg", "brand/lightseed-logo-on-light.svg",
+     "image/svg+xml", b"<svg"),
+    ("/brand/favicon.svg", "brand/favicon.svg", "image/svg+xml", b"<svg"),
+    ("/brand/favicon-180.png", "brand/favicon-180.png", "image/png",
+     b"\x89PNG\r\n\x1a\n"),
+    # The ICO lives in the brand folder but is published at the ROOT, because
+    # that is where browsers ask for it without being told to.
+    ("/favicon.ico", "brand/favicon.ico", "image/x-icon", b"\x00\x00\x01\x00"),
+)
+
+
+@pytest.mark.parametrize("route,asset,ctype,magic", _BRAND_ROUTES,
+                         ids=["logo-dark", "logo-light", "icon-svg",
+                              "icon-180", "icon-ico"])
+def test_brand_routes_serve_the_exact_file_bytes_with_their_own_type(route, asset,
+                                                                    ctype, magic):
+    """Full request path, no socket: the bytes a browser gets must BE the
+    packaged file (no re-encoding, no charset on an image)."""
+    out = _memory_response(f"GET {route} HTTP/1.1\r\n"
+                           f"Host: 127.0.0.1:8765\r\n\r\n".encode(),
+                           server.load_static_assets())
+    head, _, body = out.partition(b"\r\n\r\n")
+    text = head.decode("latin-1")
+    assert text.split("\r\n")[0] == "HTTP/1.1 200 OK", text.split("\r\n")[0]
+    assert f"Content-Type: {ctype}" in text, text
+    assert "charset" not in text.split("Content-Type", 1)[1].split("\r\n")[0], \
+        f"{ctype} must not claim a charset"
+    assert f"Content-Length: {len(body)}" in text
+    assert "X-Content-Type-Options: nosniff" in text
+    assert body.startswith(magic), route
+    assert body == server.load_static_assets()[asset], \
+        "the served bytes must be the packaged file verbatim"
+    # The CSP the page ships with already allows 'img-src self': a brand file
+    # must never be the reason to loosen it.
+    assert "img-src 'self'" in text
+
+
+def test_brand_asset_table_matches_magic_and_stays_inside_the_folder():
+    for route, (asset, ctype) in server.STATIC_ROUTES.items():
+        if not asset.startswith("brand/"):
+            continue
+        data = server.load_static_assets()[asset]
+        if ctype == "image/svg+xml":
+            assert data.startswith(b"<svg"), route
+        elif ctype == "image/png":
+            assert data.startswith(b"\x89PNG\r\n\x1a\n"), route
+        elif ctype == "image/x-icon":
+            assert data[:4] == b"\x00\x00\x01\x00", route
+        else:
+            raise AssertionError(f"unhandled brand content type {ctype} for {route}")
+        # Every brand name is a fixed one-level constant under web_static/brand/:
+        # no traversal, nothing outside the folder, never a request-derived path.
+        assert asset.startswith("brand/"), asset
+        assert "/" not in asset[len("brand/"):], asset
+    assert server.resolve_route("GET", "/favicon.ico") == ("static", "/favicon.ico")
+    # An unlisted brand-looking path is still a 404, never a file read.
+    with pytest.raises(api.ApiError) as exc:
+        server.resolve_route("GET", "/brand/lightseed-banner.png")
+    assert exc.value.status == 404
+
+
+def test_load_static_assets_reads_the_brand_subfolder_byte_for_byte():
+    from qwen_engine.web.server import load_static_assets
+
+    # web/server.py -> qwen_engine/web_static (the packaged data directory).
+    root = Path(server.__file__).resolve().parents[1] / "web_static"
+    assets = load_static_assets()
+    assert set(assets) == set(server.STATIC_ASSETS)
+    for name in server.STATIC_ASSETS:
+        on_disk = (root / name).read_bytes()
+        assert assets[name] == on_disk, name
+    assert any(name.startswith("brand/") for name in assets), \
+        "the loader must reach the brand subfolder, not only the top level"

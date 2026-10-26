@@ -1,5 +1,6 @@
-/* Qwen Image Studio — W1 static workspace.
-   Dark charcoal shell, fine borders, one warm restrained accent.
+/* Lightseed Studio — W1 static workspace.
+   Dark charcoal shell, fine borders, one brand periwinkle accent (the
+   cyan/violet gradients are inside the logo artwork).
    No external fonts, no CDN, no analytics. System font stack only. */
 
 :root,
@@ -11,10 +12,14 @@
   --border-soft: #2a2e34;
   --text: #e9e7e2;
   --text-muted: #9ba1a9;
-  --accent: #d9a468;
-  --accent-dim: #b9854c;
+  /* Brand periwinkle (the #6879FF/#5361F1 gradient lifted for the charcoal
+     shell): 5.97:1 as text on --bg, 5.49:1 on --bg-panel, and the dark ink
+     --on-accent sits on it at 6.08:1. Periwinkle rather than cyan keeps
+     Original distinct from Neon, which stays cyan. */
+  --accent: #7C8CFF;
+  --accent-dim: #5361F1;
   --error: #e07b7b;
-  --focus: #e6b87e;
+  --focus: #A9B4FF;
   --on-accent: #14161a;
   --ok: #9fd6a8;
   --ok-border: #3f6b4b;
@@ -42,7 +47,7 @@
   --ok-border: #155e63;
 }
 
-/* Paper theme: light surfaces, warm ink. Muted/accent pairs keep
+/* Paper theme: light surfaces, cool brand ink. Muted/accent pairs keep
    readable contrast on the light backgrounds. */
 :root[data-theme="paper"] {
   --bg: #f6f3ec;
@@ -52,18 +57,20 @@
   --border-soft: #ddd6c6;
   --text: #23262b;
   --text-muted: #5c626b;
-  --accent: #8a5a24;
-  --accent-dim: #6d4619;
+  /* Brand periwinkle #5361F1 deepened to stay legible as TEXT on the light
+     surfaces: 6.40:1 on --bg, 6.97:1 on --bg-panel. --on-accent is the brand
+     ivory at 6.50:1 on --accent. */
+  --accent: #3F49C4;
+  --accent-dim: #2E3799;
   --error: #a13a3a;
-  --focus: #6d4619;
-  --on-accent: #fffdf7;
+  --focus: #2E3799;
+  --on-accent: #F7F5EF;
   --ok: #2c6e3f;
   --ok-border: #9fc7a8;
 }
 
-:root[data-theme="neon"] .brand-mark {
-  box-shadow: 0 0 18px #22d3ee55, 0 0 28px #db36ff33;
-}
+/* (The old neon glow lived on the removed ".brand-mark" tile; the logos carry
+   their own colour, so nothing is added here.) */
 :root[data-theme="neon"] .sticky-actions { border-color: #9445ad; }
 
 * { box-sizing: border-box; }
@@ -109,15 +116,24 @@ body { min-height: 100vh; display: flex; flex-direction: column; }
 
 .brand { display: flex; align-items: center; gap: 10px; }
 
-.brand-mark {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 30px; height: 30px; border-radius: 7px;
-  background: var(--accent); color: var(--on-accent);
-  font-weight: 700; font-size: 17px;
-}
-
+/* The wordmark IS the logo: the horizontal SVG carries "Lightseed", so only
+   "Studio" is live text. One <img> per logo variant and CSS shows exactly the
+   one the theme needs — the hidden one is display:none, so it neither takes
+   space nor contributes a second accessible name. 37px tall per the asset
+   README (the SVG is 503x148, so about 126px wide; it never forces a wider
+   header because the header wraps). */
 .brand-name {
-  margin: 0; font-size: 17px; font-weight: 650; letter-spacing: 0.2px;
+  margin: 0; display: flex; align-items: center; gap: 8px;
+  font-size: 17px; font-weight: 650; letter-spacing: 0.2px;
+}
+.brand-logo { height: 37px; width: auto; display: block; }
+.brand-logo-light { display: none; }
+:root[data-theme="paper"] .brand-logo-dark { display: none; }
+:root[data-theme="paper"] .brand-logo-light { display: block; }
+/* Muted, so the wordmark stays the loud part of the lockup. */
+.brand-suffix {
+  color: var(--text-muted); font-size: 17px; font-weight: 650;
+  letter-spacing: 0.2px;
 }
 
 .main-nav { display: flex; gap: 4px; margin-left: 8px; }

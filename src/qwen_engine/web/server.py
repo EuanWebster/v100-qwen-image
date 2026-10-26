@@ -93,12 +93,32 @@ MAX_QUEUED_CONNECTIONS = 16
 _JSON_CONTENT_TYPE_RE = re.compile(
     r"application/json(\s*;\s*charset\s*=\s*utf-8)?\Z", re.IGNORECASE)
 
-STATIC_ASSETS = ("index.html", "app.css", "app.js")
+#: Bundled brand artwork: byte-for-byte copies of the agreed Lightseed assets
+#: under web_static/brand/. Served through the SAME fixed allowlist as the text
+#: assets — the names are compile-time constants, never request input.
+BRAND_ASSETS = ("brand/lightseed-logo-on-dark.svg",
+                "brand/lightseed-logo-on-light.svg",
+                "brand/favicon.svg",
+                "brand/favicon.ico",
+                "brand/favicon-180.png")
+STATIC_ASSETS = ("index.html", "app.css", "app.js") + BRAND_ASSETS
+#: Binary brand files carry their exact image type and NO charset; the text
+#: assets keep "charset=utf-8".
 STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/brand/lightseed-logo-on-dark.svg":
+        ("brand/lightseed-logo-on-dark.svg", "image/svg+xml"),
+    "/brand/lightseed-logo-on-light.svg":
+        ("brand/lightseed-logo-on-light.svg", "image/svg+xml"),
+    "/brand/favicon.svg": ("brand/favicon.svg", "image/svg+xml"),
+    "/brand/favicon-180.png": ("brand/favicon-180.png", "image/png"),
+    # Browsers request /favicon.ico at the root on their own, so the packaged
+    # file is published under that exact route (the file itself stays in the
+    # brand folder; one asset, one route).
+    "/favicon.ico": ("brand/favicon.ico", "image/x-icon"),
 }
 STATUS_ROUTE = "/api/v1/status"
 PLAN_ROUTE = "/api/v1/plan"
@@ -405,7 +425,10 @@ def load_static_assets() -> dict[str, bytes]:
     root = resources.files("qwen_engine").joinpath("web_static")
     assets: dict[str, bytes] = {}
     for name in STATIC_ASSETS:
-        assets[name] = root.joinpath(name).read_bytes()
+        # An asset name is the fixed, slash-separated path INSIDE web_static
+        # (brand files live in a subfolder). It never comes from a request,
+        # so no user-controlled path is ever resolved here.
+        assets[name] = root.joinpath(*name.split("/")).read_bytes()
     return assets
 
 
@@ -960,7 +983,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="qwen-web",
         description=(
-            "Qwen Image Studio local web server: serves the workspace, "
+            "Lightseed Studio local web server: serves the workspace, "
             "status/plan/config-export API and opt-in serial generation jobs. Planning "
             "is available by default. Explicit IPv4 loopback/LAN/Tailscale binds. "
             "Omitted path options mean 'unconfigured': the server "

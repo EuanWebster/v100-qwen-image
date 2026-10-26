@@ -1,4 +1,4 @@
-/* Qwen Image Studio — W3 front-end (local same-origin engine jobs).
+/* Lightseed Studio — W3 front-end (local same-origin engine jobs).
  *
  * Honest by construction:
  *   * Network calls use the local status/plan/config/export and job API. Opened over

@@ -1721,3 +1721,203 @@ def test_every_output_format_the_engine_writes_is_accepted_as_a_reference():
     assert accepted == {"JPEG": "jpeg", "PNG": "png", "WEBP": "webp"}
     assert set(types.values()) == {"image/jpeg", "image/png", "image/webp"}
 
+
+# ------------------------------------------------------- Lightseed brand
+
+
+def _brand_file(name: str) -> bytes:
+    path = WEB_DIR / "brand" / name
+    assert path.is_file(), f"missing brand asset: {path}"
+    data = path.read_bytes()
+    assert data, f"brand asset is empty: {path}"
+    return data
+
+
+def _theme_blocks(css: str) -> dict[str, dict[str, str]]:
+    """Token map of every ``:root[data-theme=…]`` block. Comments are stripped
+    first so a colour named in prose can never be read as a token."""
+    body = re.sub(r"/\*[\s\S]*?\*/", "", css)
+    out: dict[str, dict[str, str]] = {}
+    for m in re.finditer(r':root\[data-theme="([a-z]+)"\]\s*\{([^}]*)\}', body):
+        out[m.group(1)] = dict(re.findall(r"(--[\w-]+):\s*(#[0-9a-fA-F]{6})\b",
+                                          m.group(2)))
+    return out
+
+
+def _hls(color: str) -> tuple[float, float, float]:
+    import colorsys
+    digits = color.lstrip("#")
+    r, g, b = (int(digits[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    return colorsys.rgb_to_hls(r, g, b)
+
+
+def _channel(v: float) -> float:
+    # WCAG 2.1 relative luminance: linearised sRGB channel.
+    return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+
+
+def _luminance(color: str) -> float:
+    digits = color.lstrip("#")
+    r, g, b = (int(digits[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    return 0.2126 * _channel(r) + 0.7152 * _channel(g) + 0.0722 * _channel(b)
+
+
+def _contrast(a: str, b: str) -> float:
+    la, lb = _luminance(a), _luminance(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+
+def test_app_is_named_lightseed_studio_and_keeps_its_storage_key():
+    html, js, css = _read("index.html"), _read("app.js"), _read("app.css")
+    assert "<title>Lightseed Studio</title>" in html
+    header = re.search(r"<header[\s\S]*?</header>", html).group(0)
+    assert 'alt="Lightseed"' in header, "the wordmark must carry the name"
+    assert ">Studio<" in header, "the live suffix word must be real text"
+    # The old product name is gone from everything the user sees; the ENGINE
+    # keeps its real model naming (Qwen-Image, qwen_engine, qwen-web).
+    for name, text in (("index.html", html), ("app.js", js), ("app.css", css)):
+        assert "Qwen Image Studio" not in text, f"{name} still says the old name"
+    assert js.splitlines()[0].startswith("/* Lightseed Studio"), js.splitlines()[0]
+    assert css.splitlines()[0].startswith("/* Lightseed Studio"), css.splitlines()[0]
+    # Renaming the saved-theme key would silently reset every user's theme, so
+    # the rebrand must leave it exactly as it was.
+    assert "localStorage.setItem(THEME_STORAGE_KEY" in js
+    assert "'qwen-studio-theme'" in js, "the storage key must NOT be renamed"
+
+
+def test_header_lockup_is_two_theme_logos_plus_the_live_suffix():
+    html = _read("index.html")
+    lockup = re.search(r'<h1 class="brand-name">([\s\S]*?)</h1>', html)
+    assert lockup, "the header wordmark is missing"
+    lockup = lockup.group(1)
+    dark = re.search(r'<img[^>]*src="brand/lightseed-logo-on-dark\.svg"[^>]*>', lockup)
+    light = re.search(r'<img[^>]*src="brand/lightseed-logo-on-light\.svg"[^>]*>', lockup)
+    assert dark and light, "both logo variants must be present (one per surface)"
+    for tag, cls in ((dark, "brand-logo-dark"), (light, "brand-logo-light")):
+        assert cls in tag.group(0), f"missing {cls}"
+        assert 'class="brand-logo ' in tag.group(0)
+        # The alt text IS the image's accessible name, so the h1 reads
+        # "Lightseed" + "Studio"; a decorative empty alt would lose the name.
+        assert 'alt="Lightseed"' in tag.group(0)
+    assert '<span class="brand-suffix">Studio</span>' in lockup
+    # The old letter tile is removed from the markup, not merely hidden.
+    assert "brand-mark" not in html
+
+
+def test_only_the_theme_matching_logo_is_displayed():
+    css = _read("app.css")
+    # The logo height drives the whole lockup width, so it is checked against
+    # the asset's OWN declared geometry rather than a guessed pixel value.
+    declared = re.search(rb'<svg[^>]*\bwidth="(\d+)"[^>]*\bheight="(\d+)"',
+                         _brand_file("lightseed-logo-on-dark.svg"))
+    assert declared, "the wordmark must declare width/height for the layout math"
+    native_w, native_h = (int(g) for g in declared.groups())
+    assert (native_w, native_h) == (503, 148), (native_w, native_h)
+    css_px = re.search(r"\.brand-logo \{[^}]*height: (\d+)px", css)
+    assert css_px, "the logo height must be declared in .brand-logo"
+    height = int(css_px.group(1))
+    assert 36 <= height <= 38, f"{height}px is outside the 36-38px brand band"
+    # The brand README promises "≈126px wide"; the aspect ratio is what makes
+    # that true, so a future size bump cannot quietly widen the header.
+    assert round(height * native_w / native_h) <= 130, \
+        f"{height}px tall renders {round(height * native_w / native_h)}px wide"
+    assert re.search(r"\.brand-logo-light \{[^}]*display: none", css), \
+        "the Paper logo must be hidden by default (Original/Neon are dark)"
+    assert re.search(r':root\[data-theme="paper"\] \.brand-logo-dark \{[^}]*display: none', css)
+    assert re.search(r':root\[data-theme="paper"\] \.brand-logo-light \{[^}]*display: block', css)
+    assert not re.search(r':root\[data-theme="neon"\] \.brand-logo', css), \
+        "Neon uses the default dark logo: a third rule would be a second source"
+    assert not re.search(r"\.brand-mark \{", css), "the removed tile must stay removed"
+    # The wider lockup may wrap but must never create horizontal scroll.
+    assert re.search(r"\.app-header \{[^}]*flex-wrap: wrap", css)
+
+
+def test_favicon_links_are_relative_and_point_at_packaged_files():
+    html = _read("index.html")
+    head = html[:html.index("</head>")]
+    assert '<link rel="icon" href="brand/favicon.svg" type="image/svg+xml">' in head
+    assert '<link rel="icon" href="favicon.ico" sizes="any">' in head
+    assert '<link rel="apple-touch-icon" href="brand/favicon-180.png">' in head
+    for href in re.findall(r'<link[^>]*href="([^"]+)"', head):
+        assert not href.startswith(("http:", "https:", "//")), href
+        # Browsers request the ICO at the ROOT, so the markup says
+        # "favicon.ico" while the packaged copy lives in brand/.
+        relative = "brand/favicon.ico" if href == "favicon.ico" else href
+        assert (WEB_DIR / relative).is_file(), f"{href} is not packaged"
+    assert b"<svg" in _brand_file("favicon.svg")[:64]
+    assert _brand_file("favicon.ico")[:4] == b"\x00\x00\x01\x00"
+    assert _brand_file("favicon-180.png")[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_accent_tokens_pass_wcag_contrast_in_every_theme():
+    """--accent is used AS TEXT (.recipe-note, .transparency-note, .back-link)
+    and as a filled button background under --on-accent, so both pairs must
+    clear 4.5:1 (WCAG 2.1 SC 1.4.3) in EACH of the three themes."""
+    blocks = _theme_blocks(_read("app.css"))
+    assert set(blocks) == {"original", "neon", "paper"}
+    for theme in ("original", "neon", "paper"):
+        tokens = blocks[theme]
+        for token in ("--bg", "--bg-panel", "--accent", "--on-accent"):
+            assert token in tokens, f"{theme} has no {token}"
+        accent, on_accent = tokens["--accent"], tokens["--on-accent"]
+        assert _contrast(accent, tokens["--bg"]) >= 4.5, \
+            f"{theme}: --accent {accent} on --bg {tokens['--bg']}"
+        assert _contrast(accent, tokens["--bg-panel"]) >= 4.5, \
+            f"{theme}: --accent {accent} on --bg-panel {tokens['--bg-panel']}"
+        assert _contrast(on_accent, accent) >= 4.5, \
+            f"{theme}: --on-accent {on_accent} on --accent {accent}"
+
+
+def test_accent_colours_belong_to_the_brand_palette():
+    """Every accent token must sit in the logo's cyan→periwinkle→violet hue
+    band, and none of the old warm amber/brown trio may survive anywhere."""
+    css = _read("app.css")
+    for old in ("#d9a468", "#b9854c", "#e6b87e", "#8a5a24", "#6d4619"):
+        assert old not in css, f"the old accent {old} is still in the stylesheet"
+    for theme, tokens in _theme_blocks(css).items():
+        accent_light = _hls(tokens["--accent"])[1]
+        for token in ("--accent", "--accent-dim", "--focus"):
+            hue, lightness, saturation = _hls(tokens[token])
+            assert saturation > 0.2, \
+                f"{theme} {token} {tokens[token]} is not a brand colour"
+            assert 180 <= hue * 360 <= 290, \
+                f"{theme} {token} {tokens[token]} hue {hue * 360:.0f} is off-brand"
+            assert 0.05 < lightness < 0.95
+        # Button text is the one place a near-neutral ivory/ink belongs: it must
+        # be an obvious light-or-dark against the accent, not a mid tone.
+        assert abs(_hls(tokens["--on-accent"])[1] - accent_light) >= 0.4, \
+            f"{theme}: --on-accent is too close in lightness to --accent"
+
+
+def test_brand_assets_are_the_agreed_files_and_stay_inert():
+    """Byte-level guard: the copies are the agreed artwork, unchanged. The
+    digests are of the delivered assets, so an edit inside the repo is caught
+    even though agreed-logos/ itself is never git-tracked."""
+    import hashlib
+
+    expected = {
+        "lightseed-logo-on-dark.svg": "25af2ad2af048b491be09caf6e36fd46c7f438c5"
+                                      "98d1e4fb5b658dfbf7134d54",
+        "lightseed-logo-on-light.svg": "e099b6537519ab7f8b940452a322b8c3be9ca3f2"
+                                       "6906799b53bcf1bd0dd63620",
+        "favicon.svg": "93aefd55b834aca11558ccafd785325c5c3a0790b3e05064a1c600ff"
+                       "094540ae",
+        "favicon.ico": "576b3e0560c98818172146227c7c1e5f9d24e1ef29c0c2218133fbd9"
+                       "1a39053c",
+        "favicon-180.png": "df93907470009a303e7e99e2b36d5beb8e35f39ebb17cc92fc64"
+                           "5d8d6eb3458b",
+    }
+    got = {name: hashlib.sha256(_brand_file(name)).hexdigest() for name in expected}
+    assert got == expected
+    # The two wordmarks differ in the LETTERING colour only, which is exactly
+    # why both ship rather than one being tinted by CSS.
+    dark = _brand_file("lightseed-logo-on-dark.svg")
+    light = _brand_file("lightseed-logo-on-light.svg")
+    assert b"#F7F5EF" in dark and b"#0B102B" in light
+    assert dark.count(b"<linearGradient") == light.count(b"<linearGradient")
+    # Inert documents: no script, no embedded raster, no external reference.
+    # The only URL in the files is the SVG namespace declaration itself.
+    for blob in (dark, light, _brand_file("favicon.svg")):
+        assert b"<script" not in blob and b"<image" not in blob
+        assert b"xlink:href" not in blob and b"<style" not in blob
+        assert blob.count(b"http") == blob.count(b"http://www.w3.org/2000/svg")

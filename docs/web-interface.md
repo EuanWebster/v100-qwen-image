@@ -1,4 +1,4 @@
-# Web interface design — local Qwen Image Studio (W milestones)
+# Web interface design — local Lightseed Studio (W milestones)
 
 > **Current, 2026-10-24:** W3 generation is implemented. See
 > [W3 run instructions, contracts and validation](web-generation-w3.md).
@@ -86,9 +86,10 @@ queue/automatic-download/cloud features are out of scope by directive.
 
 ## Visual hierarchy
 
-Full-browser dark charcoal shell (`#16181b`), fine 1px borders, one warm
-restrained accent (amber), high-contrast type on the system font stack.
-Header: product name **Qwen Image Studio**, Create/History navigation,
+Full-browser dark charcoal shell (`#16181b`), fine 1px borders, one brand
+periwinkle accent (`#7C8CFF`; the cyan/violet gradients live inside the logo).
+Header: the Lightseed wordmark image plus the live word **Studio** — the product
+name **Lightseed Studio** — with Create/History navigation,
 Settings, and a connection chip. Desktop layout is a 380 px controls column
 plus a flexible preview column; under ~940 px it stacks with no horizontal
 overflow. Visible focus rings, labels for every control, `aria-live` error
