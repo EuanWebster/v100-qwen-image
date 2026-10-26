@@ -2011,7 +2011,7 @@
         $('plan-panel').hidden = true;   // imported draft is not yet validated
         promptTouched = true;
         syncPresetButtons();
-        setPreviewAspect(plan.config.width, plan.config.height);
+        syncPreviewShape();
         renderValidation(validateForm().errors);
         syncPlanStaleness();       // keeps staleness bookkeeping consistent
         setText('api-message', 'Imported configuration into the draft ' +
@@ -2452,9 +2452,34 @@
     // Larger presets need tiled decode; 1K presets restore clean untiled decode.
     $('vae-tiling').checked = (preset.width / 16) * (preset.height / 16) > 4096;
     syncPresetButtons();
-    setPreviewAspect(preset.width, preset.height);
+    syncPreviewShape();
     renderValidation(validateForm().errors);
     syncPlanStaleness();   // preset edits stale any visible result too
+  }
+
+  // Size of the finished image on screen ({width, height}), or null when the
+  // frame shows no image. While an image is shown the frame keeps ITS shape:
+  // job polling re-renders it, so following the draft would flip the frame to
+  // the new preset and straight back. The draft's size shows as a label.
+  var shownImageSize = null;
+
+  function sizeLabel(width, height) {
+    var name = presetNameFor(width, height);
+    return (name ? PRESETS[name].ratio + ' \u00b7 ' : '') + width + '\u00d7' + height;
+  }
+
+  function syncPreviewShape() {
+    var width = Number($('width').value), height = Number($('height').value);
+    var note = $('preview-next-size');
+    if (!shownImageSize) {
+      setPreviewAspect(width, height);
+      note.hidden = true;
+      return;
+    }
+    setPreviewAspect(shownImageSize.width, shownImageSize.height);
+    var differs = width !== shownImageSize.width || height !== shownImageSize.height;
+    note.hidden = !differs || !isValidDimension(width) || !isValidDimension(height);
+    note.textContent = note.hidden ? '' : 'Next image: ' + sizeLabel(width, height);
   }
 
   function setPreviewAspect(width, height) {
@@ -2699,10 +2724,12 @@
     if (complete) {
       if (image.getAttribute('src') !== job.image_url) image.src = job.image_url;
       image.alt = job.config.prompt;
-      setPreviewAspect(job.config.width, job.config.height);
+      shownImageSize = { width: job.config.width, height: job.config.height };
     } else {
       image.removeAttribute('src');
+      shownImageSize = null;
     }
+    syncPreviewShape();
     image.hidden = !complete;
     $('preview-empty').hidden = complete;
   }
@@ -2823,6 +2850,8 @@
           $('preview-image').hidden = true;
           $('preview-image').removeAttribute('src');
           $('preview-empty').hidden = false;
+          shownImageSize = null;
+          syncPreviewShape();
           ['cancel-job', 'action-download', 'action-open', 'action-again'].forEach(function (id) { $(id).disabled = true; });
           updateUseAsReferenceControl();   // same block reason: no result
           setText('job-status', 'No job selected.');
@@ -2966,9 +2995,11 @@
 
   function updateUseAsReferenceControl() {
     var reason = useAsReferenceBlock(jobCache[selectedJob]);
-    $('action-reference').disabled = reason !== '';
-    $('action-reference').title = reason || 'Add this image as reference image ' +
-      (references.length + 1) + ' of ' + MAX_REFERENCES;
+    // "Last image" is the one in the preview: the newest result unless an
+    // older one was opened from History.
+    $('use-last-image').disabled = reason !== '';
+    $('use-last-image').title = reason || 'Add the image shown in the preview ' +
+      'as reference image ' + (references.length + 1) + ' of ' + MAX_REFERENCES;
   }
 
   // Bytes plus a display name for the upload path, which reads file.size and
@@ -3169,7 +3200,7 @@
     });
     // Same refusal discipline as its siblings: the disabled state is a
     // courtesy, the function re-checks the block and states the reason.
-    $('action-reference').addEventListener('click', function () {
+    $('use-last-image').addEventListener('click', function () {
       useJobImageAsReference(selectedJob);
     });
     $('preview-image').addEventListener('error', function () {
@@ -3210,7 +3241,7 @@
     ['steps', 'seed', 'cfg', 'width', 'height', 'prompt', 'negative'].forEach(function (id) {
       $(id).addEventListener('input', function () {
         if (id === 'width' || id === 'height') {
-          setPreviewAspect(Number($('width').value), Number($('height').value));
+          syncPreviewShape();
           syncPresetButtons();
         }
         if (id === 'prompt') { promptTouched = true; bumpPromptRevision(); }

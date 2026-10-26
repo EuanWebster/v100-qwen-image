@@ -1538,21 +1538,25 @@ def test_w5_rewrite_ui_is_a_suggestion_flow_not_an_automatic_edit():
 
 
 def test_use_as_reference_button_exists_on_both_surfaces_and_is_labelled():
-    """One click, two places: the finished-image panel and each History card."""
+    """One click, two places: the reference panel and each History card."""
     html = _read("index.html")
+    # The finished-image panel no longer carries it: the shortcut lives with
+    # the other reference controls, so it is only offered in edit mode.
     actions = re.search(r'<div class="result-actions"[^>]*>([\s\S]*?)</div>', html)
     assert actions, "result-actions group missing"
-    actions = actions.group(0)
-    button = re.search(r'<button[^>]*id="action-reference"[^>]*>([\s\S]*?)</button>',
-                       actions)
-    assert button, "the finished-image panel needs #action-reference"
+    assert "reference" not in actions.group(0).lower()
+    toolbar = re.search(r'<div class="reference-toolbar">([\s\S]*?)</div>', html)
+    assert toolbar, "reference toolbar missing"
+    toolbar = toolbar.group(0)
+    button = re.search(r'<button[^>]*id="use-last-image"[^>]*>([\s\S]*?)</button>',
+                       toolbar)
+    assert button, "the reference panel needs #use-last-image"
     tag, label = button.group(0), button.group(1)
-    assert label.strip() == "Use as reference", "the label names the action"
+    assert label.strip() == "Use last image as reference", "the label names the action"
     assert 'type="button"' in tag, "never a submit button inside the form"
-    # It starts disabled with the reason in the title, exactly like its
-    # Download/Open/Generate-again siblings — no result, no shortcut.
+    # It starts disabled with the reason in the title — no result, no shortcut.
     assert "disabled" in tag and 'title="No result yet"' in tag
-    assert actions.index('id="action-download"') < actions.index('id="action-reference"')
+    assert toolbar.index('id="add-reference"') < toolbar.index('id="use-last-image"')
 
     js = _read("app.js")
     history = _js_function(js, "renderHistory")
@@ -1640,8 +1644,8 @@ def test_use_as_reference_respects_the_cap_and_the_finished_image_rule():
     # predicate, so they cannot disagree about what is addable.
     control = _js_function(js, "updateUseAsReferenceControl")
     assert "useAsReferenceBlock(jobCache[selectedJob])" in control
-    assert "$('action-reference').disabled = reason !== '';" in control
-    assert "$('action-reference').title = reason" in control
+    assert "$('use-last-image').disabled = reason !== '';" in control
+    assert "$('use-last-image').title = reason" in control
     history = _js_function(js, "renderHistory")
     assert "var blocked = useAsReferenceBlock(job);" in history
     assert "reuse.disabled = blocked !== '';" in history
@@ -1921,3 +1925,36 @@ def test_brand_assets_are_the_agreed_files_and_stay_inert():
         assert b"<script" not in blob and b"<image" not in blob
         assert b"xlink:href" not in blob and b"<style" not in blob
         assert blob.count(b"http") == blob.count(b"http://www.w3.org/2000/svg")
+
+
+def test_preview_keeps_the_shown_images_shape_and_labels_the_next_size():
+    # Job polling re-renders the selected job, so a frame that followed the
+    # draft would flip to a new preset and straight back. While a finished
+    # image is shown the frame keeps the image's shape; the draft's size shows
+    # as a "Next image" label instead.
+    html = _read("index.html")
+    frame = re.search(r'<div class="preview-frame" id="preview-frame"[\s\S]*?\n        </div>', html)
+    assert frame and 'id="preview-next-size"' in frame.group(0)
+    assert re.search(r'<p class="preview-next-size" id="preview-next-size" hidden>', html)
+
+    js = _read("app.js")
+    shape = _js_function(js, "syncPreviewShape")
+    assert "if (!shownImageSize) {" in shape
+    assert "setPreviewAspect(width, height);" in shape
+    assert "setPreviewAspect(shownImageSize.width, shownImageSize.height);" in shape
+    assert "'Next image: ' + sizeLabel(width, height)" in shape
+    assert "width !== shownImageSize.width || height !== shownImageSize.height" in shape
+    # Every draft-size change goes through syncPreviewShape, never straight
+    # to setPreviewAspect.
+    assert "syncPreviewShape();" in _js_function(js, "applyPreset")
+    assert "setPreviewAspect(preset" not in js
+    assert "setPreviewAspect(plan.config" not in js
+    assert js.count("setPreviewAspect(") == 3, "only syncPreviewShape and the definition"
+    # The selected job sets or clears the shown size, then re-syncs.
+    job = _js_function(js, "renderSelectedJob")
+    assert "shownImageSize = { width: job.config.width, height: job.config.height };" in job
+    assert "shownImageSize = null;" in job
+    assert job.index("shownImageSize = null;") < job.rindex("syncPreviewShape();")
+    label = _js_function(js, "sizeLabel")
+    assert "PRESETS[name].ratio" in label
+    assert ".preview-next-size {" in _read("app.css")
