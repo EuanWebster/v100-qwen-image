@@ -25,6 +25,17 @@ line says otherwise. Numbers are single runs, not a benchmark suite.
 | `QWEN_LAN_HOST`, `QWEN_TAILSCALE_HOST` | extra bind addresses |
 | `QWEN_ATTEST_UNBOUNDED_HOST=0` | do not attest "no cgroup RAM cap" (set this in a memory-capped container) |
 
+`qwen-web --reuse-verified-assets[=SECONDS]` (off by default, and not set by
+`start-web.sh`) relaxes the asset check each job starts with: instead of
+hashing every model artifact per job, the server may reuse a recorded
+**successful** verification while every artifact's stat fingerprint is
+unchanged and the record is younger than `SECONDS` (bare flag = 3600). That
+is a deliberately weaker guarantee than the default — size-or-mtime tricks
+are not what it guards — so enable it only for model trees you control.
+Failed verifications are never reused, the server's startup log states when
+reuse is ON and its max age, and bad ages (zero, negative, non-finite)
+refuse startup.
+
 The page is prompt-first: type a prompt, pick a preset, press **Generate**.
 Progress, cancellation, history, config import/export, three themes
 and in-UI help for every option are all in the page. Nothing is written to
@@ -237,7 +248,7 @@ Limits and automatic behaviour (each measured, none silent):
 | Noise seed | An edit's sampler noise is derived from `(seed, ordered reference ids)` — `qwen-engine.edit-noise.v1`. Same seed + same references in the same order reproduces the edit; changing either changes the noise. The visible seed/filename stay yours; the derived value is recorded as `noise_seed` in the run metadata. Text-to-image is unaffected. |
 | KV cache | FP16 + references keeps the KV cache **off** automatically (KV on OOMs at the first denoise step). Q8 keeps it on. Recorded as `kv_cache_policy` in the run metadata. |
 | Decode precision | References always decode in FP32, including opaque output (a Q8 2-reference run sampled fine and died at `vae_decoding` in FP16). |
-| Decode tiling | Above ~4096 latent tokens an edit needs tiled decode (1088×1088 untiled OOMed in FP32; the same run finished with `--tiled-decode`, `batch17`). The web server refuses an untiled config that large (`422 tiled_decode_required`); the CLI does not — it fails later, at decode. |
+| Decode tiling | Above ~4096 latent tokens an edit needs tiled decode (1088×1088 untiled OOMed in FP32; the same run finished with `--tiled-decode`, `batch17`). The web server refuses an untiled config that large (`422 tiled_decode_required`); the CLI refuses it too, before any model load, as a config error naming `--tiled-decode`. |
 | File caps | 32 MiB per file, sides ≤ 4096 px, ≤ 4096² pixels, at most 10 references. Larger images are accepted, then resized to about one megapixel for the model. |
 | Transparency in a reference | The alpha channel is kept in the stored bytes, but the vision encoder sees the image composited over white. |
 | First encode cost | The text+vision encoder runs on CPU: an uncached 1024² reference costs ~66–73 s to encode; two references ~107–116 s (measured 116.0 s on one 2-reference job). Repeats hit the embedding cache. |

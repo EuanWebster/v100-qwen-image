@@ -59,6 +59,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib import resources
 from typing import Any
 
+from qwen_engine import local_bundle
 from qwen_engine import rewrite as rw
 from qwen_engine import rewrite_client as rc
 from qwen_engine.config import ConfigError, GenerationConfig
@@ -985,6 +986,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="write opt-in prompt-free synchronized metrics in each job directory")
     p.add_argument("--attest-unbounded-host", action="store_true",
                    help="operator attestation of no cgroup RAM cap; encoder uses fresh host MemAvailable")
+    p.add_argument("--reuse-verified-assets", type=float, nargs="?",
+                   metavar="SECONDS",
+                   const=local_bundle.VERIFICATION_REUSE_DEFAULT_MAX_AGE_S,
+                   default=None,
+                   help="opt-in, generation only: re-use a recorded SUCCESSFUL "
+                        "asset verification younger than SECONDS (default "
+                        f"{local_bundle.VERIFICATION_REUSE_DEFAULT_MAX_AGE_S:g}s) "
+                        "while every artifact's stat fingerprint is unchanged "
+                        "— weaker than re-hashing content; omitted (default): "
+                        "every job hashes every artifact")
     # -- prompt rewriting (opt-in; off by default) --------------------------
     p.add_argument("--rewrite-backend", choices=("off",) + _rewrite_service.BACKENDS,
                    default="off",
@@ -1066,6 +1077,16 @@ def main(argv: list[str] | None = None) -> int:
     if not 0 <= args.port <= 65535:
         print("error: --port must be in [0, 65535]", file=sys.stderr)
         return 2
+    reuse_policy = None
+    if args.reuse_verified_assets is not None:
+        # Typed startup refusal before any bind; the policy itself owns
+        # what a valid age is (positive, finite seconds).
+        try:
+            reuse_policy = local_bundle.VerificationReusePolicy(
+                max_age_s=args.reuse_verified_assets)
+        except ValueError as exc:
+            print(f"error: --reuse-verified-assets: {exc}", file=sys.stderr)
+            return 2
 
     paths = {
         # SAFELY RESOLVED at startup (realpath normalizes symlinks/'..' —
@@ -1152,7 +1173,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             Path(runtime.output_dir).mkdir(parents=True, exist_ok=True)
             httpd.generation = WebGeneration(runtime, trust_unbounded_host=args.attest_unbounded_host,
-                                            performance=args.performance)
+                                            performance=args.performance,
+                                            reuse_verified_assets=reuse_policy)
         except (OSError, ValueError, RuntimeError):
             for listener in listeners:
                 listener.server_close()
@@ -1161,6 +1183,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.attest_unbounded_host:
             print("notice: operator attests no cgroup RAM limit for generation; "
                   "the encoder still checks fresh host MemAvailable", file=sys.stderr)
+        if reuse_policy is not None:
+            print("notice: asset-verification reuse is ON: a successful asset "
+                  f"verification up to {reuse_policy.max_age_s:g}s old may be "
+                  "reused while every artifact's stat fingerprint is unchanged "
+                  "— a weaker guarantee than hashing every artifact per job")
 
     for listener in listeners:
         listener.generation = httpd.generation

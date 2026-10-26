@@ -16,6 +16,7 @@ from pathlib import Path
 from dataclasses import replace
 
 from qwen_engine.config import ConfigError
+from qwen_engine.local_bundle import VerificationReusePolicy
 from qwen_engine.core import generate
 from qwen_engine.errors import GenerationCancelled
 from qwen_engine.jobs import JobCancelled, JobController, JobError
@@ -42,7 +43,7 @@ PUBLIC_ERROR_CODES = {
 
 class WebGeneration:
     def __init__(self, runtime: WebRuntime, *, trust_unbounded_host=False, executor=None,
-                 performance=False, memory_release=None):
+                 performance=False, memory_release=None, reuse_verified_assets=None):
         if _blockers(runtime):
             raise ValueError("generation runtime is incomplete or disabled")
         self.runtime = runtime
@@ -50,17 +51,30 @@ class WebGeneration:
             raise ValueError("performance must be boolean")
         self.performance = performance
         self.trust_unbounded_host = trust_unbounded_host
+        # Opt-in verification reuse (server flag --reuse-verified-assets):
+        # None (default) content-verifies every artifact on every job; a
+        # positive-finite age (seconds) or a ready-made policy lets a job
+        # reuse a recorded SUCCESSFUL verification while every artifact's
+        # stat fingerprint is unchanged — strictly weaker than re-hashing.
+        if reuse_verified_assets is None:
+            self.reuse_policy = None
+        elif isinstance(reuse_verified_assets, VerificationReusePolicy):
+            self.reuse_policy = reuse_verified_assets
+        else:
+            self.reuse_policy = VerificationReusePolicy(max_age_s=reuse_verified_assets)
         self._lock = threading.Lock()
         self._metrics = {}
         self._executor = executor or self._execute
         self.controller = JobController(runtime.output_dir, self._run, memory_release=memory_release)
 
     def _execute(self, context):
-        # Identical asset verification, adapter and host policy to --run.
+        # Identical asset verification, adapter and host policy to --run,
+        # including the operator's opt-in reuse policy (None = full
+        # content verification per job, the default).
         from qwen_engine.cli import _make_adapter, _verify_assets
 
         context.check_cancelled()
-        assets = _verify_assets(context.config)
+        assets = _verify_assets(context.config, reuse_policy=self.reuse_policy)
         context.check_cancelled()
         adapter = _make_adapter(trust_unbounded_host=self.trust_unbounded_host)
         progress_binder = getattr(adapter, "set_progress_callback", None)

@@ -83,3 +83,49 @@ def test_listeners_share_worker_and_shutdown(tmp_path, monkeypatch):
                           '--cache-dir', str(tmp_path / 'cache')])
     assert result == 0
     assert workers[0].closed and all(listener.closed for listener in opened)
+
+
+def test_reuse_flag_reaches_worker_with_path_free_notice(tmp_path, monkeypatch, capsys):
+    from qwen_engine.web import generation
+    workers = []
+
+    class Listener:
+        def __init__(self, address, handler):
+            self.server_address, self.closed = (address[0], address[1] or 54321), False
+            self.bound_ip, self.bound_port = address[0], address[1] or 54321
+        def server_close(self): self.closed = True
+
+    class Worker:
+        def __init__(self, runtime, **kwargs):
+            self.kwargs, self.closed = kwargs, False
+            workers.append(self)
+        def close(self):
+            self.closed = True
+            return True
+
+    class Selector:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def register(self, *args): pass
+        def select(self, **kwargs): raise KeyboardInterrupt
+
+    monkeypatch.setattr(server, '_Server', Listener)
+    monkeypatch.setattr(generation, 'WebGeneration', Worker)
+    monkeypatch.setattr(server.selectors, 'DefaultSelector', Selector)
+    monkeypatch.setattr(server, 'read_manifest_limited', lambda _: (b'{}', None))
+    monkeypatch.setattr(server.api, 'summarize_manifest_bytes', lambda *a: {
+        'configured': True, 'valid': True, 'schema_version': 1, 'artifact_count': 24})
+    base = ['--host', '127.0.0.1', '--host', '192.168.68.103', '--port', '0',
+            '--enable-generation', '--manifest', str(tmp_path / 'manifest.json'),
+            '--models-dir', str(tmp_path / 'models'), '--output-dir', str(tmp_path / 'out'),
+            '--cache-dir', str(tmp_path / 'cache')]
+    assert server.main(base + ['--reuse-verified-assets', '90']) == 0
+    policy = workers[0].kwargs['reuse_verified_assets']
+    assert policy is not None and policy.max_age_s == 90
+    out = capsys.readouterr().out
+    assert 'asset-verification reuse is ON' in out and '90s' in out
+    assert str(tmp_path) not in out        # the notice never names paths
+    assert server.main(base) == 0
+    out = capsys.readouterr().out
+    assert workers[1].kwargs['reuse_verified_assets'] is None
+    assert 'reuse' not in out              # off by default: nothing announced

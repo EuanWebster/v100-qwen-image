@@ -77,8 +77,8 @@ def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, 
             return path
         def close(self): events.append('closed')
 
-    def verify(config):
-        events.append('verified')
+    def verify(config, *, reuse_policy=None):
+        events.append(('verified', reuse_policy))
         return SimpleNamespace(resolved={'weights': ()})
 
     def factory(*, trust_unbounded_host):
@@ -94,7 +94,7 @@ def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, 
         record = service.controller.wait(submitted['job_id'])
         doc = service.job_response(record.job_id).payload
         assert record.state == JobState.SUCCEEDED
-        assert events == ['verified', 'factory', ('load', {'weights': ()}), 'closed']
+        assert events == [('verified', None), 'factory', ('load', {'weights': ()}), 'closed']
         assert set(doc['phase_ms']) == {'load', 'encode', 'denoise', 'decode', 'save'}
         assert all(value >= 0 for value in doc['phase_ms'].values())
         assert doc['elapsed_ms'] >= sum(doc['phase_ms'].values())
@@ -115,7 +115,7 @@ def test_real_core_executor_reports_timings_closes_and_verifies_assets(runtime, 
 
 @pytest.mark.parametrize("performance", [False, True])
 def test_assets_failure_never_creates_adapter_and_error_is_private(runtime, monkeypatch, performance):
-    def fail(config): raise RuntimeError('/private/model/path secret detail')
+    def fail(config, *, reuse_policy=None): raise RuntimeError('/private/model/path secret detail')
     monkeypatch.setattr(cli, '_verify_assets', fail)
     monkeypatch.setattr(cli, '_make_adapter', lambda **kw: pytest.fail('adapter loaded'))
     service = WebGeneration(runtime, performance=performance)
@@ -131,6 +131,54 @@ def test_assets_failure_never_creates_adapter_and_error_is_private(runtime, monk
         if performance:
             assert json.loads(report.read_text())["status"] == "failed"
             assert 'secret detail' not in report.read_text()
+    finally:
+        assert service.close()
+
+
+def test_reuse_verified_assets_flows_into_job_verification(runtime, monkeypatch):
+    """The opt-in policy is carried verbatim into every job's asset
+    verification; the default (None) keeps the full per-job hash call."""
+    from qwen_engine.local_bundle import VerificationReusePolicy
+    seen = []
+
+    class Adapter:
+        def set_progress_callback(self, callback): pass
+        def load(self, config, assets): pass
+        def encode(self, config): return 'conditioning'
+        def denoise(self, config, conditioning): return 'latents'
+        def decode(self, latents): return PNG
+        def save(self, image, config):
+            path = Path(config.output_dir) / 'reuse.png'
+            path.write_bytes(image)
+            return path
+        def close(self): pass
+
+    def verify(config, *, reuse_policy=None):
+        seen.append(reuse_policy)
+        return SimpleNamespace(resolved={'weights': ()})
+
+    monkeypatch.setattr(cli, '_verify_assets', verify)
+    monkeypatch.setattr(cli, '_make_adapter', lambda **kw: Adapter())
+    policy = VerificationReusePolicy(max_age_s=5)
+    service = WebGeneration(runtime, reuse_verified_assets=policy)
+    try:
+        assert service.reuse_policy is policy  # pass-through, not a rebuild
+        job_id = service.submit(envelope()).payload['job_id']
+        assert service.controller.wait(job_id).state == JobState.SUCCEEDED
+    finally:
+        assert service.close()
+    assert seen == [policy]
+
+
+def test_reuse_age_below_one_second_refuses_the_service(runtime):
+    """The service constructor fail-fasts on the same grammar as the CLI
+    flag: positive, finite seconds only (the server maps this to exit 2)."""
+    for bad in (0, -1, float('nan'), float('inf')):
+        with pytest.raises(ValueError):
+            WebGeneration(runtime, reuse_verified_assets=bad)
+    service = WebGeneration(runtime, reuse_verified_assets=90)
+    try:
+        assert service.reuse_policy.max_age_s == 90
     finally:
         assert service.close()
 
@@ -447,7 +495,7 @@ def test_terminal_web_jobs_release_executor_frames_without_gc(runtime, monkeypat
             pass
 
     monkeypatch.setattr(cli, '_verify_assets',
-                        lambda config: SimpleNamespace(resolved={'weights': ()}))
+                        lambda config, *, reuse_policy=None: SimpleNamespace(resolved={'weights': ()}))
     monkeypatch.setattr(cli, '_make_adapter', lambda **kw: Adapter())
     service = WebGeneration(runtime, trust_unbounded_host=True,
                             memory_release=lambda: None)

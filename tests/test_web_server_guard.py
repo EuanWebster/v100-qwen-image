@@ -451,6 +451,20 @@ def test_main_startup_config_validation_before_bind(tmp_path, capsys):
     assert "config error" in capsys.readouterr().err
 
 
+def test_reuse_verified_assets_parser_defaults():
+    p = server.build_parser()
+    assert p.parse_args([]).reuse_verified_assets is None          # off by default
+    assert p.parse_args(["--reuse-verified-assets"]).reuse_verified_assets == 3600.0
+    assert p.parse_args(["--reuse-verified-assets", "45"]).reuse_verified_assets == 45.0
+
+
+def test_main_refuses_bad_reuse_age_before_any_bind(capsys):
+    assert server.main(["--reuse-verified-assets", "0"]) == 2
+    assert server.main(["--reuse-verified-assets", "-5"]) == 2
+    err = capsys.readouterr().err
+    assert err.count("--reuse-verified-assets") == 2 and "max_age_s" in err
+
+
 def test_module_entrypoint_and_script_declared():
     pyproject = tomllib.loads(
         (Path(server.__file__).resolve().parents[3] / "pyproject.toml")
