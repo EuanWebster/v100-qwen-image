@@ -51,6 +51,7 @@
   var API_EXPORT = '/api/v1/config/export';
   var API_IMPORT = '/api/v1/config/import';
   var API_JOBS = '/api/v1/jobs';
+  var API_JOBS_FORGET_ALL = API_JOBS + '/forget-all';
   var API_REFERENCES = '/api/v1/references';
   var API_REWRITE = '/api/v1/rewrite';
   // The rewriter choice is a SERVER setting (Settings page): one document in
@@ -779,6 +780,11 @@
   var refreshingJobs = false;
   var jobTimer = null;
   var jobSeq = 0;
+  // The History tab's delete confirmation is IN the page (never alert() or
+  // confirm()): one panel speaks for both targets — 'all' or one job id —
+  // and its tick box is the only thing that authorizes deleting files.
+  var historyConfirmTarget = null;
+  var clearingHistory = false;
   // EVERY status completion branch is guarded by this sequence: a newer
   // check (success OR failure) always wins over an older late arrival —
   // an old success must not re-enable planning after a newer disconnect,
@@ -3951,6 +3957,16 @@
     if ([null, 'execution_failed', 'worker_stopped', 'invalid_cancellation_acknowledgment',
          'out_of_gpu_memory'].indexOf(job.error_code) === -1) return null;
     if (job.image_url !== (job.state === 'succeeded' ? jobUrl(job.job_id) + '/image' : null)) return null;
+    // image_bytes sizes the per-entry/per-all delete confirmation. Older
+    // servers omit it (the tick box then simply has no size to name); a
+    // server that sends it must agree with image_url exactly: a byte count
+    // belongs to a job that HAS an image, and null only to one that has not.
+    if (job.image_bytes !== undefined && !(
+          job.image_bytes === null
+            ? job.image_url === null
+            : (typeof job.image_bytes === 'number' && isFinite(job.image_bytes) &&
+               Number.isInteger(job.image_bytes) && job.image_bytes >= 0 &&
+               job.image_url !== null))) return null;
     // Older servers have no step observations; keep their bar indeterminate.
     if (job.progress !== undefined && (!job.progress ||
         !Number.isInteger(job.progress.completed_steps) ||
@@ -4128,12 +4144,14 @@
         forget.type = 'button';
         forget.className = 'btn-secondary';
         forget.textContent = 'Forget entry';
-        forget.title = 'Remove this saved history entry (job.json); the image file stays on disk';
-        forget.addEventListener('click', function () { jobAction(id, 'forget'); });
+        forget.title = 'Remove this saved history entry; the in-page ' +
+          'confirmation asks whether its image file is deleted too';
+        forget.addEventListener('click', function () { openHistoryConfirm(id); });
         card.appendChild(forget);
       }
       grid.appendChild(card);
     });
+    updateHistoryControls();
   }
 
   function jobFailure(message) {
@@ -4275,11 +4293,171 @@
       } else if (action === 'cancel') {
         var job = parseJob(r.json);
         if (job) { jobCache[id] = job; renderSelectedJob(job); }
-      } else if (r.json && r.json.schema === 'qwen_engine.web_jobs.v1' && r.json.forgotten === id) {
-        delete jobCache[id];
-        jobSeq++;
       }
       refreshJobs();
+    });
+  }
+
+  /* ---------------- Deleting history ----------------
+   * Both deletes run through the in-page confirmation on the History tab
+   * (never alert()/confirm()): it names the entries and their image files
+   * BEFORE anything is removed, and "Also delete the image files from disk"
+   * is an explicit tick box, unticked by default. The server decides what
+   * is live and skips it; the status line repeats only the server's own
+   * counts from the answer it confirmed. Sizes are named through the page's
+   * ONE formatBytes (binary units, defined with the reference code) — there
+   * is deliberately no second formatter here.
+   */
+
+  function terminalHistoryJobs() {
+    return Object.keys(jobCache).map(function (id) { return jobCache[id]; })
+      .filter(function (job) { return jobTerminal(job); });
+  }
+
+  function historyImageInfo(jobs) {
+    var files = 0, bytes = 0, unknown = false;
+    jobs.forEach(function (job) {
+      if (!job.image_url) return;
+      files += 1;
+      if (typeof job.image_bytes === 'number') bytes += job.image_bytes;
+      else unknown = true;
+    });
+    return { files: files, bytes: unknown ? -1 : bytes };
+  }
+
+  function setHistoryStatus(message) {
+    var node = $('history-status');
+    node.textContent = message;
+    node.hidden = message === '';
+  }
+
+  function updateHistoryControls() {
+    var button = $('history-delete-all');
+    var finished = terminalHistoryJobs().length;
+    button.disabled = finished === 0 || clearingHistory;
+    button.title = finished === 0 ? 'No finished history entries to delete'
+      : 'Remove every finished history entry (' + finished +
+        '); queued and running jobs are kept';
+  }
+
+  function openHistoryConfirm(target) {
+    var jobs;
+    if (target === 'all') {
+      if (clearingHistory) return;
+      jobs = terminalHistoryJobs();
+    } else {
+      jobs = jobCache[target] && jobTerminal(jobCache[target])
+        ? [jobCache[target]] : [];
+    }
+    if (!jobs.length) return;
+    historyConfirmTarget = target;
+    var info = historyImageInfo(jobs);
+    var question = target === 'all'
+      ? 'Delete all history? ' + jobs.length +
+        (jobs.length === 1 ? ' saved entry' : ' saved entries') +
+        ' will be forgotten. Queued and running jobs are kept.'
+      : 'Forget this history entry?';
+    if (info.files === 0) {
+      question += target === 'all' ? ' None of these entries has an image file.'
+                                   : ' This entry has no image file.';
+    } else {
+      question += (target === 'all' ? ' These entries hold ' : ' This entry holds ') +
+        info.files + (info.files === 1 ? ' image file' : ' image files') +
+        ' on disk' +
+        (info.bytes < 0 ? '' : ', about ' + formatBytes(info.bytes)) + '.';
+    }
+    setText('history-confirm-question', question);
+    $('history-confirm-files').checked = false;
+    $('history-confirm-files').parentNode.hidden = info.files === 0;
+    $('history-confirm').hidden = false;
+    updateHistoryConfirmButton();
+    setHistoryStatus('');
+    $('history-confirm-yes').focus();
+  }
+
+  function updateHistoryConfirmButton() {
+    var files = $('history-confirm-files').checked === true;
+    var button = $('history-confirm-yes');
+    if (historyConfirmTarget === 'all') {
+      var count = terminalHistoryJobs().length;
+      button.textContent = (files ? 'Delete ' : 'Forget ') + count +
+        (count === 1 ? ' entry' : ' entries') +
+        (files ? ' and their files' : ' (files stay on disk)');
+    } else {
+      button.textContent = files ? 'Forget entry and delete its image file'
+                                 : 'Forget entry (image file stays on disk)';
+    }
+  }
+
+  function closeHistoryConfirm() {
+    historyConfirmTarget = null;
+    $('history-confirm').hidden = true;
+  }
+
+  function parseHistoryDeletion(json, target, id) {
+    // The server's own counts are the only numbers the status line shows;
+    // anything else-shaped is an unconfirmed answer, never a partial trust.
+    if (!json || json.schema !== 'qwen_engine.web_jobs.v1') return null;
+    if (!Number.isInteger(json.deleted_files) || json.deleted_files < 0) return null;
+    if (target === 'all') {
+      if (!Number.isInteger(json.forgotten) || json.forgotten < 0 ||
+          !Number.isInteger(json.skipped_live) || json.skipped_live < 0) return null;
+    } else if (json.forgotten !== id) return null;
+    return json;
+  }
+
+  function confirmHistoryDeletion() {
+    var target = historyConfirmTarget;
+    if (!target || clearingHistory) return;
+    var deleteFiles = $('history-confirm-files').checked === true;
+    var id = target === 'all' ? null : target;
+    var url = target === 'all' ? API_JOBS_FORGET_ALL : jobUrl(target) + '/forget';
+    clearingHistory = true;
+    updateHistoryControls();
+    apiRequest(url,
+      {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Qwen-UI': '1'},
+       body: JSON.stringify({delete_files: deleteFiles})},
+      'json').then(function (r) {
+      var answer = r.res && r.res.ok && !r.bodyError
+        ? parseHistoryDeletion(r.json, target, id) : null;
+      if (!answer) {
+        var line = 'History was NOT deleted. Refresh and try again.';
+        if (r.res && !r.res.ok && r.json && r.json.schema === ERROR_SCHEMA &&
+            typeof r.json.code === 'string' && /^[a-z0-9_]{1,64}$/.test(r.json.code)) {
+          line += ' (' + r.json.code + ')';
+        }
+        setHistoryStatus(line);
+      } else if (target === 'all') {
+        setHistoryStatus('Deleted all history: ' + answer.forgotten +
+          (answer.forgotten === 1 ? ' entry forgotten' : ' entries forgotten') +
+          (deleteFiles
+            ? ', ' + answer.deleted_files +
+              (answer.deleted_files === 1 ? ' file' : ' files') +
+              ' deleted from disk'
+            : ', image files kept on disk') +
+          (answer.skipped_live > 0
+            ? ', ' + answer.skipped_live +
+              (answer.skipped_live === 1 ? ' running job kept' : ' running jobs kept')
+            : '') + '.');
+        terminalHistoryJobs().forEach(function (job) {
+          delete jobCache[job.job_id];
+        });
+      } else {
+        setHistoryStatus('Forgotten 1 entry' +
+          (deleteFiles
+            ? (answer.deleted_files > 0
+                ? ', ' + answer.deleted_files +
+                  (answer.deleted_files === 1 ? ' file' : ' files') +
+                  ' deleted from disk'
+                : ', no files were left to delete')
+            : ', image file kept on disk') + '.');
+        delete jobCache[id];
+      }
+      jobSeq++;   // an in-flight refresh must not resurrect these entries
+      closeHistoryConfirm();
+      clearingHistory = false;
+      refreshJobs();
+      updateHistoryControls();
     });
   }
 
@@ -4531,6 +4709,16 @@
     $('preview-image').addEventListener('error', function () {
       jobFailure('The saved image could not be loaded; it may have moved or changed.');
     });
+
+    // Deleting history: both entry points open the SAME in-page
+    // confirmation; only its tick box authorizes deleting files, and only
+    // the confirm button sends the request.
+    $('history-delete-all').addEventListener('click', function () {
+      openHistoryConfirm('all');
+    });
+    $('history-confirm-files').addEventListener('change', updateHistoryConfirmButton);
+    $('history-confirm-cancel').addEventListener('click', closeHistoryConfirm);
+    $('history-confirm-yes').addEventListener('click', confirmHistoryDeletion);
 
     var presetButtons = document.querySelectorAll('.preset-btn');
     for (var i = 0; i < presetButtons.length; i++) {

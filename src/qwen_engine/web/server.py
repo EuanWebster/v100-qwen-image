@@ -134,6 +134,9 @@ REWRITE_ROUTE = "/api/v1/rewrite"
 SETTINGS_ROUTE = "/api/v1/settings/rewrite"
 SETTINGS_TEST_ROUTE = "/api/v1/settings/rewrite/test"
 JOBS_ROUTE = "/api/v1/jobs"
+#: Clearing the terminal history is its OWN route: the per-job grammar is a
+#: 32-hex identifier, so nothing else may ever resolve under /api/v1/jobs.
+JOBS_FORGET_ALL_ROUTE = "/api/v1/jobs/forget-all"
 _JOB_ROUTE = re.compile(r"/api/v1/jobs/([0-9a-f]{32})(?:/(image|cancel|forget))?\Z")
 REFERENCES_ROUTE = "/api/v1/references"
 #: Strict lowercase-content-id grammar; anything else never matches (404).
@@ -354,6 +357,8 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "models_download", target
         if target == JOBS_ROUTE:
             return "submit", target
+        if target == JOBS_FORGET_ALL_ROUTE:
+            return "forget_all", target
         if target == REFERENCES_ROUTE:
             return "upload", REFERENCES_ROUTE
     ref_match = _REFERENCE_ROUTE.fullmatch(target)
@@ -371,6 +376,9 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return action, match[1]
         raise ApiError(405, "method_not_allowed", "this route does not accept that method",
                        headers=(("Allow", allow),))
+    if target == JOBS_FORGET_ALL_ROUTE:
+        raise ApiError(405, "method_not_allowed", "this route does not accept that method",
+                       headers=(("Allow", "POST"),))
     if target == JOBS_ROUTE:
         raise ApiError(405, "method_not_allowed", "this route does not accept that method",
                        headers=(("Allow", "GET, POST"),))
@@ -786,6 +794,10 @@ class _Handler(BaseHTTPRequestHandler):
                         raise ApiError(503, "generation_disabled", "generation is disabled on this server")
                     if kind == "submit":
                         self._send_api(jobs.submit(body))
+                    elif kind == "forget_all":
+                        self._send_api(jobs.forget_all_response(body))
+                    elif kind == "forget":
+                        self._send_api(jobs.forget_response(arg, body))
                     else:
                         if api.parse_request_json(body) != {}:
                             raise ApiError(400, "invalid_envelope", "job actions require an empty JSON object")

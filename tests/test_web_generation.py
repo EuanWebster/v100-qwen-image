@@ -273,7 +273,9 @@ def test_forget_preserves_files_and_list_is_bounded_ids_only(runtime):
         assert isinstance(record.config.seed, int)
         assert service.list_response().payload['jobs'] == [job_id]
         path = Path(record.config.output_dir) / record.artifact.filename
-        service.job_response(job_id, action='forget')
+        assert service.forget_response(job_id, b'{}').payload == \
+            {'schema': 'qwen_engine.web_jobs.v1', 'forgotten': job_id,
+             'deleted_files': 0}
         assert path.read_bytes() == PNG
         assert service.list_response().payload['jobs'] == []
         with pytest.raises(api.ApiError): service.image(job_id)
