@@ -60,6 +60,7 @@ from importlib import resources
 from typing import Any
 
 from qwen_engine import local_bundle
+from qwen_engine import model_setup as _setup
 from qwen_engine import rewrite as rw
 from qwen_engine import rewrite_client as rc
 from qwen_engine.config import ConfigError, GenerationConfig
@@ -137,6 +138,12 @@ _JOB_ROUTE = re.compile(r"/api/v1/jobs/([0-9a-f]{32})(?:/(image|cancel|forget))?
 REFERENCES_ROUTE = "/api/v1/references"
 #: Strict lowercase-content-id grammar; anything else never matches (404).
 _REFERENCE_ROUTE = re.compile(r"/api/v1/references/([0-9a-f]{64})(/thumb)?\Z")
+
+#: First-run model setup. Three routes, no ids in the URL: the catalogue is read
+#: with GET and one download job is started or stopped with POST.
+MODELS_ROUTE = api.MODELS_HREF
+MODELS_DOWNLOAD_ROUTE = api.MODELS_DOWNLOAD_HREF
+MODELS_CANCEL_ROUTE = api.MODELS_CANCEL_HREF
 
 #: The one route that accepts raw bytes instead of JSON (design §2.4).
 _OCTET_STREAM_CONTENT_TYPE_RE = re.compile(r"application/octet-stream\Z",
@@ -321,6 +328,8 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "status", target
         if target == SETTINGS_ROUTE:
             return "settings_get", target
+        if target == MODELS_ROUTE:
+            return "models", target
         if target == JOBS_ROUTE:
             return "jobs", target
         match = _REFERENCE_ROUTE.fullmatch(target)
@@ -339,6 +348,10 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "settings_test", target
         if target == SETTINGS_ROUTE:
             return "settings_set", target
+        if target == MODELS_CANCEL_ROUTE:
+            return "models_cancel", target
+        if target == MODELS_DOWNLOAD_ROUTE:
+            return "models_download", target
         if target == JOBS_ROUTE:
             return "submit", target
         if target == REFERENCES_ROUTE:
@@ -361,9 +374,18 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
     if target == JOBS_ROUTE:
         raise ApiError(405, "method_not_allowed", "this route does not accept that method",
                        headers=(("Allow", "GET, POST"),))
+    if target == MODELS_ROUTE:
+        raise ApiError(405, "method_not_allowed",
+                       "the model catalogue is read with GET",
+                       headers=(("Allow", "GET"),))
+    if target in (MODELS_DOWNLOAD_ROUTE, MODELS_CANCEL_ROUTE):
+        raise ApiError(405, "method_not_allowed",
+                       "a model download is started or stopped with POST",
+                       headers=(("Allow", "POST"),))
     known = set(STATIC_ROUTES) | {STATUS_ROUTE, PLAN_ROUTE, EXPORT_ROUTE,
                                   IMPORT_ROUTE, REWRITE_ROUTE, SETTINGS_ROUTE,
-                                  SETTINGS_TEST_ROUTE}
+                                  SETTINGS_TEST_ROUTE, MODELS_ROUTE,
+                                  MODELS_DOWNLOAD_ROUTE, MODELS_CANCEL_ROUTE}
     if target in known:
         # The Settings page reads its state with GET and writes it with POST;
         # everything else here is one method only.
@@ -689,6 +711,9 @@ class _Handler(BaseHTTPRequestHandler):
             elif kind == "settings_get":
                 self._send_api(settings_get_response(
                     getattr(self.server, "rewrite", None)))
+            elif kind == "models":
+                self._send_api(models_get_response(
+                    getattr(self.server, "setup", None), self.client_address))
             elif kind in ("reference", "reference_thumb"):
                 data, ctype = api.reference_bytes(self.server.web_runtime, arg,
                                                   thumb=kind == "reference_thumb")
@@ -734,6 +759,16 @@ class _Handler(BaseHTTPRequestHandler):
                 if kind == "settings_test":
                     self._send_api(settings_test_response(
                         getattr(self.server, "rewrite", None), body))
+                    return
+                if kind == "models_download":
+                    self._send_api(models_download_response(
+                        getattr(self.server, "setup", None), body,
+                        self.client_address))
+                    return
+                if kind == "models_cancel":
+                    self._send_api(models_cancel_response(
+                        getattr(self.server, "setup", None), body,
+                        self.client_address))
                     return
                 if kind == "plan":
                     self._send_api(api.plan_response(self.server.web_runtime, body))
@@ -1298,6 +1333,80 @@ def settings_test_response(service: _rewrite_service.RewriteService | None,
     return ApiResponse(200, result)
 
 
+# ---------------------------------------------------------------------------
+# First-run model setup: the three routes
+# ---------------------------------------------------------------------------
+
+
+def models_get_response(service: Any, client_address: Any) -> ApiResponse:
+    """``GET /api/v1/models``: the catalogue, the sizes and the one job.
+
+    Every caller may READ it, including a Tailscale address: seeing what is
+    missing is not a privilege. ``can_download`` carries the difference, so the
+    page can explain why its buttons are not there.
+    """
+    if service is None:
+        raise ApiError(503, "models_unavailable",
+                       "this server cannot read its model catalogue")
+    return ApiResponse(200, api.validate_models_state(
+        {**service.state(),
+         "can_download": _setup.client_is_loopback(client_address),
+         "server_command": api.SETUP_SERVER_COMMAND,
+         "notices": service.notices()}))
+
+
+def _setup_write_allowed(client_address: Any) -> None:
+    """Downloads and cancels are for the person standing at the machine."""
+    if not _setup.client_is_loopback(client_address):
+        raise ApiError(403, "setup_server_only",
+                       "model downloads are started on the machine that runs "
+                       "this server; run "
+                       f"{api.SETUP_SERVER_COMMAND} there")
+
+
+def models_download_response(service: Any, body: bytes,
+                             client_address: Any) -> ApiResponse:
+    """``POST /api/v1/models/download``: ids in, the running job out.
+
+    Every refusal — an unknown id, too little free space, a job already
+    running, no fetch tool — happens before a thread exists, so a refused
+    request leaves nothing half-downloaded.
+    """
+    if service is None:
+        raise ApiError(503, "models_unavailable",
+                       "this server cannot download models")
+    _setup_write_allowed(client_address)
+    request = api.build_models_download_request(body)
+    try:
+        return ApiResponse(202, service.start(request["ids"]))
+    except _setup.UnknownItem as exc:
+        raise ApiError(422, "unknown_model", str(exc),
+                       (("ids", "this server does not offer that model"),)) from None
+    except _setup.NotEnoughSpace as exc:
+        raise ApiError(507, "insufficient_space", str(exc),
+                       (("disk", "free space is needed for the download and "
+                                 "for the temp file it resumes from"),)) from None
+    except _setup.DownloadBusy as exc:
+        raise ApiError(409, "setup_busy", str(exc)) from None
+    except _setup.FetcherUnavailable as exc:
+        raise ApiError(503, "models_unavailable", str(exc)) from None
+    except _setup.SetupError as exc:
+        raise ApiError(500, "models_unavailable", str(exc)) from None
+
+
+def models_cancel_response(service: Any, body: bytes,
+                           client_address: Any) -> ApiResponse:
+    """``POST /api/v1/models/download/cancel``: stop, keep the temp file."""
+    if service is None:
+        raise ApiError(503, "models_unavailable",
+                       "this server has no model download to cancel")
+    _setup_write_allowed(client_address)
+    if api.parse_request_json(body) != {}:
+        raise ApiError(400, "invalid_envelope",
+                       "cancelling a model download takes an empty JSON object")
+    return ApiResponse(200, service.cancel())
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     hosts = list(dict.fromkeys(args.host or [DEFAULT_HOST]))
@@ -1385,12 +1494,24 @@ def main(argv: list[str] | None = None) -> int:
         raw, unreadable = read_manifest_limited(paths["manifest_path"])
         summary = api.summarize_manifest_bytes(raw, unreadable)
 
+    # First-run model setup: the catalogue comes from the pinned manifests this
+    # checkout carries and the directory the operator pointed at. Building it is
+    # never fatal — a server that cannot read its catalogue still serves pages,
+    # and the Settings notice says so.
+    setup_service = _setup.ModelSetupService.for_paths(
+        models_dir=paths["models_dir"], manifest_path=paths["manifest_path"])
+
     runtime = WebRuntime(**paths, manifest_summary=summary,
                          generation_enabled=args.enable_generation,
-                         rewrite_block=rewrite.status_block())
-    if args.enable_generation and api._blockers(runtime):
+                         rewrite_block=rewrite.status_block(),
+                         setup_service=setup_service)
+    if args.enable_generation and api.startup_blockers(runtime):
+        # Missing weights are NOT a startup error: the page is how they get
+        # here, and WebGeneration applies the same rule via the same helper.
+        # Every other blocker still refuses to start generation.
         print("error: generation requires valid manifest metadata and explicit "
-              "--manifest, --models-dir, --output-dir and --cache-dir", file=sys.stderr)
+              "--manifest, --models-dir, --output-dir and --cache-dir",
+              file=sys.stderr)
         return 2
     try:
         assets = load_static_assets()
@@ -1443,6 +1564,7 @@ def main(argv: list[str] | None = None) -> int:
     for listener in listeners:
         listener.generation = httpd.generation
         listener.rewrite = rewrite
+        listener.setup = setup_service
         print(f"qwen-web listening on http://{listener.bound_ip}:{port}")
     mode = "generation enabled (serial jobs)" if httpd.generation else "planning only (no generation)"
     if rewrite.available:
@@ -1458,6 +1580,27 @@ def main(argv: list[str] | None = None) -> int:
         mode += "; prompt rewriting off"
     print(f"qwen-web: {mode}; explicit address binds with per-listener "
           "Host and same-origin request checks.")
+    if setup_service.notices():
+        # A catalogue this checkout cannot build is a packaging problem, and the
+        # console says so as plainly as the Settings page does.
+        print("model setup: " + "; ".join(setup_service.notices()),
+              file=sys.stderr)
+    if setup_service.required_missing():
+        # The one line a fresh machine needs: what is missing, how big, and the
+        # two ways to get it. Paths stay off the wire; a console may name them.
+        # The size is the REQUIRED files' own size — quoting the whole
+        # catalogue's total beside one label would overstate the price of the
+        # thing the sentence names.
+        state = setup_service.state()
+        wanted = [row for row in state["items"]
+                  if row["required"] and row["installed"] != _setup.INSTALLED]
+        labels = " and ".join(str(row["label"]) for row in wanted) or \
+            "the base image model (this checkout's catalogue does not list it)"
+        needed = sum(int(row["bytes_needed"]) for row in wanted)
+        print(f"model setup: missing {labels}"
+              f" ({needed / 2**30:.1f} GiB) — open the Settings page on this "
+              f"machine to download them, or run "
+              f"{api.SETUP_SERVER_COMMAND}", file=sys.stderr)
     sys.stdout.flush()
     def terminate(signum, frame):
         raise KeyboardInterrupt

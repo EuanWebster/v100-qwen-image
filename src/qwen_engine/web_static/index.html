@@ -49,6 +49,21 @@
   <!-- ===================== Create view ===================== -->
   <section id="view-create" class="view" aria-labelledby="create-heading">
     <h2 class="visually-hidden" id="create-heading" tabindex="-1">Create an image</h2>
+
+    <!-- First-run only: while the required model files are absent. Dismissing it
+         hides it for this page load; it says so again the moment a draft is asked
+         for, because Generate stays disabled. -->
+    <section class="models-banner" id="models-banner" hidden
+             aria-labelledby="models-banner-heading">
+      <h3 id="models-banner-heading">Models not downloaded</h3>
+      <p class="help" id="models-banner-text"></p>
+      <div class="models-banner-actions">
+        <a class="btn-primary" id="models-banner-link" href="#settings">Set up now</a>
+        <button type="button" class="btn-secondary" id="models-banner-dismiss">
+          Not now</button>
+      </div>
+    </section>
+
     <div class="layout">
 
       <aside class="controls" aria-label="Generation controls">
@@ -521,6 +536,128 @@
       <p class="error" id="rewrite-settings-error" aria-live="polite"></p>
       <p class="help" id="rewrite-settings-note" role="status"></p>
     </section>
+
+    <!-- First-run model setup. The list below is the server's catalogue, whose
+         ids are fixed by this checkout; the page only ever sends ids back. -->
+    <section class="settings-section" id="models-card" hidden
+             aria-labelledby="models-settings-heading">
+      <h3 id="models-settings-heading">Models</h3>
+      <p class="help" id="models-intro">The files this app needs, and the ones it
+        can use. Nothing is downloaded until you press Download, and the download
+        runs on the machine this server runs on.</p>
+      <p class="error" id="models-error" aria-live="polite"></p>
+      <p class="help" id="models-note" role="status"></p>
+
+      <div class="models-total" id="models-total" role="status"></div>
+
+      <div class="models-list" id="models-list">
+        <div class="model-row" id="model-row-base">
+          <div class="model-head">
+            <span class="model-label" id="model-label-base"></span>
+            <span class="model-tag" id="model-tag-base"></span>
+            <span class="model-size" id="model-size-base"></span>
+          </div>
+          <p class="help settings-reason" id="model-reason-base"></p>
+          <p class="help settings-reason" id="model-dest-base"></p>
+          <p class="help settings-reason" id="model-state-base" role="status"></p>
+          <ul class="models-files" id="model-files-base"></ul>
+        </div>
+        <div class="model-row" id="model-row-turbo">
+          <div class="model-head">
+            <label class="model-tick" for="model-tick-turbo">
+              <input type="checkbox" id="model-tick-turbo" autocomplete="off"
+                     aria-describedby="model-reason-turbo">
+              <span class="model-label" id="model-label-turbo"></span>
+            </label>
+            <span class="model-size" id="model-size-turbo"></span>
+          </div>
+          <p class="help settings-reason" id="model-reason-turbo"></p>
+          <p class="help settings-reason" id="model-dest-turbo"></p>
+          <p class="help settings-reason" id="model-state-turbo" role="status"></p>
+          <ul class="models-files" id="model-files-turbo"></ul>
+        </div>
+        <div class="model-row" id="model-row-q8">
+          <div class="model-head">
+            <label class="model-tick" for="model-tick-q8">
+              <input type="checkbox" id="model-tick-q8" autocomplete="off"
+                     aria-describedby="model-reason-q8">
+              <span class="model-label" id="model-label-q8"></span>
+            </label>
+            <span class="model-size" id="model-size-q8"></span>
+          </div>
+          <p class="help settings-reason" id="model-reason-q8"></p>
+          <p class="help settings-reason" id="model-dest-q8"></p>
+          <p class="help settings-reason" id="model-state-q8" role="status"></p>
+          <ul class="models-files" id="model-files-q8"></ul>
+        </div>
+        <div class="model-row" id="model-row-pe-t2i">
+          <div class="model-head">
+            <label class="model-tick" for="model-tick-pe-t2i">
+              <input type="checkbox" id="model-tick-pe-t2i" autocomplete="off"
+                     aria-describedby="model-reason-pe-t2i">
+              <span class="model-label" id="model-label-pe-t2i"></span>
+            </label>
+            <span class="model-size" id="model-size-pe-t2i"></span>
+          </div>
+          <p class="help settings-reason" id="model-reason-pe-t2i"></p>
+          <p class="help settings-reason" id="model-dest-pe-t2i"></p>
+          <p class="help settings-reason" id="model-state-pe-t2i" role="status"></p>
+          <ul class="models-files" id="model-files-pe-t2i"></ul>
+        </div>
+        <div class="model-row" id="model-row-pe-edit">
+          <div class="model-head">
+            <label class="model-tick" for="model-tick-pe-edit">
+              <input type="checkbox" id="model-tick-pe-edit" autocomplete="off"
+                     aria-describedby="model-reason-pe-edit">
+              <span class="model-label" id="model-label-pe-edit"></span>
+            </label>
+            <span class="model-size" id="model-size-pe-edit"></span>
+          </div>
+          <p class="help settings-reason" id="model-reason-pe-edit"></p>
+          <p class="help settings-reason" id="model-dest-pe-edit"></p>
+          <p class="help settings-reason" id="model-state-pe-edit" role="status"></p>
+          <ul class="models-files" id="model-files-pe-edit"></ul>
+        </div>
+        <div class="model-row" id="model-row-rewrite-prompts">
+          <div class="model-head">
+            <label class="model-tick" for="model-tick-rewrite-prompts">
+              <input type="checkbox" id="model-tick-rewrite-prompts"
+                     autocomplete="off"
+                     aria-describedby="model-reason-rewrite-prompts">
+              <span class="model-label" id="model-label-rewrite-prompts"></span>
+            </label>
+            <span class="model-size" id="model-size-rewrite-prompts"></span>
+          </div>
+          <p class="help settings-reason" id="model-reason-rewrite-prompts"></p>
+          <p class="help settings-reason" id="model-dest-rewrite-prompts"></p>
+          <p class="help settings-reason" id="model-state-rewrite-prompts"
+             role="status"></p>
+          <ul class="models-files" id="model-files-rewrite-prompts"></ul>
+        </div>
+      </div>
+
+      <div class="settings-actions">
+        <button type="button" id="models-download" class="btn-primary"
+                disabled>Download</button>
+        <button type="button" id="models-cancel" class="btn-secondary"
+                disabled>Cancel</button>
+        <p class="help" id="models-status" role="status" aria-live="polite"></p>
+      </div>
+
+      <!-- Replaces the button row's action for a browser that is not on this
+           machine: the download has to run where the models folder is. -->
+      <div class="models-server" id="models-server-only" hidden>
+        <p class="help" id="models-server-text"></p>
+        <p class="models-command" id="models-server-command" role="status"></p>
+      </div>
+
+      <div class="models-progress" id="models-progress" hidden>
+        <label for="models-progress-bar" id="models-progress-label">Downloading</label>
+        <progress id="models-progress-bar" max="1" value="0"
+                  aria-labelledby="models-progress-label"></progress>
+        <ul class="models-files" id="models-progress-files"></ul>
+      </div>
+    </section>
     <p><a class="back-link" href="#create">← Back to Create</a></p>
   </section>
 
@@ -544,8 +681,14 @@
       <div><dt>Runtime paths &amp; model files</dt><dd>Runtime paths
         (output, cache, log, benchmarks, models, manifest) belong to the
         server's own configuration and can never be set from this page;
-        the editable-config export omits them. No model or weight is
-        downloaded by this page.</dd></div>
+        the editable-config export omits them. Settings → Models can download
+        model files, but only from the catalogue this server was built with: the
+        page sends ids, never URLs or paths. Files are written to the server's
+        own models dir — which the card names, next to the size of each download
+        — and a download can be cancelled at any time; files already fetched stay
+        put and the next Download resumes with the rest. Until every required
+        model is installed, generation stays disabled. Nothing is downloaded
+        without a press of Download.</dd></div>
       <div><dt>Validation of full settings</dt><dd>What this page checks is
         a lightweight form check only, not a fitness or memory check. The
         local server performs the authoritative GenerationConfig validation
