@@ -23,19 +23,44 @@ Working today on a real V100:
 - **Turbo recipe** (`--recipe turbo`, or Quality/Turbo in the web workspace):
   the official 8-step Turbo transformer with the base encoder and VAE. Sampling
   is ~5x faster; total run time barely moves because loading dominates.
+- **Transparent backgrounds** (`--transparent`, or the web checkbox): a
+  see-through background saved with a real alpha channel in PNG or WebP.
+- **Reference-image editing** (up to 10 ordered images, web or
+  `--reference`): **experimental** — it works end to end, but an output whose
+  latent grid matches a reference's comes out over-processed: references are
+  resized to a 1024² area, so a 1024×1024 output collides with every square
+  reference. Measured clean at 512², 768² and 1024×960; use a non-square or
+  non-1024 size until the fix lands.
+- **Optional prompt rewriting** through a local OpenAI-compatible service,
+  off by default and never applied without an explicit **Apply**.
 - Output as JPG (default), PNG or lossless WebP, named
   `qi21-DDMMYYYY-<seed>` and never overwriting existing files.
 
+Day-to-day usage, plain-language trade-offs and what is measured versus still
+unknown: **[`docs/user-guide.md`](docs/user-guide.md)**.
+
 Measured on the development machine (single runs, not a benchmark suite):
 
-| Job | Wall time |
-|---|---|
-| 1024², 40 steps, FP16 | ~107–109 s |
-| 2048², 20 steps, FP16, tiled decode | ~3 m 39 s |
+| Job | Denoise | Wall time |
+|---|---|---|
+| 1024², 40 steps, FP16 (Quality) | 42.0 s | ~107–109 s, measured before the hashing/encoder speed-ups |
+| 1024², 8 steps, FP16 (Turbo) | 8.5 s | 68.9 s cold, 26.8 s with the prompt cached |
+| 1024², 40 steps, FP16, 1 reference image | 95.4 s | 130.2 s |
+| 2048², 20 steps, FP16, tiled decode | 149.5 s | ~3 m 39 s (15,835 MiB peak) |
+
+Model loading and the CPU text encoder, not sampling, dominate a cold run —
+which is why the denoise column and the wall-time column tell different
+stories, and why Turbo barely shortens a cold job. Model files are now hashed
+once per job and the encoder uses all cores, so cold figures measured before
+that are pessimistic; [`docs/user-guide.md`](docs/user-guide.md) has the
+per-stage numbers.
 
 Not done yet: memory preflight before generation (submitting a job is **not**
-a guarantee it fits), 2K VAE-decode headroom, single- and multi-reference
-editing, native RGBA transparency and optional prompt rewriting. See
+a guarantee it fits), 2K VAE-decode headroom, and the fix for edits whose
+output grid matches a reference's (cause identified and measured — a same-size
+target shares every RoPE position with the reference; workaround: non-square or
+non-1024 output, see
+[`docs/user-guide.md`](docs/user-guide.md)). See
 [`docs/next-features-plan-2026-10-25.md`](docs/next-features-plan-2026-10-25.md)
 and [`PLAN.md`](PLAN.md).
 
@@ -87,15 +112,19 @@ when running under a cgroup memory limit. See
 # Show the resolved plan without loading anything
 python cli_gen.py --dry-run --prompt "a lighthouse at dusk" --preset square
 
-# Generate
+# Generate (an actual run needs the manifest, models, output and cache paths)
 python cli_gen.py --run --prompt "a lighthouse at dusk" --preset landscape2k \
-    --steps 40 --seed 42 --output-format png
+    --steps 40 --seed 42 --output-format png \
+    --manifest models/manifest.json --models-dir models/assets \
+    --cache-dir cache --output-dir output/runs
 ```
 
 Useful options: `--quant {fp16,q8}`, `--negative` with `--true-cfg-scale`,
-`--width/--height` (overrides the preset), `--[no-]tiled-decode` (2K requires
-tiling), `--config FILE` (JSON `GenerationConfig`). Run `python cli_gen.py
---help` for the full list.
+`--width/--height` (overrides the preset), `--[no-]tiled-decode` (2K presets
+turn it on; the web API refuses an untiled 2K job, the CLI does not),
+`--config FILE` (JSON `GenerationConfig`), `--transparent`, `--recipe
+{base,turbo}`, `--reference PATH` (repeatable). Run `python cli_gen.py --help`
+for the full list.
 
 ### Turbo recipe
 
@@ -105,17 +134,17 @@ tiling), `--config FILE` (JSON `GenerationConfig`). Run `python cli_gen.py
 the honest label is "Turbo transformer + base encoder/VAE".
 
 Measured on a V100 at 1K/FP16: denoise 8.5 s vs 42.0 s for the reference
-model, but a whole job ~70 s vs ~74 s, because model loading (~30-41 s) and
-the text encoder dominate a run. Turbo's saved sigmas make the step count
-inert, so the CLI and UI both fix steps at 8 and **refuse** anything else
-rather than accepting a number that would be ignored. Turbo is evaluated at
-CFG 1.0 with no negative prompt and has no reviewed Q8 artifact: a true-CFG
-request (negative prompt *and* scale > 1) and `--quant q8` are refused with a
-typed field error. The web workspace locks steps, guidance, the negative
-prompt and quantization while Turbo is selected, says why, and restores your
-own values when you switch back to **Quality**; an imported config without a
-`recipe` key imports as `base`. See
-[`docs/turbo-plan.md`](docs/turbo-plan.md).
+model, but a whole job 68.9 s vs 73.9 s (different cache states — see the
+table above), because model loading and the text encoder dominate a run.
+Turbo's saved sigmas make the step count inert, so the CLI and UI both fix
+steps at 8 and **refuse** anything else rather than accepting a number that
+would be ignored. Turbo is evaluated at CFG 1.0 with no negative prompt and
+has no reviewed Q8 artifact: a true-CFG request (negative prompt *and* scale
+above 1) and `--quant q8` are refused with a typed field error. The web
+workspace locks steps, guidance, the negative prompt and quantization while
+Turbo is selected, says why, and restores your own values when you switch back
+to **Quality**; an imported config without a `recipe` key imports as `base`.
+See [`docs/turbo-plan.md`](docs/turbo-plan.md).
 
 ### Transparent backgrounds
 
