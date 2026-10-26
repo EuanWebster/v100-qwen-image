@@ -94,6 +94,54 @@ The generation worker child (used by the web/job runner) adds exit `6` =
 `out_of_gpu_memory`: a CUDA out-of-memory crash is reported with that code —
 the same classification the web API surfaces — instead of a generic failure.
 
+## First run: getting the models
+
+A fresh checkout has no weights, and the app knows it. Start the server and the
+Create page shows **"Models not downloaded"**, Settings has a **Models** section,
+and the console prints one line naming what is missing, how big it is, and the
+two ways to get it. Nothing is fetched until you press the button.
+
+| Item | Needed? | Size | Lands in |
+|---|---|---|---|
+| Base Qwen-Image-2.1 (transformer, text encoder, VAE, processor, scheduler) | **required** | 30.9 GiB | `models/assets/` |
+| Turbo transformer | optional | 13.25 GiB | `models/turbo/assets/` |
+| Q8 transformer | optional | 7.1 GiB | `models/q8/` |
+| Official text enhancer (`PE-T2I`) | optional | 8.87 GiB | `models/pe/PE-T2I-Q8_0/` |
+| Official edit enhancer (`PE-I2I` + BF16 `mmproj`) | optional | 9.73 GiB | `models/pe/PE-I2I-Q8_0/` |
+| Rewriter system prompts | optional | ~28 KiB | `models/rewrite/` |
+
+The list is fixed by the server — it comes from the committed manifests and the
+pins in `qwen_engine/model_setup.py`, never from the browser. A request carries
+item ids only: no URL, repository, revision or path ever crosses the wire, and
+an opt-in item is never fetched unless its box is ticked. The required base
+assets are always included, because nothing can be drawn without them.
+
+**Downloading happens on the machine the models live on.** The **Download**
+button only works for a browser on `127.0.0.1`/`::1`; a Tailscale or LAN page is
+shown the command to run there instead (`python tools/fetch_models.py --manifest
+models/manifest.json --models-dir models/assets --fetch`) with an explanation.
+Generation stays blocked while the required assets are missing — the reason reads
+"Models not downloaded" — while planning, history, settings and the rest of the
+page keep working.
+
+One download job runs at a time, on a worker thread, and the page shows progress
+per file and overall with a **Cancel** button. Each file is verified (SHA256, plus
+the md5 the rewriter prompts are pinned to) before it is published, an interruption
+leaves the partial file so the next attempt resumes it, and a verification failure
+deletes the file and says so. Disk free space at the models directory is checked
+before the first byte: a job that would not fit is refused up front.
+
+**A restart is still needed to use a newly downloaded enhancer.** The rewriter's
+capability block is computed once at startup, so `./start-web.sh` picks the new
+files up on its next start (it already looks for `models/pe/…` and
+`models/rewrite/…` on every launch); the image assets themselves are re-checked
+per job, so the base download needs no restart.
+
+The enhancers need one more thing a download cannot supply: a `llama-server`
+binary built with CUDA for sm_70. The Models section says so in plain words; the
+build commands are in [the rewriter section](#prompt-rewriting--two-rewriters-chosen-per-draft-kind-in-settings)
+below and in [`docs/models.md`](models.md).
+
 ## Quality vs Turbo
 
 **Quality** (the default, `--recipe base`) is the reference model at the step
@@ -356,6 +404,28 @@ Those paths are the script's defaults, overridable in the environment:
 `QWEN_PE_I2I_MMPROJ` and `QWEN_PE_TIMEOUT` (which becomes `--pe-timeout`). They
 are still launch flags by the time the server sees them, so they remain the
 operator's, not the page's.
+
+### Building the `llama-server` the enhancer needs
+
+No download can supply this one: the enhancer weights run under a `llama.cpp`
+`llama-server` built **with CUDA for sm_70** (the V100), and a CPU-only build
+answers slowly enough to look broken. On a Debian/Ubuntu box with the CUDA
+toolkit installed:
+
+```bash
+sudo apt install nvidia-cuda-toolkit g++-13 cmake git
+git clone https://github.com/ggml-org/llama.cpp ~/Sandbox/llama.cpp-build/llama.cpp
+cmake -S ~/Sandbox/llama.cpp-build/llama.cpp -B ~/Sandbox/llama.cpp-build/llama.cpp/build \
+      -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 \
+      -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13
+cmake --build ~/Sandbox/llama.cpp-build/llama.cpp/build --config Release -j --target llama-server
+```
+
+`start-web.sh` looks for the binary at
+`$HOME/Sandbox/llama.cpp-build/llama.cpp/build/bin/llama-server`; anywhere else
+is fine with `QWEN_PE_LLAMA_SERVER=/path/to/llama-server`. The Models section of
+Settings says in plain words when the checkpoints are downloaded but this binary
+is missing, because that combination cannot rewrite anything yet.
 
 ### Settings → Prompt rewriter
 

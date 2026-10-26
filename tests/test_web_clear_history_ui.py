@@ -92,6 +92,10 @@ def test_job_documents_carry_the_image_size_the_confirmation_names():
     assert "image_bytes" in parse
     assert f"var API_JOBS_FORGET_ALL = API_JOBS + '/forget-all';" in js
     assert "'qwen_engine.web_jobs.v1'" in _js_function(js, "parseHistoryDeletion")
+    # ONE page-wide byte formatter (the model-setup one, binary units): a
+    # second definition would silently win by declaration order, which is
+    # exactly the merge collision this pins shut.
+    assert js.count("function formatBytes(") == 1
 
 
 HARNESS_VARS = ("API_JOBS", "API_JOBS_FORGET_ALL", "ERROR_SCHEMA", "jobCache",
@@ -172,7 +176,7 @@ out.emptyDisabled = (function () {
 
 out.allUnticked = (function () {
   reset();
-  jobCache[A] = job(A, "succeeded", 1572864 + 1048576);   // exactly 2.5 MB
+  jobCache[A] = job(A, "succeeded", 1572864 + 1048576);   // exactly 2.5 MiB
   jobCache[B] = job(B, "failed", null);
   jobCache[C] = job(C, "queued", null);
   updateHistoryControls();
@@ -312,7 +316,7 @@ def test_the_confirmation_names_entries_image_files_and_disk_size(tmp_path):
     assert "2 saved entries" in opened["question"]    # the queued job is not counted
     assert "Queued and running jobs are kept" in opened["question"]
     assert "1 image file" in opened["question"]
-    assert "2.5 MB" in opened["question"]             # roughly how much disk
+    assert "2.5 MiB" in opened["question"]             # roughly how much disk
     assert opened["filesChecked"] is False            # unticked by default
     assert opened["filesHidden"] is False             # the tick box is shown
     assert opened["yesText"] == "Forget 2 entries (files stay on disk)"
@@ -344,7 +348,7 @@ def test_the_per_entry_forget_uses_the_same_panel_and_its_own_route(tmp_path):
     single = out["singleEntryForget"]
     opened = single["opened"]
     assert "Forget this history entry?" in opened["question"]
-    assert "This entry holds 1 image file on disk, about 1 KB." in opened["question"]
+    assert "This entry holds 1 image file on disk, about 1.5 KiB." in opened["question"]
     assert opened["yesText"] == "Forget entry (image file stays on disk)"
     after = single["after"]
     assert after["calls"][0]["url"] == "/api/v1/jobs/" + "a" * 32 + "/forget"
@@ -368,9 +372,10 @@ def test_a_refused_or_insane_answer_deletes_nothing_locally(tmp_path):
 def test_size_math_and_edge_targets(tmp_path):
     out = _run_history_harness(tmp_path)
     math = out["sizeMath"]
-    assert math["bytes"] == "512 bytes"
-    assert math["kb"] == "2 KB"
-    assert math["mb"] == "1.5 MB"
+    assert math["bytes"] == "512 B"                    # the shared page formatter
+    assert math["kb"] == "2.0 KiB"
+    assert math["mb"] == "1.5 MiB"
+    assert math["twoAndHalf"] == "2.5 MiB"
     assert math["unknown"] == {"files": 1, "bytes": -1}   # unknown sizes are never summed
     assert math["mixed"] == {"files": 2, "bytes": 4096}
     assert out["noImagesNoTick"]["filesHidden"] is True   # nothing to delete, no tick box

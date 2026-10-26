@@ -39,6 +39,10 @@
 
   var GENERATION_UNAVAILABLE_REASON =
     'Connect to a qwen-web server started with --enable-generation to generate images.';
+  // The one sentence that explains a dead Generate button on a fresh install.
+  var MODELS_GENERATE_REASON =
+    'Models not downloaded — Settings → Models lists what is needed and can ' +
+    'fetch them on this machine.';
 
   /* ---- Same-origin API contract (relative paths only: never a host,
    *      never an absolute URL, never a CDN) ---- */
@@ -55,6 +59,11 @@
   // and never sends — a filesystem path.
   var API_REWRITE_SETTINGS = '/api/v1/settings/rewrite';
   var API_REWRITE_SETTINGS_TEST = API_REWRITE_SETTINGS + '/test';
+  // First-run model setup: the catalogue is read, one download job is started or
+  // stopped, and the page never names a repository, a revision or a path.
+  var API_MODELS = '/api/v1/models';
+  var API_MODELS_DOWNLOAD = API_MODELS + '/download';
+  var API_MODELS_DOWNLOAD_CANCEL = API_MODELS_DOWNLOAD + '/cancel';
   var PLAN_REQUEST_SCHEMA = 'qwen_engine.web_plan_request.v1';
   var STATUS_SCHEMA = 'qwen_engine.web_status.v1';
   var PLAN_SCHEMA = 'qwen_engine.web_plan.v1';
@@ -65,6 +74,10 @@
   var REWRITE_SETTINGS_SCHEMA = 'qwen_engine.web_rewrite_settings.v1';
   var REWRITE_TEST_REQUEST_SCHEMA = 'qwen_engine.web_rewrite_test_request.v1';
   var REWRITE_TEST_SCHEMA = 'qwen_engine.web_rewrite_test.v1';
+  var MODELS_SCHEMA = 'qwen_engine.web_models.v1';
+  var MODELS_JOB_SCHEMA = 'qwen_engine.web_models_job.v1';
+  var MODELS_DOWNLOAD_REQUEST_SCHEMA =
+    'qwen_engine.web_models_download_request.v1';
   var UI_HEADER = 'X-Qwen-UI';
 
   // Reference images (design §5). The caps MIRROR the server contract
@@ -89,10 +102,46 @@
   };
 
   // CLOSED blocker-code list — exactly what the real server can emit.
+  // A required model that has not been downloaded is one of the blockers, so a
+  // fresh install still parses its status document instead of rejecting it.
+  var MODELS_MISSING = 'models_missing';
   var KNOWN_BLOCKER_CODES = [
     'generation_disabled', 'runtime_unconfigured', 'manifest_unconfigured', 'manifest_file_missing',
-    'manifest_invalid', 'manifest_unreadable'
+    'manifest_invalid', 'manifest_unreadable', MODELS_MISSING
   ];
+
+  // First-run model setup (CLOSED sets, mirroring web/api.py). An item row, one
+  // of its pinned files, the one download job and its typed error. A document
+  // outside these sets is an unread contract and the whole card stays empty.
+  var MODELS_KEYS = ['schema', 'items', 'bytes_needed', 'free_bytes',
+                     'required_missing', 'can_download', 'server_command',
+                     'job', 'notices'];
+  var MODEL_ITEM_KEYS = ['id', 'label', 'required', 'reason', 'files', 'dest',
+                         'installed', 'missing_files', 'bytes_needed', 'extra'];
+  var MODEL_FILE_KEYS = ['name', 'bytes'];
+  var MODELS_JOB_KEYS = ['schema', 'state', 'ids', 'files', 'bytes_done',
+                         'bytes_total', 'error'];
+  var MODELS_JOB_FILE_KEYS = ['item', 'name', 'done', 'total'];
+  var MODELS_ERROR_KEYS = ['code', 'message'];
+  var MODEL_INSTALL_STATES = ['installed', 'partial', 'missing'];
+  var MODEL_JOB_STATES = ['idle', 'running', 'completed', 'failed', 'cancelled'];
+  // The catalogue ids this checkout ships, in display order. The card has static
+  // markup for exactly these, so an id outside the list is a version mismatch.
+  var MODEL_IDS = ['base', 'turbo', 'q8', 'pe-t2i', 'pe-edit',
+                   'rewrite-prompts'];
+  // A row whose files a download cannot complete: the official enhancers also
+  // need a llama.cpp llama-server built for this card.
+  var MODEL_NEEDS_BINARY = 'llama-server';   // model_setup.NEEDS_BINARY
+  var MODEL_NEEDS_BINARY_TEXT = 'A download cannot supply everything this option ' +
+    'needs: it also needs a llama.cpp llama-server built with CUDA for this ' +
+    'card (sm_70). Until that binary exists this option stays unusable, even ' +
+    'after the files arrive.';
+  // One sentence per install state, so a row never reads as a bare word.
+  var MODEL_STATE_TEXT = {
+    installed: 'Downloaded',
+    partial: 'Partly downloaded — Download finishes it',
+    missing: 'Not downloaded'
+  };
 
   /* Rewrite availability (plan §4.1 plus the two-backend amendment). CLOSED
      state/code pairs: the code is the key, the state is the value it must pair
@@ -919,6 +968,9 @@
     var rewrite = parseRewriteBlock(s.rewrite);
     if (rewrite === INVALID) return null;
     return { recognized: true, planning: true, generation: s.generation_available,
+             // Derived, not a wire key: the banner needs to know WHICH blocker
+             // it is answering, and the list above is already validated closed.
+             models_missing: s.generation_blockers.indexOf(MODELS_MISSING) !== -1,
              rewrite: rewrite };
   }
 
@@ -1098,7 +1150,10 @@
   // failure indicated by the metadata. Submission availability must agree.
   function blockersExact(list, manifestBlocker) {
     if (!Array.isArray(list)) return false;
-    if (list.length > 3 || new Set(list).size !== list.length) return false;
+    // Four is the most this server can report at once: generation disabled, an
+    // unconfigured runtime, one manifest reason, and missing model files. A
+    // longer list is not a document this build produces.
+    if (list.length > 4 || new Set(list).size !== list.length) return false;
     for (var j = 0; j < list.length; j++) {
       if (KNOWN_BLOCKER_CODES.indexOf(list[j]) === -1) return false;
       if (MANIFEST_REASON_CODES.indexOf(list[j]) !== -1 && list[j] !== manifestBlocker) return false;
@@ -1166,7 +1221,11 @@
         }
         setApiAvailable(true);
         generationConnected = status.generation;
+        // Which blocker kills the button has to be known BEFORE the button is
+        // re-labelled, or Generate explains last week's reason.
+        modelsMissingBlocked = !!status.models_missing;
         updateGenerate();
+        renderModelsBanner(status.models_missing);
         setRewriterState(status.rewrite);
         renderChip(status.generation ? 'Connected — engine jobs' : 'Connected — planning only',
                    status.generation ? 'Connected — engine jobs' : 'Connected — planning only');
@@ -1178,8 +1237,13 @@
           'assets: not verified · calibration: not verified for this ' +
           'server (unknown)');
         setText('settings-generation',
-          'FP16 resident generation uses the same engine as the CLI. ' +
-          'Submission availability does not establish memory fitness.');
+                'FP16 resident generation uses the same engine as the CLI. ' +
+                'Submission availability does not establish memory fitness.' +
+                (status.models_missing
+                   ? ' The model files are not downloaded on this machine yet, ' +
+                     'so Generate stays disabled until Settings → Models has ' +
+                     'fetched them.'
+                   : ''));
         if (status.generation) refreshJobs();
         return status;
       });
@@ -2164,6 +2228,462 @@
     });
   }
 
+  /* ---------------- First-run model setup ----------------
+   * The server owns the catalogue (fixed pins in this checkout); this page only
+   * reads it and sends ids back. A document that is not exactly the one expected
+   * leaves the whole card empty with one sentence — a half-rendered list of
+   * models you cannot trust is worse than none.
+   */
+
+  var modelsDoc = null;          // the last parsed GET /api/v1/models
+  var modelsBusy = false;        // a download/cancel POST is in flight
+  var modelsTimer = 0;           // the serial progress timer: one shot at a time
+  var modelsSeq = 0;             // out-of-order GET guard, like statusSeq
+  var modelsBannerDismissed = false;  // page load only: nothing is stored
+  var modelsMissingBlocked = false;   // the last status said a required model is
+                                      // absent, so Generate says WHICH reason.
+
+  // A file name is a repo-relative name and nothing else. The server validates
+  // the same rule; a page that accepted "../x" would print a path the install
+  // never writes, and the card's whole claim is that it shows real files.
+  function isPlainRelativeName(name) {
+    if (typeof name !== 'string' || !name || name.length > 256) return false;
+    if (name.charAt(0) === '/' || name.indexOf('\\') !== -1) return false;
+    var parts = name.split('/');
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i] === '' || parts[i] === '.' || parts[i] === '..') return false;
+      if (parts[i].length > 128) return false;
+    }
+    return parts.length <= 5;
+  }
+
+  function parseModelsFileRow(row) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+    if (!hasOnlyKeys(row, MODEL_FILE_KEYS)) return null;
+    if (!isPlainRelativeName(row.name)) return null;
+    if (!Number.isInteger(row.bytes) || row.bytes < 0) return null;
+    return { name: row.name, bytes: row.bytes };
+  }
+
+  function parseModelsItem(row) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+    if (!hasOnlyKeys(row, MODEL_ITEM_KEYS)) return null;
+    if (MODEL_IDS.indexOf(row.id) === -1) return null;
+    if (typeof row.label !== 'string' || !row.label || row.label.length > 120) {
+      return null;
+    }
+    if (typeof row.reason !== 'string' || !row.reason ||
+        row.reason.length > 400) return null;
+    if (typeof row.dest !== 'string' || !row.dest || row.dest.length > 320 ||
+        row.dest.charAt(0) === '/' || row.dest.indexOf('..') !== -1) return null;
+    if (typeof row.required !== 'boolean') return null;
+    if (MODEL_INSTALL_STATES.indexOf(row.installed) === -1) return null;
+    if (!Number.isInteger(row.bytes_needed) || row.bytes_needed < 0) return null;
+    if (row.extra !== '' && row.extra !== MODEL_NEEDS_BINARY) return null;
+    if (!Array.isArray(row.files) || !row.files.length) return null;
+    var files = [];
+    for (var i = 0; i < row.files.length; i++) {
+      var file = parseModelsFileRow(row.files[i]);
+      if (!file) return null;
+      files.push(file);
+    }
+    if (!Array.isArray(row.missing_files)) return null;
+    for (var j = 0; j < row.missing_files.length; j++) {
+      if (typeof row.missing_files[j] !== 'string') return null;
+    }
+    return { id: row.id, label: row.label, required: row.required,
+             reason: row.reason, files: files, dest: row.dest,
+             installed: row.installed, missing_files: row.missing_files,
+             bytes_needed: row.bytes_needed, extra: row.extra };
+  }
+
+  function parseModelsJob(job) {
+    if (job === null) {
+      return { schema: MODELS_JOB_SCHEMA, state: 'idle', ids: [], files: [],
+               bytes_done: 0, bytes_total: 0, error: null };
+    }
+    if (!job || typeof job !== 'object' || Array.isArray(job)) return null;
+    if (!hasOnlyKeys(job, MODELS_JOB_KEYS)) return null;
+    if (job.schema !== MODELS_JOB_SCHEMA) return null;
+    if (MODEL_JOB_STATES.indexOf(job.state) === -1) return null;
+    if (!Array.isArray(job.ids)) return null;
+    for (var i = 0; i < job.ids.length; i++) {
+      if (MODEL_IDS.indexOf(job.ids[i]) === -1) return null;
+    }
+    if (!Number.isInteger(job.bytes_done) || !Number.isInteger(job.bytes_total) ||
+        job.bytes_done < 0 || job.bytes_total < 0 ||
+        job.bytes_done > job.bytes_total) return null;
+    if (!Array.isArray(job.files)) return null;
+    var files = [];
+    for (var k = 0; k < job.files.length; k++) {
+      var row = job.files[k];
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+      if (!hasOnlyKeys(row, MODELS_JOB_FILE_KEYS)) return null;
+      if (MODEL_IDS.indexOf(row.item) === -1) return null;
+      if (!isPlainRelativeName(row.name)) return null;
+      if (!Number.isInteger(row.done) || !Number.isInteger(row.total) ||
+          row.done < 0 || row.total < 0 || row.done > row.total) return null;
+      files.push({ item: row.item, name: row.name, done: row.done,
+                   total: row.total });
+    }
+    var error = null;
+    if (job.error !== null) {
+      if (typeof job.error !== 'object' || Array.isArray(job.error) ||
+          !hasOnlyKeys(job.error, MODELS_ERROR_KEYS) ||
+          typeof job.error.code !== 'string' || !job.error.code ||
+          typeof job.error.message !== 'string') return null;
+      error = { code: job.error.code, message: job.error.message.slice(0, 400) };
+    }
+    return { schema: job.schema, state: job.state, ids: job.ids.slice(),
+             files: files, bytes_done: job.bytes_done,
+             bytes_total: job.bytes_total, error: error };
+  }
+
+  function parseModelsDocument(document) {
+    if (!document || typeof document !== 'object' || Array.isArray(document)) {
+      return null;
+    }
+    if (!hasOnlyKeys(document, MODELS_KEYS)) return null;
+    if (document.schema !== MODELS_SCHEMA) return null;
+    if (!Array.isArray(document.items) || !document.items.length) return null;
+    var items = [];
+    for (var i = 0; i < document.items.length; i++) {
+      var item = parseModelsItem(document.items[i]);
+      if (!item) return null;
+      items.push(item);
+    }
+    if (!Number.isInteger(document.bytes_needed) ||
+        document.bytes_needed < 0) return null;
+    if (document.free_bytes !== null &&
+        (!Number.isInteger(document.free_bytes) || document.free_bytes < 0)) {
+      return null;
+    }
+    if (typeof document.required_missing !== 'boolean') return null;
+    if (typeof document.can_download !== 'boolean') return null;
+    if (typeof document.server_command !== 'string' ||
+        !document.server_command || document.server_command.length > 320) {
+      return null;
+    }
+    var job = parseModelsJob(document.job);
+    if (!job) return null;
+    if (!Array.isArray(document.notices)) return null;
+    for (var notice = 0; notice < document.notices.length; notice++) {
+      var line = document.notices[notice];
+      if (typeof line !== 'string' || !line || line.length > 400) return null;
+    }
+    return { schema: document.schema, items: items,
+             bytes_needed: document.bytes_needed, free_bytes: document.free_bytes,
+             required_missing: document.required_missing,
+             can_download: document.can_download,
+             server_command: document.server_command, job: job,
+             notices: document.notices.slice() };
+  }
+
+  function loadModelStatus() {
+    var seq = ++modelsSeq;
+    return apiRequest(API_MODELS, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json', 'X-Qwen-UI': '1' }
+    }, 'json').then(function (r) {
+      if (seq !== modelsSeq) return null;
+      if (r.network) {
+        modelsDoc = null;
+        setText('models-error', 'The local engine server is unreachable, so the ' +
+          'model list could not be read.');
+        renderModelsSettings();
+        return null;
+      }
+      // apiRequest reports the response object; the status code is on it.
+      var code = (r.res && typeof r.res.status === 'number') ? r.res.status : 0;
+      if (r.bodyError || code !== 200) {
+        modelsDoc = null;
+        setText('models-error', code === 503
+          ? 'This server cannot read its model catalogue.'
+          : 'The model list could not be read.');
+        renderModelsSettings();
+        return null;
+      }
+      var parsed = parseModelsDocument(r.json);
+      if (!parsed) {
+        modelsDoc = null;
+        setText('models-error', 'The model list did not match the expected ' +
+          'schema, so nothing here is shown.');
+        renderModelsSettings();
+        return null;
+      }
+      setText('models-error', '');
+      modelsDoc = parsed;
+      renderModelsSettings();
+      if (parsed.job.state === 'running') startModelsPolling();
+      else stopModelsPolling();
+      return parsed;
+    });
+  }
+
+  // One file row per pinned file of an item, in the server's order. Built with
+  // createElement + textContent: no markup ever comes from a string.
+  function fillModelsFiles(listId, names, done, total) {
+    var list = $(listId);
+    if (!list) return;
+    while (list.firstChild) list.removeChild(list.firstChild);
+    for (var i = 0; i < names.length; i++) {
+      var li = document.createElement('li');
+      li.className = 'models-file';
+      var name = document.createElement('span');
+      name.className = 'models-file-name';
+      name.textContent = names[i];
+      li.appendChild(name);
+      if (typeof done === 'number') {
+        var count = document.createElement('span');
+        count.className = 'models-file-count';
+        count.textContent = formatBytes(done[i]) + ' of ' + formatBytes(total[i]);
+        li.appendChild(count);
+      }
+      list.appendChild(li);
+    }
+  }
+
+  function renderModelsSettings() {
+    var doc = modelsDoc;
+    var running = !!(doc && doc.job.state === 'running');
+    // The card is hidden in the markup: with no parsed document there is
+    // nothing honest to offer, and an empty catalogue would invite a press.
+    var card = $('models-card');
+    if (card) card.hidden = !doc;
+    // Packaging problems (a manifest this checkout cannot read) are said here,
+    // so a short list is never mistaken for "this server has no such option".
+    // Two of them arrive at once on a checkout missing both extra manifests,
+    // so they are separated — joined with a space they read as one run-on
+    // sentence and the second cause is lost.
+    setText('models-note', (doc && doc.notices.length)
+      ? doc.notices.join('; ') + '.' : '');
+    for (var i = 0; i < MODEL_IDS.length; i++) {
+      var id = MODEL_IDS[i];
+      var item = null;
+      if (doc) {
+        for (var j = 0; j < doc.items.length; j++) {
+          if (doc.items[j].id === id) item = doc.items[j];
+        }
+      }
+      setText('model-label-' + id, item ? item.label : '');
+      setText('model-reason-' + id, item ? item.reason : '');
+      setText('model-dest-' + id, item ? 'Stored in ' + item.dest : '');
+      // The size the user is being asked to spend, and the size of the thing:
+      // an installed row still has to say how big it is.
+      var total = 0;
+      if (item) {
+        for (var f = 0; f < item.files.length; f++) total += item.files[f].bytes;
+      }
+      setText('model-size-' + id,
+              item ? (item.bytes_needed > 0
+                       ? formatBytes(item.bytes_needed) + ' to download (' +
+                         formatBytes(total) + ' in total)'
+                       : formatBytes(total) + ' downloaded')
+                   : '');
+      var state = '';
+      if (item) {
+        state = MODEL_STATE_TEXT[item.installed] || '';
+        if (item.installed === 'partial' && item.missing_files.length) {
+          state += ' — ' + item.missing_files.length + ' file(s) still missing';
+        }
+        if (item.extra === MODEL_NEEDS_BINARY) {
+          state += (state ? ' ' : '') + MODEL_NEEDS_BINARY_TEXT;
+        }
+      }
+      setText('model-state-' + id, state);
+      var tag = $('model-tag-' + id);
+      if (tag) tag.textContent = (item && item.required) ? 'Required' : '';
+      var tick = $('model-tick-' + id);
+      if (tick) {
+        // A required row is never tickable: its files go in every request
+        // whether or not the box is ticked, so an enabled box would promise a
+        // choice that does not exist. A row with nothing left to fetch is the
+        // other unusable case.
+        var unusable = !item || item.bytes_needed === 0 || item.required;
+        tick.disabled = unusable || running || modelsBusy;
+        var tickRow = document.getElementById('model-row-' + id);
+        if (tickRow) {
+          if (unusable) tickRow.classList.add('model-row-done');
+          else tickRow.classList.remove('model-row-done');
+        }
+      }
+      $('model-row-' + id).hidden = !item;
+      fillModelsFiles('model-files-' + id,
+                      item ? item.files.map(function (f) { return f.name; }) : [],
+                      undefined, undefined);
+    }
+    if (!doc) {
+      setText('models-total', '');
+      $('models-download').disabled = true;
+      $('models-cancel').disabled = true;
+      $('models-server-only').hidden = true;
+      $('models-progress').hidden = true;
+      return;
+    }
+    var free = doc.free_bytes === null
+      ? 'free space unknown' : formatBytes(doc.free_bytes) + ' free';
+    var missing = doc.items.filter(function (row) {
+      return row.bytes_needed > 0;
+    });
+    setText('models-total', missing.length
+      ? 'Everything not yet downloaded is ' + formatBytes(doc.bytes_needed) +
+        '; the disk has ' + free + '.'
+      : 'Nothing further is needed here. The disk has ' + free + '.');
+    $('models-server-only').hidden = doc.can_download;
+    if (!doc.can_download) {
+      setText('models-server-text', 'This page is not on the machine that holds ' +
+        'the models folder, so it cannot start a download. Run this there:');
+      setText('models-server-command', doc.server_command);
+    }
+    setText('models-status', running ? 'Downloading…' : '');
+    var selected = modelsSelectedIds();
+    $('models-download').disabled = !doc.can_download || running || modelsBusy ||
+      !selected.length;
+    $('models-cancel').disabled = !doc.can_download || !running || modelsBusy;
+    renderModelsProgress();
+    renderModelsBanner(doc.required_missing);
+  }
+
+  // The ids a Download press sends: the required ones (the server adds them
+  // anyway, and they are never tickable) plus every ticked optional item that
+  // still needs bytes. Nothing else can ever leave the page.
+  function modelsSelectedIds() {
+    var doc = modelsDoc;
+    if (!doc) return [];
+    var ids = [];
+    for (var i = 0; i < doc.items.length; i++) {
+      var item = doc.items[i];
+      if (item.bytes_needed <= 0) continue;
+      if (item.required) { ids.push(item.id); continue; }
+      var tick = $('model-tick-' + item.id);
+      if (tick && tick.checked) ids.push(item.id);
+    }
+    return ids;
+  }
+
+  function modelsDownloadEnvelope() {
+    return { schema: MODELS_DOWNLOAD_REQUEST_SCHEMA, ids: modelsSelectedIds() };
+  }
+
+  function renderModelsProgress() {
+    var doc = modelsDoc;
+    var panel = $('models-progress');
+    if (!doc || doc.job.state !== 'running') {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    var job = doc.job;
+    $('models-progress-bar').value = job.bytes_total > 0
+      ? Math.min(1, job.bytes_done / job.bytes_total) : 0;
+    setText('models-progress-label', 'Downloading ' +
+            formatBytes(job.bytes_done) + ' of ' + formatBytes(job.bytes_total));
+    fillModelsFiles('models-progress-files',
+                    job.files.map(function (row) { return row.name; }),
+                    job.files.map(function (row) { return row.done; }),
+                    job.files.map(function (row) { return row.total; }));
+  }
+
+  // Progress is a serial self-rearming timeout, like the job poll: never two
+  // requests at once, and nothing keeps running once the job is not running.
+  function startModelsPolling() {
+    if (modelsTimer) return;
+    modelsTimer = setTimeout(function () {
+      modelsTimer = 0;
+      loadModelStatus();
+    }, 1000);
+  }
+
+  function stopModelsPolling() {
+    if (!modelsTimer) return;
+    clearTimeout(modelsTimer);
+    modelsTimer = 0;
+  }
+
+  function postModels(url, body) {
+    // A promise either way: a press that finds one already in flight resolves
+    // immediately rather than leaving a caller waiting on nothing.
+    if (modelsBusy) return Promise.resolve(null);
+    modelsBusy = true;
+    $('models-download').disabled = true;
+    $('models-cancel').disabled = true;
+    $('models-download').setAttribute('aria-busy', 'true');
+    return apiRequest(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json',
+                 'X-Qwen-UI': '1' },
+      body: JSON.stringify(body),
+      // This POST only starts or stops a job; the bytes move on a server
+      // thread, so the page's own wait stays short.
+      timeoutMs: 10000
+    }, 'json').then(function (r) {
+      modelsBusy = false;
+      $('models-download').removeAttribute('aria-busy');
+      if (r.network) {
+        setText('models-error', 'The local engine server is unreachable, so ' +
+          'nothing was changed.');
+        renderModelsSettings();
+        return;
+      }
+      var code = (r.res && typeof r.res.status === 'number') ? r.res.status : 0;
+      if (code !== 200 && code !== 202) {
+        setText('models-error', (r.json && typeof r.json.message === 'string')
+          ? r.json.message.slice(0, 400)
+          : 'The server refused that request.');
+        renderModelsSettings();
+        return;
+      }
+      var job = parseModelsJob(r.json);
+      if (!job) {
+        setText('models-error', 'The download reply did not match the expected ' +
+          'schema.');
+        renderModelsSettings();
+        return;
+      }
+      setText('models-error', '');
+      if (modelsDoc) modelsDoc.job = job;
+      setText('models-status', job.state === 'running' ? 'Downloading…'
+        : (job.error ? job.error.message : ''));
+      renderModelsSettings();
+      if (job.state === 'running') startModelsPolling();
+      // A finished download changes what the server can do, so the generation
+      // gate is re-read rather than assumed.
+      if (job.state !== 'running') checkStatus();
+    });
+  }
+
+  function startModelsDownload() {
+    if (!modelsSelectedIds().length) return;
+    setText('models-status', 'Starting the download…');
+    postModels(API_MODELS_DOWNLOAD, modelsDownloadEnvelope());
+  }
+
+  function cancelModelsDownload() {
+    setText('models-status', 'Stopping the download…');
+    postModels(API_MODELS_DOWNLOAD_CANCEL, {});
+  }
+
+  // The Create-page banner: up while the server says a required model is
+  // missing, hidden for this page load by "Not now". Nothing is stored, so the
+  // next load says it again — Generate is still disabled until the files arrive.
+  function renderModelsBanner(missing) {
+    var banner = $('models-banner');
+    if (!banner) return;
+    if (!missing || modelsBannerDismissed) {
+      banner.hidden = true;
+      return;
+    }
+    setText('models-banner-text', 'The image model itself is not on this machine ' +
+      'yet, so nothing can be drawn. Settings → Models lists what is needed, how ' +
+      'big it is and where it goes.');
+    banner.hidden = false;
+  }
+
+  function dismissModelsBanner() {
+    modelsBannerDismissed = true;
+    $('models-banner').hidden = true;
+  }
+
   /* ---------------- Plan flow ----------------
    * Both "Check configuration" and "Plan" submit the snapshot; the server
    * verdict is authoritative. On ANY failure the draft stays exactly as
@@ -2868,11 +3388,14 @@
 
   function setReferenceStatus(text) { setText('reference-status', text); }
 
-  function formatReferenceBytes(n) {
+  // The page's ONE byte formatter: reference files (capped at 32 MiB) and the
+  // model sizes in the Settings Models card (tens of GiB) both read through it.
+  function formatBytes(n) {
     if (typeof n !== 'number' || !isFinite(n) || n < 0) return 'unknown size';
     if (n < 1024) return n + ' B';
     if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KiB';
-    return (n / (1024 * 1024)).toFixed(1) + ' MiB';
+    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MiB';
+    return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GiB';
   }
 
   // Add is offered only when a RECOGNIZED status has been seen (uploads are
@@ -2942,7 +3465,7 @@
     if (Number.isInteger(ref.width) && Number.isInteger(ref.height)) {
       facts.push(ref.width + '×' + ref.height);
     }
-    if (typeof ref.bytes === 'number') facts.push(formatReferenceBytes(ref.bytes));
+    if (typeof ref.bytes === 'number') facts.push(formatBytes(ref.bytes));
     if (ref.has_alpha === true) facts.push('alpha');
     meta.textContent = facts.length ? facts.join(' · ') : 'stored on the server';
     // A pruned id (an imported plan naming bytes the server no longer holds)
@@ -3121,7 +3644,7 @@
       });
     }).catch(function (err) {
       var why = (err && err.message === 'too_large')
-        ? 'the file exceeds the ' + formatReferenceBytes(MAX_REFERENCE_BYTES) +
+        ? 'the file exceeds the ' + formatBytes(MAX_REFERENCE_BYTES) +
           ' upload limit'
         : 'the file could not be read';
       setReferenceStatus('Upload refused: ' + why +
@@ -3310,7 +3833,12 @@
     // The rewriter choice lives on the server, so opening the page RE-reads
     // it: another browser (or another tab) may have changed it since, and a
     // form that shows a stale choice would then be a form that lies.
-    if (active === 'settings') loadRewriteSettings();
+    if (active === 'settings') {
+      loadRewriteSettings();
+      // Same reason: the catalogue and the one download job are server state,
+      // and a download may have finished since this page last looked.
+      loadModelStatus();
+    }
   }
 
   function routeOnHashchange() {
@@ -3468,7 +3996,8 @@
     $('generate-btn').textContent = submittingJob ? 'Submitting…' : active ? 'Queue another image' : 'Generate';
     setText('generate-reason', generationConnected
       ? (submittingJob ? 'Submitting…' : 'Jobs run one at a time. Model and resource checks run for each job.')
-      : GENERATION_UNAVAILABLE_REASON);
+      : (modelsMissingBlocked ? MODELS_GENERATE_REASON
+                                : GENERATION_UNAVAILABLE_REASON));
   }
 
   function renderSelectedJob(job) {
@@ -3775,14 +4304,10 @@
    * BEFORE anything is removed, and "Also delete the image files from disk"
    * is an explicit tick box, unticked by default. The server decides what
    * is live and skips it; the status line repeats only the server's own
-   * counts from the answer it confirmed.
+   * counts from the answer it confirmed. Sizes are named through the page's
+   * ONE formatBytes (binary units, defined with the reference code) — there
+   * is deliberately no second formatter here.
    */
-
-  function formatBytes(bytes) {
-    if (bytes < 1024) return bytes + ' bytes';
-    if (bytes < 1048576) return Math.round(bytes / 1024) + ' KB';
-    return (bytes / 1048576).toFixed(1) + ' MB';
-  }
 
   function terminalHistoryJobs() {
     return Object.keys(jobCache).map(function (id) { return jobCache[id]; })
@@ -4030,7 +4555,7 @@
           'Status rejected — server contract broken');
         setReferenceStatus('The saved image could not be read (' +
           (r.bodyError === 'too_large'
-            ? 'over the ' + formatReferenceBytes(MAX_JOB_IMAGE_BYTES) + ' limit'
+            ? 'over the ' + formatBytes(MAX_JOB_IMAGE_BYTES) + ' limit'
             : 'unreadable bounded body') +
           ') — a broken response, not a disconnect. Nothing was added.');
         return false;
@@ -4259,6 +4784,23 @@
     $('rewrite-save').addEventListener('click', saveRewriteSettings);
     $('rewrite-test').addEventListener('click', testRewriteConnection);
 
+    // Models card: the ticks only decide which OPTIONAL ids are sent, so a
+    // change re-reads what Download would do rather than storing anything.
+    MODEL_IDS.forEach(function (id) {
+      var tick = $('model-tick-' + id);
+      if (!tick) return;
+      tick.addEventListener('change', function () {
+        setText('models-status', '');
+        renderModelsSettings();
+      });
+    });
+    $('models-download').addEventListener('click', startModelsDownload);
+    $('models-cancel').addEventListener('click', cancelModelsDownload);
+    $('models-banner-dismiss').addEventListener('click', dismissModelsBanner);
+    $('models-banner-link').addEventListener('click', function () {
+      modelsBannerDismissed = false;   // the banner was answered, not refused
+    });
+
     ['steps', 'seed', 'cfg', 'width', 'height', 'prompt', 'negative'].forEach(function (id) {
       $(id).addEventListener('input', function () {
         if (id === 'width' || id === 'height') {
@@ -4413,6 +4955,32 @@
     loadRewriteSettings: loadRewriteSettings,
     saveRewriteSettings: saveRewriteSettings,
     testRewriteConnection: testRewriteConnection,
-    API_REWRITE_SETTINGS: API_REWRITE_SETTINGS
+    API_REWRITE_SETTINGS: API_REWRITE_SETTINGS,
+    // First-run model setup surface for the checks: the closed parsers, the one
+    // envelope the card sends, the renderer, and the routes.
+    parseModelsDocument: parseModelsDocument,
+    parseModelsJob: parseModelsJob,
+    renderModelsSettings: renderModelsSettings,
+    loadModelStatus: loadModelStatus,
+    modelsDownloadEnvelope: modelsDownloadEnvelope,
+    modelsSelectedIds: modelsSelectedIds,
+    startModelsDownload: startModelsDownload,
+    cancelModelsDownload: cancelModelsDownload,
+    renderModelsBanner: renderModelsBanner,
+    dismissModelsBanner: dismissModelsBanner,
+    setModelsDocForChecks: function (doc) {
+      modelsDoc = doc ? parseModelsDocument(doc) : null;
+      renderModelsSettings();
+      return !!modelsDoc;
+    },
+    setModelsBannerDismissedForChecks: function (value) {
+      modelsBannerDismissed = !!value;
+    },
+    MODELS_SCHEMA: MODELS_SCHEMA,
+    MODELS_JOB_SCHEMA: MODELS_JOB_SCHEMA,
+    MODELS_DOWNLOAD_REQUEST_SCHEMA: MODELS_DOWNLOAD_REQUEST_SCHEMA,
+    API_MODELS: API_MODELS,
+    API_MODELS_DOWNLOAD: API_MODELS_DOWNLOAD,
+    API_MODELS_DOWNLOAD_CANCEL: API_MODELS_DOWNLOAD_CANCEL
   };
 })();
