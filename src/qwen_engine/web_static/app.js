@@ -620,7 +620,7 @@
       // Reference ids in LIST order — the displayed order IS the
       // conditioning order ("image 1" in the prompt). Ids only: the bytes
       // live in the server store, keyed by these hashes.
-      references: referenceIds()
+      references: activeReferenceIds()
     };
   }
 
@@ -1042,7 +1042,7 @@
   // derived from the references, so this can never ask for an impossible edit.
   function rewriteAvailable() {
     if (!rewriteBackend || rewriteInFlight) return false;
-    return rewriteTask() === 't2i' || referenceIds().length > 0;
+    return rewriteTask() === 't2i' || activeReferenceIds().length > 0;
   }
 
   function refreshRewriteButton() {
@@ -1088,7 +1088,7 @@
   function rewriteTask() {
     // Reference images imply editing; the request must never claim a task the
     // draft's own references contradict.
-    return referenceIds().length ? 'edit' : 't2i';
+    return activeReferenceIds().length ? 'edit' : 't2i';
   }
 
   function requestRewrite() {
@@ -1108,7 +1108,7 @@
     var task = rewriteTask();
     // The displayed order IS the conditioning order: reference N is <imageN>
     // in the edit system prompt, so the ids go out exactly as rendered.
-    var imageIds = task === 'edit' ? referenceIds() : [];
+    var imageIds = task === 'edit' ? activeReferenceIds() : [];
     if (task === 'edit' && !imageIds.length) {
       setText('rewrite-error', 'An edit rewrite needs at least one reference image.');
       return;
@@ -1897,6 +1897,9 @@
       return { id: id, width: null, height: null, has_alpha: null, bytes: null };
     });
     renderReferences();
+    // An imported draft with references is an edit; one without is not.
+    $('edit-mode').checked = c.references.length > 0;
+    applyEditMode();
     setReferenceStatus(c.references.length
       ? 'Imported ' + c.references.length + ' reference image' +
         (c.references.length === 1 ? '' : 's') + ' in the file\'s order. ' +
@@ -2025,6 +2028,23 @@
 
   function referenceIds() {
     return references.map(function (ref) { return ref.id; });
+  }
+
+  // The ids a job, plan or rewrite actually uses: the list only counts while
+  // edit mode is ticked. Unticking keeps the list (ticking again restores it)
+  // but sends nothing, so a hidden reference can never condition a job.
+  function activeReferenceIds() {
+    return $('edit-mode').checked ? referenceIds() : [];
+  }
+
+  // Show or hide the reference controls to match the edit-mode box. Toggling
+  // changes which images the draft uses, so a visible rewrite proposal and the
+  // current plan go stale exactly as they do when a reference is removed.
+  function applyEditMode() {
+    $('reference-field').hidden = !$('edit-mode').checked;
+    if (references.length) bumpPromptRevision();
+    refreshRewriteButton();
+    syncPlanStaleness();
   }
 
   function setReferenceStatus(text) { setText('reference-status', text); }
@@ -3030,6 +3050,7 @@
     // Transparency owns the jpg -> png switch, so it is wired separately
     // from the change-only group above.
     $('transparent').addEventListener('change', onTransparencyChange);
+    $('edit-mode').addEventListener('change', applyEditMode);
 
     // Recipe: every radio in the group shares one handler, so the lock state
     // is derived from whichever control the user (or an import) selected.

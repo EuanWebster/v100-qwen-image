@@ -95,9 +95,20 @@
           </div>
 
           <div class="settings-scroll" tabindex="0" role="region" aria-label="Generation settings">
-          <fieldset class="field reference-field" id="reference-field">
+          <div class="field edit-mode-field">
+            <div class="checkbox-field">
+              <input id="edit-mode" type="checkbox" autocomplete="off"
+                     aria-controls="reference-field"
+                     aria-describedby="edit-mode-help">
+              <label for="edit-mode">Edit with reference images</label>
+            </div>
+            <p id="edit-mode-help" class="help">Tick to edit or combine existing
+              images. Unticked, the prompt alone makes the image and any added
+              references are kept but not used.</p>
+          </div>
+          <fieldset class="field reference-field" id="reference-field" hidden>
             <legend>Reference images</legend>
-            <p id="reference-help" class="help">Optional. Add up to
+            <p id="reference-help" class="help">Add up to
               <span id="reference-limit">10</span> images (PNG, JPEG or WebP) and
               refer to them as image 1, image 2 … in your prompt, in the order
               shown here. Output size comes from the preset, not from the
