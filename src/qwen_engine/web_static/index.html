@@ -410,8 +410,31 @@
     <p class="history-empty" id="history-empty">
       No saved generations yet. Completed images from this machine will appear
       here as thumbnails, including ones from earlier server runs; image files
-      stay on disk when entries are forgotten.
+      stay on disk when entries are forgotten, unless a delete is confirmed
+      with the file tick box ticked.
     </p>
+    <div class="history-actions">
+      <button id="history-delete-all" class="btn-danger" type="button" disabled
+              title="Remove every finished history entry. Queued and running jobs are kept.">
+        Delete all history
+      </button>
+    </div>
+    <div class="history-confirm" id="history-confirm" role="group"
+         aria-labelledby="history-confirm-question" hidden>
+      <p class="history-confirm-question" id="history-confirm-question"
+         role="status" aria-live="polite"></p>
+      <div class="field checkbox-field history-confirm-files">
+        <input id="history-confirm-files" type="checkbox" autocomplete="off"
+               title="Tick to delete the image files of these entries from disk, not just the history records. Unticked keeps every file.">
+        <label for="history-confirm-files">Also delete the image files from disk</label>
+      </div>
+      <div class="history-confirm-buttons">
+        <button id="history-confirm-yes" class="btn-danger" type="button">Delete</button>
+        <button id="history-confirm-cancel" class="btn-secondary" type="button">Cancel</button>
+      </div>
+    </div>
+    <p class="history-status" id="history-status" role="status"
+       aria-live="polite" hidden></p>
     <div class="history-grid" id="history-grid" aria-live="polite"></div>
     <p class="history-note" id="history-missing-note" role="status"
        aria-live="polite" hidden></p>

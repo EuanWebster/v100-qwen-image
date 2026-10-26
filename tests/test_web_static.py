@@ -1605,7 +1605,8 @@ def test_use_as_reference_reads_the_job_image_endpoint_and_reuses_the_upload():
     # exactly two (read the choice, write the choice) plus the probe hanging off
     # the write route; nothing else may appear.
     assert sorted(set(re.findall(r"var (API_[A-Z_]+) = ", js))) == \
-        ["API_EXPORT", "API_IMPORT", "API_JOBS", "API_PLAN", "API_REFERENCES",
+        ["API_EXPORT", "API_IMPORT", "API_JOBS", "API_JOBS_FORGET_ALL",
+         "API_PLAN", "API_REFERENCES",
          "API_REWRITE", "API_REWRITE_SETTINGS", "API_REWRITE_SETTINGS_TEST",
          "API_STATUS"]
     # Every failure mode is narrated on the reference status line, never an

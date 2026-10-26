@@ -20,7 +20,9 @@ from qwen_engine.config import ConfigError
 from qwen_engine.local_bundle import VerificationReusePolicy
 from qwen_engine.core import generate
 from qwen_engine.errors import GenerationCancelled
-from qwen_engine.jobs import JobCancelled, JobController, JobError
+from qwen_engine.jobs import (
+    JobCancelled, JobController, JobError, JobHistoryFullError,
+)
 from qwen_engine.log import PhaseLogger
 from qwen_engine.web.api import (
     ApiError, ApiResponse, WebRuntime, _blockers, build_config,
@@ -201,6 +203,12 @@ class WebGeneration:
             "progress": {"completed_steps": completed, "total_steps": record.config.steps},
             "image_url": (f"/api/v1/jobs/{record.job_id}/image" if record.artifact else None),
             "image_filename": record.artifact.filename if record.artifact else None,
+            # The recorded byte size of THIS job's own image (None when it has
+            # no artifact): what the History tab names in its delete
+            # confirmations so the user sees what "also delete the files"
+            # means before ticking it. The record is the source; nothing is
+            # stat'ed off disk here.
+            "image_bytes": record.artifact.bytes if record.artifact else None,
         }
 
     def submit(self, body):
@@ -233,6 +241,10 @@ class WebGeneration:
                          seed=config.seed if config.seed is not None else secrets.randbits(64))
         try:
             record = self.controller.submit(config)
+        except JobHistoryFullError:
+            raise ApiError(409, "job_submission_refused",
+                           "History is full — delete old entries on the History tab "
+                           "(Delete all history or Forget entry)") from None
         except (JobError, OSError):
             raise ApiError(409, "job_submission_refused", "job queue/history is full or its output storage is unavailable") from None
         return ApiResponse(202, self.public_job(record))
@@ -259,17 +271,55 @@ class WebGeneration:
         try:
             if action == "cancel":
                 record = self.controller.cancel(job_id)
-            elif action == "forget":
-                self.controller.forget(job_id)
-                with self._lock:
-                    self._metrics.pop(job_id, None)
-                return ApiResponse(200, {"schema": JOBS_SCHEMA, "forgotten": job_id})
             else:
                 record = self.controller.get(job_id)
             return ApiResponse(200, self.public_job(record))
         except (JobError, OSError):
-            raise ApiError(409 if action == "forget" else 404, "job_unavailable",
+            raise ApiError(404, "job_unavailable",
                            "job is unknown or cannot perform this action") from None
+
+    #: The two job-deletion bodies the wire accepts: the plain forget, and
+    #: the explicit file-delete opt-in. Anything else is a typed refusal.
+    @staticmethod
+    def _delete_files_flag(body):
+        payload = parse_request_json(body)
+        if payload == {}:
+            return False
+        if (type(payload) is not dict or set(payload) != {"delete_files"}
+                or type(payload["delete_files"]) is not bool):
+            raise ApiError(400, "invalid_envelope",
+                           'job deletion bodies are {} or {"delete_files": true|false} '
+                           'and nothing else')
+        return payload["delete_files"]
+
+    def forget_response(self, job_id, body):
+        delete_files = self._delete_files_flag(body)
+        try:
+            deleted = self.controller.forget(job_id, delete_files=delete_files)
+        except (JobError, OSError):
+            raise ApiError(409, "job_unavailable",
+                           "job is unknown or cannot perform this action") from None
+        with self._lock:
+            self._metrics.pop(job_id, None)
+        return ApiResponse(200, {"schema": JOBS_SCHEMA, "forgotten": job_id,
+                                 "deleted_files": deleted})
+
+    def forget_all_response(self, body):
+        delete_files = self._delete_files_flag(body)
+        try:
+            forgotten, deleted, skipped = self.controller.forget_all(
+                delete_files=delete_files)
+        except (JobError, OSError):
+            raise ApiError(409, "job_unavailable",
+                           "the job history could not be cleared on this server") from None
+        # Metrics die with the records they belong to; live jobs keep theirs.
+        live = {record.job_id for record in self.controller.snapshots()}
+        with self._lock:
+            for job_id in [j for j in self._metrics if j not in live]:
+                del self._metrics[job_id]
+        return ApiResponse(200, {"schema": JOBS_SCHEMA, "forgotten": forgotten,
+                                 "deleted_files": deleted,
+                                 "skipped_live": skipped})
 
     def image(self, job_id):
         try:

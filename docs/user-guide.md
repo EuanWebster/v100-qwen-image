@@ -50,12 +50,19 @@ listing nothing that fails validation — a corrupt or unknown record is skipped
 with one log line and a job that was still running when the server stopped is
 never resurrected. Restored entries count against the same cap as live ones, so
 a rebuilt history that already fills it must be trimmed with **Forget entry**
-before new jobs are accepted. The image endpoint re-hashes the bytes it returns,
+or **Delete all history** before new jobs are accepted. The image endpoint
+re-hashes the bytes it returns,
 so an image that was changed, resized or deleted on disk is never served; its
 history entry stays listed with the thumbnail marked unavailable, so the job's
 settings remain readable and it can still be forgotten.
-**Forget entry** deletes only that `job.json`: the image file stays where it is,
-and the entry stays gone after a restart. Per-phase timings are measurements of
+**Forget entry** and **Delete all history** (History tab) open an in-page
+confirmation naming the entries, their image-file count and roughly the disk
+space the images use; ticking **Also delete the image files from disk** (off
+by default) additionally deletes each forgotten job's own output folder, and
+only that folder — the server refuses anything symlink-shaped and never
+touches queued or running jobs. Unticked, **Forget entry** deletes only that
+`job.json`: the image file stays where it is, and the entry stays gone after
+a restart. Per-phase timings are measurements of
 a running job, so a restored entry reports no elapsed time — everything else it
 shows (settings, state, image) is what the stopped server recorded.
 

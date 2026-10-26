@@ -5,7 +5,10 @@ default executor, implicit ML imports or synthetic success exists. Cancellation
 is cooperative: running jobs stay CANCELLING until the executor returns. A
 finite close reports whether the worker actually stopped; it cannot kill a
 Python thread. Production execution must additionally own/reap its child and
-release model resources before returning. No images/directories are deleted.
+release model resources before returning. No images/directories are deleted
+by default: an explicit ``delete_files`` forget opt-in removes one forgotten
+terminal job's OWN directory through root-anchored, identity-checked FDs and
+nothing else.
 A terminal FAILED/CANCELLED job additionally gets one deterministic
 boundary reference release (injectable ``release_cyclic_references``) after
 its state is recorded; successful jobs and queued-only cancellations never
@@ -88,6 +91,10 @@ def _is_gpu_oom(exc: BaseException | None) -> bool:
 
 class JobError(ValueError):
     """Bounded, fixed diagnostics; never expose executor exception text."""
+
+
+class JobHistoryFullError(JobError):
+    """Terminal history is full; forget terminal entries to accept new jobs."""
 
 
 class JobCancelled(Exception):
@@ -323,8 +330,10 @@ class JobController:
 
     Construction requires an existing explicit root; canonical root aliases
     are intentional. Root identity and artifact FDs detect observed changes,
-    not arbitrary hostile rewriting. Forget evicts only terminal metadata,
-    NEVER files. Queue/history limits are not disk quotas. Executors are
+    not arbitrary hostile rewriting. Forget evicts only terminal metadata and
+    NEVER files unless the caller passes the explicit ``delete_files`` opt-in,
+    which deletes only that job's own directory, never anything else.
+    Queue/history limits are not disk quotas. Executors are
     trusted local code, not untrusted plugin isolation.
     """
 
@@ -376,7 +385,7 @@ class JobController:
             if self._closing:
                 raise JobError("controller closed or worker unavailable")
             if len(self._records) >= self._max_records:
-                raise JobError("job history full; explicitly forget terminal metadata")
+                raise JobHistoryFullError("job history full; explicitly forget terminal metadata")
             if len(self._pending) >= self._max_pending:
                 raise JobError("job queue full")
             self._check_root()
@@ -498,17 +507,131 @@ class JobController:
             self._condition.notify_all()
             return record
 
-    def forget(self, job_id: str):
+    def forget(self, job_id: str, *, delete_files: bool = False) -> int:
+        """Evict one terminal job's history; returns the number of files deleted.
+
+        ``delete_files`` (exact bool, default False) additionally deletes the
+        job's own directory through ``_delete_job_directory``'s checks; the
+        default forget touches no files at all, exactly as before.
+        """
+        if type(delete_files) is not bool:
+            raise JobError("delete_files must be boolean")
         with self._condition:
-            if not self._record(job_id).terminal:
-                raise JobError("cannot forget live job")
-            # Removing the stored record is what makes a forget survive a
-            # restart; the image file itself is never deleted.
-            self._discard_job_record(job_id)
-            del self._records[job_id]  # never delete partials or completed artifacts
-            del self._directories[job_id]
-            self._created_ns.pop(job_id, None)
-            self._collect_ms.pop(job_id, None)  # evicted with the metadata
+            return self._forget_locked(job_id, delete_files)
+
+    def forget_all(self, *, delete_files: bool = False) -> tuple[int, int, int]:
+        """Forget EVERY terminal job; queued/running/cancelling jobs untouched.
+
+        Returns ``(forgotten, deleted_files, skipped_live)``. Each entry goes
+        through exactly the one-forget path, under one lock hold per job set
+        walk, so a partial stop can never resurrect an entry that was already
+        gone: what was forgotten stays gone across a restart.
+        """
+        if type(delete_files) is not bool:
+            raise JobError("delete_files must be boolean")
+        with self._condition:
+            forgotten = deleted = 0
+            for job_id in tuple(job_id for job_id, record in self._records.items()
+                                if record.terminal):
+                deleted += self._forget_locked(job_id, delete_files)
+                forgotten += 1
+            return forgotten, deleted, len(self._records)
+
+    def _forget_locked(self, job_id: str, delete_files: bool) -> int:
+        """One forget, with the controller lock already held by the caller.
+
+        Removing the stored record is what makes a forget survive a restart;
+        files are touched ONLY via ``_delete_job_directory`` and only when
+        the caller explicitly passed the opt-in.
+        """
+        if not self._record(job_id).terminal:
+            raise JobError("cannot forget live job")
+        self._discard_job_record(job_id)
+        # Deleted while _directories still carries this job's identity, so
+        # the directory open below is the same identity-checked one the
+        # image endpoint uses; then the metadata goes away.
+        deleted = self._delete_job_directory(job_id) if delete_files else 0
+        del self._records[job_id]  # never delete partials or completed artifacts
+        del self._directories[job_id]
+        self._created_ns.pop(job_id, None)
+        self._collect_ms.pop(job_id, None)  # evicted with the metadata
+        return deleted
+
+    def _delete_job_directory(self, job_id: str) -> int:
+        """Delete one forgotten job's OWN directory, and only its own.
+
+        Every step is anchored to the owned root FD and requires the
+        directory identity captured when this controller first saw the job,
+        so nothing outside the root is reachable: a job directory that was
+        swapped for a symlink never opens (O_NOFOLLOW), a swapped real
+        directory fails the identity check, and each entry is deleted by
+        name through the directory FD with an lstat proof that it is a
+        regular file — a symlink entry is unlinked as a link, its target
+        is never followed. Any directory that cannot be proven regular all
+        the way down keeps everything it holds. Returns the file count
+        actually deleted.
+        """
+        try:
+            self._check_root()
+            directory_fd = self._open_job_directory(job_id)
+        except (JobError, OSError):
+            print(f"qwen-history: job {job_id} files not deleted "
+                  f"(directory is unreadable or was replaced)", file=sys.stderr)
+            return 0
+        try:
+            try:
+                # Phase one: prove EVERY entry is a regular file BEFORE a
+                # single unlink — a directory holding a link or a nested
+                # directory keeps everything it holds, untouched.
+                names = os.listdir(directory_fd)
+                for name in names:
+                    try:
+                        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if not stat.S_ISREG(entry.st_mode):
+                        raise JobError("entry is not a regular file")
+            except JobError:
+                print(f"qwen-history: job {job_id} directory kept "
+                      f"(contains an entry that is not an owned regular file)",
+                      file=sys.stderr)
+                return 0
+            except OSError:
+                print(f"qwen-history: job {job_id} files not deleted "
+                      f"(directory is unreadable)", file=sys.stderr)
+                return 0
+            deleted = 0
+            # Phase two: delete by name through the verified directory FD.
+            # unlink never follows a link: even an entry replaced by a
+            # symlink after phase one loses only the link, never its
+            # target outside this directory.
+            for name in names:
+                try:
+                    os.unlink(name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    print(f"qwen-history: job {job_id} file not deleted "
+                          f"(storage error)", file=sys.stderr)
+                    return deleted
+                deleted += 1
+            try:
+                # Remove the job directory itself: the name is resolved
+                # ONLY through the owned root FD, and its lstat must still
+                # match the identity the verified open above was checked
+                # against, so a meanwhile-replaced entry is never removed.
+                # rmdir succeeds only once the directory is truly empty.
+                opened = os.fstat(directory_fd)
+                named = os.stat(job_id, dir_fd=self._root_fd, follow_symlinks=False)
+                if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise JobError("job directory replaced")
+                os.rmdir(job_id, dir_fd=self._root_fd)
+            except (JobError, OSError):
+                print(f"qwen-history: job {job_id} directory still in place",
+                      file=sys.stderr)
+            return deleted
+        finally:
+            os.close(directory_fd)
 
     def wait(self, job_id: str, *, timeout_s: float = 5) -> JobSnapshot:
         deadline = time.monotonic() + _timeout(timeout_s)
