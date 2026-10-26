@@ -5,6 +5,7 @@ owned; the browser supplies only the shared editable config envelope.
 """
 from __future__ import annotations
 
+import gc
 import json
 import re
 import secrets
@@ -41,9 +42,28 @@ PUBLIC_ERROR_CODES = {
 }
 
 
+def release_gpu_cache():
+    """Return PyTorch's cached-but-unused CUDA memory to the driver.
+
+    Jobs run in this process and each one loads its own models, so after a
+    job the caching allocator holds ~9-15 GiB that nothing is using; other
+    programs cannot have it until the server exits. Measured on the V100
+    (2026-10-26, Turbo 1024 x3): the release takes ~0.17 s and the next job's
+    load phase is unchanged (7.9-8.0 s kept vs 7.8-8.0 s released), so it
+    runs after every job rather than on a timer. A no-op when torch was never
+    imported or CUDA never initialised (CPU tests, planning-only servers).
+    """
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.cuda.is_initialized():
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 class WebGeneration:
     def __init__(self, runtime: WebRuntime, *, trust_unbounded_host=False, executor=None,
-                 performance=False, memory_release=None, reuse_verified_assets=None):
+                 performance=False, memory_release=None, reuse_verified_assets=None,
+                 gpu_cache_release=release_gpu_cache):
         if _blockers(runtime):
             raise ValueError("generation runtime is incomplete or disabled")
         self.runtime = runtime
@@ -62,6 +82,7 @@ class WebGeneration:
             self.reuse_policy = reuse_verified_assets
         else:
             self.reuse_policy = VerificationReusePolicy(max_age_s=reuse_verified_assets)
+        self._gpu_cache_release = gpu_cache_release
         self._lock = threading.Lock()
         self._metrics = {}
         self._executor = executor or self._execute
@@ -119,6 +140,14 @@ class WebGeneration:
         finally:
             with self._lock:
                 self._metrics[context.job_id]["elapsed_ms"] = (time.monotonic() - started) * 1000
+            # After every outcome, outside the job's elapsed time. A failed
+            # release is reported but never replaces the job's own result.
+            try:
+                self._gpu_cache_release()
+            except Exception:
+                print(f"qwen-web job {context.job_id}: GPU cache release failed:",
+                      file=sys.stderr)
+                traceback.print_exc()
 
     def report_steps(self, job_id, completed, total):
         """Actual completed sampler steps; never a wall-clock estimate."""

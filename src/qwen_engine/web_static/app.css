@@ -456,7 +456,9 @@ details.advanced > .help { margin-top: 10px; }
 .history-card button { margin: 4px; }
 #job-status, #job-timings { overflow-wrap: anywhere; }
 
-.result-actions { display: flex; gap: 8px; margin-top: 12px; }
+/* flex-wrap: four labelled buttons ("Download", "Open", "Generate again",
+   "Use as reference") do not fit one row in the preview column at 320px. */
+.result-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 
 /* ---------- Stats ---------- */
 

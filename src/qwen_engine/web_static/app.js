@@ -664,6 +664,13 @@
   // fields is bounded by the request itself); an over-cap body is refused,
   // never buffered. No unbounded bodies are ever read.
   var MAX_RESPONSE_BYTES = 262144;
+  // The ONE response this UI has to read whole is a finished job's own image,
+  // which "Use as reference" feeds straight back into the reference upload: a
+  // large PNG is nowhere near the JSON cap. The override is bound to the
+  // store's own upload limit, so an over-cap body is still refused rather than
+  // buffered, and it is passed PER CALL — every other route keeps
+  // MAX_RESPONSE_BYTES.
+  var MAX_JOB_IMAGE_BYTES = MAX_REFERENCE_BYTES;
   var apiConnected = false;      // a RECOGNIZED status document was seen
   var generationConnected = false;
   var submittingJob = false;
@@ -686,8 +693,14 @@
 
   // Complete body bytes, capped. The abort signal of the surrounding
   // request also errors an in-flight body stream, so a stalled or
-  // truncated body cannot hang the page.
-  function readBodyLimited(res) {
+  // truncated body cannot hang the page. `cap` is the per-call override
+  // computed by apiRequest; anything else (absent, zero, negative, NaN or
+  // larger than the ONE legitimately large response) fails closed to the
+  // default cap — an unbounded read is never reachable.
+  function readBodyLimited(res, cap) {
+    if (typeof cap !== 'number' || !(cap > 0) || cap > MAX_JOB_IMAGE_BYTES) {
+      cap = MAX_RESPONSE_BYTES;
+    }
     if (!res.body || typeof res.body.getReader !== 'function') {
       // No bounded streaming available: FAIL CLOSED. An arrayBuffer-style
       // fallback would read the whole body before the cap could be
@@ -709,7 +722,7 @@
           return out;
         }
         total += r.value.byteLength;
-        if (total > MAX_RESPONSE_BYTES) {
+        if (total > cap) {
           // Stop at once: an over-cap body is cancelled, never buffered.
           return reader.cancel().then(function () { throw BODY_TOO_LARGE; });
         }
@@ -733,7 +746,8 @@
   //   { res, bodyError: 'json' }       — complete body, malformed/undecodable
   //                                    JSON: a schema rejection, NOT a
   //                                    disconnect
-  //   { res, bodyError: 'too_large' }  — body exceeded the fixed cap
+  //   { res, bodyError: 'too_large' }  — body exceeded the applicable cap
+  //                                    (the default, or opts.maxBytes)
   //   { res, bytes }                   — mode 'raw': the COMPLETE raw bytes,
   //                                    untouched (export downloads these)
   function apiRequest(url, opts, mode) {
@@ -744,6 +758,12 @@
     // call must stay bounded by the short default.
     var budget = (opts && typeof opts.timeoutMs === 'number' &&
                   opts.timeoutMs > 0) ? opts.timeoutMs : FETCH_TIMEOUT_MS;
+    // Per-call response cap. Only the finished-image download raises it, and
+    // only up to MAX_JOB_IMAGE_BYTES (the reference store's own upload limit);
+    // an absent, non-positive or oversized value keeps the default.
+    var cap = (opts && typeof opts.maxBytes === 'number' &&
+               opts.maxBytes > 0 && opts.maxBytes <= MAX_JOB_IMAGE_BYTES)
+      ? opts.maxBytes : MAX_RESPONSE_BYTES;
     var timer = setTimeout(function () {
       timedOut = true;
       controller.abort();
@@ -751,7 +771,8 @@
     var requestOpts = {};
     if (opts) {
       for (var k in opts) {
-        if (k !== 'timeoutMs' &&
+        // timeoutMs/maxBytes are this core's own knobs, never fetch options.
+        if (k !== 'timeoutMs' && k !== 'maxBytes' &&
             Object.prototype.hasOwnProperty.call(opts, k)) requestOpts[k] = opts[k];
       }
     }
@@ -762,7 +783,7 @@
     requestOpts.cache = 'no-store';
     function settle(value) { clearTimeout(timer); return value; }
     return fetch(url, requestOpts).then(function (res) {
-      return readBodyLimited(res).then(function (bytes) {
+      return readBodyLimited(res, cap).then(function (bytes) {
         if (mode === 'raw') return settle({ res: res, bytes: bytes });
         var value;
         try {
@@ -2067,6 +2088,9 @@
       ? 'No references'
       : references.length + ' of ' + MAX_REFERENCES + ' references');
     $('reference-empty').hidden = references.length > 0;
+    // The cap gates the finished-image shortcut too: a full list must not
+    // offer another image, whether it comes from disk or from a job.
+    updateUseAsReferenceControl();
   }
 
   function referenceButton(id, action) {
@@ -2668,6 +2692,9 @@
       $(id).disabled = !complete;
       $(id).title = complete ? '' : 'No completed result selected';
     });
+    // Its own helper: the gate is the cap and the connection too, not just
+    // "a result exists", and the reason belongs in the title.
+    updateUseAsReferenceControl();
     var image = $('preview-image');
     if (complete) {
       if (image.getAttribute('src') !== job.image_url) image.src = job.image_url;
@@ -2723,6 +2750,27 @@
       view.textContent = 'View job';
       view.addEventListener('click', function () { renderSelectedJob(jobCache[id]); location.hash = '#create'; });
       card.appendChild(view);
+      // Only entries that HAVE an image get the shortcut: a queued, cancelled
+      // or failed job has nothing to feed back in.
+      if (job.state === 'succeeded') {
+        var reuse = document.createElement('button');
+        reuse.type = 'button';
+        reuse.className = 'btn-secondary';
+        reuse.textContent = 'Use as reference';
+        var blocked = useAsReferenceBlock(job);
+        reuse.disabled = blocked !== '';
+        reuse.title = blocked || 'Add this image as reference image ' +
+          (references.length + 1) + ' of ' + MAX_REFERENCES;
+        reuse.addEventListener('click', function () {
+          if (reuse.disabled) return;
+          // The list and its status line live on the Create view, so switch
+          // there first: the added card must be visible, not narrated to a
+          // hidden view. The selected job is deliberately left alone.
+          location.hash = '#create';
+          useJobImageAsReference(id);
+        });
+        card.appendChild(reuse);
+      }
       if (jobTerminal(job)) {
         var forget = document.createElement('button');
         forget.type = 'button';
@@ -2776,6 +2824,7 @@
           $('preview-image').removeAttribute('src');
           $('preview-empty').hidden = false;
           ['cancel-job', 'action-download', 'action-open', 'action-again'].forEach(function (id) { $(id).disabled = true; });
+          updateUseAsReferenceControl();   // same block reason: no result
           setText('job-status', 'No job selected.');
           setText('job-feedback', 'Ready to submit a generation.');
           $('job-feedback').removeAttribute('data-state');
@@ -2877,6 +2926,135 @@
         jobSeq++;
       }
       refreshJobs();
+    });
+  }
+
+  /* ---------------- Use as reference ----------------
+   * A finished image goes back in as a reference image. The bytes come from
+   * the job's own image endpoint and leave through the EXISTING reference
+   * upload, so no route is added and no extra trust is granted: the server
+   * re-identifies the bytes by magic and re-hashes what it just served.
+   */
+
+  // MIME type for the carrier object only. The store sniffs the magic and
+  // ignores headers; this mirrors what the endpoint served for this job's
+  // output_format (generation.py image_content_type), so name and type agree.
+  var IMAGE_CONTENT_TYPES = { jpg: 'image/jpeg', png: 'image/png',
+                              webp: 'image/webp' };
+
+  // Why the action is unavailable for THIS job, or '' when it is available.
+  // The result-panel button and every History card share it, so an image that
+  // cannot be added never looks addable, and the same sentence is the status
+  // line if a stale enabled card is clicked anyway.
+  function useAsReferenceBlock(job) {
+    if (!job || job.state !== 'succeeded' || !job.image_url) {
+      return 'That job has no finished image to add as a reference';
+    }
+    if (!apiConnected) {
+      return 'Adding a reference needs a recognized server status — use ' +
+             '"Check configuration" first';
+    }
+    if (uploadingReference) {
+      return 'A reference upload is already in flight — wait for it to finish';
+    }
+    if (references.length >= MAX_REFERENCES) {
+      return 'At most ' + MAX_REFERENCES + ' reference images are allowed — ' +
+             'remove an image before adding another';
+    }
+    return '';
+  }
+
+  function updateUseAsReferenceControl() {
+    var reason = useAsReferenceBlock(jobCache[selectedJob]);
+    $('action-reference').disabled = reason !== '';
+    $('action-reference').title = reason || 'Add this image as reference image ' +
+      (references.length + 1) + ' of ' + MAX_REFERENCES;
+  }
+
+  // Bytes plus a display name for the upload path, which reads file.size and
+  // file.name: File where the constructor exists (the status line then names
+  // the real filename), Blob otherwise. Neither wrapper reaches the server.
+  function carrierFileFromBytes(bytes, name, type) {
+    var parts = [bytes];
+    if (typeof File === 'function') {
+      try {
+        return new File(parts, name, { type: type });
+      } catch (err) {
+        /* this build rejects the File constructor: the Blob below carries it */
+      }
+    }
+    return new Blob(parts, { type: type });
+  }
+
+  function useJobImageAsReference(id) {
+    var job = jobCache[id];
+    var block = useAsReferenceBlock(job);
+    if (block) {
+      setReferenceStatus(block + '. Nothing was added.');
+      return Promise.resolve(false);
+    }
+    // Reveal the reference controls BEFORE the first request: progress,
+    // success and every refusal are narrated on the reference status line,
+    // and a hidden fieldset would leave the user with silence. Ticking the
+    // box is what this action is for — no other setting is written here.
+    $('edit-mode').checked = true;
+    applyEditMode();
+    setReferenceStatus('Loading the saved image so it can be added as a ' +
+                       'reference…');
+    return apiRequest(job.image_url, {
+      headers: {'Accept': 'image/png, image/jpeg, image/webp'},
+      maxBytes: MAX_JOB_IMAGE_BYTES
+    }, 'raw').then(function (r) {
+      if (r.network) {
+        setApiAvailable(false);
+        renderChip('Not connected', 'Not connected — the image request ' +
+          (r.timedOut ? 'timed out' : 'failed'));
+        setReferenceStatus('Could not load the saved image: the local server ' +
+          'is not reachable (or it timed out). Nothing was added.');
+        return false;
+      }
+      if (r.bodyError) {
+        // A usable response whose BODY failed is a broken contract, exactly
+        // like a rejected upload: a typed rejection, never a fake disconnect.
+        setApiAvailable(false);
+        renderChip('Status rejected',
+          'Status rejected — server contract broken');
+        setReferenceStatus('The saved image could not be read (' +
+          (r.bodyError === 'too_large'
+            ? 'over the ' + formatReferenceBytes(MAX_JOB_IMAGE_BYTES) + ' limit'
+            : 'unreadable bounded body') +
+          ') — a broken response, not a disconnect. Nothing was added.');
+        return false;
+      }
+      if (!r.res.ok) {
+        // The endpoint answers with the typed error document; only a
+        // schema-tagged, code-shaped value is ever quoted back.
+        var payload = apiErrorPayloadFromBytes(r.bytes);
+        var code = payload && payload.schema === ERROR_SCHEMA &&
+                   typeof payload.code === 'string' &&
+                   /^[a-z0-9_]{1,64}$/.test(payload.code)
+          ? payload.code : 'HTTP ' + r.res.status;
+        setReferenceStatus('The saved image could not be loaded — ' + code +
+          '. It may be missing from the server or have changed; nothing was ' +
+          'added.');
+        return false;
+      }
+      if (!(r.bytes instanceof Uint8Array) || r.bytes.length === 0) {
+        setReferenceStatus('The saved image arrived with no bytes to add. ' +
+                           'Nothing was added.');
+        return false;
+      }
+      // The existing upload path keeps ownership of the caps, the sequential
+      // upload, the dedupe by content id and the "Added reference image N"
+      // message; only the origin of the bytes differs here.
+      return addReferenceFiles([carrierFileFromBytes(
+        r.bytes, jobDownloadName(job),
+        IMAGE_CONTENT_TYPES[job.config.output_format] || 'image/png'
+      )]).then(function (count) { return count > 0; });
+    }, function () {
+      setReferenceStatus('Loading the saved image stopped unexpectedly; ' +
+                         'nothing was added.');
+      return false;
     });
   }
 
@@ -2989,6 +3167,11 @@
       var job = jobCache[selectedJob];
       if (job && job.state === 'succeeded') submitGeneration(job.config);
     });
+    // Same refusal discipline as its siblings: the disabled state is a
+    // courtesy, the function re-checks the block and states the reason.
+    $('action-reference').addEventListener('click', function () {
+      useJobImageAsReference(selectedJob);
+    });
     $('preview-image').addEventListener('error', function () {
       jobFailure('The saved image could not be loaded; it may have moved or changed.');
     });
@@ -3095,7 +3278,7 @@
   // that shortens the whole-operation timeout so a stalled response BODY
   // can be observed quickly — production code never calls it.
   window.QwenStudio = {
-    version: 'w5-rewrite',
+    version: 'w6-use-as-reference',
     formSnapshot: formSnapshot,
     buildEnvelope: buildEnvelope,
     validateForm: validateForm,
@@ -3118,6 +3301,10 @@
     parseReferenceResponse: parseReferenceResponse,
     renderReferences: renderReferences,
     MAX_REFERENCES: MAX_REFERENCES,
+    // Finished-image shortcut: the checks assert the block reasons and drive
+    // the fetch-and-upload round trip without a server.
+    useJobImageAsReference: useJobImageAsReference,
+    useAsReferenceBlock: useAsReferenceBlock,
     EDITABLE_KEYS: EDITABLE_KEYS,
     // Recipe surface: the real-Chrome check drives the lock behaviour and
     // reads what the draft would submit without a server.
