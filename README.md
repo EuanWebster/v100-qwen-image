@@ -85,14 +85,30 @@ uv venv --python 3.13 .venv
 uv pip sync --python .venv/bin/python --index-strategy unsafe-best-match requirements.lock
 
 # 2. Model weights: 24 files pinned by revision and SHA256 in models/manifest.json.
-#    Generation never downloads; fetching is a separate, explicit step.
+#    Generation never downloads on its own; you either press Download in the
+#    page (loopback only) or run the explicit fetch below.
 .venv/bin/python tools/fetch_models.py --manifest models/manifest.json \
     --models-dir models/assets --fetch
 ```
 
+Open the page after `./start-web.sh` and the **Settings → Models** section lists
+every asset with its size, reason and destination, ticks the optional ones you
+ask for, and downloads them on this machine — resumable, verified against the
+pinned SHA256, cancellable, and refused up front if the disk cannot hold it.
+
+Starting the server before any of that is the intended first run: an empty
+`models/` starts `--enable-generation` normally (it only refuses a *job* until the
+base files arrive), so the page is always reachable on a machine that has nothing
+yet.
+Generate stays disabled with "Models not downloaded" until the required base
+assets are in place. A browser on a Tailscale or LAN address sees the command
+above instead of a button, because the download belongs on the machine the
+models live on. Details:
+[`docs/user-guide.md`](docs/user-guide.md#first-run-getting-the-models).
+
 The optional Q8 transformer comes from `unsloth/Qwen-Image-2.1-GGUF`
-(`q8/qwen-image-2.1-Q8_0.gguf`), pinned in `models/q8_manifest.json`. Place it
-under `models/q8/`.
+(`q8/qwen-image-2.1-Q8_0.gguf`), pinned in `models/q8_manifest.json`. It is
+offered in that same list, or place it under `models/q8/` yourself.
 
 ## Usage
 

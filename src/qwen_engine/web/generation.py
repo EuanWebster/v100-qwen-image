@@ -23,8 +23,8 @@ from qwen_engine.errors import GenerationCancelled
 from qwen_engine.jobs import JobCancelled, JobController, JobError
 from qwen_engine.log import PhaseLogger
 from qwen_engine.web.api import (
-    ApiError, ApiResponse, WebRuntime, _blockers, build_config,
-    editable_config_dict, parse_request_json,
+    ApiError, ApiResponse, WebRuntime, build_config, editable_config_dict,
+    models_missing, parse_request_json, startup_blockers,
 )
 
 JOB_SCHEMA = "qwen_engine.web_job.v1"
@@ -64,7 +64,11 @@ class WebGeneration:
     def __init__(self, runtime: WebRuntime, *, trust_unbounded_host=False, executor=None,
                  performance=False, memory_release=None, reuse_verified_assets=None,
                  gpu_cache_release=release_gpu_cache, gpu_lock=None):
-        if _blockers(runtime):
+        if startup_blockers(runtime):
+            # `models_missing` deliberately does NOT refuse construction: the
+            # first-run page is how those bytes arrive, and a server that would
+            # not start on an empty models dir could never offer it. submit()
+            # refuses a job until the download has finished.
             raise ValueError("generation runtime is incomplete or disabled")
         self.runtime = runtime
         if type(performance) is not bool:
@@ -204,6 +208,14 @@ class WebGeneration:
         }
 
     def submit(self, body):
+        if models_missing(self.runtime):
+            # The page disables Generate for exactly this, and the server says
+            # the same thing to a client that posts anyway: no job is queued to
+            # fail inside the loader. A client that has just downloaded the
+            # weights is unblocked the moment they are on disk — no restart.
+            raise ApiError(503, "models_missing",
+                           "the image model files are not downloaded on this "
+                           "machine yet; open Settings → Models to fetch them")
         config = build_config(self.runtime, parse_request_json(body))
         if config.references:
             # Every id must resolve to a hash-verified blob BEFORE enqueue:

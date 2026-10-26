@@ -34,6 +34,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any
 
 from qwen_engine import _jsonsafe
+from qwen_engine import model_setup as _setup
 from qwen_engine import reference_store as _reference_store
 from qwen_engine import rewrite as _rewrite
 from qwen_engine import rewrite_client as _rewrite_client
@@ -491,6 +492,11 @@ class WebRuntime:
     #: reports. Additive to the status document: the schema tag does not
     #: change (plan §4.1).
     rewrite_block: Mapping[str, Any] | None = None
+    #: The first-run model setup service (:mod:`qwen_engine.model_setup`), or
+    #: ``None`` on a server that cannot offer downloads. Not JSON: it is read by
+    #: the ``/api/v1/models`` routes and by :func:`_blockers`, and never enters a
+    #: document, so it stays out of ``freeze_json``.
+    setup_service: Any = None
 
     def __post_init__(self) -> None:
         if type(self.generation_enabled) is not bool:
@@ -507,6 +513,10 @@ class WebRuntime:
             # ONE validator, so the server can never emit a block its own UI
             # parser would reject (and never leak a backend location).
             object.__setattr__(self, "rewrite_block", validate_rewrite_block(block))
+        # A service, or nothing: a half-wired object must not half-work.
+        if self.setup_service is not None and not callable(
+                getattr(self.setup_service, "required_missing", None)):
+            object.__setattr__(self, "setup_service", None)
 
     def path_fields(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in RUNTIME_PATH_FIELDS}
@@ -857,7 +867,36 @@ def _blockers(runtime: WebRuntime) -> list[str]:
     blocker = _manifest_blocker(runtime.manifest_summary)
     if blocker:
         codes.append(blocker)
+    service = getattr(runtime, "setup_service", None)
+    if service is not None and service.required_missing():
+        # Generate cannot succeed without the base assets, so the page says so
+        # with one button ("Get the basics") instead of a job that would fail in
+        # the loader. The blocker list is additive: no schema tag moves.
+        codes.append(MODELS_MISSING)
     return codes
+
+
+def startup_blockers(runtime: WebRuntime) -> list[str]:
+    """The blockers that must refuse a generation worker, and the one that must
+    not: a machine whose weights are simply not here yet is the machine that
+    needs the page.
+
+    ``models_missing`` is excluded because first-run setup IS the way those
+    bytes arrive: refusing to build the worker would leave a server that cannot
+    start at all, which is worse than a server that starts, shows the Models
+    section, and refuses a job until the download has finished. Every other
+    blocker (generation off, an unconfigured runtime, an unreadable manifest)
+    still means there is nothing to run jobs against.
+
+    Both ``web.server.main`` and :class:`WebGeneration` ask THIS question, so
+    the startup check and the worker's own guard can never drift apart.
+    """
+    return [code for code in _blockers(runtime) if code != MODELS_MISSING]
+
+
+def models_missing(runtime: WebRuntime) -> bool:
+    """True while a required model of this server's is not fully on disk."""
+    return MODELS_MISSING in _blockers(runtime)
 
 
 # ---------------------------------------------------------------------------
@@ -1405,6 +1444,296 @@ def build_rewrite_test_request(raw: bytes) -> dict[str, Any]:
     return {key: checked[key] for key in _REWRITE_TEST_KEYS}
 
 
+# ---------------------------------------------------------------------------
+# First-run model setup: the catalogue the Settings page shows, and the ONE
+# request shape that may ask for a download.
+#
+# The catalogue is built from files the SERVER owns (the committed manifests
+# plus the pins in :mod:`qwen_engine.model_setup`). Neither document may carry a
+# repository, a revision, a URL or a filesystem path: the page's only power is
+# to name items by ``id``.
+# ---------------------------------------------------------------------------
+
+#: Routes, published once so the page never types one by hand.
+MODELS_HREF = "/api/v1/models"
+MODELS_DOWNLOAD_HREF = MODELS_HREF + "/download"
+MODELS_CANCEL_HREF = MODELS_DOWNLOAD_HREF + "/cancel"
+
+#: A generation blocker, and the app.js list it must appear in.
+MODELS_MISSING = "models_missing"
+
+#: A request key that names a SOURCE rather than a choice. The catalogue lives in
+#: this checkout, so a browser that sends a repo, revision, URL, hash or path is
+#: asking for something this server will never fetch; the refusal names the rule
+#: it hit instead of answering with a bare "unexpected key".
+_SOURCE_SHAPED_KEY_RE = re.compile(
+    r"[/\\]|(^|_)(path|dir|folder|file|binary|bin|exe|gguf|model_path|repo|"
+    r"repository|revision|ref|commit|url|uri|link|sha|sha256|hash|digest|"
+    r"filename|source)$", re.I)
+
+_MODELS_KEYS = ("schema", "items", "bytes_needed", "free_bytes",
+                "required_missing", "can_download", "server_command", "job",
+                "notices")
+_MODEL_ITEM_KEYS = ("id", "label", "required", "reason", "files", "dest",
+                    "installed", "missing_files", "bytes_needed", "extra")
+_MODEL_FILE_KEYS = ("name", "bytes")
+_MODEL_JOB_KEYS = ("schema", "state", "ids", "files", "bytes_done",
+                   "bytes_total", "error")
+_MODEL_JOB_FILE_KEYS = ("item", "name", "done", "total")
+_MODEL_ERROR_KEYS = ("code", "message")
+
+#: A destination is a repo-relative directory and nothing else: no leading
+#: slash, no parent step, no drive. It is display text, and keeping it that
+#: small is what makes "the browser never learns a path" checkable.
+_DEST_RE = re.compile(r"[A-Za-z0-9._-]{1,64}(?:/[A-Za-z0-9._-]{1,64}){0,4}")
+_MODEL_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}(?:/[A-Za-z0-9._-]{1,128}){0,4}")
+
+#: The message a non-loopback client is given. It is the whole remedy: the
+#: command runs on the machine the models live on.
+SETUP_SERVER_COMMAND = ("python tools/fetch_models.py --manifest "
+                        "models/manifest.json --models-dir models/assets --fetch")
+
+
+def _bounded_text(value: Any, what: str, limit: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > limit:
+        raise ValueError(f"{what} must be a string of 1-{limit} characters")
+    return value
+
+
+def _bounded_count(value: Any, what: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{what} must be a non-negative integer")
+    return value
+
+
+def _plain_relative(value: str, what: str) -> str:
+    """A relative name with no parent step. The regexes above already refuse a
+    leading slash, a drive and any separator but ``/``; this closes the last door
+    an attacker has left, which is ``..`` as a path segment."""
+    if value in (".", "..") or any(part == ".." for part in value.split("/")):
+        raise ValueError(f"{what} must not step outside the directory it is in")
+    return value
+
+
+def _validate_model_file(row: Any) -> dict[str, Any]:
+    if not isinstance(row, Mapping) or set(row) != set(_MODEL_FILE_KEYS):
+        raise ValueError("a model file must carry exactly "
+                         f"{list(_MODEL_FILE_KEYS)}")
+    name = _bounded_text(row["name"], "a model file name", 256)
+    if _MODEL_NAME_RE.fullmatch(name) is None:
+        raise ValueError("a model file name must be a plain relative name")
+    return {"name": _plain_relative(name, "a model file name"),
+            "bytes": _bounded_count(row["bytes"], "a model file size")}
+
+
+def validate_model_item(row: Any) -> dict[str, Any]:
+    """One catalogue row, pure. Raises :class:`ValueError`, which the web layer
+    turns into a console warning and a Settings notice: a broken catalogue must
+    never reach the page as a half-rendered list."""
+    if not isinstance(row, Mapping) or set(row) != set(_MODEL_ITEM_KEYS):
+        raise ValueError(f"a model catalogue row must carry exactly "
+                         f"{list(_MODEL_ITEM_KEYS)}")
+    item_id = _bounded_text(row["id"], "a model id", 64)
+    if item_id not in _setup.ITEM_IDS:
+        raise ValueError(f"unknown model id {item_id!r}")
+    files = row["files"]
+    if (not isinstance(files, (list, tuple)) or not files
+            or len(files) > _setup.MAX_FILES_PER_ITEM):
+        raise ValueError(f"model {item_id!r} needs between one and "
+                         f"{_setup.MAX_FILES_PER_ITEM} files")
+    dest = _bounded_text(row["dest"], "a model destination", 320)
+    if _DEST_RE.fullmatch(dest) is None:
+        raise ValueError("a model destination must be a repo-relative "
+                         "directory, never an absolute path")
+    dest = _plain_relative(dest, "a model destination")
+    if row["installed"] not in _setup.INSTALL_STATES:
+        raise ValueError(f"model {item_id!r} has an unknown install state "
+                         f"{row['installed']!r}")
+    missing = row["missing_files"]
+    if (not isinstance(missing, (list, tuple))
+            or any(not isinstance(name, str) or not name or len(name) > 256
+                   or ".." in name.split("/") for name in missing)):
+        raise ValueError(f"model {item_id!r} lists missing files badly")
+    if row["extra"] not in ("", _setup.NEEDS_BINARY):
+        raise ValueError(f"model {item_id!r} carries an unknown extra "
+                         "requirement")
+    if not isinstance(row["required"], bool):
+        raise ValueError(f"model {item_id!r} needs a boolean required flag")
+    return {
+        "id": item_id,
+        "label": _bounded_text(row["label"], "a model label", 120),
+        "required": row["required"],
+        "reason": _bounded_text(row["reason"], "a model reason", 400),
+        "files": [_validate_model_file(one) for one in files],
+        "dest": dest,
+        "installed": row["installed"],
+        "missing_files": [str(name) for name in missing],
+        "bytes_needed": _bounded_count(row["bytes_needed"],
+                                       "a model byte count"),
+        "extra": row["extra"],
+    }
+
+
+def validate_models_job(job: Any) -> dict[str, Any]:
+    """The one download job, pure; ``None`` means idle."""
+    if job is None:
+        return {"schema": _setup.JOB_SCHEMA, "state": _setup.STATE_IDLE,
+                "ids": [], "files": [], "bytes_done": 0, "bytes_total": 0,
+                "error": None}
+    if not isinstance(job, Mapping) or set(job) != set(_MODEL_JOB_KEYS):
+        raise ValueError(f"a download job must carry exactly "
+                         f"{list(_MODEL_JOB_KEYS)}")
+    if job["schema"] != _setup.JOB_SCHEMA:
+        raise ValueError(f"a download job must be tagged "
+                         f"{_setup.JOB_SCHEMA!r}")
+    if job["state"] not in _setup.JOB_STATES:
+        raise ValueError(f"unknown download state {job['state']!r}")
+    ids = job["ids"]
+    if (not isinstance(ids, (list, tuple))
+            or any(item not in _setup.ITEM_IDS for item in ids)):
+        raise ValueError("a download job lists an unknown model id")
+    rows = job["files"]
+    if not isinstance(rows, (list, tuple)) or len(rows) > _setup.MAX_FILES_PER_ITEM:
+        raise ValueError("a download job lists too many files")
+    files = []
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != set(_MODEL_JOB_FILE_KEYS):
+            raise ValueError("a download progress row must carry exactly "
+                             f"{list(_MODEL_JOB_FILE_KEYS)}")
+        name = _bounded_text(row["name"], "a download file name", 256)
+        if _MODEL_NAME_RE.fullmatch(name) is None:
+            raise ValueError("a download file name must be a plain relative name")
+        done = _bounded_count(row["done"], "a download byte count")
+        total = _bounded_count(row["total"], "a download byte total")
+        if done > total:
+            raise ValueError("a download row counted more bytes than the file has")
+        files.append({"item": _bounded_text(row["item"], "a model id", 64),
+                      "name": _plain_relative(name, "a download file name"),
+                      "done": done, "total": total})
+    error = job["error"]
+    if error is None:
+        checked_error = None
+    elif isinstance(error, Mapping) and set(error) == set(_MODEL_ERROR_KEYS):
+        checked_error = {
+            "code": _bounded_text(error["code"], "a download error code", 64),
+            "message": _bounded_text(error["message"],
+                                     "a download error message", 400)}
+    else:
+        raise ValueError("a download error must carry exactly "
+                         f"{list(_MODEL_ERROR_KEYS)} or be null")
+    bytes_done = _bounded_count(job["bytes_done"], "a download byte count")
+    bytes_total = _bounded_count(job["bytes_total"], "a download byte total")
+    if bytes_done > bytes_total:
+        raise ValueError("the download counted more bytes than it was asked for")
+    return {"schema": _setup.JOB_SCHEMA, "state": job["state"],
+            "ids": [str(item) for item in ids], "files": files,
+            "bytes_done": bytes_done, "bytes_total": bytes_total,
+            "error": checked_error}
+
+
+def validate_models_state(document: Any) -> dict[str, Any]:
+    """The whole ``GET /api/v1/models`` document, pure.
+
+    The server validates its own catalogue before it sends it, the same way the
+    rewriter choice is validated before it is saved: a page must never receive a
+    document it cannot parse, and the key set is closed so a stale page and a
+    new server fail loudly rather than silently.
+    """
+    if not isinstance(document, Mapping) or set(document) != set(_MODELS_KEYS):
+        raise ApiError(500, "models_unavailable",
+                       "the model catalogue is malformed",
+                       (("models", "the server could not build a model list"),))
+    if document["schema"] != _setup.MODELS_SCHEMA:
+        raise ApiError(500, "models_unavailable",
+                       "the model catalogue is malformed",
+                       (("models", "the server could not build a model list"),))
+    items = document["items"]
+    if not isinstance(items, (list, tuple)) or not items:
+        raise ApiError(500, "models_unavailable",
+                       "the model catalogue is empty",
+                       (("models", "no model could be read from this "
+                                   "server's pinned list"),))
+    try:
+        rows = [validate_model_item(row) for row in items]
+        job = validate_models_job(document["job"])
+        needed = _bounded_count(document["bytes_needed"],
+                                "the catalogue byte total")
+        free = document["free_bytes"]
+        free = None if free is None else _bounded_count(free, "the free space")
+        command = _bounded_text(document["server_command"],
+                                "the setup command", 320)
+        if command != SETUP_SERVER_COMMAND:
+            # One definition, pinned like the schema tag: the page renders this
+            # string as the remedy, so it may only ever be the real command.
+            raise ValueError("the setup command is not the one this build ships")
+        notices = document["notices"]
+        if not isinstance(notices, (list, tuple)):
+            raise ValueError("the setup notices must be a list of sentences")
+        notices = [_bounded_text(one, "a setup notice", 400) for one in notices]
+        for one in notices:
+            if "://" in one or "//" in one or "/home/" in one or "/tmp/" in one:
+                raise ValueError("a setup notice must not name a location")
+    except ValueError as exc:
+        raise ApiError(500, "models_unavailable",
+                       "the model catalogue is malformed",
+                       (("models", str(exc)[:400]),)) from None
+    # The same rule the service applies: a required id that is not in the rows
+    # at all (an unreadable base manifest) is missing too, so a server that
+    # cannot list the base model still reports the truth instead of being
+    # refused by its own consistency check.
+    required_missing = any(
+        row["required"] and row["installed"] != _setup.INSTALLED for row in rows
+    ) or any(item_id not in {row["id"] for row in rows}
+             for item_id in _setup.REQUIRED_IDS)
+    if bool(document["required_missing"]) != required_missing:
+        raise ApiError(500, "models_unavailable",
+                       "the model catalogue is inconsistent",
+                       (("models", "the required-model flag did not match the "
+                                   "rows"),))
+    return {"schema": _setup.MODELS_SCHEMA, "items": rows,
+            "bytes_needed": needed, "free_bytes": free,
+            "required_missing": required_missing,
+            "can_download": bool(document["can_download"]),
+            "server_command": command, "job": job, "notices": notices}
+
+
+def build_models_download_request(raw: bytes) -> dict[str, Any]:
+    """``POST /api/v1/models/download`` body -> ``{"ids": [...]}``.
+
+    Ids only. There is no key that could carry a path, a repo or a revision, and
+    an empty id list is legal: the required items are always added by the
+    service, which is what makes "Get the basics" a one-button action.
+    """
+    data = parse_request_json(raw)
+    if not isinstance(data, Mapping):
+        raise ApiError(400, "invalid_envelope",
+                       "the model download request must be a JSON object")
+    if any(not isinstance(key, str) for key in data):
+        raise ApiError(400, "invalid_envelope", "request keys must be strings")
+    missing = sorted({"schema", "ids"} - set(data))
+    extra = sorted(set(data) - {"schema", "ids"})
+    if missing or extra:
+        parts = []
+        if missing:
+            parts.append("missing key(s): " + ", ".join(missing))
+        if extra:
+            parts.append("unexpected key(s): " + ", ".join(extra))
+            if any(_SOURCE_SHAPED_KEY_RE.search(key) for key in extra):
+                parts.append("this server takes no repository, revision, URL, "
+                             "hash or path from the browser: a download is "
+                             "requested by model id only")
+        raise ApiError(400, "invalid_envelope", "; ".join(parts))
+    if data["schema"] != _setup.DOWNLOAD_REQUEST_SCHEMA:
+        raise ApiError(400, "invalid_envelope",
+                       f"schema must be {_setup.DOWNLOAD_REQUEST_SCHEMA!r}")
+    ids = data["ids"]
+    if (not isinstance(ids, (list, tuple))
+            or any(not isinstance(item, str) or not item or len(item) > 64
+                   for item in ids)):
+        raise ApiError(422, "invalid_request",
+                       "the download ids must be a list of model id strings",
+                       (("ids", f"expected some of: {', '.join(_setup.ITEM_IDS)}"),))
+    return {"ids": list(dict.fromkeys(ids))}
 #: The Settings page's per-task groups: one row per draft kind, each listing
 #: every rewriter with `available`/`reason` already resolved.
 _TASK_ROW_KEYS = frozenset({"task", "label", "choices"})
@@ -1586,6 +1915,9 @@ __all__ = [
     "validate_rewrite_active_by_task", "validate_rewrite_settings",
     "validate_rewrite_settings_state", "build_rewrite_settings_request",
     "build_rewrite_test_request", "rewrite_test_result", "strip_command",
+    "MODELS_HREF", "MODELS_DOWNLOAD_HREF", "MODELS_CANCEL_HREF",
+    "MODELS_MISSING", "SETUP_SERVER_COMMAND", "build_models_download_request",
+    "validate_model_item", "validate_models_job", "validate_models_state",
 ]
 
 

@@ -1603,11 +1603,13 @@ def test_use_as_reference_reads_the_job_image_endpoint_and_reuses_the_upload():
     assert "JSON.stringify" not in body and "btoa(" not in body
     # The closed set of routes the page knows. The rewriter Settings page adds
     # exactly two (read the choice, write the choice) plus the probe hanging off
-    # the write route; nothing else may appear.
+    # the write route; first-run model setup adds three (read the catalogue,
+    # start the download, cancel it). Nothing else may appear.
     assert sorted(set(re.findall(r"var (API_[A-Z_]+) = ", js))) == \
-        ["API_EXPORT", "API_IMPORT", "API_JOBS", "API_PLAN", "API_REFERENCES",
-         "API_REWRITE", "API_REWRITE_SETTINGS", "API_REWRITE_SETTINGS_TEST",
-         "API_STATUS"]
+        ["API_EXPORT", "API_IMPORT", "API_JOBS", "API_MODELS",
+         "API_MODELS_DOWNLOAD", "API_MODELS_DOWNLOAD_CANCEL", "API_PLAN",
+         "API_REFERENCES", "API_REWRITE", "API_REWRITE_SETTINGS",
+         "API_REWRITE_SETTINGS_TEST", "API_STATUS"]
     # Every failure mode is narrated on the reference status line, never an
     # alert(): network, unusable body, typed HTTP error, empty body.
     assert "alert(" not in body
@@ -2015,8 +2017,8 @@ def test_the_rewriter_is_chosen_once_on_the_server_not_per_rewrite():
     assert 'id="view-settings"' in html
     assert '<section id="view-settings" class="view" hidden' in html
     assert "settings: 'view-settings'" in js
-    assert "if (active === 'settings') loadRewriteSettings();" in \
-        _js_function(js, "renderView"), "opening Settings re-reads the server"
+    assert "loadRewriteSettings();" in _js_function(
+        js, "renderView"), "opening Settings re-reads the server"
 
 
 def test_the_settings_page_offers_every_rewriter_for_each_draft_kind():
@@ -2308,10 +2310,34 @@ process.stdout.write(JSON.stringify(out));
 
 
 def _js_var(js: str, name: str) -> str:
-    """One top-level ``var <name> = ...;`` statement from app.js, verbatim."""
-    m = re.search(rf"^  var {re.escape(name)} = [\s\S]*?;$", js, re.M)
-    assert m, f"{name} not found in app.js"
-    return m.group(0)
+    """One top-level ``var <name> = ...;`` statement from app.js, verbatim.
+
+    The statement is found by scanning for its terminator, not by guessing the
+    layout: the value may wrap onto further lines and the line may carry a
+    trailing comment, so only a bracket/string-aware scan knows where it ends.
+    """
+    start = re.search(rf"^  var {re.escape(name)} =\s", js, re.M)
+    assert start, f"{name} not found in app.js"
+    depth = 0
+    quote = ""
+    index = start.end()
+    while index < len(js):
+        char = js[index]
+        if quote:
+            if char == "\\":
+                index += 1
+            elif char == quote:
+                quote = ""
+        elif char in "'\"`":
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == ";" and depth == 0:
+            return js[start.start():index + 1]
+        index += 1
+    raise AssertionError(f"{name} has no statement end in app.js")
 
 
 def _run_settings_parsers(tmp_path: Path, docs: list[dict]) -> list[dict]:
@@ -2539,3 +2565,728 @@ def test_the_settings_parsers_still_refuse_a_document_that_is_not_theirs(tmp_pat
         assert result["checked"] == {"t2i": None, "edit": None}, why
         assert result["off"] is False, why
         assert result["fields"] == {"endpoint": "", "model": "", "timeout": ""}
+
+
+# --------------------------------------------------------------------------
+# First-run model setup: the Models card and the Create-page banner, EXECUTED
+# in node over the documents the server really produces. The card's whole job
+# is to render a server document and to send ids back, so a string check would
+# prove nothing about the two things that can actually go wrong: a real
+# document the closed parser refuses (the page then offers nothing), and a page
+# that sends back more than ids.
+# --------------------------------------------------------------------------
+
+MODEL_VARS = ("MODEL_IDS", "MODELS_KEYS", "MODEL_ITEM_KEYS",
+              "MODEL_FILE_KEYS", "MODELS_JOB_KEYS", "MODELS_JOB_FILE_KEYS",
+              "MODELS_ERROR_KEYS", "MODEL_INSTALL_STATES", "MODEL_JOB_STATES",
+              "MODELS_MISSING", "MODELS_SCHEMA", "MODELS_JOB_SCHEMA",
+              "MODELS_DOWNLOAD_REQUEST_SCHEMA", "MODEL_NEEDS_BINARY",
+              "MODEL_NEEDS_BINARY_TEXT", "MODEL_STATE_TEXT",
+              "modelsDoc", "modelsBusy", "modelsTimer", "modelsSeq",
+              "modelsBannerDismissed", "modelsMissingBlocked")
+
+MODEL_FNS = ("hasOnlyKeys", "isPlainRelativeName", "parseModelsFileRow",
+             "parseModelsItem", "parseModelsJob", "parseModelsDocument",
+             "fillModelsFiles", "renderModelsSettings", "renderModelsProgress",
+             "modelsSelectedIds", "modelsDownloadEnvelope",
+             "renderModelsBanner", "formatBytes")
+
+# Both model harnesses share this: the extracted app.js code, then the smallest
+# DOM the Models card touches. Neither one reimplements a product rule.
+_MODELS_HEAD = """// Built by tests/test_web_static.py: the real app.js model functions,
+// extracted verbatim and run over the documents the server really produces.
+var fs = require("node:fs");
+__PARTS__
+"""
+
+_MODELS_STUB = """
+var textSets = {};
+function setText(id, value) { textSets[id] = String(value); }
+
+var ELEMENTS = {};
+function classList(node) {
+  var held = {};
+  return {
+    add: function (name) { held[name] = true; },
+    remove: function (name) { delete held[name]; },
+    contains: function (name) { return !!held[name]; },
+    _held: function () { return Object.keys(held); }
+  };
+}
+function element(id, extra) {
+  ELEMENTS[id] = Object.assign({ id: id, hidden: true, checked: false,
+                                 disabled: true, textContent: "" },
+                               extra || {});
+  ELEMENTS[id].classList = classList(ELEMENTS[id]);
+  return ELEMENTS[id];
+}
+["models-card", "models-total", "models-note", "models-error", "models-status",
+ "models-server-only", "models-progress", "models-progress-label",
+ "models-banner", "models-banner-text"].forEach(function (id) {
+  element(id);
+});
+["models-download", "models-cancel"].forEach(function (id) {
+  element(id, { setAttribute: function () {},
+                removeAttribute: function () {} });
+});
+element("models-progress-bar", { value: -1 });
+["models-progress-files"].forEach(function (id) { element(id, {}); });
+MODEL_IDS.forEach(function (id) {
+  element("model-row-" + id);
+  element("model-tick-" + id);
+  element("model-tag-" + id);
+  element("model-files-" + id, { firstChild: null,
+                                 removeChild: function () { this.firstChild = null; },
+                                 appendChild: function (child) { this.firstChild = child; } });
+});
+
+var created = [];
+var document = {
+  createElement: function (tag) {
+    var node = { tagName: tag, className: "", textContent: "",
+                 children: [], appendChild: function (c) { this.children.push(c); } };
+    created.push(node);
+    return node;
+  },
+  // The card asks for one element by id without the $ helper, so the stub
+  // answers both spellings the way the browser does.
+  getElementById: function (id) { return ELEMENTS[id] || null; }
+};
+function $(id) { return ELEMENTS[id]; }
+
+function resetElements() {
+  Object.keys(ELEMENTS).forEach(function (id) {
+    var el = ELEMENTS[id];
+    el.hidden = true; el.checked = false; el.disabled = true;
+    el.textContent = "";
+    if (id === "models-progress-bar") el.value = -1;
+  });
+}
+
+function tickState() {
+  var out = {};
+  MODEL_IDS.forEach(function (id) {
+    var row = ELEMENTS["model-row-" + id];
+    var tick = ELEMENTS["model-tick-" + id];
+    out[id] = { shown: !row.hidden, checked: tick.checked, disabled: tick.disabled };
+  });
+  return out;
+}
+"""
+
+# The synchronous pass: hand the parser and the renderer a document, read what
+# the card shows and what the Download button would send.
+_MODELS_SYNC_BODY = """
+var docs = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+var out = docs.map(function (item) {
+  resetElements();
+  textSets = {};
+  modelsDoc = parseModelsDocument(item.doc);
+  modelsBusy = false;
+  modelsBannerDismissed = !!item.dismissed;
+  modelsMissingBlocked = !!item.blocked;
+  renderModelsSettings();
+  // The product calls this from checkStatus with the status blocker; the case
+  // flag stands in for that document.
+  renderModelsBanner(!!item.blocked);
+  return {
+    parsed: modelsDoc,
+    card: !$("models-card").hidden,
+    ticks: tickState(),
+    banner: !$("models-banner").hidden,
+    envelope: modelsDownloadEnvelope(),
+    downloadDisabled: $("models-download").disabled,
+    cancelDisabled: $("models-cancel").disabled,
+    sets: textSets
+  };
+});
+process.stdout.write(JSON.stringify(out));
+"""
+
+_MODELS_HARNESS = _MODELS_HEAD + _MODELS_STUB + _MODELS_SYNC_BODY
+
+# The asynchronous pass: the SAME handlers driven through the page's real
+# request path, so a reply is only accepted if the code that arrived is the
+# code that is read.
+_MODELS_FETCH_STUB = """
+// The one collaborator this pass does not exercise: after a job ends the page
+// re-reads the whole status document, and that path is tested elsewhere.
+function checkStatus() { return Promise.resolve(null); }
+
+var fetchCalls = [];
+function makeResponse(status, body) {
+  var bytes = new TextEncoder().encode(body);
+  var sent = false;
+  return {
+    ok: status >= 200 && status < 300,
+    status: status,
+    headers: { get: function () { return "application/json"; } },
+    body: { getReader: function () {
+      return { read: function () {
+        if (sent) return Promise.resolve({ done: true });
+        sent = true;
+        return Promise.resolve({ done: false, value: bytes });
+      }, cancel: function () { return Promise.resolve(); } };
+    } }
+  };
+}
+function fetch(url, opts) {
+  fetchCalls.push({ url: url, opts: opts });
+  var plan = docs[nextCase].response;
+  return Promise.resolve(makeResponse(plan.status, plan.body));
+}
+"""
+
+_MODELS_ASYNC_BODY = """
+var docs = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+var nextCase = 0;
+var out = docs.map(function (item) {
+  resetElements();
+  textSets = {};
+  fetchCalls = [];
+  modelsDoc = null;
+  modelsBusy = false;
+  modelsTimer = 0;
+  modelsBannerDismissed = !!item.dismissed;
+  var work = (item.step === "post")
+    ? postModels(item.url || "/api/v1/models/download", item.body)
+    : loadModelStatus();
+  return work.then(function () {
+    renderModelsBanner(!!item.blocked);
+    return {
+      parsed: modelsDoc,
+      card: !$("models-card").hidden,
+      banner: !$("models-banner").hidden,
+      error: textSets["models-error"] || "",
+      status: textSets["models-status"] || "",
+      polls: modelsTimer !== 0,
+      calls: fetchCalls.map(function (c) { return c.url; }),
+      sentBodies: fetchCalls.map(function (c) { return c.opts && c.opts.body; }),
+      sentHeaders: fetchCalls.map(function (c) {
+        return (c.opts && c.opts.headers) ? Object.keys(c.opts.headers).sort() : [];
+      })
+    };
+  });
+});
+Promise.all(out).then(function (rows) {
+  process.stdout.write(JSON.stringify(rows));
+});
+"""
+
+_MODELS_REQUEST_HARNESS = (_MODELS_HEAD + _MODELS_STUB + _MODELS_FETCH_STUB
+                           + _MODELS_ASYNC_BODY)
+
+_MODELS_CARD = "models-card"
+
+
+def _models_document(tmp_path: Path) -> dict:
+    """The exact ``GET /api/v1/models`` body for a fresh temporary install."""
+    from qwen_engine import model_setup as setup
+    from qwen_engine.web import api
+    service = setup.ModelSetupService(_models_roots(tmp_path))
+    return {**service.state(), "can_download": True,
+            "server_command": api.SETUP_SERVER_COMMAND,
+            "notices": list(service.notices())}
+
+
+def _models_roots(tmp_path: Path):
+    """A ``models/`` parent pinning two base files with NEITHER present.
+
+    The manifest uses the production schema and real sha256s, so the catalogue,
+    the byte figures and the required-missing verdict all come out of the real
+    code path: the card is exercised in the state a first run actually shows.
+    """
+    import hashlib
+    import json
+
+    from qwen_engine import model_setup as setup
+    small = b"config-json\n"
+    big = b"weights-" * 64
+
+    def artifact(filename, data, role):
+        return {"role": role, "repo": "Qwen/Test-Base",
+                "revision": "a" * 40, "filename": filename,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "bytes": len(data)}
+
+    parent = tmp_path / "assetroot"
+    (parent / "assets").mkdir(parents=True, exist_ok=True)
+    (parent / "manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "artifacts": [artifact("model_index.json", small, "pipeline"),
+                      artifact("transformer/weights.bin", big,
+                               "transformer")]}))
+    return setup.SetupRoots.for_paths(models_dir=str(parent / "assets"),
+                                      manifest_path=str(parent / "manifest.json"),
+                                      q8_manifest_path=None)
+
+
+def _run_models_card(tmp_path: Path, cases: list[dict]) -> list[dict]:
+    """Run the real model parsers and the real renderer over `cases`, in node."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed, so app.js cannot be executed")
+    js = _read("app.js")
+    parts = "\n".join([_js_var(js, name) for name in MODEL_VARS]
+                      + [_js_function(js, fn) for fn in MODEL_FNS])
+    harness = tmp_path / "models_harness.js"
+    documents = tmp_path / "models_documents.json"
+    harness.write_text(_MODELS_HARNESS.replace("__PARTS__", parts),
+                       encoding="utf-8")
+    documents.write_text(json.dumps(cases), encoding="utf-8")
+    run = subprocess.run([node, str(harness), str(documents)],
+                         capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, f"node harness failed: {run.stderr[:2000]}"
+    return json.loads(run.stdout)
+
+
+def test_the_models_card_renders_the_document_the_server_sends(tmp_path):
+    from qwen_engine import model_setup as setup
+
+    doc = _models_document(tmp_path)
+    result = _run_models_card(tmp_path, [{"doc": doc}])[0]
+
+    assert result["parsed"] is not None, "the real document was rejected"
+    assert result["card"] is True, "a parsed catalogue must show the card"
+    # An offered row is visible; the required one is not tickable (its files come
+    # with every request), an offered optional one is. A row the server did not
+    # offer at all stays hidden — no dead checkbox.
+    ticks = result["ticks"]
+    assert ticks[setup.BASE]["shown"] is True
+    assert ticks[setup.BASE]["disabled"] is True
+    assert ticks[setup.PE_TEXT]["shown"] is True
+    assert ticks[setup.PE_TEXT]["disabled"] is False
+    assert ticks[setup.TURBO]["shown"] is False, "no turbo manifest, no row"
+    assert ticks[setup.Q8]["shown"] is False, "no q8 sidecar, no row"
+    # Size and destination are on the page, in the server's own words.
+    sizes = {k: v for k, v in result["sets"].items() if k.startswith("model-size-")}
+    assert any("to download" in value for value in sizes.values()), sizes
+    dests = {k: v for k, v in result["sets"].items() if k.startswith("model-dest-")}
+    assert any(value.startswith("Stored in ") for value in dests.values()), dests
+    for value in list(sizes.values()) + list(dests.values()):
+        # The real invariant: the page shows a name, never a machine location.
+        shown = value.split("Stored in ", 1)[-1]
+        assert not shown.startswith("/") and ".." not in shown, value
+        assert tmp_path.as_posix() not in value, value
+    # Nothing was ticked, so only the required ids would be sent — and the
+    # document's own shape, not a guess, decides that.
+    assert result["envelope"] == {"schema": setup.DOWNLOAD_REQUEST_SCHEMA,
+                                  "ids": [setup.BASE]}
+    assert result["downloadDisabled"] is False
+    assert result["cancelDisabled"] is True
+
+
+def test_the_models_card_sends_only_the_ids_the_user_ticked(tmp_path):
+    from qwen_engine import model_setup as setup
+
+    doc = _models_document(tmp_path)
+    js_case = {"doc": doc}
+    # The harness reads the ticks out of the DOM; ticking happens by name so
+    # the test says which items a user chose, not how the DOM is wired.
+    result = _run_models_card(tmp_path, [js_case])[0]
+    assert result["envelope"]["ids"] == [setup.BASE]
+
+    # With the optional enhancer weights ticked the request grows by exactly
+    # that id, and never by a path, a repo or a revision.
+    doc["items"][0]["required"] = False  # a server that asks nothing of us
+    grew = _run_models_card(tmp_path, [{"doc": doc}])[0]
+    assert grew["envelope"] == {"schema": setup.DOWNLOAD_REQUEST_SCHEMA,
+                                "ids": []}
+
+
+def test_the_models_card_refuses_documents_that_are_not_the_servers(tmp_path):
+    doc = _models_document(tmp_path)
+    tampered: dict[str, dict] = {}
+    for why, mutate in (
+            ("an extra top-level key", lambda d: d.update({"model_dir": "/tmp"})),
+            ("a top-level key gone", lambda d: d.pop("job")),
+            ("a non-integer byte count",
+             lambda d: d["items"][0]["files"][0].update({"bytes": "5"})),
+            ("a parent step in a file name",
+             lambda d: d["items"][0]["files"][0].update({"name": "../x.gguf"})),
+            ("an absolute destination",
+             lambda d: d["items"][0].update({"dest": "/home/op/models"})),
+            ("an unknown install state",
+             lambda d: d["items"][0].update({"installed": "probably"})),
+            ("a job over its own byte bound",
+             lambda d: d.update({"job": {"schema": "qwen_engine.web_models_job.v1",
+                                         "state": "running", "ids": ["base"],
+                                         "files": [], "bytes_done": -1,
+                                         "bytes_total": 4, "error": None}})),
+            ("a negative free-space figure",
+             lambda d: d.update({"free_bytes": -1})),
+            ("a notice that is not a string",
+             lambda d: d.update({"notices": [None]})),
+            ("a JSON null instead of a document", lambda d: d.clear())):
+        broken = json.loads(json.dumps(doc))
+        mutate(broken)
+        tampered[why] = {"doc": broken if broken else None}
+
+    results = _run_models_card(tmp_path, list(tampered.values()))
+    for (why, _doc), result in zip(tampered.items(), results):
+        assert result["parsed"] is None, f"{why} was accepted"
+        assert result["card"] is False, f"{why} rendered a half card"
+        assert result["envelope"] == {"schema":
+                                      _MODELS_SCHEMA_NAME, "ids": []}, why
+        assert result["downloadDisabled"] is True, why
+
+
+_MODELS_SCHEMA_NAME = "qwen_engine.web_models_download_request.v1"
+
+
+def test_the_models_banner_follows_the_server_not_the_browser(tmp_path):
+    doc = _models_document(tmp_path)
+    shown, hidden, dismissed = _run_models_card(tmp_path, [
+        {"doc": doc, "blocked": True},
+        {"doc": doc, "blocked": False},
+        {"doc": doc, "blocked": True, "dismissed": True},
+    ])
+    assert shown["banner"] is True, "a missing required model must say so"
+    assert hidden["banner"] is False
+    assert dismissed["banner"] is False, "'Not now' hides it for this page load"
+    assert "not on this machine" in shown["sets"]["models-banner-text"]
+
+
+def test_a_server_that_cannot_download_says_so_instead_of_failing(tmp_path):
+    doc = _models_document(tmp_path)
+    doc["can_download"] = False
+    result = _run_models_card(tmp_path, [{"doc": doc}])[0]
+    assert result["parsed"] is not None
+    assert result["downloadDisabled"] is True and result["cancelDisabled"] is True
+    assert result["sets"].get("models-error", "") == ""
+
+
+def test_the_models_markup_and_css_are_present_and_theme_neutral():
+    html, css = _read("index.html"), _read("app.css")
+    for element_id in ("models-card", "models-banner", "models-download",
+                       "models-cancel", "models-progress", "models-total",
+                       "models-server-only", "models-server-command"):
+        assert f'id="{element_id}"' in html, element_id
+    assert '<section class="models-banner" id="models-banner" hidden' in html
+    assert 'id="models-card" hidden' in html
+    for selector in (".models-banner", ".model-row", ".models-progress",
+                     ".models-server", ".models-files"):
+        assert selector in css, selector
+    assert "#models-note:not(:empty) { color: var(--text-muted); }" in css
+
+
+def test_the_models_literals_are_the_servers_literals():
+    """Every one of these is a wire token, not a label: the parser compares the
+    document against them, so a page and a server that drifted apart would show
+    an empty card on a healthy install."""
+    from qwen_engine import model_setup as setup
+    from qwen_engine.web import api
+    js = _read("app.js")
+    assert (_js_var(js, "MODELS_SCHEMA") ==
+            f"  var MODELS_SCHEMA = '{setup.MODELS_SCHEMA}';")
+    assert (_js_var(js, "MODELS_JOB_SCHEMA") ==
+            f"  var MODELS_JOB_SCHEMA = '{setup.JOB_SCHEMA}';")
+    assert (_js_var(js, "MODELS_DOWNLOAD_REQUEST_SCHEMA") ==
+            f"  var MODELS_DOWNLOAD_REQUEST_SCHEMA =\n"
+            f"    '{setup.DOWNLOAD_REQUEST_SCHEMA}';")
+    assert (f"'{setup.NEEDS_BINARY}'" in _js_var(js, "MODEL_NEEDS_BINARY"))
+    assert _js_var(js, "MODELS_MISSING") == \
+        f"  var MODELS_MISSING = '{api.MODELS_MISSING}';"
+    assert re.findall(r"'([a-z0-9-]+)'", _js_var(js, "MODEL_IDS")) == \
+        list(setup.ITEM_IDS)
+    assert set(re.findall(r"'([a-z_-]+)'", _js_var(js, "MODEL_INSTALL_STATES"))) \
+        == set(setup.INSTALL_STATES)
+    assert set(re.findall(r"'([a-z_-]+)'", _js_var(js, "MODEL_JOB_STATES"))) \
+        == set(setup.JOB_STATES)
+    # The closed key sets, both directions: the JS parser and the Python
+    # validator must describe the same document.
+    for var, python in (("MODELS_KEYS", api._MODELS_KEYS),
+                        ("MODEL_ITEM_KEYS", api._MODEL_ITEM_KEYS),
+                        ("MODEL_FILE_KEYS", api._MODEL_FILE_KEYS),
+                        ("MODELS_JOB_KEYS", api._MODEL_JOB_KEYS),
+                        ("MODELS_JOB_FILE_KEYS", api._MODEL_JOB_FILE_KEYS),
+                        ("MODELS_ERROR_KEYS", api._MODEL_ERROR_KEYS)):
+        assert sorted(re.findall(r"'([a-z_-]+)'", _js_var(js, var))) == \
+            sorted(python), var
+
+
+# --------------------------------------------------------------------------
+# The same card, but through the page's REAL request path (apiRequest +
+# readBodyLimited + fetch). The harness above stubs the request away, which is
+# exactly how one bug survived it: apiRequest reports the Response object, so a
+# handler that reads a `status` field that does not exist treats EVERY healthy
+# reply as a failure and the card stays empty on a healthy install. Only
+# running the handlers over a fake fetch can see that.
+# --------------------------------------------------------------------------
+
+MODEL_REQUEST_VARS = MODEL_VARS + ("API_MODELS", "API_MODELS_DOWNLOAD",
+                                   "API_MODELS_DOWNLOAD_CANCEL",
+                                   "FETCH_TIMEOUT_MS", "MAX_RESPONSE_BYTES",
+                                   "MAX_JOB_IMAGE_BYTES", "MAX_REFERENCE_BYTES",
+                                   "BODY_TOO_LARGE", "UNSUPPORTED_BODY")
+
+MODEL_REQUEST_FNS = ("readBodyLimited", "apiRequest") + MODEL_FNS + (
+    "loadModelStatus", "postModels", "startModelsPolling", "stopModelsPolling")
+
+
+def _run_models_request(tmp_path: Path, cases: list[dict]) -> list[dict]:
+    """Run the page's real request path (fetch → apiRequest → handlers)."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed, so app.js cannot be executed")
+    js = _read("app.js")
+    parts = "\n".join([_js_var(js, name) for name in MODEL_REQUEST_VARS]
+                      + [_js_function(js, fn) for fn in MODEL_REQUEST_FNS])
+    harness = tmp_path / "models_request_harness.js"
+    documents = tmp_path / "models_requests.json"
+    harness.write_text(_MODELS_REQUEST_HARNESS.replace("__PARTS__", parts),
+                       encoding="utf-8")
+    documents.write_text(json.dumps(cases), encoding="utf-8")
+    run = subprocess.run([node, str(harness), str(documents)],
+                         capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, f"node harness failed: {run.stderr[:2000]}"
+    return json.loads(run.stdout)
+
+
+def test_the_models_card_reads_a_healthy_reply_as_healthy(tmp_path):
+    """The regression: the handler used a `status` field apiRequest never
+    returns, so a 200 with a perfect document was reported as unreadable and the
+    card stayed empty on a healthy install."""
+    doc = _models_document(tmp_path)
+    result = _run_models_request(tmp_path, [{
+        "response": {"status": 200, "body": json.dumps(doc)}}])[0]
+    assert result["error"] == "", result["error"]
+    assert result["parsed"] is not None, "a healthy 200 must be parsed"
+    assert result["card"] is True
+    assert result["calls"] == ["/api/v1/models"]
+    assert result["sentHeaders"] == [["Accept", "X-Qwen-UI"]]
+
+
+def test_the_models_card_uses_the_status_code_it_was_given(tmp_path):
+    """503 and 403 say different things to a user, and only if the code that
+    arrived is the code that is read."""
+    unavailable = _run_models_request(tmp_path, [{
+        "response": {"status": 503,
+                     "body": json.dumps({"schema": "qwen_engine.web_error.v1",
+                                         "code": "models_unavailable",
+                                         "message": "the catalogue is "
+                                                    "unreadable"})}}])[0]
+    assert unavailable["parsed"] is None
+    assert unavailable["card"] is False
+    assert unavailable["error"] == \
+        "This server cannot read its model catalogue."
+
+    refused = _run_models_request(tmp_path, [{
+        "step": "post",
+        "body": {"ids": ["base"]},
+        "response": {"status": 403,
+                     "body": json.dumps({"schema": "qwen_engine.web_error.v1",
+                                         "code": "setup_on_server",
+                                         "message": "Run python "
+                                                    "tools/fetch_models.py "
+                                                    "there"})}}])[0]
+    assert refused["card"] is False
+    assert refused["error"] == "Run python tools/fetch_models.py there"
+    assert refused["sentBodies"] == ['{"ids":["base"]}']
+
+
+def test_a_started_download_shows_progress_and_polls_until_it_ends(tmp_path):
+    from qwen_engine import model_setup as setup
+
+    running = {"schema": setup.JOB_SCHEMA, "state": "running", "ids": ["base"],
+               "files": [{"item": "base", "name": "model_index.json",
+                          "done": 4, "total": 12}],
+               "bytes_done": 4, "bytes_total": 12, "error": None}
+    result = _run_models_request(tmp_path, [{
+        "step": "post",
+        "body": {"ids": ["base"]},
+        "response": {"status": 202, "body": json.dumps(running)}}])[0]
+    assert result["error"] == "", result["error"]
+    assert result["status"] == "Downloading…"
+    assert result["polls"] is True, "a running job must arm the progress poll"
+    assert result["sentBodies"] == ['{"ids":["base"]}']
+
+    finished = dict(running, state="cancelled", error=None)
+    stopped = _run_models_request(tmp_path, [{
+        "step": "post",
+        "body": {},
+        "response": {"status": 200, "body": json.dumps(finished)}}])[0]
+    assert stopped["polls"] is False, "a finished job must not keep polling"
+
+
+# --------------------------------------------------------------------------
+# checkStatus EXECUTED: the second live-found bug was an ordering one. The
+# page labels the Generate button from `modelsMissingBlocked`, and the flag was
+# written after the label, so a fresh install explained a dead button with the
+# wrong sentence. A string check cannot see an order; running the handler can.
+# --------------------------------------------------------------------------
+
+# Concatenated in this order, so a constant that another constant's initialiser
+# references (KNOWN_BLOCKER_CODES contains MODELS_MISSING) is already assigned
+# when the array literal is evaluated.
+STATUS_VARS = ("MODELS_MISSING", "INVALID", "REWRITE_BLOCK_KEYS",
+               "REWRITE_STATES", "API_REWRITE_SETTINGS", "STATUS_SCHEMA",
+               "GATE_STATES", "MANIFEST_REASON_CODES", "KNOWN_BLOCKER_CODES",
+               "MODELS_GENERATE_REASON", "GENERATION_UNAVAILABLE_REASON",
+               "API_STATUS",
+               "FETCH_TIMEOUT_MS", "MAX_RESPONSE_BYTES", "MAX_JOB_IMAGE_BYTES",
+               "MAX_REFERENCE_BYTES", "BODY_TOO_LARGE", "UNSUPPORTED_BODY",
+               "apiConnected", "generationConnected", "submittingJob",
+               "jobCache", "modelsMissingBlocked", "modelsBannerDismissed",
+               "statusSeq")
+
+STATUS_FNS = ("readBodyLimited", "apiRequest", "containsId", "hasAnyValue",
+              "parseManifestCore", "blockersExact",
+              "parseRewriteSettingsPointer", "parseRewriteBackends",
+              "parseRewriteActiveByTask", "parseRewriteBlock", "parseStatus",
+              "statusUnrecognizedText", "updateGenerate", "renderChip",
+              "renderModelsBanner", "checkStatus")
+
+_STATUS_HARNESS = """// Built by tests/test_web_static.py: the real status handler, run over the
+// real /api/v1/status document with three collaborators stubbed (each is
+// covered by its own section: the connection flag, the rewriter block, the job
+// list). The button's label is the thing under test.
+var fs = require("node:fs");
+__PARTS__
+
+var textSets = {};
+function setText(id, value) { textSets[id] = String(value); }
+var ELEMENTS = {
+  "generate-btn": { id: "generate-btn", disabled: true, textContent: "" },
+  "models-banner": { id: "models-banner", hidden: true },
+  "connection-chip": { id: "connection-chip", textContent: "" }
+};
+function $(id) { return ELEMENTS[id]; }
+
+function setApiAvailable(value) { apiConnected = value; }
+function setRewriterState(block) {}
+function refreshJobs() { return Promise.resolve(null); }
+
+function fetch(url, opts) {
+  return Promise.resolve({
+    ok: plan.status >= 200 && plan.status < 300,
+    status: plan.status,
+    headers: { get: function () { return "application/json"; } },
+    body: (function () {
+      var bytes = new TextEncoder().encode(plan.body);
+      var sent = false;
+      return { getReader: function () {
+        return { read: function () {
+          if (sent) return Promise.resolve({ done: true });
+          sent = true;
+          return Promise.resolve({ done: false, value: bytes });
+        }, cancel: function () { return Promise.resolve(); } };
+      } };
+    })()
+  });
+}
+
+var docs = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+var plan = null;
+var out = docs.map(function (item) {
+  Object.keys(textSets).forEach(function (k) { delete textSets[k]; });
+  ELEMENTS["generate-btn"].disabled = true;
+  ELEMENTS["models-banner"].hidden = true;
+  generationConnected = false;
+  submittingJob = false;
+  modelsMissingBlocked = false;
+  modelsBannerDismissed = false;
+  plan = item;
+  return checkStatus().then(function () {
+    return { reason: textSets["generate-reason"] || "",
+             banner: !ELEMENTS["models-banner"].hidden,
+             disabled: ELEMENTS["generate-btn"].disabled,
+             sets: textSets };
+  });
+});
+Promise.all(out).then(function (rows) {
+  process.stdout.write(JSON.stringify(rows));
+});
+"""
+
+
+def _run_check_status(tmp_path: Path, cases: list[dict]) -> list[dict]:
+    """Run the real status handler over `cases` (each a canned /api/v1/status)."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed, so app.js cannot be executed")
+    js = _read("app.js")
+    parts = "\n".join([_js_var(js, name) for name in STATUS_VARS]
+                      + [_js_function(js, fn) for fn in STATUS_FNS])
+    harness = tmp_path / "status_harness.js"
+    documents = tmp_path / "status_documents.json"
+    harness.write_text(_STATUS_HARNESS.replace("__PARTS__", parts),
+                       encoding="utf-8")
+    documents.write_text(json.dumps(cases), encoding="utf-8")
+    run = subprocess.run([node, str(harness), str(documents)],
+                         capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, f"node harness failed: {run.stderr[:2000]}"
+    return json.loads(run.stdout)
+
+
+def test_the_generate_button_names_the_blocker_that_killed_it(tmp_path):
+    """The server's own status document decides the sentence beside the button,
+    and the banner beside the prompt — in the same pass, not the next one.
+
+    Each document is produced by the real status route for a machine in a real
+    state, so the page is driven by what qwen-web actually sends.
+    """
+    import hashlib
+
+    from qwen_engine import model_setup as setup
+    from qwen_engine.web import api
+
+    def status(*, installed: bool, generation_enabled: bool) -> dict:
+        root = tmp_path / ("full" if installed else "bare")
+        assets = root / "assets"
+        assets.mkdir(parents=True, exist_ok=True)
+        alpha, beta = b"config-json\n", b"weights-" * 64
+
+        def artifact(name, data, role):
+            return {"role": role, "repo": "Qwen/Test-Base",
+                    "revision": "a" * 40, "filename": name,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "bytes": len(data)}
+
+        (root / "manifest.json").write_text(json.dumps({
+            "schema_version": 1,
+            "artifacts": [artifact("model_index.json", alpha, "pipeline"),
+                          artifact("transformer/weights.bin", beta,
+                                   "transformer")]}))
+        if installed:
+            (assets / "model_index.json").write_bytes(alpha)
+            (assets / "transformer").mkdir(parents=True, exist_ok=True)
+            (assets / "transformer" / "weights.bin").write_bytes(beta)
+        roots = setup.SetupRoots.for_paths(
+            models_dir=str(assets), manifest_path=str(root / "manifest.json"),
+            q8_manifest_path=None)
+        service = setup.ModelSetupService(roots)
+        runtime = api.WebRuntime(
+            output_dir=str(tmp_path / "out"), cache_dir=str(tmp_path / "cache"),
+            models_dir=str(assets), manifest_path=str(root / "manifest.json"),
+            manifest_summary=api.summarize_manifest_bytes(
+                (root / "manifest.json").read_bytes()),
+            generation_enabled=generation_enabled, setup_service=service)
+        return api.status_response(runtime).payload
+
+    fresh = _run_check_status(tmp_path, [{
+        "status": 200,
+        "body": json.dumps(status(installed=False,
+                                  generation_enabled=True))}])[0]
+    assert fresh["disabled"] is True
+    assert fresh["reason"] == ("Models not downloaded — Settings → Models lists "
+                               "what is needed and can fetch them on this "
+                               "machine."), fresh["reason"]
+    assert fresh["banner"] is True
+
+    installed = _run_check_status(tmp_path, [{
+        "status": 200,
+        "body": json.dumps(status(installed=True,
+                                  generation_enabled=True))}])[0]
+    assert installed["disabled"] is False
+    assert "Jobs run one at a time" in installed["reason"], installed["reason"]
+    assert installed["banner"] is False
+
+    no_generation = _run_check_status(tmp_path, [{
+        "status": 200,
+        "body": json.dumps(status(installed=True,
+                                  generation_enabled=False))}])[0]
+    assert "Connect to a qwen-web server started with --enable-generation" \
+        in no_generation["reason"], no_generation["reason"]
+    assert no_generation["banner"] is False
+

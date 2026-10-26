@@ -120,7 +120,7 @@ include the transformer shard whose fetch timed out** (whose recoverable
 statement extends to environment files, tensor code or anything else beyond
 what §3 explicitly scopes.
 
-## 4. Storage location and the no-download rule
+## 4. Storage location and who may fetch
 
 Assets, when an operator deliberately fetches them, live under
 **`models/assets/`** (gitignored; the *manifest itself* is committed under
@@ -137,6 +137,33 @@ Config path defaults for `manifest_path`/`models_dir` stay **unset** — a run
 without an explicit manifest refuses (exit 4) rather than guessing, and the
 resolver **never** downloads, mirrors or "auto-fixes": local loading verifies
 or fails.
+
+That remains true of every *generation* path. What changed is who may start the
+explicit step: the server now offers it as a first-run flow. `GET /api/v1/models`
+serves a catalogue built from the committed manifests plus the pins in
+`qwen_engine/model_setup.py`, and `POST /api/v1/models/download` runs exactly the
+`tools.fetch_models._download` step above — same partial file, same resume rules,
+same exact-size + SHA256 publish — for the items the operator named by `id`,
+always including the required base assets. Nothing about it comes from the
+browser but the ids: no URL, repository, revision or path, and only a loopback
+client may write. An empty `models/` is a normal startup, not an error; Generate
+is simply gated until the required files arrive. The enhancer checkpoints, their
+BF16 vision projector and the digest-pinned system prompts are offered the same
+way (their SHA256/md5 pins live in `model_setup.py`, next to the values
+`rewrite.py` checks); a download that fails verification deletes the file and
+reports the failure instead of publishing it. The one thing the page cannot
+fetch is the `llama-server` binary the enhancer needs: it must be built with
+CUDA for sm_70 (`nvidia-cuda-toolkit`, then cmake with `-DGGML_CUDA=ON
+-DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-13`).
+
+That sentence is now enforced in one place rather than two. `api.startup_blockers()`
+is the single rule `web.server.main` and `WebGeneration` both ask, and it omits
+`models_missing` from the status blockers: a machine whose weights have not
+arrived is the machine that needs the page, so refusing to build the generation
+worker there left the server exiting with "could not be initialized" and no way
+to fetch anything. The gate moved to where it can be lifted without a restart:
+`WebGeneration.submit()` refuses a job with `503 models_missing` while a required
+file is absent, and unblocks the moment the download publishes it.
 
 **Fetch tool: ready (code + offline tests; subsequently run by root —
 partially complete).** `tools/fetch_models.py` exists as the separate, explicit operator step

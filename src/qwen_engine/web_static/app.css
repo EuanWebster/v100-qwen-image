@@ -585,6 +585,56 @@ details.advanced > .help { margin-top: 10px; }
 .rewrite-source:empty { display: none; }
 .rewrite-actions .help a { color: var(--accent); }
 
+/* ---------- First-run model setup ----------
+   The Models card and the Create-page banner. Colour comes only from the theme
+   tokens, so all three themes keep their contrast. */
+.models-banner { max-width: 720px; margin: 0 0 16px; padding: 14px 16px;
+                 border: 1px solid var(--ok-border); border-radius: var(--radius);
+                 background: var(--bg-raised); }
+.models-banner h3 { margin: 0 0 6px; font-size: 15px; }
+.models-banner .help { margin: 0 0 10px; }
+.models-banner-actions { display: flex; flex-wrap: wrap; gap: 10px;
+                         align-items: center; }
+.models-banner-actions .btn-primary { text-decoration: none; }
+
+.models-total { margin: 10px 0 4px; font-size: 13px; color: var(--text-muted); }
+.models-total:empty { display: none; }
+.models-list { margin-top: 8px; }
+.model-row { padding: 10px 0; border-top: 1px solid var(--border-soft); }
+.model-row:first-child { border-top: 0; }
+.model-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.model-tick { display: flex; gap: 8px; align-items: baseline; cursor: pointer; }
+.model-tick input { margin: 0; }
+.model-label { font-weight: 600; }
+.model-tag { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+             color: var(--text-muted); border: 1px solid var(--border);
+             border-radius: 999px; padding: 1px 7px; }
+.model-tag:empty { display: none; }
+.model-size { font-size: 12px; color: var(--text-muted); margin-left: auto; }
+.model-row .settings-reason { padding-left: 26px; }
+.model-row-done .model-label, .model-row-done .model-size { opacity: .62; }
+.models-files { list-style: none; margin: 6px 0 0; padding: 0 0 0 26px; }
+.models-files:empty { display: none; }
+.models-file { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px;
+               color: var(--text-muted); }
+.models-file-name { overflow-wrap: anywhere; }
+.models-file-count { margin-left: auto; }
+
+.models-server { margin-top: 12px; padding: 10px 12px;
+                 border: 1px solid var(--border-soft);
+                 border-radius: var(--radius); background: var(--bg-raised); }
+.models-server .help { margin: 0 0 6px; }
+.models-command { margin: 0; font-family: monospace; font-size: 12px;
+                  overflow-wrap: anywhere; color: var(--text); }
+
+.models-progress { margin-top: 14px; }
+.models-progress label { display: block; font-size: 13px; margin-bottom: 4px; }
+.models-progress progress { width: 100%; height: 10px; }
+#models-status:not(:empty) { color: var(--ok); }
+/* No --warning token exists in any theme, so the caution line is muted text, */
+#models-note:not(:empty) { color: var(--text-muted); }
+#generate-reason { overflow-wrap: anywhere; }
+
 .back-link { color: var(--accent); text-decoration: none; display: inline-block;
              margin-top: 14px; }
 .back-link:hover { text-decoration: underline; }
