@@ -16,6 +16,7 @@ import time
 import pytest
 from PIL import Image
 
+from qwen_engine import _jsonsafe
 from qwen_engine import reference_store
 from qwen_engine import rewrite as rw
 from qwen_engine import rewrite_client as rc
@@ -25,6 +26,15 @@ from qwen_engine.web import rewrite_service as rs
 ENDPOINT = "http://127.0.0.1:8079/v1/chat/completions"
 MODEL = "Qwen3.8"
 PROMPTS = {"t2i": "system prompt for t2i", "edit": "system prompt for edit"}
+#: Both enhancer checkpoints: PE-T2I answers a text draft, and the edit draft
+#: needs its own GGUF PLUS its vision projector.
+BINARY = "/opt/llama/llama-server"
+GGUF_T2I = "/models/pe/PE-T2I-Q8_0.gguf"
+GGUF_I2I = "/models/pe/PE-I2I-Q8_0.gguf"
+MMPROJ = "/models/pe/mmproj-PE-I2I-BF16.gguf"
+#: A syntactically valid reference id: the store is consulted only after the
+#: rewriter for the draft kind has been chosen.
+REFERENCE_ID = "a" * 64
 
 
 def reply(content: str) -> bytes:
@@ -73,8 +83,10 @@ def store_image(root, mode="RGB", size=(64, 48), colour=(200, 30, 30),
     return reference_store.put_bytes(root, buffer.getvalue())
 
 
-def user_parts(log_entry: dict) -> list:
-    return log_entry["messages"][-1]["content"]
+def user_parts(log_entry) -> list:
+    """The user turn's content, from a logged request body or a fake client."""
+    messages = log_entry["messages"] if isinstance(log_entry, dict) else log_entry
+    return messages[-1]["content"]
 
 
 def edit_service(tmp_path, transport, **overrides) -> tuple:
@@ -91,19 +103,87 @@ def edit_service(tmp_path, transport, **overrides) -> tuple:
     return svc, request(task="edit", image_ids=[ref])
 
 
+class RecordingClient:
+    """A fake rewriter client: the drafts it answered and the messages it saw.
+
+    The official enhancer is a llama-server subprocess in production, so every
+    test that routes to it uses one of these. What is observable — and what the
+    per-task contract is actually about — is WHICH client object answered, and
+    what it was shown.
+    """
+
+    def __init__(self, name, timeout=30.0):
+        self.name = name
+        self.timeout = timeout
+        self.messages = []
+        self.requests = []
+        self.closes = 0
+
+    def complete(self, messages, task, sampling=None):
+        self.messages.append(messages)
+        self.requests.append(task)
+        return json.dumps({"rewritten_prompt": f"rewritten by {self.name}"})
+
+    def close(self):
+        self.closes += 1
+        return True
+
+
+def enhancer_service(clients, *, pe=None, preferences=None, **overrides):
+    """A service with BOTH official checkpoints installed and every client fake.
+
+    The edit checkpoint plus its vision projector are installed by default (that
+    is what makes the edit group's official radio real); ``pe`` overrides any
+    enhancer field, so ``{"i2i_model_path": None, "i2i_mmproj_path": None}``
+    describes a server with only the text weights.
+
+    ``clients`` ends up holding the live client per ``(task, backend)`` the
+    service built: one per checkpoint, plus the ONE endpoint client the service
+    keys by both draft kinds.
+    """
+    files = {"i2i_model_path": GGUF_I2I, "i2i_mmproj_path": MMPROJ}
+    files.update(pe or {})
+    pe_settings = rs.PESettings(llama_server=BINARY, model_path=GGUF_T2I,
+                                system_prompts=dict(PROMPTS), timeout=300.0,
+                                **files)
+
+    def factory(task, backend, local, pe_cfg, prefs):
+        clients[(task, backend)] = RecordingClient(f"{backend} for {task}")
+        return clients[(task, backend)]
+
+    return rs.RewriteService(settings(**overrides), pe=pe_settings,
+                             preferences=preferences, client_factory=factory)
+
+
 # ---------------------------------------------------------------------------
 # Off by default
 # ---------------------------------------------------------------------------
 
 
-def test_disabled_is_the_default_and_refuses_without_a_transport():
+def test_disabled_is_the_default_and_refuses_every_draft_kind():
+    """Nothing is configured here, so a draft of EITHER kind is refused with
+    the fact the user can act on — never silently handed to the other kind's
+    rewriter. The OFF SWITCH is a different answer, and says so differently."""
     service_off = rs.RewriteService(rs.RewriteSettings.disabled())
     assert service_off.available is False
+    assert service_off.active_by_task() == {"t2i": None, "edit": None}
     assert service_off.status_block()["code"] == "rewrite_disabled"
     assert service_off.status_block()["backend"] is None
+    for task, words, images in (("t2i", "text-to-image", []),
+                                ("edit", "image-edit", [REFERENCE_ID])):
+        with pytest.raises(api.ApiError) as exc:
+            service_off.submit(request(task=task, image_ids=images))
+        assert (exc.value.status, code(exc)) == (422, "task_unsupported"), task
+        assert words in exc.value.message
+        assert "OpenAI-compatible endpoint" in exc.value.message
+    switched_off = rs.RewriteService(
+        rs.RewriteSettings.disabled(),
+        preferences=rs.RewritePreferences(
+            choices={"t2i": "local-llm", "edit": "local-llm"}, enabled=False))
     with pytest.raises(api.ApiError) as exc:
-        service_off.submit(request())
+        switched_off.submit(request())
     assert exc.value.status == 503 and code(exc) == "rewrite_disabled"
+    assert "switched off" in switched_off.status_block()["reason"]
 
 
 def test_disabled_settings_refuse_to_carry_a_backend_surface():
@@ -118,18 +198,22 @@ def test_a_disabled_service_builds_no_client_at_all():
     service_off = rs.RewriteService(rs.RewriteSettings.disabled())
     assert service_off._clients == {}
     assert service_off.active_backend is None
+    assert service_off.active_by_task() == {"t2i": None, "edit": None}
+    assert service_off.backend_tasks("local-llm") == []
     assert service_off.available_backends() == []
 
 
 def test_status_block_carries_no_endpoint_or_path():
     block = service(answer()).status_block()
-    # The closed shape the UI parser expects, plus the two keys the amendment
-    # adds: which rewriters exist here, and the ROUTE their choice is written
-    # to. An on-disk path never appears — the file lives in the cache dir and
-    # is named on the operator's console instead.
+    # The closed shape the UI parser expects, plus the keys the rewriter
+    # contract adds: which rewriters exist here, WHICH DRAFT KIND each of them
+    # answers, and the ROUTE the choice is written to. An on-disk path never
+    # appears — the file lives in the cache dir and is named on the operator's
+    # console instead.
     assert set(block) == {"state", "code", "backend", "reason", "backends",
-                          "settings"}
+                          "settings", "active_by_task"}
     assert block["backend"] == "local-llm" and block["reason"] == ""
+    assert block["active_by_task"] == {"t2i": "local-llm", "edit": "local-llm"}
     assert [row["id"] for row in block["backends"]] == ["local-llm"]
     assert block["settings"] == {"href": api.REWRITE_SETTINGS_HREF,
                                  "saved": False}
@@ -766,6 +850,65 @@ def test_status_block_is_built_by_the_shared_validator():
         dict(web_api.REWRITE_DISABLED_BLOCK)
 
 
+def test_the_per_task_block_survives_the_freeze_the_runtime_applies():
+    """``WebRuntime`` stores the block FROZEN — lists become tuples, mappings
+    become mappingproxies — and validates that frozen form. What comes back
+    must be plain JSON again or every status poll 500s on its own shape, and
+    the per-task map has to survive the round trip because it is the only key
+    that says who answers an edit draft."""
+    clients: dict = {}
+    svc = enhancer_service(clients, preferences=rs.RewritePreferences(
+        choices={"t2i": "pe-llamacpp", "edit": "local-llm"}, enabled=True))
+    block = svc.status_block()
+    assert block["active_by_task"] == {"t2i": "pe-llamacpp",
+                                       "edit": "local-llm"}
+    # The single ``backend`` field stays for older readers: the text draft's.
+    assert block["backend"] == "pe-llamacpp"
+    assert {row["id"]: row["tasks"] for row in block["backends"]} == \
+        {"pe-llamacpp": ["t2i", "edit"], "local-llm": ["t2i", "edit"]}
+    errors: list[str] = []
+    frozen = _jsonsafe.freeze_json(block, "rewrite_block", errors)
+    assert errors == [] and not isinstance(frozen, dict)
+    checked = api.validate_rewrite_block(frozen)
+    assert checked == block and type(checked) is dict
+    assert isinstance(checked["backends"], list)
+    assert isinstance(checked["active_by_task"], dict)
+    assert json.loads(json.dumps(checked)) == block
+
+
+def test_a_block_cannot_claim_a_rewriter_answers_what_it_cannot():
+    """``active_by_task`` is a claim about capability, so the block's own
+    ``backends`` rows must back it up: a status that says the enhancer answers
+    an edit draft while its own row lists only ``t2i`` is a contradiction, and
+    the browser would offer a radio the server cannot honour."""
+    row = {"id": "pe-llamacpp",
+           "label": api.REWRITE_BACKEND_LABELS["pe-llamacpp"],
+           "tasks": ["t2i"], "uses_gpu": True}
+    base = {"state": "available", "code": "rewrite_available",
+            "backend": "pe-llamacpp", "reason": "", "backends": [row]}
+    with pytest.raises(ValueError, match="answers"):
+        api.validate_rewrite_block({**base, "active_by_task": {
+            "t2i": "pe-llamacpp", "edit": "pe-llamacpp"}})
+    with pytest.raises(ValueError, match="does not list"):
+        api.validate_rewrite_block({**base, "active_by_task": {
+            "t2i": "pe-llamacpp", "edit": "local-llm"}})
+    for active in ({"t2i": "pe-llamacpp"},
+                   {"t2i": "pe-llamacpp", "edit": "pe-llamacpp",
+                    "video": None},
+                   {"t2i": None, "edit": None}):
+        with pytest.raises(ValueError):
+            api.validate_rewrite_block({**base, "active_by_task": active})
+    # Legal: the other draft kind simply has nothing answering it yet.
+    assert api.validate_rewrite_block({**base, "active_by_task": {
+        "t2i": "pe-llamacpp", "edit": None}})["active_by_task"] == \
+        {"t2i": "pe-llamacpp", "edit": None}
+    # An UNAVAILABLE block answers nothing, per task as well as overall.
+    with pytest.raises(ValueError):
+        api.validate_rewrite_block({**dict(api.REWRITE_DISABLED_BLOCK),
+                                    "active_by_task": {"t2i": "local-llm",
+                                                       "edit": None}})
+
+
 def test_status_block_refuses_a_backend_name_that_would_leak_a_location():
     """A backend string is echoed to the browser, so a location in it is a
     configuration error caught at startup, not a leaked address."""
@@ -840,6 +983,97 @@ def test_references_are_downscaled_but_never_enlarged(tmp_path):
     assert wire_size(rs._reference_image_uri(str(root), big, 1)) == (768, 384)
     # And a small reference is sent at its own size, not blown up.
     assert wire_size(rs._reference_image_uri(str(root), small, 1)) == (40, 20)
+
+
+def test_the_two_rewriters_are_shown_different_copies_of_the_same_reference(tmp_path):
+    """The 768 px copy was chosen for the chat endpoint; the official edit
+    enhancer was verified with a reference of up to 1 MP and
+    ``--image-max-tokens 1280``, so it gets its profile's PIXEL budget instead.
+    Those are different claims about how much a rewriter needs to SEE, so the
+    caller names one rather than the service guessing."""
+    root = tmp_path / "store"
+    wide = store_image(root, size=(1600, 800), fmt="JPEG")
+    assert rs.OFFICIAL_IMAGE_MAX_PIXELS == 1024 * 1024
+    assert wire_size(rs._reference_image_uri(str(root), wide, 1)) == (768, 384)
+    official = wire_size(rs._reference_image_uri(
+        str(root), wide, 1, max_dim=None,
+        max_pixels=rs.OFFICIAL_IMAGE_MAX_PIXELS))
+    assert official[0] * official[1] <= rs.OFFICIAL_IMAGE_MAX_PIXELS
+    assert official[0] / official[1] == pytest.approx(2.0, abs=0.01)
+    # A pixel budget is not a thumbnail: the official copy keeps more detail.
+    assert max(official) > rs.REWRITE_IMAGE_MAX_DIM
+    # Only an image already OVER budget is resampled, so a compliant reference
+    # reaches the weights exactly as the user supplied it.
+    fits = store_image(root, size=(1000, 900))
+    assert wire_size(rs._reference_image_uri(
+        str(root), fits, 1, max_dim=None,
+        max_pixels=rs.OFFICIAL_IMAGE_MAX_PIXELS)) == (1000, 900)
+
+
+def test_a_rewrite_shows_each_rewriter_its_own_copy(tmp_path):
+    """Same reference, same edit draft: the official edit client is shown the
+    1 MP copy, the endpoint the 768 px one, and the text checkpoint — which the
+    choice did not select — is shown neither."""
+    root = tmp_path / "store"
+    ref = store_image(root, size=(1600, 800), fmt="JPEG")
+    official_clients: dict = {}
+    official = enhancer_service(official_clients, references_dir=str(root))
+    payload = official.submit(request(task="edit", image_ids=[ref])).payload
+    assert payload["backend"] == "pe-llamacpp"
+    assert official_clients[("t2i", "pe-llamacpp")].requests == []
+    parts = user_parts(official_clients[("edit", "pe-llamacpp")].messages[0])
+    shown = wire_size(parts[0]["image_url"]["url"])
+    assert shown[0] * shown[1] <= rs.OFFICIAL_IMAGE_MAX_PIXELS
+    assert max(shown) > rs.REWRITE_IMAGE_MAX_DIM
+
+    endpoint_clients: dict = {}
+    split = enhancer_service(endpoint_clients, references_dir=str(root),
+                             preferences=rs.RewritePreferences(
+                                 choices={"t2i": "pe-llamacpp",
+                                          "edit": "local-llm"}, enabled=True))
+    assert split.submit(request(task="edit",
+                               image_ids=[ref])).payload["backend"] == \
+        "local-llm"
+    parts = user_parts(endpoint_clients[("t2i", "local-llm")].messages[0])
+    assert wire_size(parts[0]["image_url"]["url"]) == (768, 384)
+
+
+def test_only_the_installed_checkpoint_is_offered_for_its_own_draft_kind(tmp_path):
+    """PE-T2I alone means the enhancer answers text drafts and NOTHING else:
+    the edit client is never built, the edit draft goes to the endpoint instead,
+    and a server with no endpoint refuses it rather than showing the reference
+    to weights that were never trained on one."""
+    root = tmp_path / "store"
+    ref = store_image(root, size=(64, 48))
+    text_only = {"i2i_model_path": None, "i2i_mmproj_path": None}
+    with_endpoint: dict = {}
+    svc = enhancer_service(with_endpoint, pe=text_only, references_dir=str(root))
+    assert svc.backend_tasks("pe-llamacpp") == ["t2i"]
+    assert svc.backend_tasks("local-llm") == ["t2i", "edit"]
+    assert svc.active_by_task() == {"t2i": "pe-llamacpp", "edit": "local-llm"}
+    assert ("edit", "pe-llamacpp") not in with_endpoint
+    assert svc.submit(request(task="edit", image_ids=[ref])).payload[
+        "backend"] == "local-llm"
+    assert svc.status_block()["active_by_task"] == {"t2i": "pe-llamacpp",
+                                                    "edit": "local-llm"}
+    # The task-specific reason is what the page shows, and it names no path.
+    reason = svc.unavailable_reason("pe-llamacpp", "edit")
+    assert "image-edit" in reason and "/" not in reason
+    # The text draft's sentence is a different fact, and does not mention it.
+    assert "image-edit" not in svc.unavailable_reason("pe-llamacpp", "t2i")
+
+    alone: dict = {}
+    no_endpoint = rs.RewriteService(
+        rs.RewriteSettings.disabled(),
+        pe=rs.PESettings(llama_server=BINARY, model_path=GGUF_T2I,
+                         system_prompts=dict(PROMPTS), timeout=300.0),
+        client_factory=lambda task, backend, local, pe_cfg, prefs:
+        alone.setdefault((task, backend), RecordingClient(backend)))
+    assert no_endpoint.active_by_task() == {"t2i": "pe-llamacpp", "edit": None}
+    with pytest.raises(api.ApiError) as exc:
+        no_endpoint.submit(request(task="edit", image_ids=[ref]))
+    assert (exc.value.status, code(exc)) == (422, "task_unsupported")
+    assert alone[("t2i", "pe-llamacpp")].requests == []
 
 
 def test_the_downscale_bound_preserves_aspect_and_stays_within_the_cap(tmp_path):
@@ -917,10 +1151,12 @@ def test_a_blocked_decode_holds_no_lock_and_never_deadlocks(tmp_path):
 
     original = module._reference_image_uri
 
-    def slow(root_arg, reference_id, ordinal):
+    # The budget keywords travel with the call, so a seam has to accept them:
+    # the endpoint copy is capped by long side, the official one by pixels.
+    def slow(root_arg, reference_id, ordinal, **budget):
         entered.set()
         assert release.wait(10.0)
-        return original(root_arg, reference_id, ordinal)
+        return original(root_arg, reference_id, ordinal, **budget)
 
     module._reference_image_uri = slow
     try:

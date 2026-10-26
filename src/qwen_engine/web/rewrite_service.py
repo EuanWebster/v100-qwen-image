@@ -69,7 +69,7 @@ single source of truth.
 *Typed failures* — :class:`~qwen_engine.web.api.ApiError`, messages bounded and
 **never containing prompt text, a path, a port or a URL**::
 
-    503 rewrite_disabled         no backend configured, or the choice is off
+    503 rewrite_disabled         the Off switch is on for both draft kinds
     503 rewrite_busy             another rewrite is in flight (never a queue)
     503 rewrite_gpu_busy         an image job holds the GPU; the enhancer
                                  cannot share it, and it does not wait
@@ -77,8 +77,8 @@ single source of truth.
     502 rewrite_unavailable      transport failure / non-2xx from the backend
     502 rewrite_invalid_answer   transport violation (not a completion)
     422 prompt_too_long          over ``PROMPT_MAX_CHARS``
-    422 task_unsupported         unknown task, a t2i rewrite with images, or an
-                                 edit draft with no backend that supports edit
+    422 task_unsupported         unknown task, a t2i rewrite with images, or a
+                                 draft kind this server has no rewriter for
     422 reference_required       an edit rewrite with no reference images
     422 too_many_references      more ids than the edit-job cap (``REF_MAX``)
     404 reference_unknown        an id is unknown or its blob is unreadable
@@ -156,23 +156,25 @@ BACKENDS = ("pe-llamacpp", "local-llm")
 #: Everything the Settings page may choose, including switching off.
 SETTINGS_BACKENDS = BACKENDS + ("off",)
 
-#: The friendly names the UI shows. A label is display text only: nothing here
-#: is a path, an address or a model identifier.
-BACKEND_LABELS: Mapping[str, str] = {
-    "pe-llamacpp": "Official enhancer (Q8, uses GPU)",
-    "local-llm": "Local LLM service",
-}
+#: The rewriter a task falls back to when nothing was saved for it: the Official
+#: enhancer, because that is the default the page shows. It is a CHOICE, not a
+#: promise — if this server has no checkpoint for that draft kind the task lands
+#: on the endpoint instead, and the Settings page says so.
+DEFAULT_CHOICE = BACKENDS[0]
 
-#: What each backend can rewrite. The enhancer checkpoints are task-specific
-#: and only the text-to-image one is installed; the local service handles both.
-BACKEND_TASKS: Mapping[str, tuple[str, ...]] = {
-    "pe-llamacpp": pe_client.SUPPORTED_TASKS,
-    "local-llm": rw.TASKS,
-}
+#: The friendly names the UI shows, and whether a rewriter takes the V100. Both
+#: live in ``web/api.py`` — the same words go out in the status block, the
+#: Settings payload and the suggestion box, so they are aliased here rather than
+#: restated. A label is display text only: never a path, an address or a model
+#: identifier.
+BACKEND_LABELS: Mapping[str, str] = web_api.REWRITE_BACKEND_LABELS
+BACKEND_USES_GPU: Mapping[str, bool] = web_api.REWRITE_BACKEND_USES_GPU
 
-#: Whether using this backend takes the V100. The UI says so plainly, because
-#: "uses GPU" means "waits for, or blocks, image jobs".
-BACKEND_USES_GPU: Mapping[str, bool] = {"pe-llamacpp": True, "local-llm": False}
+#: What a backend can rewrite is NOT a constant here: the enhancer checkpoints
+#: are task-specific and installed independently (PE-T2I for a text draft,
+#: PE-I2I plus its vision projector for an edit draft), so the answer comes from
+#: the clients this server actually built — see
+#: :meth:`RewriteService.backend_tasks`. The shared endpoint serves every task.
 
 #: Default deadline for the local service. Worst measured round trip against
 #: the shared service was 38 s; a slower backend needs this raised explicitly,
@@ -201,6 +203,12 @@ PE_LOG_FILENAME = "pe-llamacpp.log"
 #: fine text legible. The ORIGINAL is never sent: only these copies leave the
 #: server, as data URIs, so the backend can never fetch a URL or read a path.
 REWRITE_IMAGE_MAX_DIM = 768
+
+#: The official edit enhancer's own image budget, taken from the frozen upstream
+#: profile rather than chosen here: PE-I2I was verified with a reference of up to
+#: 1 MP and ``--image-max-tokens 1280``, so the 768 px copy made for the chat
+#: endpoint is NOT what these weights expect.
+OFFICIAL_IMAGE_MAX_PIXELS = int(rw.sampling("edit")["image_max_pixels"])
 
 #: PNG, because it is lossless for the flat art and text the rewriter reasons
 #: about and needs no quality knob.
@@ -300,17 +308,34 @@ class PESettings:
     """Startup-owned enhancer configuration: operator files plus a budget.
 
     Every field here is a launch flag. None of it is ever accepted from the
-    browser: a binary path, a GGUF path and a system prompt are the three
-    things this project refuses to take over HTTP.
+    browser: a binary path, a GGUF path and a system prompt are the three things
+    this project refuses to take over HTTP.
+
+    The two enhancers are separate checkpoints serving separate tasks, installed
+    independently: ``model_path`` answers ``t2i``, and the ``i2i_*`` pair answers
+    ``edit``. That pair is both-or-neither, because a Q8 GGUF without its vision
+    projector cannot see the reference it is being asked to describe.
     """
 
     llama_server: str
     model_path: str
-    system_prompt: str
+    #: The digest-pinned prompt each checkpoint was trained on, by task. A
+    #: missing entry for an installed checkpoint is a startup refusal: the wrong
+    #: prompt degrades the rewrite quietly instead of failing.
+    system_prompts: Mapping[str, str] = field(default_factory=dict)
     timeout: float = DEFAULT_PE_TIMEOUT_SECONDS
     #: Where the child's bounded log goes: one file under the server's cache
-    #: dir, replaced by each attempt.
+    #: dir, replaced by each attempt. One file for both checkpoints, because the
+    #: single rewrite slot means only one enhancer server ever runs at a time —
+    #: so the log always holds the attempt that just happened.
     log_path: str | None = None
+    i2i_model_path: str | None = None
+    i2i_mmproj_path: str | None = None
+    #: Root's verified numbers for PE-I2I on the V100: the vision tokens need a
+    #: wider context than the text weights, and one image must be capped or it
+    #: crowds out the thinking budget.
+    i2i_context: int = pe_client.I2I_CONTEXT_TOKENS
+    image_max_tokens: int = pe_client.IMAGE_MAX_TOKENS
 
     def __post_init__(self) -> None:
         for name, value, what in (("llama_server", self.llama_server,
@@ -320,10 +345,25 @@ class PESettings:
             del name
             if not isinstance(value, str) or not value.strip():
                 raise rc.RewriteConfigError(f"{what} must be a non-empty path")
-        if not isinstance(self.system_prompt, str) or not self.system_prompt.strip():
+        if (self.i2i_model_path is None) != (self.i2i_mmproj_path is None):
             raise rc.RewriteConfigError(
-                "the enhancer needs the digest-pinned text-to-image system "
-                "prompt it was trained on")
+                "the edit enhancer needs its model AND its vision projector: "
+                "give both --pe-i2i-model and --pe-i2i-mmproj, or neither")
+        for value, what in ((self.i2i_model_path, "edit enhancer model file"),
+                            (self.i2i_mmproj_path, "edit enhancer vision "
+                                                   "projector")):
+            if value is not None and (not isinstance(value, str)
+                                      or not value.strip()):
+                raise rc.RewriteConfigError(f"{what} must be a non-empty path")
+        if not isinstance(self.system_prompts, Mapping):
+            raise rc.RewriteConfigError(
+                "the enhancer needs its system prompts as a task mapping")
+        for task in self.tasks:
+            prompt = self.system_prompts.get(task)
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise rc.RewriteConfigError(
+                    f"the enhancer needs the digest-pinned {task} system prompt "
+                    "its weights were trained on")
         if (isinstance(self.timeout, bool)
                 or not isinstance(self.timeout, (int, float))
                 or not 0 < float(self.timeout) <= 3600):
@@ -333,17 +373,59 @@ class PESettings:
                                           or not self.log_path.strip()):
             raise rc.RewriteConfigError("the enhancer log path must be a "
                                         "non-empty path or None")
+        for name in ("i2i_context", "image_max_tokens"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise rc.RewriteConfigError(f"{name} must be a positive integer")
 
-    def build_client(self, *, gpu_lock: threading.Lock | None = None,
+    @property
+    def tasks(self) -> tuple[str, ...]:
+        """The tasks the INSTALLED weights can answer, in task order."""
+        installed = []
+        if self.model_path:
+            installed.append("t2i")
+        if self.i2i_model_path and self.i2i_mmproj_path:
+            installed.append("edit")
+        return tuple(task for task in rw.TASKS if task in installed)
+
+    def files_for(self, task: str) -> tuple[str, str | None, int]:
+        """``(model, mmproj, context)`` for one task, or a refusal."""
+        rw.check_task(task)
+        if task == "t2i":
+            return self.model_path, None, pe_client.CONTEXT_TOKENS
+        if not self.i2i_model_path or not self.i2i_mmproj_path:
+            raise rc.RewriteConfigError(
+                "the edit enhancer is not installed on this server")
+        return self.i2i_model_path, self.i2i_mmproj_path, self.i2i_context
+
+    def system_prompt_for(self, task: str) -> str:
+        """The digest-pinned system prompt the weights for `task` were trained
+        on. Each checkpoint has its own (PE-T2I and PE-I2I differ), so asking
+        for one prompt "the enhancer" uses is not a question with one answer."""
+        rw.check_task(task)
+        prompt = self.system_prompts.get(task)
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise rc.RewriteConfigError(
+                f"the enhancer has no {task} system prompt loaded")
+        return prompt
+
+    def build_client(self, *, task: str = "t2i",
+                     gpu_lock: threading.Lock | None = None,
                      cancel: Callable[[], bool] | None = None,
                      **seams: Any) -> pe_client.PELlamaCppClient:
-        """The enhancer client. ``cancel`` is the service's single-slot
-        cancel probe (see :meth:`RewriteService._current_cancelled`)."""
+        """The enhancer client for ONE task. ``cancel`` is the service's
+        single-slot cancel probe (see :meth:`RewriteService._current_cancelled`),
+        and the GPU lock is the one shared with image generation — both
+        checkpoints take the card, and never together."""
         if self.log_path is None:
             raise rc.RewriteConfigError(
                 "the enhancer needs a log path inside the server cache dir")
+        model, mmproj, context = self.files_for(task)
         return pe_client.PELlamaCppClient(
-            server_binary=self.llama_server, model_path=self.model_path,
+            server_binary=self.llama_server, model_path=model,
+            mmproj_path=mmproj, context=context,
+            image_max_tokens=(self.image_max_tokens if mmproj else None),
+            supported_tasks=(task,),
             log_path=self.log_path, gpu_lock=gpu_lock,
             timeout=self.timeout, cancel=cancel, **seams)
 
@@ -355,30 +437,58 @@ class PESettings:
 
 @dataclass(frozen=True)
 class RewritePreferences:
-    """The saved choice. ``None`` on a field means "not saved: use the flag".
+    """The saved choice. ``None`` on a field means "not saved: use the default".
 
-    Only four things are ever saved, and none of them is a path: which backend
-    is active, and the local service's endpoint, model and timeout.
+    What is saved is the user's choice plus how the shared endpoint is reached,
+    and none of it is a path: the per-task rewriter, the on/off switch, and the
+    endpoint, model and timeout of the OpenAI-compatible service. The llama
+    server binary, both GGUFs and the system prompts stay launch flags.
     """
 
-    backend: str | None = None
+    #: task -> backend id. A missing task means "not chosen: Official".
+    choices: Mapping[str, str] | None = None
+    enabled: bool | None = None
     endpoint: str | None = None
     model: str | None = None
     timeout_s: float | None = None
 
-    #: The keys of the saved document, in its canonical order.
-    KEYS = ("backend", "endpoint", "model", "timeout_s")
+    def choice_for(self, task: str) -> str | None:
+        """The saved choice for one task, or None for "use the default"."""
+        return None if self.choices is None else self.choices.get(task)
 
-    def as_dict(self) -> dict[str, Any]:
-        return {key: getattr(self, key) for key in self.KEYS}
+    @property
+    def off(self) -> bool:
+        """The single Off switch, read the way the service reads it."""
+        return self.enabled is False
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "RewritePreferences":
-        """Validate and build, as a SAVED document: a null backend means "not
-        chosen yet, use the start-up default", which a POST may not carry."""
-        checked = web_api.validate_rewrite_settings(data, allow_unset_backend=True)
-        return cls(backend=checked["backend"], endpoint=checked["endpoint"],
-                   model=checked["model"], timeout_s=checked["timeout_s"])
+        """Validate and build, as a SAVED document: a null choice or a null
+        ``enabled`` means "not chosen yet, use the default", which a POST may
+        not carry. The endpoint fields are OVERRIDES here, so a record that
+        chose the endpoint for one draft kind with no address of its own is
+        legal — the launch flags supply the address. Demanding one made a server
+        throw away a good choice at startup and fall back to the defaults
+        without being asked; the rule that an enabled endpoint choice needs an
+        address belongs to the effective document a POST carries."""
+        checked = web_api.validate_rewrite_settings(data, allow_unset_choice=True,
+                                                    require_endpoint=False)
+        return cls(choices={task: checked[task] for task in rw.TASKS},
+                   enabled=checked["enabled"],
+                   endpoint=checked["endpoint"], model=checked["model"],
+                   timeout_s=checked["timeout_s"])
+
+    def as_dict(self) -> dict[str, Any]:
+        """The document itself — the SAME shape on the wire and on disk.
+
+        Flat per-task keys plus the shared endpoint fields; no legacy ``backend``
+        key, because a file we write must be a file this server accepts without a
+        translation step. The old key is understood on READ only (see
+        :func:`migrate_saved`), so round-tripping a migrated file converts it.
+        """
+        return {"t2i": self.choice_for("t2i"), "edit": self.choice_for("edit"),
+                "enabled": self.enabled, "endpoint": self.endpoint,
+                "model": self.model, "timeout_s": self.timeout_s}
 
 
 def preferences_path(cache_dir: str | None) -> str | None:
@@ -387,6 +497,50 @@ def preferences_path(cache_dir: str | None) -> str | None:
     if not cache_dir:
         return None
     return os.path.join(cache_dir, SETTINGS_FILENAME)
+
+
+#: The key the PREVIOUS settings document used for the choice. It exists here
+#: only so a file already on disk still means something after the choice became
+#: per-task; nothing writes it any more.
+LEGACY_BACKEND_KEY = "backend"
+
+
+def migrate_saved(document: Any) -> Any:
+    """An old saved document -> the current shape; anything else unchanged.
+
+    The rules for the single old ``backend``:
+
+    - a real rewriter (``pe-llamacpp`` / ``local-llm``) applies to BOTH tasks —
+      that is what it always meant;
+    - ``off`` was a switch, not a rewriter, so it becomes ``enabled: false`` and
+      NO per-task choice: the page then shows the default (the Official
+      enhancer where one is installed) ready for when the switch comes back on;
+    - ``null`` meant "not chosen", which stays "not chosen".
+
+    A value that cannot serve a task (the official edit checkpoint missing on
+    this server) is NOT dropped here: capability is resolved when the service
+    builds its clients, which is also where the fallback and its reason are
+    reported, so migration stays a pure key translation. The file on disk keeps
+    its old shape until the user saves again, so this runs on every read rather
+    than rewriting the operator's file as a side effect of starting.
+    """
+    if not isinstance(document, Mapping):
+        return document
+    if "t2i" in document or "edit" in document:
+        # Already the current shape: a leftover legacy key (a hand-merge, say)
+        # is dropped rather than obeyed, so this doubles as the normalizer the
+        # validator needs.
+        return {key: value for key, value in document.items()
+                if key != LEGACY_BACKEND_KEY}
+    if LEGACY_BACKEND_KEY not in document:
+        return document
+    legacy = document.get(LEGACY_BACKEND_KEY)
+    choice = legacy if legacy in BACKENDS else None
+    migrated = {task: choice for task in rw.TASKS}
+    migrated["enabled"] = None if legacy is None else legacy != "off"
+    for key in ("endpoint", "model", "timeout_s"):
+        migrated[key] = document.get(key)
+    return migrated
 
 
 def load_preferences(path: str | None) -> tuple[RewritePreferences | None, str]:
@@ -419,7 +573,7 @@ def load_preferences(path: str | None) -> tuple[RewritePreferences | None, str]:
         return None, ("saved rewrite settings are not valid JSON; using the "
                       "start-up defaults")
     try:
-        return RewritePreferences.from_dict(document), ""
+        return RewritePreferences.from_dict(migrate_saved(document)), ""
     except (ApiError, ValueError) as exc:
         return None, (f"saved rewrite settings are invalid "
                       f"({_safe(exc.message if isinstance(exc, ApiError) else str(exc))}); "
@@ -465,9 +619,10 @@ class _Job:
     """One in-flight rewrite's hand-off slot, guarded by the service Condition."""
 
     __slots__ = ("cancel", "finished", "payload", "error", "elapsed_ms",
-                 "client", "backend", "timeout")
+                 "client", "backend", "task", "timeout")
 
-    def __init__(self, client: Any, backend: str, timeout: float) -> None:
+    def __init__(self, client: Any, backend: str, task: str,
+                 timeout: float) -> None:
         # Per-job, not per-service: a cancel aimed at one rewrite must never
         # poison the next one.
         self.cancel = threading.Event()
@@ -480,6 +635,7 @@ class _Job:
         # it started with.
         self.client = client
         self.backend = backend
+        self.task = task
         self.timeout = timeout
 
 
@@ -505,14 +661,19 @@ def _flatten_alpha(image):
     return canvas
 
 
-def _reference_image_uri(root: str | None, reference_id: str, ordinal: int) -> str:
+def _reference_image_uri(root: str | None, reference_id: str, ordinal: int, *,
+                         max_dim: int | None = REWRITE_IMAGE_MAX_DIM,
+                         max_pixels: int | None = None) -> str:
     """One reference as a downscaled PNG data URI, ready for the user turn.
 
     Reads the stored blob (hash-verified), applies the store's own decode
-    gates, flattens alpha onto white, and shrinks the longest side to
-    :data:`REWRITE_IMAGE_MAX_DIM`. Returns ``data:image/png;base64,...`` —
-    never a path and never a URL, so the backend cannot be made to fetch
-    anything.
+    gates, flattens alpha onto white, then resizes it to the budget the REWRITER
+    that is about to read it expects: the shared chat endpoint gets a copy whose
+    longest side is :data:`REWRITE_IMAGE_MAX_DIM`, the official edit enhancer
+    gets its profile's :data:`OFFICIAL_IMAGE_MAX_PIXELS` pixel budget instead —
+    the two budgets are different claims about how much a rewriter needs to SEE,
+    so the caller names one. Returns ``data:image/png;base64,...`` — never a
+    path and never a URL, so the backend cannot be made to fetch anything.
 
     Every failure names the reference by ORDINAL only: the store's own errors
     quote paths and (truncated) ids, and neither belongs in a browser-visible
@@ -530,9 +691,10 @@ def _reference_image_uri(root: str | None, reference_id: str, ordinal: int) -> s
                        "reference store") from None
     pil = _reference_store._load_pil()
     image = _flatten_alpha(image)
-    if max(image.size) > REWRITE_IMAGE_MAX_DIM:
-        image.thumbnail((REWRITE_IMAGE_MAX_DIM, REWRITE_IMAGE_MAX_DIM),
-                        pil.LANCZOS)
+    if max_pixels is not None:
+        image = _within_pixel_budget(image, max_pixels, pil)
+    elif max_dim is not None and max(image.size) > max_dim:
+        image.thumbnail((max_dim, max_dim), pil.LANCZOS)
     buffer = io.BytesIO()
     try:
         image.save(buffer, format="PNG")
@@ -543,15 +705,39 @@ def _reference_image_uri(root: str | None, reference_id: str, ordinal: int) -> s
     return _IMAGE_URI_PREFIX + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def _reference_image_uris(root: str | None, reference_ids: list[str]) -> list[str]:
+def _within_pixel_budget(image, max_pixels: int, pil):
+    """Shrink `image` (aspect kept) until ``W*H <= max_pixels``.
+
+    ``thumbnail`` is longest-side based, which is not what a pixel budget means:
+    a 2000x400 strip fits 1 MP but overflows a 1000 px thumbnail. Only images
+    already over budget are resampled, so a compliant reference is sent exactly
+    as the user supplied it.
+    """
+    width, height = image.size
+    if width * height <= max_pixels:
+        return image
+    scale = (max_pixels / (width * height)) ** 0.5
+    size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    return image.resize(size, pil.LANCZOS)
+
+
+def _reference_image_uris(root: str | None, reference_ids: list[str], *,
+                          max_dim: int | None = REWRITE_IMAGE_MAX_DIM,
+                          max_pixels: int | None = None) -> list[str]:
     """The ordered data URIs for `reference_ids`, in the user's order.
 
     Order is load-bearing: ``build_messages`` puts image N first and the edit
     system prompt refers to it as ``<imageN>``, so reordering here would
     silently re-point every reference in the rewrite.
     """
-    return [_reference_image_uri(root, reference_id, ordinal)
+    return [_reference_image_uri(root, reference_id, ordinal,
+                                 max_dim=max_dim, max_pixels=max_pixels)
             for ordinal, reference_id in enumerate(reference_ids, start=1)]
+
+
+def _task_words(task: str) -> str:
+    """A task name as prose, for a sentence the browser shows."""
+    return "text-to-image" if task == "t2i" else "image-edit"
 
 
 # ---------------------------------------------------------------------------
@@ -560,14 +746,20 @@ def _reference_image_uris(root: str | None, reference_ids: list[str]) -> list[st
 
 
 class RewriteService:
-    """Single-slot rewrite executor over two backends. One instance per server."""
+    """Single-slot rewrite executor, one rewriter PER TASK. One instance per server.
+
+    The choice is per task (``t2i`` and ``edit`` may use different rewriters)
+    with one switch that turns rewriting off altogether. The slot stays singular:
+    one rewrite at a time whichever backend it lands on, because both enhancer
+    checkpoints want the whole V100 and the endpoint is a shared service.
+    """
 
     def __init__(self, settings: RewriteSettings, transport: Callable | None = None,
                  *, pe: PESettings | None = None,
                  gpu_lock: threading.Lock | None = None,
                  cache_dir: str | None = None,
                  preferences: RewritePreferences | None = None,
-                 client_factory: Callable[[str, RewriteSettings, PESettings,
+                 client_factory: Callable[[str, str, RewriteSettings, PESettings,
                                            RewritePreferences], Any] | None = None
                  ) -> None:
         """`settings` is the local-service configuration (or
@@ -577,7 +769,8 @@ class RewriteService:
         executor: with no lock the enhancer and an image job would load onto
         the V100 together and one of them would fail with an out-of-memory.
         ``cache_dir`` is where the saved Settings document and the enhancer log
-        live. ``client_factory`` builds clients and exists for tests only.
+        live. ``client_factory(task, backend, …)`` builds clients and exists for
+        tests only.
         """
         self.settings = settings
         self._pe = pe
@@ -594,23 +787,24 @@ class RewriteService:
         self._cond = threading.Condition()
         self._current: _Job | None = None
         self._closing = False
-        self._clients: dict[str, Any] = {}
-        self._active: str | None = None
+        #: ``(task, backend) -> client``. The endpoint is one client keyed by two
+        #: tasks; each enhancer checkpoint is its own client, because it is its
+        #: own llama-server with its own files.
+        self._clients: dict[tuple[str, str], Any] = {}
+        self._active: dict[str, str | None] = {task: None for task in rw.TASKS}
         self._last_error = ""
         self._rebuild_clients()
 
     # -- capability ---------------------------------------------------------
 
     def _backend_available(self, backend: str) -> bool:
-        """What the LAUNCH FLAGS make possible.
+        """What the LAUNCH FLAGS make possible AT ALL.
 
-        The enhancer needs its binary and its GGUF; the local service needs an
-        address, a model name and its two system prompt files. Neither can be
-        widened by a saved choice — a browser never sends a binary, a GGUF or a
-        prompt file. What the flags do NOT decide is which one is the DEFAULT:
-        ``--rewrite-backend`` only seeds the choice, so a server that starts on
-        the enhancer can still answer an edit draft with the local service, and
-        Settings can still switch to it.
+        The enhancer needs its binary and at least one checkpoint; the endpoint
+        needs an address, a model name and its two system prompt files. Neither
+        can be widened by a saved choice — a browser never sends a binary, a GGUF
+        or a prompt file. Per-TASK availability is the narrower question,
+        answered by :meth:`backend_tasks` from the clients actually built.
         """
         if backend == "pe-llamacpp":
             return self.pe is not None
@@ -621,6 +815,15 @@ class RewriteService:
     def available_backends(self) -> list[str]:
         return [backend for backend in BACKENDS if self._backend_available(backend)]
 
+    def backend_tasks(self, backend: str) -> list[str]:
+        """The tasks this backend can answer HERE, in task order.
+
+        Derived from the built clients, never from a table: a server with PE-T2I
+        but no PE-I2I genuinely cannot enhance an edit draft with the official
+        weights, and the page must say so instead of offering it.
+        """
+        return [task for task in rw.TASKS if (task, backend) in self._clients]
+
     def backend_rows(self, only_available: bool = False) -> list[dict[str, Any]]:
         """The ``backends`` list, in preference order (enhancer first).
 
@@ -630,26 +833,33 @@ class RewriteService:
         of them, with ``available`` and ``reason`` added.
         """
         rows = [{"id": backend, "label": BACKEND_LABELS[backend],
-                 "tasks": list(BACKEND_TASKS[backend]),
+                 "tasks": self.backend_tasks(backend),
                  "uses_gpu": BACKEND_USES_GPU[backend]}
                 for backend in BACKENDS
                 if not only_available or self._backend_available(backend)]
         return rows
 
-    def unavailable_reason(self, backend: str) -> str:
+    def unavailable_reason(self, backend: str, task: str | None = None) -> str:
         """Why a radio is greyed out. No paths, ever — the reason is rendered
         in the browser, and a path here would say where the operator's files
-        live."""
+        live. With a `task` it explains the task specifically, because "no
+        official rewriter for an edit draft" and "no enhancer at all" are
+        different things for the user to act on."""
         if backend == "pe-llamacpp":
+            if (task is not None and self.pe is not None
+                    and task not in self.pe.tasks):
+                return (f"this server has no official {_task_words(task)} "
+                        "checkpoint, so that draft has no official rewriter — "
+                        "use the OpenAI-compatible endpoint, or start the server "
+                        "with the edit enhancer files")
             return ("this server was started without the enhancer flags, so "
                     "the llama-server binary and its Q8 model are not "
                     "configured")
         if backend == "local-llm":
-            return ("this server was started without the local rewriting "
-                    "service, so its endpoint, model or system prompt files "
-                    "are not configured")
+            return ("this server was started without an OpenAI-compatible "
+                    "rewriting service, so its endpoint, model or system prompt "
+                    "files are not configured")
         return ""
-
 
     def preferences(self) -> RewritePreferences:
         """The choice in force. Read under the lock so a caller that has to
@@ -660,87 +870,143 @@ class RewriteService:
 
     @property
     def active_backend(self) -> str | None:
-        """The backend a rewrite would use right now, or None when off."""
+        """The backend a text draft would use, or whichever task has one.
+
+        Kept because the log line and the status block's single ``backend``
+        field still speak of ONE rewriter; the per-task truth is
+        :meth:`active_by_task`.
+        """
         with self._cond:
-            return self._active
+            return self._active_backend_locked()
+
+    def _active_backend_locked(self) -> str | None:
+        for task in rw.TASKS:
+            if self._active.get(task):
+                return self._active[task]
+        return None
+
+    def active_by_task(self) -> dict[str, str | None]:
+        """``{task: backend | None}`` — what would answer each draft kind."""
+        with self._cond:
+            return dict(self._active)
+
+    def effective_choices(self) -> dict[str, str]:
+        """The radios the Settings page should show, per task.
+
+        The saved choice where one was saved, else the default — the Official
+        enhancer when this server has any checkpoint installed, otherwise the
+        endpoint. This is choice, not capability: a choice that cannot be honoured
+        still shows as chosen, and :meth:`active_by_task` says what answers.
+        """
+        with self._cond:
+            return {task: self._effective_choice_locked(task) for task in rw.TASKS}
+
+    def _effective_choice_locked(self, task: str) -> str:
+        saved = self._preferences.choice_for(task)
+        if saved in BACKENDS:
+            return saved
+        for backend in BACKENDS:
+            if self._backend_available(backend):
+                return backend
+        return DEFAULT_CHOICE
 
     @property
     def available(self) -> bool:
         """True when a rewrite can actually be attempted."""
         with self._cond:
-            return self._active is not None
+            return any(self._active.values())
 
     def status_block(self) -> dict[str, Any]:
         """The additive status block. Never carries a host, port or path.
 
-        It says which backend is active, which ones this server could run, and
-        where the choice is changed — a ROUTE plus whether a saved document is
-        on disk. The on-disk path itself is for the operator's console only.
+        It says which rewriter answers EACH TASK, which ones this server could
+        run, and where the choice is changed — a ROUTE plus whether a saved
+        document is on disk. The on-disk path itself is for the operator's
+        console only.
         """
         with self._cond:
-            active = self._active
-            choice = self._preferences.backend
+            active = dict(self._active)
+            off = self._preferences.off
             detail = self._last_error
-            configured = bool(self._fallback_locked())
+            configured = any(self._fallback_locked(task) for task in rw.TASKS)
             backends = self.backend_rows(only_available=True)
         pointer = {"href": web_api.REWRITE_SETTINGS_HREF,
                    "saved": bool(self._settings_path) and os.path.exists(
                        self._settings_path)}
-        if active is None:
-            if choice == "off":
-                block = dict(web_api.REWRITE_DISABLED_BLOCK)
+        answers = [backend for backend in active.values() if backend]
+        if not answers:
+            block = dict(web_api.REWRITE_DISABLED_BLOCK)
+            block["settings"] = pointer
+            if off:
                 block["reason"] = ("rewriting is switched off here; choose a "
                                    "rewriter in Settings")
-                block["settings"] = pointer
                 return block
             if not configured:
                 # The operator started this server with neither rewriter's
                 # flags; Settings cannot conjure a binary or a prompt file.
-                return {**web_api.REWRITE_DISABLED_BLOCK, "settings": pointer}
+                return block
             # Something is configured but no client could be built (a bad
             # saved endpoint, for instance): say so without disclosing where
             # the backend lives. The full line is for the console only.
-            block = dict(web_api.REWRITE_DISABLED_BLOCK)
             block["reason"] = _public_reason(detail)
-            block["settings"] = pointer
             return block
         # Built through the ONE validator (web_api.validate_rewrite_block), so
         # this block can never be a shape the browser parser rejects — and can
-        # never carry a host, port or path in `reason`.
+        # never carry a host, port or path in `reason`. `backend` is the
+        # text-draft rewriter (or the only one that exists), because the block
+        # still has to answer "which rewriter is this" for older readers;
+        # `active_by_task` is the per-task truth.
         return web_api.validate_rewrite_block(
             {"state": "available", "code": "rewrite_available",
-             "backend": active, "reason": "", "backends": backends,
+             "backend": active.get("t2i") or answers[0], "reason": "",
+             "backends": backends, "active_by_task": active,
              "settings": pointer})
 
     def settings_state(self) -> dict[str, Any]:
         """The ``GET /api/v1/settings/rewrite`` payload.
 
-        It carries the saved choice and the local service's endpoint — the user
-        typed both — plus which backends exist and why one does not. It never
-        carries a filesystem path: no binary, no GGUF, no prompt file, no log
-        file.
+        One row per rewriter PER TASK with `available` and `reason` already
+        resolved, so the page never has to know which launch flags exist — it
+        only disables what the server says is unavailable. It carries the saved
+        choice and the local service's endpoint (the user typed both), and never
+        a filesystem path: no binary, no GGUF, no prompt file, no log file.
         """
         with self._cond:
-            active = self._active
             saved = self._preferences
-            rows = self.backend_rows()
+            rows = {row["id"]: row for row in self.backend_rows()}
+            choices = {task: self._effective_choice_locked(task)
+                       for task in rw.TASKS}
             persist = self._settings_path is not None
+            task_rows = [{
+                "task": task,
+                "label": web_api.REWRITE_TASK_LABELS[task],
+                "choices": [{
+                    "id": backend,
+                    "label": web_api.REWRITE_BACKEND_LABELS[backend],
+                    "available": (task, backend) in self._clients,
+                    "uses_gpu": web_api.REWRITE_BACKEND_USES_GPU[backend],
+                    "reason": ("" if (task, backend) in self._clients
+                               else self.unavailable_reason(backend, task)),
+                } for backend in BACKENDS],
+            } for task in rw.TASKS]
         # The effective local service: the saved override where there is one,
         # else the launch flags. The page prefills from this, and the Test
-        # button probes exactly what it shows.
-        local = {"backend": None,
-                 "endpoint": saved.endpoint or self.settings.endpoint,
+        # button probes exactly what it shows. It is NOT a per-task choice — it
+        # is one endpoint shared by both groups, which is why it has no backend.
+        local = {"endpoint": saved.endpoint or self.settings.endpoint,
                  "model": saved.model or self.settings.model,
                  "timeout_s": saved.timeout_s or self.settings.timeout}
         payload = {"schema": REWRITE_SETTINGS_SCHEMA,
-                   "backend": active,
+                   "enabled": not saved.off,
+                   "choices": choices,
                    "saved": saved.as_dict(),
                    "local": local,
-                   "backends": [{**row,
-                                 "available": self._backend_available(row["id"]),
-                                 "reason": ("" if self._backend_available(row["id"])
-                                            else self.unavailable_reason(row["id"]))}
-                                for row in rows],
+                   "backends": [{**rows[backend],
+                                 "available": self._backend_available(backend),
+                                 "reason": ("" if self._backend_available(backend)
+                                            else self.unavailable_reason(backend))}
+                                for backend in BACKENDS],
+                   "tasks": task_rows,
                    "off": {"id": "off", "label": "Off", "available": True,
                            "reason": ""},
                    "persistent": persist}
@@ -751,9 +1017,10 @@ class RewriteService:
 
     # -- client map ---------------------------------------------------------
 
-    def _build_client(self, backend: str, settings: RewriteSettings,
-                      pe: PESettings | None, prefs: RewritePreferences) -> Any:
-        """The real client for one backend under the current preferences."""
+    def _build_client(self, task: str, backend: str, settings: RewriteSettings,
+                      pe: PESettings | None,
+                      prefs: RewritePreferences) -> Any:
+        """The real client for one (task, backend) under current preferences."""
         if backend == "local-llm":
             endpoint = prefs.endpoint or settings.endpoint
             model = prefs.model or settings.model
@@ -771,7 +1038,10 @@ class RewriteService:
                                          endpoint=endpoint, model=model,
                                          timeout=timeout)
         assert pe is not None
-        return pe.build_client(gpu_lock=self._gpu_lock,
+        # Each TASK gets its own enhancer client: PE-T2I and PE-I2I are two
+        # checkpoints, so they are two llama-server processes with different
+        # files, different context sizes and different vision requirements.
+        return pe.build_client(task=task, gpu_lock=self._gpu_lock,
                                cancel=self._current_cancelled)
 
     def _rebuild_clients(self, prefs: RewritePreferences | None = None) -> None:
@@ -785,17 +1055,35 @@ class RewriteService:
         saved endpoint.
         """
         prefs = self._preferences if prefs is None else prefs
-        clients: dict[str, Any] = {}
+        clients: dict[tuple[str, str], Any] = {}
         self._last_error = ""
-        for backend in BACKENDS:
-            if not self._backend_available(backend):
+        endpoint_client: Any = None
+        for task in rw.TASKS:
+            # One client per (task, backend) that this server can actually run.
+            # The endpoint is ONE service, so it is built once and keyed by both
+            # tasks; each enhancer checkpoint is built separately. A client that
+            # cannot be built is dropped with its reason kept for the status
+            # block — the server never dies over a bad saved endpoint.
+            if (self._backend_available("pe-llamacpp")
+                    and task in (self.pe.tasks if self.pe is not None else ())):
+                try:
+                    clients[(task, "pe-llamacpp")] = self._client_factory(
+                        task, "pe-llamacpp", self.settings, self.pe, prefs)
+                except (rc.RewriteConfigError, ApiError) as exc:
+                    self._last_error = _safe(
+                        exc.message if isinstance(exc, ApiError) else str(exc))
+            if not self._backend_available("local-llm"):
                 continue
-            try:
-                clients[backend] = self._client_factory(backend, self.settings,
-                                                        self.pe, prefs)
-            except (rc.RewriteConfigError, ApiError) as exc:
-                self._last_error = _safe(
-                    exc.message if isinstance(exc, ApiError) else str(exc))
+            if endpoint_client is None:
+                try:
+                    endpoint_client = self._client_factory(
+                        task, "local-llm", self.settings, self.pe, prefs)
+                except (rc.RewriteConfigError, ApiError) as exc:
+                    self._last_error = _safe(
+                        exc.message if isinstance(exc, ApiError) else str(exc))
+                    endpoint_client = False
+            if endpoint_client:
+                clients[(task, "local-llm")] = endpoint_client
         with self._cond:
             # Prefs, clients and the active id move together: a concurrent
             # settings_state() never sees a new choice beside old clients.
@@ -803,46 +1091,60 @@ class RewriteService:
             self._clients = clients
             self._active = self._choose_active_locked()
 
-    def _choose_active_locked(self) -> str | None:
-        """The active backend, given the saved choice and availability."""
-        chosen = self._preferences.backend
-        if chosen == "off":
+    def _choose_active_locked(self) -> dict[str, str | None]:
+        """The rewriter answering EACH TASK, given the saved choice and
+        what could actually be built."""
+        return {task: self._choose_task_locked(task) for task in rw.TASKS}
+
+    def _choose_task_locked(self, task: str) -> str | None:
+        if self._preferences.off:
             return None
-        if chosen is not None and chosen in self._clients:
+        saved = self._preferences.choice_for(task)
+        chosen = saved if saved is not None else DEFAULT_CHOICE
+        if (task, chosen) in self._clients:
             return chosen
-        fallback = self._fallback_locked()
-        if chosen is not None:
-            # The saved choice names something this server cannot run (the
-            # enhancer flags are gone, or the local system prompts were never
-            # loaded). Fall back rather than silently going quiet, and say why
-            # in the status block.
+        fallback = self._fallback_locked(task)
+        if saved is not None and chosen != fallback:
+            # The user chose something this server cannot run for THIS task (no
+            # enhancer flags, or no checkpoint for this draft kind). Fall back
+            # rather than silently going quiet, and say why — the choice stays
+            # saved, so putting the missing file in place fixes it without a
+            # second visit to Settings.
             self._last_error = (
-                f"the saved rewriter choice {chosen!r} is not available on this "
-                f"server; using {fallback}" if fallback else
-                "the saved rewriter choice is not available on this server, and "
-                "no other rewriter is configured")
+                f"the saved rewriter choice {chosen!r} cannot answer a "
+                f"{_task_words(task)} draft on this server; using {fallback}"
+                if fallback else
+                f"the saved rewriter choice {chosen!r} cannot answer a "
+                f"{_task_words(task)} draft on this server, and no other "
+                "rewriter is configured for it")
         return fallback
 
-    def _fallback_locked(self) -> str | None:
-        """The default when nothing was chosen: enhancer first, then local."""
+    def _fallback_locked(self, task: str) -> str | None:
+        """The default for one task when nothing usable was chosen: enhancer
+        first, then the endpoint — the same order the Settings page lists."""
         for backend in BACKENDS:
-            if backend in self._clients:
+            if (task, backend) in self._clients:
                 return backend
         return None
 
     def check_preferences(self, prefs: RewritePreferences) -> None:
         """Refuse a choice this server cannot run, BEFORE it is saved.
 
-        The browser may ask for the enhancer on a server that was started
-        without its flags: that is not a setting, it is a question about files
-        only the operator can place, so the answer is a refusal that says why.
-        (A saved document naming a backend that has since disappeared is
-        different: startup falls back and states it in the status block,
-        because there is no user waiting for an answer.)
+        Checked per task: a server with PE-T2I only genuinely cannot honour
+        "Official enhancer" for an edit draft, and the browser needs that answer
+        rather than a save that quietly does nothing. A saved document naming a
+        rewriter that has since disappeared is different: startup falls back and
+        states it in the status block, because nobody is waiting for a reply.
         """
-        backend = prefs.backend
-        if backend is not None and backend != "off" and not self._backend_available(backend):
-            raise ApiError(422, "backend_unavailable", self.unavailable_reason(backend))
+        if prefs.off:
+            return
+        for task in rw.TASKS:
+            chosen = prefs.choice_for(task)
+            if chosen is None:
+                continue
+            if not self._backend_available(chosen) or (task, chosen) not in self._clients:
+                raise ApiError(422, "backend_unavailable",
+                               self.unavailable_reason(chosen, task))
 
     def apply_preferences(self, prefs: RewritePreferences, *,
                           persist: bool = True) -> None:
@@ -874,29 +1176,33 @@ class RewriteService:
         return self._await(job, fields)
 
     def _pick_client(self, task: str) -> tuple[Any, str]:
-        """The client for `task`, under the Condition, or a typed refusal.
+        """The client for `task` — the one that TASK's choice resolved to.
 
-        Order: the active backend first; if it cannot do this task, the other
-        available one (an edit draft with the enhancer active uses the local
-        service, which is what the user asked for by configuring it). Only when
-        no available backend supports the task is the request refused — with
-        the reason, because "the rewriter cannot do this" is information, not a
-        failure to explain.
+        No cross-task guessing: `edit` never silently lands on the text
+        rewriter, because a different rewriter is a different prompt contract
+        and the user is entitled to know which one answered. A task with no
+        usable rewriter is refused with the reason, which is information: "the
+        official edit checkpoint is not installed here" is actionable, a silent
+        swap is not.
         """
         with self._cond:
-            active, clients = self._active, dict(self._clients)
-        if active is None:
+            active, clients = dict(self._active), dict(self._clients)
+            off = self._preferences.off
+            configured = any((task, backend) in clients for backend in BACKENDS)
+        if off:
             raise ApiError(503, "rewrite_disabled",
                            "rewriting is switched off in Settings")
-        order = [active] + [backend for backend in BACKENDS if backend != active]
-        for backend in order:
-            client = clients.get(backend)
-            if client is not None and task in BACKEND_TASKS[backend]:
-                return client, backend
+        backend = active.get(task)
+        if backend:
+            return clients[(task, backend)], backend
+        if configured:
+            raise ApiError(503, "rewrite_unavailable",
+                           "the rewriter for this draft kind is not ready right now")
         raise ApiError(
             422, "task_unsupported",
-            "the official enhancer rewrites text-to-image drafts only, and no "
-            "local LLM service is configured for edit drafts")
+            f"this server has no rewriter for a {_task_words(task)} draft: the "
+            "official enhancer needs its checkpoint for this draft kind, and no "
+            "OpenAI-compatible endpoint is configured — change it in Settings")
 
     def _claim(self, task: str) -> _Job:
         """Take the single slot or refuse. The job owns its own cancel flag."""
@@ -909,7 +1215,7 @@ class RewriteService:
             if self._current is not None:
                 raise ApiError(503, "rewrite_busy",
                                "another rewrite is already in progress")
-            job = _Job(client, backend, timeout)
+            job = _Job(client, backend, task, timeout)
             self._current = job
             return job
 
@@ -960,16 +1266,21 @@ class RewriteService:
             task = fields["task"]
             if job.cancel.is_set():
                 raise _Cancelled
-            # Decode and re-encode the references HERE, on the worker thread:
-            # _claim() took the slot under ``self._cond`` and released the lock
-            # before this thread existed, so no imaging work runs while the
-            # service holds its Condition, and a slow decode cannot block
-            # status reads or the next caller's refusal.
-            images = _reference_image_uris(self.settings.references_dir,
-                                           fields["image_ids"])
+            # Each rewriter is shown the copy of the references sized for IT:
+            # the endpoint gets the long-side cap it was configured with, the
+            # official enhancer gets its own profile's pixel budget. Both run on
+            # THIS thread — `_claim` took and released the slot before this
+            # thread existed, so no imaging work happens under the Condition and
+            # a slow decode cannot block status reads or the next refusal.
+            images = (_reference_image_uris(self.settings.references_dir,
+                                            fields["image_ids"], max_dim=None,
+                                            max_pixels=OFFICIAL_IMAGE_MAX_PIXELS)
+                      if job.backend == "pe-llamacpp"
+                      else _reference_image_uris(self.settings.references_dir,
+                                                 fields["image_ids"]))
             if job.cancel.is_set():
                 raise _Cancelled
-            system_prompt = (self.pe.system_prompt
+            system_prompt = (self.pe.system_prompt_for(task)
                              if job.backend == "pe-llamacpp"
                              else self.settings.prompts[task])
             messages = rw.build_messages(system_prompt, fields["prompt"],
@@ -1066,10 +1377,18 @@ class RewriteService:
                     break
                 self._cond.wait(remaining)
             idle = self._current is None
-            clients = dict(self._clients)
-        pe_client = clients.get("pe-llamacpp")
-        kill = getattr(pe_client, "close", None)
-        if kill is not None:
+            clients = list(self._clients.values())
+        # EVERY client gets its own close, once each: two checkpoints mean two
+        # llama-server children and an orphan holding 9.5 GiB outlives the
+        # server that started it, while the endpoint's close() shuts its
+        # connection pool — the same object is keyed by both tasks, so identity
+        # is what dedupes it, not the key.
+        done: set[int] = set()
+        for client in clients:
+            kill = getattr(client, "close", None)
+            if kill is None or id(client) in done:
+                continue
+            done.add(id(client))
             idle = bool(kill()) and idle
         return idle
 

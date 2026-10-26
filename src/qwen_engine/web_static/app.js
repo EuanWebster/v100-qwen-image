@@ -101,26 +101,48 @@
     rewrite_available: 'available',
     rewrite_disabled: 'unavailable'
   };
-  // The closed key set of the status block: the four core keys, plus the two
-  // the two-backend server adds. A key outside this list is an unread
-  // contract, not a thing to ignore.
+  // The closed key set of the status block: the four core keys, plus the ones
+  // the per-task server adds. A key outside this list is an unread contract,
+  // not a thing to ignore.
   var REWRITE_BLOCK_KEYS = ['state', 'code', 'backend', 'reason', 'backends',
-                            'settings'];
+                            'settings', 'active_by_task'];
   var REWRITE_BACKEND_ROW_KEYS = ['id', 'label', 'tasks', 'uses_gpu'];
   var REWRITE_BACKEND_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
-  // The Settings document's own closed sets: the state, one choice (the saved
-  // document and the one in force share the shape) and a settings row, which
-  // adds availability plus the reason a choice is greyed out.
-  var REWRITE_SETTINGS_KEYS = ['schema', 'backend', 'saved', 'local', 'backends',
-                               'off', 'persistent', 'note'];
-  // A saved choice carries which backend was picked; the block that describes
-  // the local service does not select anything, so the server sends it without
-  // a backend key. Two documents, two closed key sets.
-  var REWRITE_CHOICE_KEYS = ['backend', 'endpoint', 'model', 'timeout_s'];
+  // The Settings document's own closed sets: the state, one saved choice and
+  // one per-task group.
+  var REWRITE_SETTINGS_KEYS = ['schema', 'enabled', 'choices', 'saved', 'local',
+                               'backends', 'tasks', 'off', 'persistent', 'note'];
+  // The saved choice is PER TASK plus one on/off switch; the block describing
+  // the shared endpoint selects nothing, so it carries no choice keys. Two
+  // documents, two closed key sets.
+  var REWRITE_CHOICE_KEYS = ['t2i', 'edit', 'enabled', 'endpoint', 'model',
+                             'timeout_s'];
   var REWRITE_LOCAL_KEYS = ['endpoint', 'model', 'timeout_s'];
   var REWRITE_SETTINGS_ROW_KEYS = ['id', 'label', 'tasks', 'uses_gpu',
                                    'available', 'reason'];
+  // One radio group per draft kind: `{task, label, choices[]}`, each choice
+  // `id/label/available/uses_gpu/reason` — the server has already decided what
+  // can be chosen here and why not, so the page never guesses.
+  var REWRITE_TASK_ROW_KEYS = ['task', 'label', 'choices'];
+  var REWRITE_TASK_CHOICE_KEYS = ['id', 'label', 'available', 'uses_gpu',
+                                  'reason'];
   var REWRITE_SETTINGS_BACKENDS = ['pe-llamacpp', 'local-llm', 'off'];
+  // The two rewriters that can be CHOSEN for a draft kind. `off` is not one of
+  // them: it is the switch below the groups, not a rewriter.
+  var REWRITE_BACKEND_IDS = ['pe-llamacpp', 'local-llm'];
+  // Every label the rewriter block carries is pinned here, exactly as the
+  // server publishes it. A block whose labels have drifted is a block this page
+  // was not written for: rendering it would put words on the screen about a
+  // rewriter nobody chose, which is how a settings page starts lying.
+  var REWRITE_TASK_LABELS = { t2i: 'Prompt enhance (text-to-image)',
+                              edit: 'Edit prompt enhance' };
+  var REWRITE_BACKEND_LABELS = {
+    'pe-llamacpp': 'Official enhancer (Q8, uses GPU)',
+    'local-llm': 'OpenAI-compatible endpoint',
+    'off': 'Off'
+  };
+  var REWRITE_BACKEND_USES_GPU = { 'pe-llamacpp': true, 'local-llm': false,
+                                   'off': false };
   // Sentinel meaning "present but malformed" — distinct from null
   // ("absent or legitimately unavailable"), so a bad block rejects the
   // whole status document instead of silently hiding a feature.
@@ -896,12 +918,12 @@
 
   /* The rewrite availability, strictly. `undefined` (absent) and the disabled
      pair both mean unavailable; only the exact available pair yields the
-     backend. The four core keys are ALWAYS present and `backends` / `settings`
-     are the only additive ones, each parsed in full: a fifth unknown key, a
-     missing key, an unknown state/code pair or a non-string backend is INVALID
-     and rejects the whole status document, exactly like every other closed-set
-     parse here. The page therefore never guesses at a contract it has not
-     read. */
+     backend. The four core keys are ALWAYS present and `backends`, `settings`
+     and `active_by_task` are the only additive ones, each parsed in full: an
+     unknown key, a missing key, an unknown state/code pair or a non-string
+     backend is INVALID and rejects the whole status document, exactly like every
+     other closed-set parse here. The page therefore never guesses at a contract
+     it has not read. */
   function parseRewriteBlock(block) {
     if (block === undefined) return null;
     if (!block || typeof block !== 'object' || Array.isArray(block)) return INVALID;
@@ -925,17 +947,50 @@
       pointer = parseRewriteSettingsPointer(block.settings);
       if (pointer === INVALID) return INVALID;
     }
+    var byTask = null;
+    if (block.active_by_task !== undefined) {
+      byTask = parseRewriteActiveByTask(block.active_by_task, rows,
+                                       block.state === 'available');
+      if (byTask === INVALID) return INVALID;
+    }
     if (block.state !== 'available') {
       return { backend: null, reason: block.reason, backends: rows,
-               settings: pointer };   // disabled / unavailable
+               settings: pointer, byTask: null };   // disabled / unavailable
     }
     if (typeof block.backend !== 'string' || !block.backend) return INVALID;
     if (block.backend.length > 64) return INVALID;
     if (block.reason !== '') return INVALID;        // available carries no reason
     if (rows !== null && !containsId(rows, block.backend)) return INVALID;
+    if (byTask !== null && !hasAnyValue(byTask)) return INVALID;
     return { backend: block.backend, reason: '', backends: rows,
-             settings: pointer };
+             settings: pointer, byTask: byTask };
   }
+
+  // Which rewriter answers EACH draft kind. One entry per known task, each one
+  // null or a rewriter the same block advertises: a block that says the text
+  // enhancer answers an edit draft while its own rows say otherwise is a
+  // contradiction, and the page shows the truth it can read instead.
+  function parseRewriteActiveByTask(active, rows, available) {
+    if (!active || typeof active !== 'object' || Array.isArray(active)) return INVALID;
+    var keys = Object.keys(active);
+    if (keys.length !== REWRITE_TASKS.length) return INVALID;
+    var out = {};
+    var answered = false;
+    for (var i = 0; i < REWRITE_TASKS.length; i++) {
+      var task = REWRITE_TASKS[i];
+      if (keys.indexOf(task) === -1) return INVALID;
+      var backend = active[task];
+      if (backend !== null) {
+        if (typeof backend !== 'string' || !REWRITE_BACKEND_ID_RE.test(backend)) return INVALID;
+        if (rows !== null && !containsId(rows, backend)) return INVALID;
+        answered = true;
+      }
+      out[task] = backend;
+    }
+    if (available !== answered) return INVALID;
+    return out;
+  }
+
 
   // The additive `backends` rows: which rewriters exist here and what each can
   // do. Labels are display text the server owns; a path, address or model name
@@ -986,6 +1041,15 @@
   function containsId(rows, id) {
     for (var i = 0; i < rows.length; i++) {
       if (rows[i].id === id) return true;
+    }
+    return false;
+  }
+
+  // True when at least one entry of an object is non-null — "something answers".
+  function hasAnyValue(map) {
+    var keys = Object.keys(map);
+    for (var i = 0; i < keys.length; i++) {
+      if (map[keys[i]] !== null) return true;
     }
     return false;
   }
@@ -1150,6 +1214,7 @@
    */
 
   var rewriteBackend = null;      // non-null ONLY when status said available
+  var rewriteByTask = null;       // {t2i: id|null, edit: id|null} or null
   var rewriteBackends = null;     // the status `backends` rows, or null
   var rewriteSettingsHref = API_REWRITE_SETTINGS;
   var rewriteInFlight = false;
@@ -1163,43 +1228,83 @@
   var rewriteSeq = 0;
   var proposal = null;            // { prompt, original, revision }
 
+  // Which rewriter answers ONE draft kind. A per-task server says so directly;
+  // against an older one the single `backend` is all the page may claim, and the
+  // server still decides which draft kinds it can actually take.
+  function rewriteActiveFor(task) {
+    if (rewriteByTask) return rewriteByTask[task] || null;
+    return rewriteBackend;
+  }
+
   // Whether Rewrite can be pressed right now. An edit rewrite names its
   // references by number and the server refuses one without them, so the
   // button is unavailable until at least one image is attached — the task is
   // derived from the references, so this can never ask for an impossible edit.
+  // The rewriter for THAT draft kind is what gates it: a server with the text
+  // enhancer only still rewrites text, and an edit draft says so by staying dark.
   function rewriteAvailable() {
-    if (!rewriteBackend || rewriteInFlight) return false;
-    return rewriteTask() === 't2i' || activeReferenceIds().length > 0;
+    if (rewriteInFlight) return false;
+    var task = rewriteTask();
+    if (!rewriteActiveFor(task)) return false;
+    return task === 't2i' || activeReferenceIds().length > 0;
   }
 
   function refreshRewriteButton() {
     var button = $('rewrite-btn');
     if (!button) return;
-    button.hidden = !rewriteBackend;
+    button.hidden = !rewritingSomewhere();
     button.disabled = !rewriteAvailable();
+  }
+
+  // Any draft kind answered at all? That is what shows the Rewrite button;
+  // `rewriteAvailable` decides whether THIS draft can use it.
+  function rewritingSomewhere() {
+    if (rewriteByTask) return hasAnyValue(rewriteByTask);
+    return !!rewriteBackend;
   }
 
   function setRewriterState(rewriter) {
     rewriteBackend = rewriter ? rewriter.backend : null;
+    rewriteByTask = rewriter && rewriter.byTask ? rewriter.byTask : null;
     rewriteBackends = rewriter && rewriter.backends ? rewriter.backends : null;
     if (rewriter && rewriter.settings) rewriteSettingsHref = rewriter.settings.href;
     var button = $('rewrite-btn');
     if (button) {
-      button.hidden = !rewriteBackend;
+      button.hidden = !rewritingSomewhere();
       button.disabled = !rewriteAvailable();
     }
     var hint = $('rewrite-hint');
-    if (hint) hint.hidden = !!rewriteBackend;
+    if (hint) hint.hidden = rewritingSomewhere();
     // Which rewriter is answering is stated, not implied: the two behave
-    // differently (one takes the graphics card, one does not) and the user
-    // just chose between them on the Settings page.
+    // differently (one takes the graphics card, one does not), they are chosen
+    // separately per draft kind, and the user just chose between them.
     var active = $('rewrite-active');
     if (active) {
-      active.hidden = !rewriteBackend;
-      setText('rewrite-active-text', rewriteBackend
-        ? 'Rewriter in use: ' + rewriteLabel(rewriteBackend) + '.' : '');
+      var sentence = rewriterSentence();
+      active.hidden = !sentence;
+      setText('rewrite-active-text', sentence);
     }
-    if (!rewriteBackend) hideProposal();
+    if (!rewritingSomewhere()) hideProposal();
+  }
+
+  // The one honest sentence about who is rewriting what, built from the labels
+  // the server sent. When the two kinds use different rewriters the page says
+  // both rather than naming one and implying the other.
+  function rewriterSentence() {
+    var text = rewriteActiveFor('t2i');
+    var edit = rewriteActiveFor('edit');
+    if (text && edit && text === edit) {
+      return 'Rewriter in use: ' + rewriteLabel(text) + '.';
+    }
+    var parts = [];
+    if (text) parts.push('text drafts by ' + rewriteLabel(text));
+    if (edit) parts.push('edit drafts by ' + rewriteLabel(edit));
+    if (!parts.length) return '';
+    var line = 'Rewriter in use: ' + parts.join(', ') + '.';
+    if (!text || !edit) {
+      line += ' ' + (!text ? 'Text' : 'Edit') + ' drafts have no rewriter here.';
+    }
+    return line;
   }
 
   // The friendly name for a backend id, taken from the status rows when the
@@ -1211,7 +1316,7 @@
       }
     }
     return backend === 'pe-llamacpp' ? 'Official enhancer (Q8, uses GPU)'
-      : backend === 'local-llm' ? 'Local LLM service' : backend;
+      : backend === 'local-llm' ? 'OpenAI-compatible endpoint' : backend;
   }
 
   function bumpPromptRevision() {
@@ -1243,7 +1348,9 @@
   }
 
   function requestRewrite() {
-    if (!rewriteBackend || rewriteInFlight) return;
+    // The rewriter for THIS draft kind, not "some rewriter": an edit draft on a
+    // text-only server must not fire a request the server will refuse.
+    if (rewriteInFlight || !rewriteActiveFor(rewriteTask())) return;
     var draft = $('prompt').value;
     if (!draft.trim()) {
       setText('rewrite-error',
@@ -1485,8 +1592,9 @@
 
   // Observable state for the browser checks (no server, no model).
   function rewriteState() {
-    return { backend: rewriteBackend, revision: promptRevision,
-             inFlight: rewriteInFlight, hasProposal: !!proposal,
+    return { backend: rewriteBackend, byTask: rewriteByTask,
+             revision: promptRevision, inFlight: rewriteInFlight,
+             hasProposal: !!proposal,
              proposal: proposal ? proposal.prompt : null };
   }
 
@@ -1516,6 +1624,49 @@
   var rewriteSettingsBusy = false;
   var rewriteTestBusy = false;
 
+  // What the FORM shows, which is deliberately NOT what the server holds: a
+  // radio or switch the user moved is a proposal until Save comes back. The
+  // renderer needs both, because it redraws labels, field muting and button
+  // states on every click — and redrawing from the server document alone would
+  // snap the user's click straight back.
+  var rewriteForm = null;   // {t2i, edit, enabled, endpoint, model, timeout_s} or null
+
+  function rewriteFormState() {
+    if (rewriteForm) return rewriteForm;
+    if (!rewriteSettings) return null;
+    return { t2i: rewriteSettings.choices.t2i, edit: rewriteSettings.choices.edit,
+             enabled: rewriteSettings.enabled,
+             endpoint: rewriteSettings.local.endpoint,
+             model: rewriteSettings.local.model,
+             timeout_s: rewriteSettings.local.timeout_s };
+  }
+
+  function noteRewriteChoice(task, id) {
+    rewriteForm = rewriteFormState() || { t2i: null, edit: null, enabled: true,
+                                          endpoint: null, model: null,
+                                          timeout_s: null };
+    rewriteForm[task] = id;
+  }
+
+  function noteRewriteEnabled(enabled) {
+    rewriteForm = rewriteFormState() || { t2i: null, edit: null, enabled: true,
+                                          endpoint: null, model: null,
+                                          timeout_s: null };
+    rewriteForm.enabled = !!enabled;
+  }
+
+  // The three endpoint boxes are part of the same pending form: an unrelated
+  // click (a radio, the Off switch) redraws the page, and a redraw that refills
+  // them from the server document would delete an address the user was typing.
+  function noteRewriteFields(fields) {
+    rewriteForm = rewriteFormState() || { t2i: null, edit: null, enabled: true,
+                                          endpoint: null, model: null,
+                                          timeout_s: null };
+    rewriteForm.endpoint = fields.endpoint;
+    rewriteForm.model = fields.model;
+    rewriteForm.timeout_s = fields.timeout_s;
+  }
+
   // The settings document, strictly — the same closed shape the server
   // validates before it sends it. Anything unexpected rejects the document
   // rather than rendering a partial guess about which rewriter is live.
@@ -1526,21 +1677,40 @@
       if (REWRITE_SETTINGS_KEYS.indexOf(keys[i]) === -1) return null;
     }
     if (payload.schema !== REWRITE_SETTINGS_SCHEMA) return null;
-    if (payload.backend !== null && typeof payload.backend !== 'string') return null;
+    if (typeof payload.enabled !== 'boolean') return null;
     if (typeof payload.persistent !== 'boolean') return null;
+    var choices = parseRewriteChoices(payload.choices);
     var saved = parseRewriteChoice(payload.saved);
     var local = parseRewriteLocal(payload.local);
-    if (saved === null || local === null) return null;
+    if (choices === null || saved === null || local === null) return null;
     var rows = parseRewriteSettingsRows(payload.backends);
     if (rows === null) return null;
+    var groups = parseRewriteTaskRows(payload.tasks);
+    if (groups === null) return null;
     var off = payload.off;
     if (!off || off.id !== 'off' || typeof off.label !== 'string') return null;
     if (payload.note !== undefined && typeof payload.note !== 'string') return null;
     return {
-      backend: payload.backend, saved: saved, local: local, backends: rows,
+      enabled: payload.enabled, choices: choices, saved: saved, local: local,
+      backends: rows, tasks: groups,
       off: { id: 'off', label: off.label }, persistent: payload.persistent,
       note: typeof payload.note === 'string' ? payload.note : ''
     };
+  }
+
+  // The choice IN FORCE per draft kind: one entry per known task, each a
+  // rewriter id. Never null — the server resolves its default, so the page
+  // always has a radio to tick rather than an empty group.
+  function parseRewriteChoices(choices) {
+    if (!choices || typeof choices !== 'object' || Array.isArray(choices)) return null;
+    if (Object.keys(choices).length !== REWRITE_TASKS.length) return null;
+    var out = {};
+    for (var i = 0; i < REWRITE_TASKS.length; i++) {
+      var task = REWRITE_TASKS[i];
+      if (REWRITE_BACKEND_IDS.indexOf(choices[task]) === -1) return null;
+      out[task] = choices[task];
+    }
+    return out;
   }
 
   // The three local-service values, shared by the saved choice and by the block
@@ -1574,21 +1744,37 @@
     return true;
   }
 
-  // One CHOICE document (the saved one): a backend id or null, plus the three
-  // local-service values.
+  // The SAVED choice: the per-task rewriters (each null when the user never
+  // picked one), the on/off switch, and the three shared endpoint values. Null
+  // means "not saved", which is a different fact from "off".
   function parseRewriteChoice(choice) {
     if (!choice || typeof choice !== 'object' || Array.isArray(choice)) return null;
     if (!hasOnlyKeys(choice, REWRITE_CHOICE_KEYS)) return null;
-    var backend = null;
-    if (choice.backend !== null) {
-      if (typeof choice.backend !== 'string' ||
-          REWRITE_SETTINGS_BACKENDS.indexOf(choice.backend) === -1) return null;
-      backend = choice.backend;
+    var out = {};
+    for (var i = 0; i < REWRITE_TASKS.length; i++) {
+      var task = REWRITE_TASKS[i];
+      var value = choice[task];
+      if (value === null || value === undefined) {
+        out[task] = null;
+      } else if (REWRITE_BACKEND_IDS.indexOf(value) !== -1) {
+        out[task] = value;
+      } else {
+        return null;
+      }
+    }
+    if (choice.enabled === null || choice.enabled === undefined) {
+      out.enabled = null;
+    } else if (typeof choice.enabled === 'boolean') {
+      out.enabled = choice.enabled;
+    } else {
+      return null;
     }
     var fields = parseRewriteLocalFields(choice);
     if (fields === null) return null;
-    fields.backend = backend;
-    return fields;
+    out.endpoint = fields.endpoint;
+    out.model = fields.model;
+    out.timeout_s = fields.timeout_s;
+    return out;
   }
 
   // The block that describes the LOCAL service as this server runs it: the same
@@ -1598,6 +1784,49 @@
     if (!local || typeof local !== 'object' || Array.isArray(local)) return null;
     if (!hasOnlyKeys(local, REWRITE_LOCAL_KEYS)) return null;
     return parseRewriteLocalFields(local);
+  }
+
+  // One radio group per draft kind. The server has already resolved whether each
+  // rewriter can be chosen for THAT kind (PE-I2I missing is not the page's
+  // business) and why not, so a greyed-out radio arrives with its reason and the
+  // page renders it verbatim instead of inventing one.
+  function parseRewriteTaskRows(rows) {
+    if (!Array.isArray(rows) || rows.length !== REWRITE_TASKS.length) return null;
+    var out = [];
+    for (var i = 0; i < REWRITE_TASKS.length; i++) {
+      var row = rows[i];
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+      if (Object.keys(row).length !== REWRITE_TASK_ROW_KEYS.length ||
+          !hasOnlyKeys(row, REWRITE_TASK_ROW_KEYS)) return null;
+      if (row.task !== REWRITE_TASKS[i]) return null;   // the server's order
+      // The label is not free text: it names the draft kind this group is for.
+      if (REWRITE_TASK_LABELS[row.task] !== row.label) return null;
+      var choices = row.choices;
+      if (!Array.isArray(choices) || choices.length !== REWRITE_BACKEND_IDS.length) return null;
+      var picked = [];
+      for (var c = 0; c < choices.length; c++) {
+        var choice = choices[c];
+        if (!choice || typeof choice !== 'object' || Array.isArray(choice)) return null;
+        if (Object.keys(choice).length !== REWRITE_TASK_CHOICE_KEYS.length ||
+            !hasOnlyKeys(choice, REWRITE_TASK_CHOICE_KEYS)) return null;
+        if (REWRITE_BACKEND_IDS.indexOf(choice.id) === -1) return null;
+        if (REWRITE_BACKEND_LABELS[choice.id] !== choice.label ||
+            REWRITE_BACKEND_USES_GPU[choice.id] !== choice.uses_gpu) return null;
+        if (typeof choice.uses_gpu !== 'boolean' ||
+            typeof choice.available !== 'boolean' ||
+            typeof choice.reason !== 'string') return null;
+        // Greyed out means the server owes the user a sentence, and an
+        // available option must not carry one: a reason beside a radio the user
+        // CAN click reads as a warning about something they are about to do.
+        if (choice.available !== (choice.reason === '')) return null;
+        if (containsId(picked, choice.id)) return null;  // one row per rewriter
+        picked.push({ id: choice.id, label: choice.label,
+                      uses_gpu: choice.uses_gpu, available: choice.available,
+                      reason: choice.reason });
+      }
+      out.push({ task: row.task, label: row.label, choices: picked });
+    }
+    return out;
   }
 
   // The settings form's rows: every backend that exists on this server, with
@@ -1613,10 +1842,18 @@
       for (var k = 0; k < keys.length; k++) {
         if (REWRITE_SETTINGS_ROW_KEYS.indexOf(keys[k]) === -1) return null;
       }
-      if (typeof row.id !== 'string' || REWRITE_SETTINGS_BACKENDS.indexOf(row.id) === -1) return null;
-      if (typeof row.label !== 'string' || !row.label || /[\/\\]/.test(row.label)) return null;
-      if (typeof row.uses_gpu !== 'boolean' || typeof row.available !== 'boolean') return null;
+      if (REWRITE_SETTINGS_BACKENDS.indexOf(row.id) === -1) return null;
+      if (containsId(out, row.id)) return null;   // one row per rewriter
+      if (REWRITE_BACKEND_LABELS[row.id] !== row.label ||
+          REWRITE_BACKEND_USES_GPU[row.id] !== row.uses_gpu) return null;
+      if (typeof row.available !== 'boolean') return null;
       if (typeof row.reason !== 'string') return null;
+      // The same rule as a task choice: unavailable comes with a sentence.
+      if (row.available !== (row.reason === '')) return null;
+      // `tasks` may be EMPTY here: a checkpoint that is installed but cannot
+      // answer either draft kind is a real server shape, and its row is how the
+      // page says so. What it may never be is a list of draft kinds this page
+      // has no group for.
       if (!Array.isArray(row.tasks)) return null;
       for (var t = 0; t < row.tasks.length; t++) {
         if (REWRITE_TASKS.indexOf(row.tasks[t]) === -1) return null;
@@ -1636,28 +1873,70 @@
     return null;
   }
 
-  function selectedRewriteBackend() {
-    var radios = document.querySelectorAll('input[name="rewrite-backend"]');
+  // One draft kind's group, as the server described it.
+  function rewriteTaskRow(task) {
+    if (!rewriteSettings) return null;
+    for (var i = 0; i < rewriteSettings.tasks.length; i++) {
+      if (rewriteSettings.tasks[i].task === task) return rewriteSettings.tasks[i];
+    }
+    return null;
+  }
+
+  // One rewriter's row FOR one draft kind: the label, whether it can be chosen
+  // for that kind here, and the server's own sentence if it cannot.
+  function rewriteChoiceRow(task, id) {
+    var row = rewriteTaskRow(task);
+    if (!row) return null;
+    for (var i = 0; i < row.choices.length; i++) {
+      if (row.choices[i].id === id) return row.choices[i];
+    }
+    return null;
+  }
+
+  function selectedRewriteChoice(task) {
+    var radios = document.querySelectorAll('input[name="rewrite-' + task + '"]');
     for (var i = 0; i < radios.length; i++) {
       if (radios[i].checked) return radios[i].value;
     }
     return null;
   }
 
-  // The POST envelope, built from what is on screen. An empty box is null —
-  // "keep what the server was started with" — never an empty string, which
-  // the server would refuse as a malformed address or name.
-  function rewriteSettingsEnvelope() {
+  // The single Off switch. Ticking the box means OFF, so the document's
+  // `enabled` is the negation — one sentence on screen, one boolean on the wire.
+  function rewriteEnabled() {
+    var box = $('rewrite-off');
+    return box ? !box.checked : true;
+  }
+
+  // The three endpoint inputs. An empty box is null — "keep what the server was
+  // started with" — never an empty string, which the server would refuse as a
+  // malformed address or name.
+  function rewriteEndpointFields() {
     var timeoutRaw = pyStrip(String($('rewrite-timeout').value));
     var timeout = null;
     if (timeoutRaw !== '') timeout = Number(timeoutRaw);
     return {
-      schema: REWRITE_SETTINGS_SCHEMA,
-      backend: selectedRewriteBackend(),
       endpoint: pyStrip(String($('rewrite-endpoint').value)) || null,
       model: pyStrip(String($('rewrite-model').value)) || null,
       timeout_s: timeout
     };
+  }
+
+  function rewriteSettingsEnvelope() {
+    var fields = rewriteEndpointFields();
+    fields.schema = REWRITE_SETTINGS_SCHEMA;
+    fields.t2i = selectedRewriteChoice('t2i');
+    fields.edit = selectedRewriteChoice('edit');
+    fields.enabled = rewriteEnabled();
+    return fields;
+  }
+
+  // The probe addresses the shared endpoint ALONE: no choice keys, and its own
+  // schema, because testing an address is not a change of rewriter.
+  function rewriteTestEnvelope() {
+    var fields = rewriteEndpointFields();
+    fields.schema = REWRITE_TEST_REQUEST_SCHEMA;
+    return fields;
   }
 
   function loadRewriteSettings() {
@@ -1682,50 +1961,78 @@
             : 'The rewriter settings did not match the expected schema, so ' +
               'nothing on this page was taken from them.');
           rewriteSettings = null;
+          rewriteForm = null;      // nothing on screen came from the server
         } else {
           rewriteSettings = state;
+          rewriteForm = null;      // the form now shows exactly this document
         }
         renderRewriteSettings();
         return state;
       });
   }
 
+  // The short name the page's own element ids use for a rewriter id.
+  function rewriteShortName(id) {
+    return id === 'pe-llamacpp' ? 'pe' : id === 'local-llm' ? 'local' : id;
+  }
+
   function renderRewriteSettings() {
     var loaded = !!rewriteSettings;
-    var radios = document.querySelectorAll('input[name="rewrite-backend"]');
-    for (var i = 0; i < radios.length; i++) {
-      var radio = radios[i];
-      var row = radio.value === 'off' ? null : rewriteRow(radio.value);
-      // An unavailable backend stays visible with its reason: "Off" and a
-      // greyed-out choice explain themselves, a missing one does not.
-      var available = radio.value === 'off' ? true : !!(row && row.available);
-      radio.disabled = !loaded || (!available && radio.value !== rewriteSettings.backend);
-      radio.checked = loaded && (rewriteSettings.backend || 'off') === radio.value;
-      var reason = $('rewrite-backend-' +
-        (radio.value === 'pe-llamacpp' ? 'pe'
-          : radio.value === 'local-llm' ? 'local' : 'off') + '-reason');
-      if (reason) {
-        setText(reason.id, !loaded ? ''
-          : available ? '' : (row && row.reason ? row.reason
-            : 'this server cannot run that rewriter'));
+    var form = rewriteFormState();   // what the user sees, not what is saved
+    // One group per draft kind. Labels and reasons are the server's words, so a
+    // renamed rewriter or a new availability sentence shows up without a page
+    // change; a group the document does not describe renders nothing rather
+    // than a guess.
+    for (var g = 0; g < REWRITE_TASKS.length; g++) {
+      var task = REWRITE_TASKS[g];
+      var group = rewriteTaskRow(task);
+      var legend = $('rewrite-group-' + task);
+      if (legend && group) setText(legend.id, group.label);
+      var radios = document.querySelectorAll('input[name="rewrite-' + task + '"]');
+      for (var i = 0; i < radios.length; i++) {
+        var radio = radios[i];
+        var choice = rewriteChoiceRow(task, radio.value);
+        var chosen = loaded && !!form && form[task] === radio.value;
+        var available = !!(choice && choice.available);
+        // An unavailable rewriter stays VISIBLE with its reason, and a choice
+        // the user already made stays ticked even when this server cannot honour
+        // it: the page shows what is saved, so putting the missing file in place
+        // fixes it without choosing twice.
+        radio.checked = chosen;
+        radio.disabled = !loaded || (!available && !chosen);
+        var suffix = '-' + task + '-' + rewriteShortName(radio.value);
+        if (choice) setText('rewrite' + suffix + '-label', choice.label);
+        setText('rewrite' + suffix + '-reason', !loaded || available ? ''
+          : (choice && choice.reason ? choice.reason
+             : 'this server cannot run that rewriter for this kind of draft'));
       }
     }
-    var local = loaded ? rewriteSettings.local : { endpoint: null, model: null,
-                                                   timeout_s: null };
-    if (loaded) {
-      $('rewrite-endpoint').value = local.endpoint || '';
-      $('rewrite-model').value = local.model || '';
-      $('rewrite-timeout').value = local.timeout_s === null ? '' : String(local.timeout_s);
+    var off = $('rewrite-off');
+    if (off) {
+      off.disabled = !loaded;
+      off.checked = loaded && !!form ? !form.enabled : false;
     }
-    // The fields describe the LOCAL service, so they belong to that choice —
-    // but they stay readable when another rewriter is active, because the
-    // edit draft falls back to them and the user needs to see what it says.
-    var isLocal = loaded && selectedRewriteBackend() === 'local-llm';
+    setText('rewrite-off-reason', loaded && !!form && !form.enabled
+      ? 'rewriting is switched off: both kinds of draft are used exactly as ' +
+        'you wrote them' : '');
+    // The three boxes show what the USER typed, or — with nothing typed yet —
+    // what the server sent. Refilling them from the document on every redraw
+    // would erase an address mid-word the moment another control is clicked.
+    var local = form || { endpoint: null, model: null, timeout_s: null };
+    $('rewrite-endpoint').value = local.endpoint == null ? '' : String(local.endpoint);
+    $('rewrite-model').value = local.model == null ? '' : String(local.model);
+    $('rewrite-timeout').value = local.timeout_s == null ? '' : String(local.timeout_s);
+    // The fields describe the SHARED endpoint, so they belong to whichever group
+    // chooses it — and stay readable when neither does, because a greyed-out
+    // official rewriter still leaves this as the fallback the user must be able
+    // to see and fix.
+    var usesEndpoint = loaded && (selectedRewriteChoice('t2i') === 'local-llm' ||
+                                  selectedRewriteChoice('edit') === 'local-llm');
     ['rewrite-endpoint', 'rewrite-model', 'rewrite-timeout'].forEach(function (id) {
       var input = $(id);
       if (input) input.disabled = !loaded;
       var box = input ? input.closest('.field') : null;
-      if (box) box.classList.toggle('field-muted', loaded && !isLocal);
+      if (box) box.classList.toggle('field-muted', loaded && !usesEndpoint);
     });
     var test = $('rewrite-test');
     if (test) {
@@ -1733,7 +2040,10 @@
         !pyStrip(String($('rewrite-endpoint').value));
     }
     var save = $('rewrite-save');
-    if (save) save.disabled = !loaded || rewriteSettingsBusy || !selectedRewriteBackend();
+    if (save) {
+      save.disabled = !loaded || rewriteSettingsBusy ||
+        !(selectedRewriteChoice('t2i') && selectedRewriteChoice('edit'));
+    }
     setText('rewrite-settings-note', loaded ? rewriteSettings.note : '');
     if (!loaded) {
       setText('rewrite-save-status', '');
@@ -1744,8 +2054,11 @@
   function saveRewriteSettings() {
     if (rewriteSettingsBusy) return;
     var envelope = rewriteSettingsEnvelope();
-    if (!envelope.backend) {
-      setText('rewrite-settings-error', 'Choose a rewriter first.');
+    if (!envelope.t2i || !envelope.edit) {
+      // Both groups must carry a choice; the server refuses a partial document
+      // rather than guess what the other kind of draft should use.
+      setText('rewrite-settings-error',
+        'Choose a rewriter for both kinds of draft first.');
       return;
     }
     rewriteSettingsBusy = true;
@@ -1782,12 +2095,26 @@
         loadRewriteSettings();
         return;
       }
-      rewriteSettings = state;
+      rewriteSettings = state;   // the server answered: the proposal IS the state
+      rewriteForm = null;
+      // Say what the NEXT rewrite will actually do, per draft kind, in the same
+      // words the groups use — a saved "Official" that had to fall back would
+      // otherwise read as a promise the server never made.
+      var sentence;
+      if (!state.enabled) {
+        sentence = 'Saved. Rewriting is switched off.';
+      } else if (state.choices.t2i === state.choices.edit) {
+        sentence = 'Saved. The next rewrite uses ' +
+          rewriteLabel(state.choices.t2i) + '.';
+      } else {
+        sentence = 'Saved. Text drafts will use ' +
+          rewriteLabel(state.choices.t2i) + ', edit drafts ' +
+          rewriteLabel(state.choices.edit) + '.';
+      }
       setText('rewrite-save-status',
-        'Saved. The next rewrite uses ' +
-        (state.backend ? rewriteLabel(state.backend) : 'no rewriter') +
-        (state.persistent ? '.' : ' — but this server has no cache directory, ' +
-         'so the change lasts only until it restarts.'));
+        sentence + (state.persistent ? ''
+          : ' — but this server has no cache directory, so the change lasts ' +
+            'only until it restarts.'));
       renderRewriteSettings();
       checkStatus();   // the Create view names the rewriter it will use
     });
@@ -1795,7 +2122,7 @@
 
   function testRewriteConnection() {
     if (rewriteTestBusy) return;
-    var envelope = rewriteSettingsEnvelope();
+    var envelope = rewriteTestEnvelope();   // the endpoint alone, never a choice
     rewriteTestBusy = true;
     $('rewrite-test').disabled = true;
     $('rewrite-test').setAttribute('aria-busy', 'true');
@@ -1804,11 +2131,7 @@
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json',
                  'X-Qwen-UI': '1' },
-      body: JSON.stringify({
-        schema: REWRITE_TEST_REQUEST_SCHEMA,
-        endpoint: envelope.endpoint, model: envelope.model,
-        timeout_s: envelope.timeout_s
-      }),
+      body: JSON.stringify(envelope),
       // A probe is bounded by the server; this only stops the page waiting on
       // a socket that never answers.
       timeoutMs: REWRITE_TIMEOUT_MS
@@ -3712,19 +4035,30 @@
     });
 
     // The Settings page. Every control here writes the SERVER's choice, so a
-    // change is only real once the server has answered: the form is rebuilt
-    // from the reply, never from what was typed.
-    Array.prototype.forEach.call(
-      document.querySelectorAll('input[name="rewrite-backend"]'),
-      function (radio) {
-        radio.addEventListener('change', function () {
-          setText('rewrite-save-status', '');
-          setText('rewrite-settings-error', '');
-          renderRewriteSettings();
+    // change is only real once the server has answered — but a radio the user
+    // clicked must survive the redraw that follows, so the form keeps its own
+    // pending selection until a load or a save replaces it.
+    ['rewrite-t2i', 'rewrite-edit'].forEach(function (name) {
+      Array.prototype.forEach.call(
+        document.querySelectorAll('input[name="' + name + '"]'),
+        function (radio) {
+          radio.addEventListener('change', function () {
+            noteRewriteChoice(radio.name.slice('rewrite-'.length), radio.value);
+            setText('rewrite-save-status', '');
+            setText('rewrite-settings-error', '');
+            renderRewriteSettings();
+          });
         });
-      });
+    });
+    $('rewrite-off').addEventListener('change', function () {
+      noteRewriteEnabled(!$('rewrite-off').checked);
+      setText('rewrite-save-status', '');
+      setText('rewrite-settings-error', '');
+      renderRewriteSettings();
+    });
     ['rewrite-endpoint', 'rewrite-model', 'rewrite-timeout'].forEach(function (id) {
       $(id).addEventListener('input', function () {
+        noteRewriteFields(rewriteEndpointFields());
         setText('rewrite-save-status', '');
         setText('rewrite-test-status', '');
         renderRewriteSettings();
@@ -3877,11 +4211,12 @@
     PROMPT_MAX_CHARS: PROMPT_MAX_CHARS,
     REWRITE_TIMEOUT_MS: REWRITE_TIMEOUT_MS,
     // Rewriter-settings surface for the real-Chrome checks: the closed
-    // parsers, the envelope an empty box turns into null, and the two calls
-    // the Settings page makes.
-    parseRewriteBlock: parseRewriteBlock,
+    // parsers, the envelopes the page sends (a choice per draft kind; the probe
+    // carries the endpoint alone), and the two calls the Settings page makes.
     parseRewriteSettings: parseRewriteSettings,
     rewriteSettingsEnvelope: rewriteSettingsEnvelope,
+    rewriteTestEnvelope: rewriteTestEnvelope,
+    renderRewriteSettings: renderRewriteSettings,
     rewriteLabel: rewriteLabel,
     loadRewriteSettings: loadRewriteSettings,
     saveRewriteSettings: saveRewriteSettings,

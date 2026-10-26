@@ -1070,17 +1070,27 @@ def build_parser() -> argparse.ArgumentParser:
                    default=_rewrite_service.DEFAULT_TIMEOUT_SECONDS,
                    help="seconds a single rewrite may take before the request "
                         f"times out (default {_rewrite_service.DEFAULT_TIMEOUT_SECONDS:g})")
-    # -- the official prompt enhancer: llama.cpp + the Q8_0 GGUF ------------
-    # These two name FILES on this machine, so they exist only as launch flags:
-    # the Settings page may CHOOSE the enhancer but can never point it at a
-    # binary or a model, and both must be given together.
+    # -- the official prompt enhancer: llama.cpp + the Q8_0 GGUFs -----------
+    # These name FILES on this machine, so they exist only as launch flags: the
+    # Settings page may CHOOSE the enhancer per draft kind but can never point it
+    # at a binary or a model. The two enhancers are separate checkpoints —
+    # PE-T2I for a text draft, PE-I2I plus its vision projector for an edit
+    # draft — installed independently, so each pair is both-or-neither.
     p.add_argument("--pe-llama-server", default=None, metavar="PATH",
                    help="llama-server binary for the official prompt enhancer "
                         "(give it together with --pe-t2i-model; never settable "
                         "from the browser)")
     p.add_argument("--pe-t2i-model", default=None, metavar="PATH",
-                   help="the enhancer's Q8_0 GGUF (give it together with "
+                   help="the text enhancer's Q8_0 GGUF (give it together with "
                         "--pe-llama-server)")
+    p.add_argument("--pe-i2i-model", default=None, metavar="PATH",
+                   help="the edit enhancer's Q8_0 GGUF (give it together with "
+                        "--pe-i2i-mmproj; without both, an edit draft has no "
+                        "official rewriter)")
+    p.add_argument("--pe-i2i-mmproj", default=None, metavar="PATH",
+                   help="the edit enhancer's vision projector (BF16 GGUF); a "
+                        "Q8 GGUF alone cannot see the reference it is asked to "
+                        "describe")
     p.add_argument("--pe-timeout", type=float,
                    default=_rewrite_service.DEFAULT_PE_TIMEOUT_SECONDS,
                    metavar="SECONDS",
@@ -1107,16 +1117,23 @@ def _startup_config_or_exit(paths: dict[str, str | None]) -> int:
 def pe_flags_error(args: argparse.Namespace) -> str:
     """One bounded startup line when the enhancer flags are wrong, else ``""``.
 
-    The binary and the GGUF must be given together and must be usable — binary
-    readable AND executable, model readable. A missing model would otherwise
-    surface as a mysterious backend failure forty seconds into the first
-    rewrite; here it is one line and exit 2. The digest-pinned system prompt the
-    enhancer reads is checked where it is loaded (:func:`load_system_prompt`),
-    because a drifted prompt is the same class of refusal.
+    Each checkpoint is a pair and each pair is both-or-neither: the binary with
+    the text GGUF, the edit GGUF with its vision projector. Files must be usable
+    — binary readable AND executable, models readable. A missing file would
+    otherwise surface as a mysterious backend failure forty seconds into the
+    first rewrite; here it is one line and exit 2. The digest-pinned system
+    prompt each checkpoint reads is checked where it is loaded
+    (:func:`load_system_prompt`), because a drifted prompt is the same class of
+    refusal — and PE-I2I needs the EDIT prompt, not the text one.
     """
     binary, model = args.pe_llama_server, args.pe_t2i_model
-    if binary is None and model is None:
+    i2i_model, i2i_mmproj = args.pe_i2i_model, args.pe_i2i_mmproj
+    if binary is None and model is None and i2i_model is None and i2i_mmproj is None:
         return ""
+    if (i2i_model is None) != (i2i_mmproj is None):
+        return ("--pe-i2i-model and --pe-i2i-mmproj must be given together: the "
+                "edit enhancer's GGUF cannot see the reference it is asked to "
+                "describe without its vision projector")
     if binary is None or model is None:
         return ("--pe-llama-server and --pe-t2i-model must be given together: "
                 "the enhancer needs its binary and its model")
@@ -1127,6 +1144,14 @@ def pe_flags_error(args: argparse.Namespace) -> str:
     if args.rewrite_prompt_t2i is None:
         return ("the enhancer needs --rewrite-prompt-t2i: the digest-pinned "
                 "system prompt its weights were trained on")
+    if i2i_model is not None:
+        for flag, value in (("--pe-i2i-model", i2i_model),
+                            ("--pe-i2i-mmproj", i2i_mmproj)):
+            if not os.path.isfile(value) or not os.access(value, os.R_OK):
+                return f"{flag} is not a readable file: {value}"
+        if args.rewrite_prompt_edit is None:
+            return ("the edit enhancer needs --rewrite-prompt-edit: the "
+                    "digest-pinned system prompt PE-I2I was trained on")
     return ""
 
 
@@ -1178,9 +1203,15 @@ def build_rewrite_service(args: argparse.Namespace,
         if complete else _rewrite_service.RewriteSettings.disabled())
     enhancer = None
     if args.pe_llama_server is not None and args.pe_t2i_model is not None:
+        # One PESettings, both checkpoints: `tasks` reports what is actually
+        # installed here, and the service builds one enhancer client per task it
+        # can serve. The edit pair is optional — without it an edit draft simply
+        # has no official rewriter, and Settings says so.
         enhancer = _rewrite_service.PESettings(
             llama_server=args.pe_llama_server, model_path=args.pe_t2i_model,
-            system_prompt=prompts.get("t2i") or "", timeout=args.pe_timeout)
+            system_prompts=prompts, timeout=args.pe_timeout,
+            i2i_model_path=args.pe_i2i_model,
+            i2i_mmproj_path=args.pe_i2i_mmproj)
     if args.rewrite_backend == "pe-llamacpp" and enhancer is None:
         raise rc.RewriteConfigError(
             "--rewrite-backend pe-llamacpp needs --pe-llama-server and "
@@ -1234,7 +1265,8 @@ def settings_post_response(service: _rewrite_service.RewriteService | None,
                        "this server has no rewriter settings to change")
     fields = api.build_rewrite_settings_request(body)
     prefs = _rewrite_service.RewritePreferences(
-        backend=fields["backend"], endpoint=fields["endpoint"],
+        choices={task: fields[task] for task in rw.TASKS},
+        enabled=fields["enabled"], endpoint=fields["endpoint"],
         model=fields["model"], timeout_s=fields["timeout_s"])
     service.check_preferences(prefs)
     previous = service.preferences()
@@ -1414,9 +1446,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"qwen-web listening on http://{listener.bound_ip}:{port}")
     mode = "generation enabled (serial jobs)" if httpd.generation else "planning only (no generation)"
     if rewrite.available:
-        # Which one will answer, and which ones could have: the operator sees
-        # the enhancer is the active rewriter without reading the settings file.
-        mode += (f"; prompt rewriting enabled ({rewrite.active_backend}"
+        # Which rewriter answers EACH draft kind, and which ones could have: the
+        # operator sees "edit fell back to the endpoint because PE-I2I is not
+        # installed here" on the console, without reading the settings file.
+        answering = ", ".join(f"{task}={backend}"
+                              for task, backend in rewrite.active_by_task().items()
+                              if backend)
+        mode += (f"; prompt rewriting enabled ({answering}"
                  f" of {', '.join(rewrite.available_backends())})")
     else:
         mode += "; prompt rewriting off"

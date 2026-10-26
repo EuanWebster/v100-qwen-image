@@ -281,23 +281,32 @@ edits use essentially the whole card; Q8 does not.
 
 Design and memory matrix: [`image-edit-design.md`](image-edit-design.md).
 
-## Prompt rewriting — two rewriters, chosen in Settings
+## Prompt rewriting — two rewriters, chosen per draft kind in Settings
 
 When the server is started **without** any rewriter, the **Rewrite prompt**
-button is hidden and `POST /api/v1/rewrite` answers 503. Nothing about
-rewriting affects generation when it is off.
+button is hidden and `POST /api/v1/rewrite` refuses: `422 task_unsupported` for
+a draft kind this server has no rewriter for at all, `503 rewrite_disabled`
+while the Off switch is on. Nothing about rewriting affects generation when it
+is off.
 
 Two rewriters exist, and one server can offer either or both:
 
-- **Official enhancer (Q8, uses GPU)** — the official `Qwen-Image-2.1-PE-T2I`
-  weights as a Q8_0 GGUF, run under `llama-server` for the length of one
-  rewrite and then shut down. Root measured 9.5 GiB resident on the V100,
-  about 70 tokens/s, and 14–37 s for one text-to-image draft. It rewrites
-  **text-to-image drafts only** — the edit weights are a separate model that
-  this build does not ship.
-- **Local LLM service** — an OpenAI-compatible service already running on this
-  machine (the shared Qwen3.8 by default). It never touches the GPU and answers
-  in seconds, and it is the only rewriter that can handle an **edit** draft.
+- **Official enhancer (Q8, uses GPU)** — the official `Qwen-Image-2.1` enhancer
+  weights as Q8_0 GGUFs, run under `llama-server` for the length of one rewrite
+  and then shut down. They are two separate checkpoints, installed
+  independently: `PE-T2I` for a text draft, and `PE-I2I` **plus its BF16 vision
+  projector (`mmproj`)** for an edit draft — a Q8 GGUF on its own cannot see the
+  reference it is asked to describe. Root measured 9.5 GiB resident on the V100
+  at about 70 tokens/s: roughly 15–40 s for one text draft, 20–50 s for an edit
+  one, which has to read the reference images as well.
+- **OpenAI-compatible endpoint** — an OpenAI-compatible service already running
+  on this machine (the shared Qwen3.8 by default). It never touches the GPU and
+  answers in seconds, and it is the only rewriter for a draft kind whose
+  official checkpoint is not installed here.
+
+Both are handed the **same digest-pinned upstream system prompt** for the draft
+kind, so switching between them changes who follows the instruction, not the
+instruction.
 
 ```bash
 python -m qwen_engine.web --enable-generation --rewrite-backend local-llm \
@@ -309,76 +318,141 @@ python -m qwen_engine.web --enable-generation --rewrite-backend local-llm \
     --cache-dir cache --output-dir output/web
 ```
 
-The enhancer needs two more flags, given together, and refuses startup with one
-line if either is missing, unreadable, or not executable:
-`--pe-llama-server /path/to/llama-server` and
-`--pe-t2i-model models/pe/PE-T2I-Q8_0/Qwen-Image-2.1-PE-T2I-Q8_0.gguf`. It
-reads the same digest-pinned t2i system prompt as the local service, so
-`--rewrite-prompt-t2i` is required alongside them. `--pe-timeout` defaults to
-300 s — the draft thinks out loud first, and that thinking is most of the
-tokens. `start-web.sh` passes all of it when both files exist; `QWEN_PE=0`
-leaves the enhancer out even then.
+`--rewrite-backend` only says what the server **starts with** when nothing has
+been saved in Settings yet; the default is `off`.
+
+The enhancer adds four file flags, checked once at startup — a missing or
+unreadable file, or a binary that is not executable, is one line on stderr and
+exit 2. Each draft kind needs its own pair, and half a pair refuses startup:
+
+- `--pe-llama-server /path/to/llama-server` with
+  `--pe-t2i-model models/pe/PE-T2I-Q8_0/Qwen-Image-2.1-PE-T2I-Q8_0.gguf` for a
+  **text** draft (the binary is shared by both checkpoints, so it belongs to
+  this pair); the digest-pinned `--rewrite-prompt-t2i` is required alongside
+  them.
+- `--pe-i2i-model
+  models/pe/PE-I2I-Q8_0/Qwen-Image-2.1-PE-I2I-Q8_0.gguf` with
+  `--pe-i2i-mmproj models/pe/PE-I2I-Q8_0/mmproj-Qwen-Image-2.1-PE-I2I-BF16.gguf`
+  for an **edit** draft, which also requires `--rewrite-prompt-edit`. Without
+  both files an edit draft has no official rewriter — and since the binary is
+  part of the text pair, no installation offers the official edit enhancer
+  alone.
+
+`--pe-timeout` defaults to 300 s — the draft thinks out loud first, and that
+thinking is most of the tokens. `start-web.sh` passes the text pair when its
+files are readable and adds the edit pair only when both of *its* files are, so
+a half-installed `models/pe/` still gets the enhancer it can actually run;
+`QWEN_PE=0` leaves both enhancers out even then.
+
+Those paths are the script's defaults, overridable in the environment:
+`QWEN_PE_LLAMA_SERVER`, `QWEN_PE_MODEL`, `QWEN_PE_I2I_MODEL`,
+`QWEN_PE_I2I_MMPROJ` and `QWEN_PE_TIMEOUT` (which becomes `--pe-timeout`). They
+are still launch flags by the time the server sees them, so they remain the
+operator's, not the page's.
 
 ### Settings → Prompt rewriter
 
-Which rewriter answers is **your setting, not the launch script's**. The
-**Settings** tab shows every rewriter this server can actually run — one with
-no binary, no GGUF or no system prompt on disk is not offered at all — plus the
-local service's endpoint, model name and timeout, and a **Test connection**
-button that asks the chosen rewriter for one short answer without touching the
-image model.
+Which rewriter answers is **your setting, not the launch script's** — and it is
+chosen **per draft kind**. The **Settings** tab has two radio groups, **Prompt
+enhance (text-to-image)** and **Edit prompt enhance**, each offering **Official
+enhancer (Q8, uses GPU)** and **OpenAI-compatible endpoint**. Both default to the
+official enhancer, so an untouched server rewrites with the official weights for
+whichever kinds it has installed; for a kind whose checkpoint is missing here,
+the endpoint radio is what gets picked instead of an unrunnable official choice.
 
-The choice is **server-side and shared**: it is written to a `0600` JSON file
-in the server's cache directory (`cache/rewrite-settings.json`), re-read at
-startup, and every browser pointed at this server sees the same active
-rewriter. The launch flags say what is *possible* and seed the file the first
-time it is written; afterwards the file wins for the active rewriter, the
-endpoint, the model name and the timeout.
+One switch covers both kinds: **Off — leave both kinds of draft exactly as you
+wrote them**. With it on, **Rewrite prompt** disappears, every rewrite answers
+`503 rewrite_disabled`, and the two radio groups keep the choices they had.
 
-Two consequences worth knowing:
+The endpoint fields — **Endpoint URL**, **Model name**, **Timeout (s)** and
+**Test connection** — are **shared by both groups**, because they describe the
+one OpenAI-compatible service and not a per-kind choice. There is one set of
+them, and the test button probes exactly what the fields hold: with no endpoint
+URL or no model name it answers `422 backend_incomplete` rather than probing
+anything. Leaving a field empty keeps the value the server was started with.
+`--rewrite-timeout` defaults to 180 s; the field accepts 1–3600 s.
+
+A radio is greyed out when this server cannot run that rewriter for that draft
+kind — no binary, no GGUF, no vision projector, no system prompt file — and the
+server's own sentence appears under it, e.g. *"this server has no official
+image-edit checkpoint, so that draft has no official rewriter — use the
+OpenAI-compatible endpoint, or start the server with the edit enhancer files."*
+Saving a choice this server cannot honour is refused with that same reason
+(`422 backend_unavailable`). A choice saved **earlier** whose files have since
+disappeared stays selected, greyed, and that draft kind falls back to the other
+rewriter for as long as the files are missing — so putting the file back fixes
+it without a second visit to Settings. A draft kind with no usable rewriter at
+all is refused (`422 task_unsupported`); it is never silently handed to the
+rewriter chosen for the other kind.
+
+The choices are **server-side and shared**: the document is written to a `0600`
+JSON file in the server's cache directory (`cache/rewrite-settings.json`),
+re-read at startup, and every browser pointed at this server sees the same two
+choices, the same Off switch and the same endpoint. The launch flags say what is
+*possible* and seed the file the first time it is written; afterwards the file
+wins for both choices, the endpoint, the model name and the timeout. A server
+started without a cache directory still applies a change, but only until it is
+restarted — and says so on the page.
+
+Three consequences worth knowing:
 
 - The enhancer **cannot share the GPU with an image job** (9.5 GiB for it plus
-  13–15 GiB for the image model, on a 16 GiB card). An image job that is
-  already generating makes a rewrite refuse at once with `rewrite_gpu_busy`
-  rather than queue behind it; an image submitted during a rewrite waits the
-  14–37 s instead.
-- With the enhancer active, an **edit** draft still uses the local service,
-  because the enhancer has no edit weights. With no local service configured
-  that edit rewrite is refused, never answered by the wrong model.
+  13–15 GiB for the image model, on a 16 GiB card), and the model is loaded onto
+  the card **only for the duration of one rewrite** — the `llama-server` child is
+  terminated and reaped before the lock is released. The two directions are
+  deliberately different: an image job already generating makes a rewrite refuse
+  at once with `rewrite_gpu_busy` rather than queue and look slow, while an image
+  submitted during a rewrite waits the 15–50 s for it.
+- Only **one rewrite runs at a time**, on either rewriter; a second request is
+  refused `503 rewrite_busy` rather than queued behind the first.
+- Cancelling a rewrite terminates the enhancer's `llama-server` child within one
+  poll interval (0.25 s), so the card is free again at once, and the request is
+  reported as `503 rewrite_cancelled` — never as a timeout.
 
 Nothing on that page accepts a filesystem path or an executable from the
-browser: the binary, the GGUF and the system prompts come from the operator's
-launch flags and are checked once at startup. The page can name a host, a port,
-a model and a number of seconds, and nothing else.
+browser. The operator's files — the `llama-server` binary, both GGUFs, the
+mmproj and the digest-pinned system prompt files — come only from the launch
+flags `--pe-llama-server`, `--pe-t2i-model`, `--pe-i2i-model`,
+`--pe-i2i-mmproj`, `--rewrite-prompt-t2i` and `--rewrite-prompt-edit`, and are
+checked at startup. The page can name a host, a port, a model and a number of
+seconds, and nothing else; a body carrying a path, or an old client's single
+`backend` key instead of the two per-kind choices, is refused outright.
 
 The endpoint is the **full URL the client POSTs to**, not a bare base URL: it
 must be `http` (no TLS policy exists for a loopback service), name an explicit
 port, be an IP literal or `localhost`, and be a loopback address (your prompt
-draft is user text and never leaves this machine). Anything else refuses
-startup. The prompt files are digest-pinned (md5 `a5e1efc4…` for t2i,
-`493264f3…` for edit); a mismatch likewise refuses startup with one line and
-exit 2 rather than sending a prompt the weights were not trained on.
-`--rewrite-timeout` defaults to 180 s.
+draft is user text and never leaves this machine). Anything else is refused — at
+startup for the flag, on save for the field. The prompt files are digest-pinned
+(md5 `a5e1efc4…` for t2i, `493264f3…` for edit); a mismatch likewise refuses
+startup with one line and exit 2 rather than sending a prompt the weights were
+not trained on.
 
 In the UI, **Rewrite prompt** produces a proposal block headed *"Suggested
 prompt — not applied"* with your draft, the suggestion, and **Apply** / **Edit**
 / **Keep original** (plus **Apply ratio** when the proposal names a preset that
-matches exactly). It never changes your draft unless you press Apply. Failed
-rewrites are typed: 503 disabled/busy/cancelled, 504 timeout, 502
-backend-unavailable or an invalid answer, 422 prompt too long (> 8000
-characters), unsupported task, or a reference count/set the task cannot use,
-and 404 for a reference id the server no longer holds.
+matches exactly). The block names the rewriter that actually answered —
+*"Rewritten by Official enhancer (Q8, uses GPU)"* or *"Rewritten by
+OpenAI-compatible endpoint"* — and the Create tab states which rewriter answers
+each draft kind, because the two differ in more than name. It never changes your
+draft unless you press Apply. Failed rewrites are typed: 503
+disabled/busy/gpu-busy/cancelled, 504 timeout, 502 backend-unavailable or an
+invalid answer, 422 prompt too long (> 8000 characters), unsupported task, or a
+reference count/set the task cannot use, and 404 for a reference id the server no
+longer holds.
 
 With reference images attached the rewrite is an **edit** rewrite, and it sends
 the references with the draft: each stored image is read on the server,
-alpha-flattened onto white, downscaled so no side exceeds 768 px, and sent as a
-PNG data URI with your draft to the same local LLM — in the order the images
-are listed, because the edit prompt refers to them as *image 1*, *image 2* and
-so on. Only those downscaled copies leave the server (as inline data, never as
-a URL or a path); the stored originals are unchanged. Without references the
-rewrite is text-only, and the button is unavailable in edit mode until one is
-attached. Changing, reordering or removing a reference makes any visible
-suggestion stale, exactly as editing the draft does.
+alpha-flattened onto white, then sized for the rewriter about to read it — the
+endpoint gets a copy whose longest side is at most 768 px, the official edit
+enhancer gets its profile's own 1024×1024-pixel budget, aspect kept, with only
+an image already over that budget resampled — and is sent as a PNG data URI
+together with your draft, in the order the images are listed, because the edit
+prompt refers to them as *image 1*, *image 2* and so on. Only those downscaled
+copies leave the server (as inline data, never as a URL or a path); the stored
+originals are unchanged. Without references the rewrite is text-only, and the
+button is unavailable in edit mode until one is attached. Changing, reordering or
+removing a reference makes any visible suggestion stale, exactly as editing the
+draft does.
 
 **Quality is only spot-checked** (7 requests, one prompt each, 19–191 s
 latency, from before the sampling-parameter fix that made the profile's full

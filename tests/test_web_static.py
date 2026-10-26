@@ -1523,10 +1523,13 @@ def test_w5_rewrite_ui_is_a_suggestion_flow_not_an_automatic_edit():
     assert "image_ids: imageIds" in req
     assert "var imageIds = task === 'edit' ? activeReferenceIds() : [];" in req
     assert "var task = rewriteTask();" in req
-    # The button is availability-gated on the task it would send.
+    # The button is gated on the draft kind it would send: a kind the server has
+    # no rewriter for is not offerable, and an edit draft with no picture yet has
+    # nothing for the enhancer to look at.
     available = _js_function(js, "rewriteAvailable")
     assert "activeReferenceIds().length > 0" in available
-    assert "rewriteTask() === 't2i'" in available
+    assert "var task = rewriteTask();" in available
+    assert "rewriteActiveFor(task)" in available
     assert "disabled = !rewriteAvailable()" in _js_function(js, "setRewriterState")
     # A reference change is a rewrite input: it must bump the PROMPT revision
     # (which kills a visible proposal), not only the plan's draftRevision.
@@ -2016,29 +2019,50 @@ def test_the_rewriter_is_chosen_once_on_the_server_not_per_rewrite():
         _js_function(js, "renderView"), "opening Settings re-reads the server"
 
 
-def test_the_settings_page_offers_every_rewriter_and_the_local_service_fields():
-    """Three radios (enhancer, local service, off), each with the reason it is
-    greyed out; three fields for the local service; save and probe buttons; and
-    a live region for each answer. Nothing on the page is a file picker."""
+def test_the_settings_page_offers_every_rewriter_for_each_draft_kind():
+    """TWO radio groups — one per draft kind, each offering the two rewriters —
+    plus ONE Off switch covering both, three fields for the shared endpoint, a
+    probe button and a live region for every answer. Each option carries the
+    node its greyed-out reason is written into, so a server-side sentence has
+    somewhere to land without a page change. Nothing on the page is a file
+    picker."""
     html = _read("index.html")
     section = html[html.index('id="rewrite-settings-heading"'):
                    html.index('id="rewrite-settings-note"')]
-    assert 'name="rewrite-backend"' in section
-    for value, label in (("pe-llamacpp", "Official enhancer (Q8, uses GPU)"),
-                         ("local-llm", "Local LLM service"), ("off", "Off")):
-        assert f'value="{value}"' in section, value
-        assert label in section, label
-    for node in ("rewrite-backend-pe-reason", "rewrite-backend-local-reason",
-                 "rewrite-backend-off-reason", "rewrite-endpoint",
-                 "rewrite-model", "rewrite-timeout", "rewrite-test",
-                 "rewrite-save", "rewrite-save-status", "rewrite-test-status",
-                 "rewrite-settings-error"):
+    # One group per draft kind, labelled with the server's own task labels.
+    for task, legend in (("t2i", "Prompt enhance (text-to-image)"),
+                         ("edit", "Edit prompt enhance")):
+        assert f'id="rewrite-group-{task}"' in section, task
+        assert f'name="rewrite-{task}"' in section, task
+        assert legend in section, legend
+        for value, label in (("pe-llamacpp", "Official enhancer (Q8, uses GPU)"),
+                             ("local-llm", "OpenAI-compatible endpoint")):
+            short = "pe" if value == "pe-llamacpp" else "local"
+            assert f'id="rewrite-{task}-{short}"\n' in section or \
+                f'id="rewrite-{task}-{short}" ' in section, (task, value)
+            assert f'value="{value}"' in section, (task, value)
+            # The label the page ships is the label the server publishes, and
+            # every option has a reason node beside it.
+            assert f'id="rewrite-{task}-{short}-label">{label}<' in section \
+                or label in section, label
+            assert f'id="rewrite-{task}-{short}-reason"' in section, (task, value)
+    # Off is ONE switch for both kinds, never a third radio in a group.
+    assert 'type="checkbox" id="rewrite-off"' in section
+    assert 'id="rewrite-off-reason"' in section
+    assert "leave both kinds of draft exactly as you wrote them" in section
+    assert 'name="rewrite-off"' not in section
+    for node in ("rewrite-endpoint", "rewrite-model", "rewrite-timeout",
+                 "rewrite-test", "rewrite-save", "rewrite-save-status",
+                 "rewrite-test-status", "rewrite-settings-error"):
         assert f'id="{node}"' in section, node
     # Every field is labelled and the refusals are announced.
     for node in ("rewrite-endpoint", "rewrite-model", "rewrite-timeout"):
         assert f'<label for="{node}">' in section, node
     assert 'aria-live="polite"' in section
     assert 'type="file"' not in section and 'type="password"' not in section
+    # The timeout box cannot even be typed out of the server's own range.
+    timeout = section[section.index('id="rewrite-timeout"'):]
+    assert 'min="1"' in timeout[:200] and 'max="3600"' in timeout[:200]
     # A shared server-side setting says so, or a second browser is confused.
     assert "stored by the server" in html
     # The GPU note has to be true: the enhancer is REFUSED outright while an
@@ -2052,23 +2076,30 @@ def test_the_settings_page_offers_every_rewriter_and_the_local_service_fields():
     assert "it waits for" not in note
 
 
-def test_the_settings_form_is_closed_and_never_carries_a_path():
+def test_the_settings_envelope_carries_a_choice_per_draft_kind_and_no_path():
     js = _read("app.js")
-    assert "REWRITE_SETTINGS_KEYS = ['schema', 'backend', 'saved', 'local'," in js
+    assert "REWRITE_SETTINGS_KEYS = ['schema', 'enabled', 'choices', 'saved'," in js
     assert "'off', 'persistent', 'note'];" in js
-    assert "REWRITE_CHOICE_KEYS = ['backend', 'endpoint', 'model', 'timeout_s'];" in js
-    # The block that describes the local service selects nothing, so its closed
-    # key set has no backend — the server sends it without one.
+    # The two closed key sets are DIFFERENT on purpose: the saved record selects
+    # rewriters, the block describing the shared endpoint selects nothing.
+    assert "REWRITE_CHOICE_KEYS = ['t2i', 'edit', 'enabled', 'endpoint', 'model'," in js
     assert "REWRITE_LOCAL_KEYS = ['endpoint', 'model', 'timeout_s'];" in js
     assert "REWRITE_SETTINGS_BACKENDS = ['pe-llamacpp', 'local-llm', 'off'];" in js
+    assert "REWRITE_BACKEND_IDS = ['pe-llamacpp', 'local-llm'];" in js
     env = _js_function(js, "rewriteSettingsEnvelope")
-    assert "schema: REWRITE_SETTINGS_SCHEMA" in env
-    assert "selectedRewriteBackend()" in env
+    assert "fields.schema = REWRITE_SETTINGS_SCHEMA;" in env
+    assert "selectedRewriteChoice('t2i')" in env
+    assert "selectedRewriteChoice('edit')" in env
+    assert "rewriteEnabled()" in env
+    # `off` is never a task choice: it is the switch, sent as `enabled`.
+    assert "'off'" not in env
     # An empty box is null ("keep what the server was started with"), never an
     # empty string the server would refuse as a malformed address.
-    assert "|| null" in env
+    fields = _js_function(js, "rewriteEndpointFields")
+    assert "|| null" in fields
     for forbidden in ("path", "binary", "dir", "file", "gguf", "exe"):
         assert forbidden not in env.lower(), f"{forbidden} must not be a field"
+        assert forbidden not in fields.lower(), f"{forbidden} must not be a field"
     saved = _js_function(js, "saveRewriteSettings")
     assert "apiRequest(API_REWRITE_SETTINGS, {" in saved
     assert "method: 'POST'" in saved
@@ -2076,9 +2107,16 @@ def test_the_settings_form_is_closed_and_never_carries_a_path():
     assert "'X-Qwen-UI': '1'" in saved, "a write needs the UI header"
     probe = _js_function(js, "testRewriteConnection")
     assert "API_REWRITE_SETTINGS_TEST" in probe
-    assert "REWRITE_TEST_REQUEST_SCHEMA" in probe
-    assert "backend" not in probe, \
-        "a probe carries no backend: it may not ask for the enhancer"
+    assert "rewriteTestEnvelope()" in probe
+    # The probe addresses the SHARED endpoint with the field rules the settings
+    # form uses, and it carries NO choice keys: pressing Test must never be able
+    # to ask the server to load an enhancer checkpoint onto the graphics card.
+    test_env = _js_function(js, "rewriteTestEnvelope")
+    assert "fields.schema = REWRITE_TEST_REQUEST_SCHEMA;" in test_env
+    assert "rewriteEndpointFields()" in test_env
+    for forbidden in ("t2i", "edit", "enabled", "backend", "task",
+                      "path", "binary", "dir", "gguf", "exe"):
+        assert forbidden not in test_env, f"{forbidden} must not be probed"
 
 
 def test_an_unexpected_settings_document_is_refused_rather_than_rendered():
@@ -2088,9 +2126,18 @@ def test_an_unexpected_settings_document_is_refused_rather_than_rendered():
     assert "payload.schema !== REWRITE_SETTINGS_SCHEMA" in parse
     rows = _js_function(js, "parseRewriteSettingsRows")
     assert "REWRITE_SETTINGS_ROW_KEYS.indexOf(keys[k]) === -1" in rows
-    # A label that looks like a location is refused outright: the page shows
-    # labels, and a server that leaked a path would be caught here too.
-    assert "row.label" in rows and "test(row.label)" in rows
+    # Nothing the server sends is displayed as written: every label must be one
+    # this page already knows, which is stronger than pattern-matching a label
+    # for a path — a renamed rewriter is a page that was not written for it.
+    for fn in ("parseRewriteSettingsRows", "parseRewriteTaskRows"):
+        body = _js_function(js, fn)
+        assert "REWRITE_BACKEND_LABELS[" in body, fn
+        assert "REWRITE_BACKEND_USES_GPU[" in body, fn
+        # Greyed out only with a sentence; available only without one.
+        assert "!== (row.reason === '')" in body or \
+            "!== (choice.reason === '')" in body, fn
+    assert "REWRITE_TASK_LABELS[row.task] !== row.label" in \
+        _js_function(js, "parseRewriteTaskRows")
     # What each parser accepts and rejects is EXECUTED below against real
     # server documents, not string-matched here.
     # Nothing model-shaped is ever treated as markup.
@@ -2113,18 +2160,26 @@ def test_the_settings_page_stores_nothing_in_the_browser():
 
 
 def test_the_page_says_which_rewriter_answered():
-    """One GPU-bound, one not: a suggestion must name its source, because the
-    wait the user just experienced is explained by it."""
+    """One GPU-bound, one not: a suggestion must name its source, and the Create
+    view must name the rewriter for EACH draft kind — the two can differ, so one
+    name would misdescribe the draft the user is about to generate."""
     html = _read("index.html")
     js = _read("app.js")
     assert 'id="rewrite-source"' in html
+    assert 'id="rewrite-active"' in html and 'id="rewrite-active-text"' in html
     shown = _js_function(js, "showProposal")
     assert "setText('rewrite-source'" in shown
     assert "rewriteLabel(answer.backend)" in shown
-    # The Create view states the rewriter it will use, and a save refreshes it.
+    # One name when both kinds agree, one clause per kind when they do not, and
+    # a kind with nothing answering it is said out loud rather than hidden.
+    sentence = _js_function(js, "rewriterSentence")
+    assert "Rewriter in use: " in sentence
+    assert "'text drafts by ' + rewriteLabel(text)" in sentence
+    assert "'edit drafts by ' + rewriteLabel(edit)" in sentence
+    assert "have no rewriter here." in sentence
     state = _js_function(js, "setRewriterState")
-    assert "Rewriter in use: " in state
-    assert "rewriteLabel(rewriteBackend)" in state
+    assert "rewriterSentence()" in state
+    assert "setText('rewrite-active-text', sentence)" in state
     saved = _js_function(js, "saveRewriteSettings")
     assert "checkStatus();" in saved, "a save refreshes the Create view"
     hidden = _js_function(js, "hideProposal")
@@ -2133,77 +2188,118 @@ def test_the_page_says_which_rewriter_answered():
     label = _js_function(js, "rewriteLabel")
     assert "rewriteBackends[i].label" in label
     assert "Official enhancer (Q8, uses GPU)" in label
-    assert "Local LLM service" in label
+    assert "OpenAI-compatible endpoint" in label
     assert "127.0.0.1" not in label and "http" not in label
+    # Which rewriter answers a kind comes from the status block's per-task map,
+    # and availability is asked about THAT kind, not about one global backend.
+    assert "rewriteByTask[task]" in _js_function(js, "rewriteActiveFor")
+    assert "rewriteActiveFor(task)" in _js_function(js, "rewriteAvailable")
 
 
 # --------------------------------------------------------------------------
-# The Settings parsers, EXECUTED in node over the documents the server really
-# sends. A string check cannot see a real document being rejected: the server's
-# `local` block is {endpoint, model, timeout_s} with NO backend key (a block
-# that describes the local service selects nothing) while `saved` is a choice
-# and does carry one. Parsing both as choices rejected every document, so the
-# page read "did not match the expected schema" on every load — which is what
-# this section pins, together with the radio that must end up checked.
+# The Settings parsers and the Settings render, EXECUTED in node over the
+# documents the server really sends. A string check cannot see a real document
+# being rejected, and it cannot see which radio ends up ticked: the settings
+# state carries a choice PER DRAFT KIND plus one on/off switch, the `saved`
+# block may hold nulls ("never chosen") and the `local` block has no choice
+# keys at all. So this section feeds the real payloads through the real app.js
+# functions and asserts what the page shows — and that the envelope the page
+# would POST is a document the real server validator accepts.
 # --------------------------------------------------------------------------
-
-PARSE_VARS = ("REWRITE_SETTINGS_SCHEMA", "REWRITE_SETTINGS_KEYS",
-              "REWRITE_CHOICE_KEYS", "REWRITE_LOCAL_KEYS",
-              "REWRITE_SETTINGS_ROW_KEYS", "REWRITE_SETTINGS_BACKENDS",
-              "REWRITE_TASKS")
-PARSE_FNS = ("hasOnlyKeys", "parseRewriteLocalFields", "parseRewriteChoice",
+# The constants the parsers enforce: every one of them is a product rule, so a
+# harness that stubs one would test a page that does not exist.
+PARSE_VARS = ("REWRITE_SETTINGS_KEYS", "REWRITE_CHOICE_KEYS",
+              "REWRITE_LOCAL_KEYS", "REWRITE_SETTINGS_ROW_KEYS",
+              "REWRITE_TASK_ROW_KEYS", "REWRITE_TASK_CHOICE_KEYS",
+              "REWRITE_SETTINGS_BACKENDS", "REWRITE_BACKEND_IDS",
+              "REWRITE_TASKS", "REWRITE_TASK_LABELS",
+              "REWRITE_BACKEND_LABELS", "REWRITE_BACKEND_USES_GPU",
+              "REWRITE_SETTINGS_SCHEMA", "INVALID")
+PARSE_FNS = ("pyStrip", "hasOnlyKeys", "containsId", "parseRewriteChoices",
+             "parseRewriteChoice", "parseRewriteLocalFields",
              "parseRewriteLocal", "parseRewriteSettingsRows",
-             "parseRewriteSettings")
-RENDER_FNS = ("pyStrip", "rewriteRow", "selectedRewriteBackend",
-              "renderRewriteSettings")
+             "parseRewriteTaskRows", "parseRewriteSettings")
+RENDER_FNS = ("pyStrip", "rewriteTaskRow", "rewriteChoiceRow",
+              "rewriteShortName", "rewriteFormState", "selectedRewriteChoice",
+              "rewriteEnabled", "rewriteEndpointFields",
+              "rewriteSettingsEnvelope", "renderRewriteSettings")
 
 _HARNESS = """// Built by tests/test_web_static.py: the real app.js functions, extracted
 // verbatim, run over real server documents with the smallest DOM that
-// renderRewriteSettings touches. Nothing here reimplements a product rule.
+// renderRewriteSettings and rewriteSettingsEnvelope touch. Nothing here
+// reimplements a product rule.
 var fs = require("node:fs");
 __PARTS__
 
 var textSets = {};
 function setText(id, value) { textSets[id] = String(value); }
 var ELEMENTS = {};
-["rewrite-endpoint", "rewrite-model", "rewrite-timeout"].forEach(function (id) {
+  ["rewrite-endpoint", "rewrite-model", "rewrite-timeout"].forEach(function (id) {
   ELEMENTS[id] = { id: id, value: "", disabled: true,
                    closest: function () { return null; } };
 });
-["rewrite-test", "rewrite-save"].forEach(function (id) {
+  ["rewrite-test", "rewrite-save", "rewrite-group-t2i", "rewrite-group-edit",
+   "rewrite-off"].forEach(function (id) {
   ELEMENTS[id] = { id: id, disabled: true };
 });
-["pe", "local", "off"].forEach(function (which) {
-  ELEMENTS["rewrite-backend-" + which + "-reason"] =
-    { id: "rewrite-backend-" + which + "-reason" };
-});
+ELEMENTS["rewrite-off"].checked = false;
 function $(id) { return ELEMENTS[id]; }
-var RADIOS = ["pe-llamacpp", "local-llm", "off"].map(function (value) {
-  return { value: value, checked: false, disabled: true };
-});
-var document = { querySelectorAll: function () { return RADIOS; } };
+
+// One radio group per draft kind, with the names index.html uses.
+function group(values) {
+  return values.map(function (value) {
+    return { value: value, checked: false, disabled: true };
+  });
+}
+var RADIOS = {
+  "rewrite-t2i": group(["pe-llamacpp", "local-llm"]),
+  "rewrite-edit": group(["pe-llamacpp", "local-llm"])
+};
+var document = {
+  querySelectorAll: function (selector) {
+    var name = /^input\\[name="([^"]+)"\\]$/.exec(selector);
+    return (name && RADIOS[name[1]]) || [];
+  }
+};
 
 var rewriteSettings = null;
+var rewriteForm = null;
 var rewriteSettingsBusy = false;
 var rewriteTestBusy = false;
 
+function checkedOf(name) {
+  return RADIOS[name].filter(function (r) { return r.checked; })
+                     .map(function (r) { return r.value; })[0] || null;
+}
+function disabledOf(name) {
+  return RADIOS[name].filter(function (r) { return r.disabled; })
+                     .map(function (r) { return r.value; });
+}
+
 var docs = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 var out = docs.map(function (doc) {
-  RADIOS.forEach(function (r) { r.checked = false; r.disabled = true; });
+  Object.keys(RADIOS).forEach(function (name) {
+    RADIOS[name].forEach(function (r) { r.checked = false; r.disabled = true; });
+  });
+  ELEMENTS["rewrite-off"].checked = false;
+  ELEMENTS["rewrite-off"].disabled = true;
   ["rewrite-endpoint", "rewrite-model", "rewrite-timeout"].forEach(function (id) {
     ELEMENTS[id].value = "";
   });
   textSets = {};
-  var state = parseRewriteSettings(doc);
-  rewriteSettings = state;
+  var parsed = parseRewriteSettings(doc);
+  rewriteSettings = parsed;
+  rewriteForm = null;
   renderRewriteSettings();
   return {
-    parsed: state,
-    checked: RADIOS.filter(function (r) { return r.checked; })
-                   .map(function (r) { return r.value; }),
+    parsed: parsed,
+    checked: { t2i: checkedOf("rewrite-t2i"), edit: checkedOf("rewrite-edit") },
+    disabled: { t2i: disabledOf("rewrite-t2i"), edit: disabledOf("rewrite-edit") },
+    off: ELEMENTS["rewrite-off"].checked,
     fields: { endpoint: ELEMENTS["rewrite-endpoint"].value,
               model: ELEMENTS["rewrite-model"].value,
               timeout: ELEMENTS["rewrite-timeout"].value },
+    envelope: rewriteSettingsEnvelope(),
     sets: textSets
   };
 });
@@ -2236,14 +2332,28 @@ def _run_settings_parsers(tmp_path: Path, docs: list[dict]) -> list[dict]:
     return json.loads(run.stdout)
 
 
-def _settings_services(tmp_path: Path) -> list[tuple[str, object, str | None]]:
-    """(name, service, backend the page must show) for every real shape."""
+def _settings_services(tmp_path: Path) -> list[tuple[str, object, dict]]:
+    """(name, service, what the page must show) for every real shape.
+
+    The expectations are written in the page's own terms — which radio is ticked
+    in EACH group, whether the Off switch is ticked, which radios are greyed and
+    which sentence appears under them — because that is the only thing the
+    browser can act on.
+    """
+    from qwen_engine.web import api
     from qwen_engine.web import rewrite_service as rs
 
     endpoint = "http://127.0.0.1:8079/v1/chat/completions"
-    pe = rs.PESettings(llama_server="/opt/llama/llama-server",
-                       model_path="/models/pe/PE.gguf",
-                       system_prompt="pe prompt", timeout=300.0)
+    prompts = {"t2i": "pe prompt t2i", "edit": "pe prompt edit"}
+    pe_both = rs.PESettings(llama_server="/opt/llama/llama-server",
+                            model_path="/models/pe/PE-T2I.gguf",
+                            system_prompts=prompts, timeout=300.0,
+                            i2i_model_path="/models/pe/PE-I2I.gguf",
+                            i2i_mmproj_path="/models/pe/mmproj.gguf")
+    # The install Root actually has: the text checkpoint without the edit pair.
+    pe_text_only = rs.PESettings(llama_server="/opt/llama/llama-server",
+                                 model_path="/models/pe/PE-T2I.gguf",
+                                 system_prompts=prompts, timeout=300.0)
 
     def local_settings(**overrides):
         fields = dict(backend="local-llm", endpoint=endpoint, model="Qwen3.8",
@@ -2252,30 +2362,79 @@ def _settings_services(tmp_path: Path) -> list[tuple[str, object, str | None]]:
         return rs.RewriteSettings(**fields)
 
     def make(cache_dir, local, pe_cfg, prefs=None):
+        # The factory stands in for a BUILT client (truthy): `settings_state`
+        # asks which (task, backend) pairs exist, it never calls into one.
         return rs.RewriteService(local, transport=lambda _body: b"{}",
                                  pe=pe_cfg, cache_dir=cache_dir,
                                  preferences=prefs,
-                                 client_factory=lambda *_args: None)
+                                 client_factory=lambda *_args: object())
 
     cache = str(tmp_path / "cache")
-    saved_local = rs.RewritePreferences(
-        backend="local-llm",
-        endpoint="http://127.0.0.1:8081/v1/chat/completions",
-        model="Other", timeout_s=45.0)
+    official = api.REWRITE_BACKEND_LABELS["pe-llamacpp"]
+    endpoint_label = api.REWRITE_BACKEND_LABELS["local-llm"]
+    no_edit_checkpoint = rs.RewritePreferences(
+        choices={"t2i": "pe-llamacpp", "edit": "pe-llamacpp"}, enabled=True)
     return [
-        ("both backends, nothing saved",
-         make(cache, local_settings(), pe), "pe-llamacpp"),
-        ("both backends, saved local service",
-         make(cache, local_settings(), pe, saved_local), "local-llm"),
-        ("both backends, saved enhancer",
-         make(cache, local_settings(), pe,
-              rs.RewritePreferences(backend="pe-llamacpp")), "pe-llamacpp"),
-        ("enhancer only", make(cache, rs.RewriteSettings.disabled(), pe),
-         "pe-llamacpp"),
-        ("local service only, nothing persistent",
-         make(None, local_settings(), None), "local-llm"),
-        ("saved off", make(cache, local_settings(), pe,
-                           rs.RewritePreferences(backend="off")), None),
+        ("both checkpoints and the endpoint, nothing saved",
+         make(cache, local_settings(), pe_both),
+         {"choices": {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"},
+          "checked": {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"},
+          "off": False, "disabled": {"t2i": [], "edit": []},
+          "reasons": {}}),
+        ("saved: both kinds on the endpoint",
+         make(cache, local_settings(), pe_both,
+              rs.RewritePreferences(
+                  choices={"t2i": "local-llm", "edit": "local-llm"}, enabled=True,
+                  endpoint="http://127.0.0.1:8081/v1/chat/completions",
+                  model="Other", timeout_s=45.0)),
+         {"choices": {"t2i": "local-llm", "edit": "local-llm"},
+          "checked": {"t2i": "local-llm", "edit": "local-llm"},
+          "off": False, "disabled": {"t2i": [], "edit": []},
+          "reasons": {}}),
+        ("saved: text on the official enhancer, edits on the endpoint",
+         make(cache, local_settings(), pe_both,
+              rs.RewritePreferences(choices={"t2i": "pe-llamacpp",
+                                             "edit": "local-llm"},
+                                    enabled=True)),
+         {"choices": {"t2i": "pe-llamacpp", "edit": "local-llm"},
+          "checked": {"t2i": "pe-llamacpp", "edit": "local-llm"},
+          "off": False, "disabled": {"t2i": [], "edit": []},
+          "reasons": {}}),
+        ("no edit checkpoint here: the official edit choice is greyed",
+         make(cache, local_settings(), pe_text_only, no_edit_checkpoint),
+         {"choices": {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"},
+          "checked": {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"},
+          "off": False, "disabled": {"t2i": [], "edit": []},
+          # The saved choice stays ticked even though it cannot be honoured,
+          # with the server's sentence under it, so installing the missing file
+          # fixes it without choosing twice.
+          "reasons": {"rewrite-edit-pe-reason": "no official image-edit"},
+          "active": {"t2i": official, "edit": endpoint_label}}),
+        ("enhancer only: an edit draft has no rewriter at all",
+         make(cache, rs.RewriteSettings.disabled(), pe_text_only),
+         {"choices": {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"},
+          "checked": {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"},
+          "off": False,
+          "disabled": {"t2i": ["local-llm"], "edit": ["local-llm"]},
+          "reasons": {"rewrite-edit-pe-reason": "no official image-edit",
+                      "rewrite-t2i-local-reason": "started without an "
+                                                  "OpenAI-compatible"}}),
+        ("endpoint only, nothing persistent",
+         make(None, local_settings(), None),
+         {"choices": {"t2i": "local-llm", "edit": "local-llm"},
+          "checked": {"t2i": "local-llm", "edit": "local-llm"},
+          "off": False,
+          "disabled": {"t2i": ["pe-llamacpp"], "edit": ["pe-llamacpp"]},
+          "reasons": {"rewrite-t2i-pe-reason": "started without the enhancer"}}),
+        ("saved off",
+         make(cache, local_settings(), pe_both,
+              rs.RewritePreferences(choices={"t2i": "pe-llamacpp",
+                                             "edit": "pe-llamacpp"},
+                                    enabled=False)),
+         {"choices": {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"},
+          "checked": {"t2i": "pe-llamacpp", "edit": "pe-llamacpp"},
+          "off": True, "disabled": {"t2i": [], "edit": []},
+          "reasons": {"rewrite-off-reason": "switched off"}}),
     ]
 
 
@@ -2284,16 +2443,22 @@ def test_the_settings_parsers_accept_the_documents_the_server_sends(tmp_path):
 
     cases = _settings_services(tmp_path)
     documents = []
-    for name, subject, _active in cases:
+    for name, subject, _want in cases:
         state = subject.settings_state()
         assert state["schema"] == api.REWRITE_SETTINGS_SCHEMA, name
         documents.append(state)
     results = _run_settings_parsers(tmp_path, documents)
 
-    for (name, subject, active), state, result in zip(cases, documents, results):
+    for (name, _subject, want), state, result in zip(cases, documents, results):
         parsed = result["parsed"]
         assert parsed is not None, f"{name}: the page would call this invalid"
-        assert parsed["backend"] == active, name
+        assert parsed["choices"] == want["choices"], name
+        assert parsed["enabled"] is (not want["off"]), name
+        # One radio ticked per draft kind, and the Off switch only when Off is
+        # what the server holds.
+        assert result["checked"] == want["checked"], (name, result["checked"])
+        assert result["off"] is want["off"], (name, result["off"])
+        assert result["disabled"] == want["disabled"], (name, result["disabled"])
         # What the block describes is what the fields are prefilled with.
         assert parsed["local"] == state["local"], name
         assert result["fields"]["endpoint"] == (state["local"]["endpoint"] or "")
@@ -2303,35 +2468,74 @@ def test_the_settings_parsers_accept_the_documents_the_server_sends(tmp_path):
         assert (shown == "" if timeout is None else float(shown) == timeout), name
         assert parsed["saved"] == state["saved"], name
         assert parsed["persistent"] == state["persistent"], name
-        # The radio for the backend actually in use is the checked one, and with
-        # nothing saved "Off" is only checked when Off is what is in force.
-        assert result["checked"] == [active or "off"], (name, result["checked"])
         note = state.get("note", "")
         assert result["sets"].get("rewrite-settings-note", "") == note, name
+        # A greyed-out or unanswerable option carries the SERVER's sentence, and
+        # that sentence names no path, URL or address.
+        for node, needle in want["reasons"].items():
+            text = result["sets"].get(node, "")
+            assert needle in text, (name, node, text)
+            assert "/" not in text and "://" not in text, (name, node, text)
+        # The body the page would POST is a document the real server validator
+        # accepts, saying exactly what the page shows.
+        posted = api.build_rewrite_settings_request(
+            json.dumps(result["envelope"]).encode("utf-8"))
+        assert posted["t2i"] == want["choices"]["t2i"], name
+        assert posted["edit"] == want["choices"]["edit"], name
+        assert posted["enabled"] is (not want["off"]), name
+        assert posted["endpoint"] == state["local"]["endpoint"], name
+        assert posted["model"] == state["local"]["model"], name
 
 
 def test_the_settings_parsers_still_refuse_a_document_that_is_not_theirs(tmp_path):
-    """The two key sets are closed on purpose: a local block that suddenly
-    carries a backend, a path-shaped key, or a value outside the server's own
-    bounds rejects the whole document rather than rendering half of it."""
+    """Every key set here is closed on purpose. A block that suddenly selects a
+    backend, a choice that is not a rewriter, a task row that dropped the
+    availability flag, or a value outside the server's own bounds rejects the
+    WHOLE document rather than rendering half of it — a half-rendered rewriter
+    choice is a setting the user believes they made."""
     base = _settings_services(tmp_path)[0][1].settings_state()
+    task_rows = [json.loads(json.dumps(row)) for row in base["tasks"]]
+    no_choice_rows = [dict(task_rows[0]), task_rows[1]]
+    no_choice_rows[0]["choices"] = [dict(no_choice_rows[0]["choices"][0])]
+    unlabelled = [json.loads(json.dumps(row)) for row in base["tasks"]]
+    unlabelled[0]["label"] = "Whatever the page feels like"
+    mute = [json.loads(json.dumps(row)) for row in base["tasks"]]
+    official = base["tasks"][1]["choices"][0]["label"]
+    mute[1]["choices"][0] = {"id": "pe-llamacpp", "label": official,
+                             "available": False, "uses_gpu": True,
+                             "reason": ""}
     tampered = {
         "local block selects a backend": {**base, "local": {
             **base["local"], "backend": "local-llm"}},
         "local block carries a path": {**base, "local": {
             **base["local"], "model_path": "/models/pe/PE.gguf"}},
-        "saved names an unknown backend": {**base, "saved": {
-            **base["saved"], "backend": "gguf-direct"}},
+        "saved names an unknown rewriter for one task": {**base, "saved": {
+            **base["saved"], "t2i": "gguf-direct"}},
+        "saved uses off as a task choice": {**base, "saved": {
+            **base["saved"], "edit": "off"}},
+        "choices answer only one draft kind": {**base, "choices": {
+            "t2i": base["choices"]["t2i"]}},
+        "choices name a rewriter that does not exist": {**base, "choices": {
+            **base["choices"], "edit": "gguf-direct"}},
+        "enabled is not a boolean": {**base, "enabled": "yes"},
+        "a task group is missing": {**base, "tasks": [task_rows[0]]},
+        "a task group lists only one rewriter": {**base, "tasks": no_choice_rows},
+        "a task group renames the draft kind": {**base, "tasks": unlabelled},
+        "an unavailable choice carries no reason": {**base, "tasks": mute},
         "timeout beyond the server bound": {**base, "local": {
             **base["local"], "timeout_s": 9000}},
         "endpoint is not a string": {**base, "local": {
             **base["local"], "endpoint": 8079}},
         "unknown top-level key": {**base, "rewriter": "pe-llamacpp"},
+        "a single backend key comes back": {k: v for k, v in base.items()
+                                            if k != "choices"} | {
+            "backend": "pe-llamacpp"},
         "wrong schema tag": {**base, "schema": base["schema"] + ".next"},
     }
     results = _run_settings_parsers(tmp_path, list(tampered.values()))
     for (why, _doc), result in zip(tampered.items(), results):
         assert result["parsed"] is None, f"{why} was accepted"
         # A rejected document leaves the page with nothing filled in at all.
-        assert result["checked"] == [], why
+        assert result["checked"] == {"t2i": None, "edit": None}, why
+        assert result["off"] is False, why
         assert result["fields"] == {"endpoint": "", "model": "", "timeout": ""}

@@ -13,10 +13,16 @@ Two doubles, each for the half that the guarded runner cannot do for real:
   with a real PID, so "the server is gone before the lock is released" and
   "no orphan remains" are asserted against ``os.kill(pid, 0)``, not a mock.
 
+The edit leg is driven through the same fixture: a real multimodal server
+invents its ``media_marker`` per process and answers it on ``GET /props``, so
+the handler serves that route too and the request ORDER — health polls, then
+``/props``, then ``/completion`` — is asserted against recorded paths.
+
 Nothing here touches a GPU, llama.cpp or a port.
 """
 from __future__ import annotations
 
+import base64
 import http.client
 import http.server
 import os
@@ -34,6 +40,7 @@ import pytest
 from qwen_engine import pe_llamacpp as pe
 from qwen_engine import rewrite as rw
 from qwen_engine import rewrite_client as rc
+from qwen_engine.web import rewrite_service as rs
 
 FAKE_SERVER = pathlib.Path(__file__).resolve().parent / "fixtures" / \
     "fake_llama_server.py"
@@ -53,6 +60,44 @@ def golden(system: str, user: str, thinking: bool = True) -> str:
     """The official template's output for one two-turn conversation."""
     out = (f"{_IM_START}system\n{system}{_IM_END}\n"
            f"{_IM_START}user\n{user}{_IM_END}\n"
+           f"{_IM_START}assistant\n")
+    return out + (f"{_THINK}\n" if thinking else "")
+
+
+# A stand-in reference image and the base64 the server is handed for it:
+# distinct bytes per reference, so a swapped reference ORDER is observable.
+def reference(tag: str) -> tuple[str, str]:
+    """``(data URI, base64 payload)`` for one stand-in reference image."""
+    payload = base64.b64encode(tag.encode("utf-8")).decode("ascii")
+    return f"data:image/png;base64,{payload}", payload
+
+
+ONE, ONE_B64 = reference("reference-one")
+TWO, TWO_B64 = reference("reference-two")
+IMAGE_PART = {"type": "image_url", "image_url": {"url": ONE}}
+TEXT_PART = {"type": "text", "text": "make it night"}
+
+#: llama.cpp invents the media marker per process, so every test below brings
+#: its own value. ``PROPS_ROUTE`` is spelled independently of ``pe.PROPS_PATH``:
+#: a client that asks a different route must fail rather than be agreed with.
+MARKER = "<|" + "extra_media_7f3a9c" + "|>"
+PROPS_ROUTE = "/props"
+
+
+def edit_messages(*images: str,
+                  draft: str = "make it night") -> list[dict[str, object]]:
+    """The conversation the edit leg sends, built by the product's own
+    :func:`qwen_engine.rewrite.build_messages`: references first, then the
+    draft."""
+    return rw.build_messages("SYS PROMPT", draft, list(images))
+
+
+def golden_edit(marker: str, images: int, user: str,
+                system: str = "SYS PROMPT", thinking: bool = True) -> str:
+    """The edit layout, written independently of the module: ``images``
+    markers immediately after the ``user\\n`` marker, then the trimmed draft."""
+    out = (f"{_IM_START}system\n{system}{_IM_END}\n"
+           f"{_IM_START}user\n{marker * images}{user}{_IM_END}\n"
            f"{_IM_START}assistant\n")
     return out + (f"{_THINK}\n" if thinking else "")
 
@@ -216,7 +261,8 @@ def test_without_thinking_the_prompt_stops_at_the_assistant_turn():
     ([], "empty"),
     ("not a list", "sequence"),
     ([["system", "SYS PROMPT"]], "mapping"),
-    ([{"role": "system", "content": ["a part"]}], "text only"),
+    ([{"role": "system", "content": "s"},
+      {"role": "user", "content": [IMAGE_PART, TEXT_PART]}], "render_prompt"),
     ([{"role": "user", "content": "x"}, {"role": "system", "content": "y"}],
      "system turn"),
     ([{"role": "system", "content": "y"}], "user turn"),
@@ -280,6 +326,99 @@ def test_health_is_ok_only_for_a_status_of_ok():
 
 
 # ---------------------------------------------------------------------------
+# the official EDIT enhancer prompt: marker, order, profile
+# ---------------------------------------------------------------------------
+
+
+def test_the_edit_prompt_puts_one_marker_per_reference_before_the_draft():
+    """llama.cpp counts the markers in the prompt against the images handed to
+    it, so a dropped marker — or markers placed after the draft instead of
+    before it — is the ``mtmd_tokenize`` mismatch, not a style choice. The
+    draft is still trimmed exactly as the text template trims it."""
+    prompt, images = pe.render_prompt(
+        edit_messages(ONE, TWO, draft="  make it night \n"),
+        media_marker=MARKER)
+    assert prompt == golden_edit(MARKER, 2, "make it night")
+    assert images == [ONE_B64, TWO_B64]
+
+
+def test_swapping_references_moves_the_payloads_and_keeps_counts_equal():
+    """The markers are interchangeable strings, so the only record of which
+    reference is ``<image1>`` is the order of ``multimodal_data`` — and the
+    server refuses a body whose marker count differs from its image count."""
+    forward_prompt, forward = pe.render_prompt(edit_messages(ONE, TWO),
+                                               media_marker=MARKER)
+    swapped_prompt, swapped = pe.render_prompt(edit_messages(TWO, ONE),
+                                               media_marker=MARKER)
+    assert forward == [ONE_B64, TWO_B64]
+    assert swapped == [TWO_B64, ONE_B64]
+    assert forward_prompt == swapped_prompt       # the payloads ARE the order
+    body = json.loads(pe.build_completion_body(swapped_prompt, task="edit",
+                                               images=swapped, seed=5))
+    assert body["prompt"]["multimodal_data"] == [TWO_B64, ONE_B64]
+    assert (body["prompt"]["prompt_string"].count(MARKER)
+            == len(body["prompt"]["multimodal_data"]))
+
+
+def test_an_image_prompt_cannot_be_rendered_without_the_servers_marker():
+    """There is no marker to fall back to: guessing one is what earns the real
+    server's "number of media markers in text (0) does not match number of
+    bitmaps"."""
+    with pytest.raises(rc.RewriteConfigError, match="/props"):
+        pe.render_prompt(edit_messages(ONE))
+
+
+def test_a_reference_in_the_system_turn_is_refused_rather_than_counted():
+    """Markers belong to the turn being answered; one in the system turn would
+    be counted by the server and addressed by nobody."""
+    with pytest.raises(rc.RewriteConfigError, match="only the user turn"):
+        pe.render_prompt([{"role": "system",
+                           "content": [IMAGE_PART, TEXT_PART]},
+                          {"role": "user", "content": "make it night"}],
+                         media_marker=MARKER)
+
+
+@pytest.mark.parametrize("parts, why", [
+    ([TEXT_PART, IMAGE_PART], "image after its text"),
+    ([{"type": "image_url", "image_url": {"url": "http://evil.example/x.png"}},
+      TEXT_PART], "never given a URL"),
+    ([{"type": "image_url", "image_url": {"url": "data:image/png;base64,"}},
+      TEXT_PART], "non-empty"),
+    ([IMAGE_PART, {"type": "text", "text": "one"},
+      {"type": "text", "text": "two"}], "exactly one text part"),
+])
+def test_a_reference_list_the_edit_server_could_not_index_is_refused(parts, why):
+    """The edit system prompt addresses the references as ``<imageN>``: an
+    ambiguous, fetchable or empty reference is refused before a server is
+    started."""
+    messages = [{"role": "system", "content": "SYS PROMPT"},
+                {"role": "user", "content": parts}]
+    with pytest.raises(rc.RewriteConfigError) as exc:
+        pe.render_prompt(messages, media_marker=MARKER)
+    assert why in str(exc.value)
+
+
+def test_the_edit_body_carries_the_edit_profile_and_the_multimodal_object():
+    """``presence_penalty`` is the load-bearing difference between the two
+    frozen profiles (1.5 text / 0 edit) and a wrong one changes the sample
+    without any error, so it is asserted next to the token budget."""
+    body = json.loads(pe.build_completion_body("P", task="edit", images=["AAA"],
+                                               seed=3))
+    assert body["prompt"] == {"prompt_string": "P", "multimodal_data": ["AAA"]}
+    assert body["n_predict"] == 24000 == rw.sampling("edit")["max_new_tokens"]
+    assert body["presence_penalty"] == 0.0
+    assert body["presence_penalty"] != rw.sampling("t2i")["presence_penalty"]
+
+
+def test_only_a_request_with_references_becomes_a_prompt_object():
+    """A bare prompt string is what a non-multimodal build reads, so an edit
+    draft with no reference stays text — for either task."""
+    for task in rw.TASKS:
+        assert json.loads(pe.build_completion_body(
+            "P", task=task, seed=3))["prompt"] == "P"
+
+
+# ---------------------------------------------------------------------------
 # argv and the operator's files
 # ---------------------------------------------------------------------------
 
@@ -292,6 +431,44 @@ def test_the_argv_is_the_command_root_verified_on_the_v100(tmp_path):
                     "--port", "43211", "--no-webui"]
     # Every value is its own argv entry and no shell string is ever built.
     assert all(isinstance(part, str) for part in argv)
+
+
+def installed_pe(tmp_path) -> rs.PESettings:
+    """Both official checkpoints installed the way the launch flags install
+    them: the text weights, and the edit weights with their vision projector."""
+    return rs.PESettings(
+        llama_server=touch(tmp_path / "bin" / "llama-server", executable=True),
+        model_path=touch(tmp_path / "models" / "PE-T2I-Q8_0.gguf"),
+        system_prompts={"t2i": "T2I PROMPT", "edit": "EDIT PROMPT"},
+        log_path=str(tmp_path / "cache" / "pe-llamacpp.log"),
+        i2i_model_path=touch(tmp_path / "models" / "PE-I2I-Q8_0.gguf"),
+        i2i_mmproj_path=touch(tmp_path / "models" / "mmproj-BF16.gguf"))
+
+
+def test_the_edit_server_gets_its_projector_and_its_image_budget(tmp_path):
+    """The command Root verified for PE-I2I on the V100: the vision projector,
+    32 768 context tokens (a 1 MP reference does not fit in the text profile's
+    24 576) and the per-image cap that leaves room for the thinking block."""
+    settings = installed_pe(tmp_path)
+    client = settings.build_client(task="edit", spawn=no_spawn)
+    assert client.build_argv(43211) == [
+        settings.llama_server, "-m", settings.i2i_model_path,
+        "-ngl", "99", "-c", "32768", "--host", "127.0.0.1", "--port", "43211",
+        "--no-webui", "--mmproj", settings.i2i_mmproj_path,
+        "--image-max-tokens", "1280"]
+    assert client.supported_tasks == ("edit",)
+
+
+def test_the_text_server_never_gets_the_vision_flags(tmp_path):
+    """Both checkpoints are installed here, so this is where a client factory
+    that handed out the projector or the wide context unconditionally shows up:
+    the text weights would load a foreign projector and pay for vision tokens
+    they never use."""
+    settings = installed_pe(tmp_path)
+    argv = settings.build_client(task="t2i", spawn=no_spawn).build_argv(43211)
+    assert "--mmproj" not in argv and "--image-max-tokens" not in argv
+    assert argv[argv.index("-m") + 1] == settings.model_path
+    assert argv[argv.index("-c") + 1] == "24576"
 
 
 def test_the_real_spawn_uses_no_shell_and_its_own_process_group(tmp_path,
@@ -329,6 +506,25 @@ def test_a_missing_operator_file_refuses_at_construction(tmp_path, field):
 def test_a_binary_that_is_not_executable_refuses_at_construction(tmp_path):
     with pytest.raises(rc.RewriteConfigError, match="executable"):
         make_client(tmp_path, server_binary=touch(tmp_path / "llama-server"))
+
+
+def test_claiming_edit_without_a_projector_refuses_at_construction(tmp_path):
+    """Half an edit install is a startup mistake, never a 502 that arrives
+    halfway through a user's rewrite: without ``--mmproj`` these weights cannot
+    see the reference they are being asked about."""
+    with pytest.raises(rc.RewriteConfigError, match="vision projector"):
+        make_client(tmp_path, supported_tasks=("edit",), spawn=no_spawn)
+
+
+@pytest.mark.parametrize("shape", ["missing", "directory"])
+def test_a_projector_that_cannot_be_read_refuses_at_construction(tmp_path,
+                                                                 shape):
+    mmproj = tmp_path / "models" / "mmproj-BF16.gguf"
+    if shape == "directory":
+        mmproj.mkdir(parents=True)
+    with pytest.raises(rc.RewriteConfigError, match="not a readable"):
+        make_client(tmp_path, mmproj_path=str(mmproj),
+                    supported_tasks=("edit",), spawn=no_spawn)
 
 
 def test_the_production_port_picker_and_transport_are_the_loopback_ones(tmp_path):
@@ -673,15 +869,33 @@ def test_a_log_file_that_cannot_be_written_is_a_typed_refusal(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_edit_is_refused_because_these_weights_are_text_to_image_only(tmp_path):
+def test_an_edit_draft_is_refused_when_the_edit_checkpoint_is_absent(tmp_path):
+    """The text weights never answer an edit draft. The refusal names the
+    missing image-edit checkpoint and the rewriter that can answer it, and no
+    server is started for a draft this backend cannot serve."""
     client = make_client(tmp_path, transport=FakeTransport(content="x"),
                          spawn=no_spawn)
     with pytest.raises(pe.RewriteTaskUnsupported) as exc:
         client.complete(MESSAGES, "edit")
-    assert "text-to-image" in str(exc.value) and "edit" in str(exc.value)
+    assert "image-edit enhancer" in str(exc.value)
+    assert "endpoint" in str(exc.value)
     assert client.uses_task("t2i") is True and client.uses_task("edit") is False
     assert no_spawn.calls == []
     assert isinstance(exc.value, rc.RewriteClientError)   # the service maps it
+
+
+def test_a_text_draft_on_edit_only_weights_is_refused_not_answered_by_swap(tmp_path):
+    """Clients are per task now: a task with no weights is refused rather than
+    quietly handed to whichever enhancer happens to be installed."""
+    client = make_client(tmp_path, spawn=no_spawn,
+                         supported_tasks=("edit",),
+                         mmproj_path=touch(
+                             tmp_path / "models" / "mmproj-BF16.gguf"),
+                         transport=FakeTransport(content="x"))
+    with pytest.raises(pe.RewriteTaskUnsupported) as exc:
+        client.complete(MESSAGES, "t2i")
+    assert "text-to-image" in str(exc.value)
+    assert no_spawn.calls == []
 
 
 def test_an_unknown_task_is_refused_by_the_shared_contract(tmp_path):
@@ -765,14 +979,25 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self):                        # noqa: N802 - stdlib name
-        plan = self.server.state["health"]
+        state = self.server.state
+        state.setdefault("paths", []).append(self.path)
+        if self.path == PROPS_ROUTE:
+            # Unscripted is answered, not dropped: a client that asks for a
+            # marker it was never given must fail loudly, not hang.
+            status, payload = state.get(
+                "props", (500, b'{"error":"no /props scripted"}'))
+            self._reply(status, payload)
+            return
+        plan = state["health"]
         status, payload = plan.pop(0) if plan else (200, b'{"status":"ok"}')
         self._reply(status, payload)
 
     def do_POST(self):                       # noqa: N802 - stdlib name
         length = int(self.headers.get("content-length") or 0)
-        self.server.state.setdefault("bodies", []).append(self.rfile.read(length))
-        status, payload = self.server.state["completion"]
+        state = self.server.state
+        state.setdefault("paths", []).append(self.path)
+        state.setdefault("bodies", []).append(self.rfile.read(length))
+        status, payload = state["completion"]
         self._reply(status, payload)
 
 
@@ -868,3 +1093,116 @@ def test_the_free_port_picker_is_only_used_in_production(tmp_path):
     port; asserting the default proves the production path is wired."""
     assert pe._free_port.__doc__ is not None
     assert make_client(tmp_path, spawn=no_spawn)._port_picker() == 43001
+
+
+# ---------------------------------------------------------------------------
+# the edit rewrite over real HTTP: /props after health, order, profile
+# ---------------------------------------------------------------------------
+
+
+def piped_factory(state):
+    """A ``transport_factory`` of real :class:`pe.LoopbackClient` transports
+    over the socketpair fixture, so the request ORDER the client chooses is the
+    order a real ``llama-server`` would see."""
+    return lambda _port, budget: piped_client(state, timeout=budget)
+
+
+def edit_ready_state(marker: str = MARKER) -> dict:
+    """A multimodal server: still loading, then healthy, then a marker of its
+    own — a value a real process invents, so no test may assume the next one
+    looks like this one."""
+    return {
+        "health": [(200, b'{"status":"loading"}'), (200, b'{"status":"ok"}')],
+        "props": (200, json.dumps({"media_marker": marker}).encode()),
+        "completion": (200, json.dumps({"content": "ENHANCED"}).encode()),
+    }
+
+
+def edit_client(tmp_path, state) -> pe.PELlamaCppClient:
+    """An edit-capable client whose every request goes through the real
+    loopback HTTP code path."""
+    return make_client(
+        tmp_path, spawn=no_spawn,
+        mmproj_path=touch(tmp_path / "models" / "mmproj-BF16.gguf"),
+        supported_tasks=("edit",), transport_factory=piped_factory(state))
+
+
+def test_an_edit_rewrite_asks_for_its_marker_after_health_and_sends_it(tmp_path):
+    """The whole official-edit round trip: two loading polls, then ``/props``,
+    then a completion whose prompt carries THIS server's marker — never the
+    literal ``__media__``, and never a marker read before the server was
+    listening, when it does not exist yet."""
+    state = edit_ready_state()
+    client = edit_client(tmp_path, state)
+    assert client.complete(edit_messages(ONE, TWO), "edit") == "ENHANCED"
+    assert state["paths"] == ["/health", "/health", PROPS_ROUTE, "/completion"]
+    body = json.loads(state["bodies"][0])
+    assert body["prompt"] == {
+        "prompt_string": golden_edit(MARKER, 2, "make it night"),
+        "multimodal_data": [ONE_B64, TWO_B64]}
+    assert "__media__" not in body["prompt"]["prompt_string"]
+
+
+def test_an_edit_rewrite_is_posted_with_the_edit_profile(tmp_path):
+    """The task has to survive from ``complete()`` into the body: a t2i profile
+    hardcoded in the call path would sample an edit draft at presence_penalty
+    1.5 with two thirds of its token budget, and the server would answer
+    happily — the deviation is invisible unless it is asserted here."""
+    state = edit_ready_state()
+    edit_client(tmp_path, state).complete(edit_messages(ONE), "edit")
+    body = json.loads(state["bodies"][0])
+    assert body["n_predict"] == 24000
+    assert body["presence_penalty"] == 0.0
+
+
+def test_the_marker_is_asked_again_next_time_never_remembered(tmp_path):
+    """One server per rewrite means one marker per rewrite: a marker cached on
+    the client matches no bitmaps on the second attempt."""
+    state = edit_ready_state()
+    client = edit_client(tmp_path, state)
+    assert client.complete(edit_messages(ONE), "edit") == "ENHANCED"
+    assert client.complete(edit_messages(ONE), "edit") == "ENHANCED"
+    assert state["paths"] == ["/health", "/health", PROPS_ROUTE, "/completion",
+                              "/health", PROPS_ROUTE, "/completion"]
+
+
+def test_a_text_rewrite_never_buys_a_props_round_trip(tmp_path):
+    """A text-only ``llama-server`` build does not answer ``/props`` at all:
+    asking for a marker on a text draft would break every t2i rewrite on such a
+    server, and is a wasted round trip on any other."""
+    state = edit_ready_state()
+    client = make_client(tmp_path, spawn=no_spawn,
+                         transport_factory=piped_factory(state))
+    assert client.complete(MESSAGES, "t2i") == "ENHANCED"
+    assert PROPS_ROUTE not in state["paths"]
+    assert json.loads(state["bodies"][0])["prompt"] == golden("SYS PROMPT",
+                                                              "a red fox")
+
+
+def scripted_props(marker: object) -> tuple[int, bytes]:
+    return 200, json.dumps({"media_marker": marker}).encode()
+
+
+@pytest.mark.parametrize("props, error", [
+    ((200, b'{"model_path":"PE-I2I-Q8_0.gguf"}'), rc.RewriteConfigError),
+    (scripted_props(None), rc.RewriteConfigError),
+    (scripted_props(""), rc.RewriteConfigError),
+    (scripted_props("<|media marker|>"), rc.RewriteConfigError),
+    (scripted_props("x" * (pe.MEDIA_MARKER_MAX + 1)), rc.RewriteConfigError),
+    ((200, b"<html>not json"), rc.RewriteInvalidAnswer),
+    ((404, b"no route"), rc.RewriteUnavailable),
+])
+def test_a_server_that_cannot_name_its_marker_fails_typed(tmp_path, props,
+                                                          error):
+    """No marker, an unusable one, or no ``/props`` route at all is a typed
+    refusal with NOTHING sent: the alternative is to post a prompt the server
+    refuses for every image, which the user reads as a broken backend. A marker
+    carrying whitespace would also be a template injection, since it is
+    embedded in the user turn verbatim."""
+    state = edit_ready_state()
+    state["props"] = props
+    client = edit_client(tmp_path, state)
+    with pytest.raises(error):
+        client.complete(edit_messages(ONE), "edit")
+    assert "bodies" not in state
+    assert client.live_process() is None
