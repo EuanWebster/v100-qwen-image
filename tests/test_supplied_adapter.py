@@ -265,6 +265,8 @@ def test_calibration_facts_measure_the_processed_conditioning(setup):
         "embedding_cache_hit": True,
         "references": 0,
         "recipe": "base",
+        "noise_seed": None,
+        "noise_seed_derivation": None,
     }
     active = replace(setup.config, negative_prompt="blurry", true_cfg_scale=2.0)
     supplied._config = active
@@ -279,6 +281,26 @@ def test_calibration_facts_measure_the_processed_conditioning(setup):
     del setup.provider.last_cache_hit
     assert supplied.calibration_facts()["embedding_cache_hit"] is None
     supplied.close()
+
+
+def test_edit_noise_seed_domain_separation():
+    """The edit sampler noise must be a deterministic 64-bit derivation of
+    (seed, ordered reference ids) under the fixed label — never equal to the
+    plain seed (that collision WAS the 1024x1024 edit artifact), and any
+    ingredient change moves it."""
+    first, second = "a" * 64, "b" * 64
+    derived = module.derive_edit_noise_seed(42, (first,))
+    assert 0 <= derived < 2**64 and derived != 42
+    assert derived == module.derive_edit_noise_seed(42, (first,))  # deterministic
+    assert derived != module.derive_edit_noise_seed(42, (second,))  # ref identity
+    assert derived != module.derive_edit_noise_seed(7, (first,))  # seed identity
+    assert module.derive_edit_noise_seed(42, (first, second)) != \
+        module.derive_edit_noise_seed(42, (second, first))  # order-sensitive
+    assert derived != module.derive_edit_noise_seed(42, (first, second))  # membership
+    # length-prefixed ids: a concatenation can never impersonate a list
+    assert module.derive_edit_noise_seed(1, ("ab",)) != \
+        module.derive_edit_noise_seed(1, ("a", "b"))
+    assert module.EDIT_NOISE_DERIVATION == "qwen-engine.edit-noise.v1"
 
 
 # -- reference-image path (edit support, part B) -----------------------------
@@ -632,6 +654,9 @@ def test_references_flow_end_to_end_from_config_through_the_pinned_call(tmp_path
         manifest=manifest, bundle=bundle, encoder_dtype="fp16")
     supplied.load(config, bundle.to_assets())
     branches = supplied.encode(config)
+    # The collector reads facts when the denoise phase opens, before the
+    # generator exists — encode() must already carry the derived seed.
+    encoded_facts = supplied.calibration_facts()
 
     assert captured["image_files"] == tuple(
         str(reference_store.path_for(store, reference_id)) for reference_id in ordered)
@@ -650,6 +675,16 @@ def test_references_flow_end_to_end_from_config_through_the_pinned_call(tmp_path
     assert pipe.records[-1]["image_pad_mask"] is branches.positive.image_pad_mask
     assert "encode_prompt" not in vars(pipe)  # the finally removed the override
     assert tuple(latents.shape) == (1, config.latent_tokens, 64)
+    # Noise domain separation on the REAL pinned call: the generator handed
+    # to the pipeline is seeded with the derived edit noise seed (config.seed
+    # here is the default 0), never the plain seed; the user-visible seed
+    # that drives the filename stays 0.
+    assert pipe.call["generator"].value == module.derive_edit_noise_seed(0, ordered)
+    assert pipe.call["generator"].value != config.seed
+    assert supplied.actual_seed == config.seed == 0
+    assert supplied._noise_seed == pipe.call["generator"].value
+    assert encoded_facts["noise_seed"] == pipe.call["generator"].value
+    assert encoded_facts["noise_seed_derivation"] == module.EDIT_NOISE_DERIVATION
     supplied.close()
 
 
@@ -747,18 +782,26 @@ def _text_payload_for(request):
                           blobs=(Blob("tensors", st_bytes(tensors, st_metadata)),))
 
 
+witness_generators: list = []
+
+
 def _step_witness(tmp_path, monkeypatch, *, fires, recipe, steps):
     """Loaded, encoded supplied adapter over a pipe firing ``fires`` step
     callbacks; returns (adapter, config, progress records)."""
     from PIL import Image as PILImage
 
     class _Generator:
+        instances: list = []
         def __init__(self, device=None):
             self.value = None
+            self.instances.append(self)
         def seed(self):
             return 7
         def manual_seed(self, value):
             self.value = value
+
+    witness_generators.append(_Generator)
+
 
     class _Torch(FakeTorch):
         float16 = "torch.float16"
@@ -839,4 +882,19 @@ def test_base_recipe_denoise_is_not_step_pinned(tmp_path, monkeypatch):
     latents = supplied.denoise(config, branches)
     assert supplied._state == "denoised"
     assert tuple(latents.shape) == (1, config.latent_tokens, 64)
+    supplied.close()
+
+
+@needs_references
+def test_text_to_image_noise_seed_stays_the_plain_seed(tmp_path, monkeypatch):
+    """Byte-identity of the T2I path: the generator is seeded with
+    config.seed exactly (no derivation) and no noise_seed is recorded."""
+    supplied, config, branches, _ = _step_witness(
+        tmp_path, monkeypatch, fires=8, recipe="turbo", steps=8)
+    config = replace(config, seed=1234)
+    supplied._config = config
+    supplied.denoise(config, branches)
+    generator = witness_generators[-1].instances[-1]
+    assert generator.value == 1234 and supplied.actual_seed == 1234
+    assert supplied._noise_seed is None
     supplied.close()

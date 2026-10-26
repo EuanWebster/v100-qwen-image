@@ -655,6 +655,13 @@ class Qwen21DiffusersAdapter:
                 current().metadata[key] = facts[key]
             if references:
                 current().metadata["joint_tokens"] = self._joint_tokens
+                # Noise domain separation: the derived sampler seed (never
+                # equal to config.seed) belongs in the run metadata next to
+                # the joint-token facts; the supplied adapter also seeds the
+                # generator with it in denoise().
+                for key in ("noise_seed", "noise_seed_derivation"):
+                    if facts.get(key) is not None:
+                        current().metadata[key] = facts[key]
         return result
 
     def calibration_facts(self):

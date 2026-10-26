@@ -6,6 +6,7 @@ Plain import is ML-free; the default CLI factory remains absent/disabled.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import threading
 import uuid
@@ -32,6 +33,37 @@ MAX_PNG_BYTES = 256 * 1024 * 1024
 #: The reference mask hook refuses on ANY drift instead of guessing.
 _ENCODE_PROMPT_PARAMETERS = ("prompt", "image", "device", "num_images_per_prompt",
                              "prompt_embeds", "prompt_embeds_mask", "image_pad_mask")
+
+#: Domain-separation label for the reference-edit noise seed (see
+#: :func:`derive_edit_noise_seed`). Fixed forever: changing it changes every
+#: edit run's noise, i.e. it is part of the generation identity.
+EDIT_NOISE_DERIVATION = "qwen-engine.edit-noise.v1"
+
+
+def derive_edit_noise_seed(seed: int, reference_ids: tuple[str, ...]) -> int:
+    """Deterministic 64-bit SAMPLER-noise seed for reference edits.
+
+    Root cause 2026-10-26 (output/gpu/FINDINGS-edit-grid.md): references
+    produced by this engine at 1024x1024/seed 42 edited at the same size and
+    seed start from the IDENTICAL initial noise tensor that generated the
+    reference, injecting its content twice (conditioning + starting noise) —
+    the over-processed artifact. Deriving the edit noise seed from
+    ``sha256(label || seed || ordered reference ids)`` makes that collision
+    structurally impossible: the edit noise can never equal the plain
+    ``seed``-noise of any generation. Purely domain separation — T2I keeps
+    using ``config.seed`` exactly, and the user-visible seed/filename stay
+    ``config.seed``; only the sampler's manual_seed argument changes.
+    Ids are length-prefixed so concatenation cannot be forged, and order is
+    significant (it is part of the conditioning identity).
+    """
+    digest = hashlib.sha256()
+    digest.update(EDIT_NOISE_DERIVATION.encode("utf-8"))
+    digest.update(int(seed).to_bytes(8, "big"))
+    for reference_id in reference_ids:
+        raw = str(reference_id).encode("utf-8")
+        digest.update(len(raw).to_bytes(4, "big"))
+        digest.update(raw)
+    return int.from_bytes(digest.digest()[:8], "big")
 
 
 def load_reference_images(config, image_module):
@@ -129,6 +161,7 @@ class SuppliedQwen21Adapter:
         self.actual_seed = None
         self._progress_callback = None
         self._reference_pils = None
+        self._noise_seed = None
 
     def set_progress_callback(self, callback):
         if self._state != "new" or (callback is not None and not callable(callback)):
@@ -244,6 +277,14 @@ class SuppliedQwen21Adapter:
             raise EngineError("conditioning hidden width disagrees with the transformer")
         self._encoding_request = encoding.request
         self._conditioning = branches
+        # Noise-seed domain separation for reference edits (see
+        # derive_edit_noise_seed): decided at ENCODE time so the calibration
+        # collector — which binds facts when the denoise phase opens, before
+        # denoise runs — already sees it. A seedless run (config.seed is
+        # None) draws its seed inside denoise; the noise seed is derived
+        # there and the facts bound earlier carry None.
+        self._noise_seed = (derive_edit_noise_seed(config.seed, tuple(config.references))
+                            if config.references and config.seed is not None else None)
         self._state = "encoded"
         return branches
 
@@ -272,6 +313,12 @@ class SuppliedQwen21Adapter:
             "embedding_cache_hit": getattr(self._encoder, "last_cache_hit", None),
             "references": len(tuple(getattr(self._config, "references", ()))),
             "recipe": self._config.recipe.value,
+            # Noise-seed domain separation: the value the sampler is actually
+            # seeded with on an edit run (None for T2I/seedless runs, which
+            # keep using config.seed itself).
+            "noise_seed": self._noise_seed,
+            "noise_seed_derivation": (EDIT_NOISE_DERIVATION
+                                      if self._noise_seed is not None else None),
         }
 
     def reference_images(self, config):
@@ -377,9 +424,19 @@ class SuppliedQwen21Adapter:
                    [(kwargs["negative_prompt_embeds"], conditioning.negative.image_pad_mask)]))
         generator = torch.Generator(device=self._device)
         self.actual_seed = generator.seed() if config.seed is None else config.seed
-        generator.manual_seed(self.actual_seed)
+        # Domain separation: an edit run seeds the SAMPLER with a value
+        # derived from (seed, ordered reference ids) so its initial noise can
+        # never be the noise that produced one of its own references
+        # (FINDINGS-edit-grid.md root cause). T2I keeps config.seed exactly.
+        noise_seed = (derive_edit_noise_seed(self.actual_seed, references)
+                      if references else self.actual_seed)
+        self._noise_seed = noise_seed if references else None
+        generator.manual_seed(noise_seed)
         if current() is not None:
             current().metadata["seed"] = self.actual_seed
+            if references:
+                current().metadata["noise_seed"] = noise_seed
+                current().metadata["noise_seed_derivation"] = EDIT_NOISE_DERIVATION
 
         steps_observed: list[int] = []
 
@@ -462,4 +519,5 @@ class SuppliedQwen21Adapter:
         self._progress_callback = None
         self._conditioning = None
         self._reference_pils = None
+        self._noise_seed = None
         self._state = "closed"
