@@ -61,8 +61,10 @@ def load_q8_transformer(transformer_cls, bundle, artifact, torch, device):
     # this call and the artifact sha256 was verified exactly once per job
     # before it (resolve_q8_artifact). Staged below so the next real run
     # splits load time from device placement WITHOUT changing behaviour
-    # (stage() is a no-op when no PerformanceRecorder is active).
-    with stage("q8_gguf_state_dict", cuda=True):
+    # (stage() is a no-op when no PerformanceRecorder is active). Wall-clock
+    # only: they run inside the caller's CUDA-measured transformer_loading
+    # stage, and CUDA performance scopes must not nest.
+    with stage("q8_gguf_state_dict"):
         model = transformer_cls.from_single_file(
             str(artifact.path), config=str(bundle.root), subfolder="transformer",
             quantization_config=GGUFQuantizationConfig(compute_dtype=torch.float16),
@@ -72,9 +74,9 @@ def load_q8_transformer(transformer_cls, bundle, artifact, torch, device):
     # GGUFParameters even in non-linear modules (notably text_norm). Those
     # modules do not dequantize in forward. Normalize only these unquantized
     # auxiliaries on CPU before placement; actual Q8 weights remain packed.
-    with stage("q8_auxiliaries", cuda=True):
+    with stage("q8_auxiliaries"):
         _restore_bf16_auxiliaries(model, torch, gguf_utils, gguf.GGMLQuantizationType.BF16)
-    with stage("q8_device_placement", cuda=True):
+    with stage("q8_device_placement"):
         model.to(device=device)
     model.eval()
     return model
