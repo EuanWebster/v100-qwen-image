@@ -597,7 +597,9 @@ def test_rewrite_status_block_is_the_canonical_disabled_pair():
     rt = runtime()
     block = api.rewrite_status_block(rt)
     assert block == dict(api.REWRITE_DISABLED_BLOCK)
-    assert set(block) == {"state", "code", "backend", "reason"}
+    # ``settings`` is the amendment's pointer to WHERE the choice is changed;
+    # it is a route, so it is safe to publish even with no rewriter configured.
+    assert set(block) == {"state", "code", "backend", "reason", "settings"}
     assert block["state"] == "unavailable" and block["backend"] is None
     # Never a gate: rewriting must not appear able to block generation.
     status = api.status_response(rt).payload

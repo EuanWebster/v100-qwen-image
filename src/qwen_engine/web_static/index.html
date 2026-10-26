@@ -27,7 +27,8 @@
   <nav class="main-nav" aria-label="Primary">
     <a href="#create" id="nav-create" class="nav-link" aria-current="page">Create</a>
     <a href="#history" id="nav-history" class="nav-link">History</a>
-    <a href="#settings" id="nav-settings" class="nav-link nav-settings">Help</a>
+    <a href="#settings" id="nav-settings" class="nav-link">Settings</a>
+    <a href="#help" id="nav-help" class="nav-link nav-settings">Help</a>
   </nav>
   <div class="theme-picker">
     <label for="theme-select">Theme</label>
@@ -64,16 +65,22 @@
                 Rewrite action <em>suggests</em> a reworded version — it never
                 replaces your draft unless you press Apply.</p>
               <p class="error" id="prompt-error" aria-live="polite"></p>
+              <p class="help rewrite-active" id="rewrite-active" hidden>
+                <span id="rewrite-active-text"></span>
+                <a class="rewrite-change" href="#settings">Change</a>
+              </p>
               <div class="rewrite-actions">
                 <button type="button" id="rewrite-btn" class="btn-secondary" hidden disabled>
                   Rewrite prompt</button>
-                <p id="rewrite-hint" class="help">Rewriting is unavailable:
-                  this server was started without a rewriter.</p>
+                <p id="rewrite-hint" class="help">Rewriting is off here: choose a
+                  rewriter under <a href="#settings">Settings</a>, or ask the
+                  operator to start this server with one.</p>
                 <p id="rewrite-status" class="help" role="status" aria-live="polite"></p>
               </div>
               <div id="rewrite-proposal" class="rewrite-proposal" hidden tabindex="-1"
                    role="group" aria-labelledby="rewrite-proposal-heading">
                 <h3 id="rewrite-proposal-heading">Suggested prompt — not applied</h3>
+                <p class="help rewrite-source" id="rewrite-source"></p>
                 <p class="rewrite-label">Your draft</p>
                 <p id="rewrite-original" class="rewrite-original"></p>
                 <p class="rewrite-label">Suggestion</p>
@@ -411,9 +418,99 @@
     <p><a class="back-link" href="#create">← Back to Create</a></p>
   </section>
 
-  <!-- ===================== Help view (legacy #settings link retained) ===================== -->
+  <!-- ===================== Settings view =====================
+       The rewriter choice is SERVER-side: one JSON document in the server's
+       cache dir, shared by every browser pointed at this server. The page
+       sends a backend, an address, a model name and a timeout — never a file
+       path, a binary or a model file: those stay launch flags the operator
+       owns, and the server refuses anything shaped like one. -->
   <section id="view-settings" class="view" hidden aria-labelledby="settings-heading">
-    <h2 id="settings-heading" tabindex="-1">Help</h2>
+    <h2 id="settings-heading" tabindex="-1">Settings</h2>
+    <p class="help settings-shared">These settings are stored by the server
+      itself, not by this browser: they apply to every browser that uses this
+      server, and they are still there after it restarts.</p>
+
+    <section class="settings-section" aria-labelledby="rewrite-settings-heading">
+      <h3 id="rewrite-settings-heading">Prompt rewriter</h3>
+      <p class="help">The rewriter turns a short draft into a fuller prompt
+        before a generation. It only ever <em>suggests</em>: nothing is written
+        into your draft until you press Apply.</p>
+      <fieldset class="settings-radios">
+        <legend>Which rewriter to use</legend>
+        <label class="settings-radio" for="rewrite-backend-pe">
+          <input type="radio" name="rewrite-backend" id="rewrite-backend-pe"
+                 value="pe-llamacpp">
+          <span>Official enhancer (Q8, uses GPU)</span>
+        </label>
+        <p class="help settings-reason" id="rewrite-backend-pe-reason"
+           role="status"></p>
+        <label class="settings-radio" for="rewrite-backend-local">
+          <input type="radio" name="rewrite-backend" id="rewrite-backend-local"
+                 value="local-llm">
+          <span>Local LLM service</span>
+        </label>
+        <p class="help settings-reason" id="rewrite-backend-local-reason"
+           role="status"></p>
+        <div class="settings-fields" id="rewrite-local-fields">
+          <div class="field">
+            <label for="rewrite-endpoint">Endpoint URL</label>
+            <input type="text" id="rewrite-endpoint" autocomplete="off"
+                   spellcheck="false"
+                   aria-describedby="rewrite-endpoint-help rewrite-settings-error">
+            <p class="help" id="rewrite-endpoint-help">This machine only, on a
+              port that is listening, ending in /v1/chat/completions — for
+              example http://127.0.0.1:8079/v1/chat/completions. Leave it empty
+              to keep the address the server was started with.</p>
+          </div>
+          <div class="field">
+            <label for="rewrite-model">Model name</label>
+            <input type="text" id="rewrite-model" autocomplete="off"
+                   aria-describedby="rewrite-model-help rewrite-settings-error">
+            <p class="help" id="rewrite-model-help">The name that service
+              expects, for example Qwen3.8. Leave empty to keep the name the
+              server was started with.</p>
+          </div>
+          <div class="field field-narrow">
+            <label for="rewrite-timeout">Timeout (s)</label>
+            <input type="number" id="rewrite-timeout" min="1" max="3600" step="1"
+                   aria-describedby="rewrite-timeout-help rewrite-settings-error">
+            <p class="help" id="rewrite-timeout-help">How long one rewrite may
+              take, 1-3600 seconds. Leave empty to keep the server's value.</p>
+          </div>
+          <div class="settings-actions">
+            <button type="button" id="rewrite-test" class="btn-secondary"
+                    disabled>Test connection</button>
+            <p class="help" id="rewrite-test-status" role="status"
+               aria-live="polite"></p>
+          </div>
+        </div>
+        <label class="settings-radio" for="rewrite-backend-off">
+          <input type="radio" name="rewrite-backend" id="rewrite-backend-off"
+                 value="off">
+          <span>Off</span>
+        </label>
+        <p class="help settings-reason" id="rewrite-backend-off-reason"
+           role="status"></p>
+      </fieldset>
+      <p class="help settings-gpu" id="rewrite-gpu-note">The official enhancer
+        loads a Q8 model onto the graphics card for each rewrite (about 15–40 s).
+        It is unavailable while an image is generating; an image started during a
+        rewrite waits for it.</p>
+      <div class="settings-actions">
+        <button type="button" id="rewrite-save" class="btn-primary"
+                disabled>Save</button>
+        <p class="help" id="rewrite-save-status" role="status"
+           aria-live="polite"></p>
+      </div>
+      <p class="error" id="rewrite-settings-error" aria-live="polite"></p>
+      <p class="help" id="rewrite-settings-note" role="status"></p>
+    </section>
+    <p><a class="back-link" href="#create">← Back to Create</a></p>
+  </section>
+
+  <!-- ===================== Help view ===================== -->
+  <section id="view-help" class="view" hidden aria-labelledby="help-heading">
+    <h2 id="help-heading" tabindex="-1">Help</h2>
     <dl class="settings-list">
       <div><dt>Backend status</dt><dd id="settings-backend">This page talks
         only to the local qwen-web server on the same origin, when it is

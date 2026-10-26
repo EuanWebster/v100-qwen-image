@@ -462,6 +462,39 @@ async function httpChecks() {
           /content-length: \d+/i.test(head(r)),
           head(r).split('\r\n')[0]);
   }
+
+  // ---- server-side rewriter settings (the document the page parses) -----
+  // The Settings view parses this with a CLOSED key set, and the block that
+  // describes the local service has NO backend key (it selects nothing) while
+  // the saved choice does. Parsing both as choices rejected every document and
+  // the page showed a schema error forever, so the shapes are pinned here on
+  // the real served socket as well as in the guarded suite.
+  const settingsDoc = jsonOf(await rawRequest(
+    `GET /api/v1/settings/rewrite HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n` +
+    `X-Qwen-UI: 1\r\nOrigin: ${ORIGIN}\r\n\r\n`));
+  check('GET settings serves the closed settings document',
+        settingsDoc?.schema === 'qwen_engine.web_rewrite_settings.v1' &&
+        Array.isArray(settingsDoc.backends) && settingsDoc.backends.length === 2 &&
+        typeof settingsDoc.persistent === 'boolean' &&
+        (settingsDoc.backend === null || typeof settingsDoc.backend === 'string'),
+        JSON.stringify(settingsDoc)?.slice(0, 200));
+  check('the local block is endpoint/model/timeout_s and selects no backend',
+        Object.keys(settingsDoc?.local || {}).sort().join(',') ===
+        'endpoint,model,timeout_s', JSON.stringify(settingsDoc?.local));
+  check('the saved block is a choice and does carry a backend',
+        Object.keys(settingsDoc?.saved || {}).sort().join(',') ===
+        'backend,endpoint,model,timeout_s', JSON.stringify(settingsDoc?.saved));
+  check('settings rows and labels name no path, host or port',
+        !/[\/\\]/.test(JSON.stringify(settingsDoc?.backends) +
+                       JSON.stringify(settingsDoc?.off)),
+        JSON.stringify(settingsDoc?.backends)?.slice(0, 200));
+  const pathKey = await post('/api/v1/settings/rewrite', JSON.stringify({
+    schema: 'qwen_engine.web_rewrite_settings.v1', backend: 'local-llm',
+    endpoint: 'http://127.0.0.1:8079/v1/chat/completions', model: 'x',
+    timeout_s: null, model_path: '/models/pe/PE.gguf' }));
+  check('a path-shaped settings key is refused with a typed 400',
+        status(pathKey) === 400 && jsonOf(pathKey)?.code === 'invalid_envelope' &&
+        !body(pathKey).includes('/models/'), head(pathKey).split('\r\n')[0]);
 }
 
 function rawChunked() {
@@ -555,6 +588,48 @@ async function chromeChecks() {
     }
     throw new Error(`timed out waiting for ${label}`);
   }
+  // ------------------------------ the rewriter Settings view (real page)
+  // The page refuses a settings document it cannot fully parse, and refusing
+  // one leaves the view on a schema error with every control greyed out — which
+  // is what happened while the block describing the local service was parsed as
+  // a saved choice. This leg runs FIRST because it needs nothing but the served
+  // page: a failing plan leg further down must not hide it.
+  await s('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+  await s('Page.navigate', { url: ORIGIN + '/' });
+  await waitUntil(async () => (await evaluate('!!window.QwenStudio')) === true,
+                  15000, 'the app to boot');
+  const settingsView = await evaluate(`(async () => {
+    const doc = await (await fetch('/api/v1/settings/rewrite')).json();
+    location.hash = '#settings';
+    return doc.backend;
+  })()`);
+  let settingsApplied = false;
+  for (let i = 0; i < 60 && !settingsApplied; i++) {
+    // The fields are enabled by the same render that fills the radios, so an
+    // enabled field means the document was ACCEPTED and applied.
+    settingsApplied = await evaluate(
+      'document.getElementById("rewrite-endpoint").disabled === false');
+    if (!settingsApplied) await delay(250);
+  }
+  const settingsError = await evaluate(
+    'document.getElementById("rewrite-settings-error").textContent');
+  check('the settings view accepts the served settings document',
+        settingsApplied && settingsError === '', settingsError);
+  const expectedRadio = settingsView === 'pe-llamacpp' ? 'rewrite-backend-pe'
+    : settingsView === 'local-llm' ? 'rewrite-backend-local' : 'rewrite-backend-off';
+  const radioState = await evaluate(`(() => {
+    const ids = ['rewrite-backend-pe', 'rewrite-backend-local', 'rewrite-backend-off'];
+    return ids.filter((id) => document.getElementById(id).checked).join(',') || 'none';
+  })()`);
+  check('exactly one rewriter radio is checked, and it is the backend in force',
+        radioState === expectedRadio, `${radioState} vs ${expectedRadio}`);
+  const gpuNote = await evaluate(
+    'document.getElementById("rewrite-gpu-note").textContent');
+  check('the GPU note is honest: unavailable during a generation, never waiting',
+        /unavailable while an image is generating/.test(gpuNote) &&
+        !/it waits for/.test(gpuNote.replace(/\s+/g, ' ')),
+        gpuNote.replace(/\s+/g, ' ').trim().slice(0, 160));
+
   const maxSeed = '18446744073709551615';   // real uint64 max ('9'*20 would EXCEED it)
   for (const [w, h, mobile] of [[1440, 900, false], [375, 800, true], [320, 640, true]]) {
     await s('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile });
