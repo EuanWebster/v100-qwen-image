@@ -80,4 +80,24 @@ if [[ ${QWEN_PE:-1} == 1 && -x "$pe_binary" && -r "$pe_model" \
     qwen_args+=(--pe-timeout "$QWEN_PE_TIMEOUT")
   fi
 fi
+# Machine names browsers may type instead of an IP address live in
+# cache/web-settings.json ({"host_names": [...]}), read at startup. The first
+# run writes it with this PC's hostname, its mDNS name (<hostname>.local) and,
+# when Tailscale is up, its MagicDNS name. Edit it and restart to change them;
+# an empty list accepts IP addresses and localhost only.
+if [[ ! -e cache/web-settings.json ]]; then
+  short_name="$(hostname -s 2>/dev/null || true)"
+  magic_dns=""
+  if command -v tailscale >/dev/null 2>&1; then
+    magic_dns="$(tailscale status --self --json 2>/dev/null \
+      | .venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"])' 2>/dev/null || true)"
+  fi
+  mkdir -p cache
+  .venv/bin/python - "$short_name" "${magic_dns%.}" > cache/web-settings.json <<'PY'
+import json, sys
+short, magic = (arg.lower() for arg in sys.argv[1:])
+names = [short, short + ".local", magic] if short else [magic]
+print(json.dumps({"host_names": [name for name in names if name]}, indent=2))
+PY
+fi
 exec .venv/bin/python "${qwen_args[@]}" "$@"
