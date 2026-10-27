@@ -393,7 +393,7 @@ class WebGeneration:
 
     def forget_response(self, job_id, body, *, owner=None, history_cap=None):
         delete_files = self._delete_files_flag(body)
-        if owner is not None:
+        if owner is not None and owner != LOCAL_OWNER:
             # C3: a forget that names somebody else's job (or no job at all)
             # gets the SAME fixed 404 a job read gets, so a remote id cannot
             # be confirmed by trying to delete it. The local port keeps its
@@ -417,11 +417,12 @@ class WebGeneration:
                 self.controller.finished_for(owner), history_cap)
         return ApiResponse(200, document)
 
-    def forget_all_response(self, body):
+    def forget_all_response(self, body, *, owner=None):
+        """Clear ``owner``'s finished history (everyone's when ``None``)."""
         delete_files = self._delete_files_flag(body)
         try:
             forgotten, deleted, skipped = self.controller.forget_all(
-                delete_files=delete_files)
+                delete_files=delete_files, owner=owner)
         except (JobError, OSError):
             raise ApiError(409, "job_unavailable",
                            "the job history could not be cleared on this server") from None

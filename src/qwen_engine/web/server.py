@@ -1033,13 +1033,13 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             kind, arg = resolve_route(method, target)
             remote = getattr(self.server, "remote", None)
-            # ``owner`` stays None on the local port: every owner-aware
-            # controller/API method treats None as "the whole history", which is
-            # exactly the unchanged local behaviour. ``owner_id`` is what NEW
-            # data is tagged with, and is always a real owner.
-            owner = allow = history_cap = queue_limit = None
+            # Every listener sees only its own owner's jobs: on the local port
+            # that is the person at the machine, so invited people's pictures
+            # never appear in the owner's History (the Admin page shows only
+            # counts). ``owner_id`` is what NEW data is tagged with.
+            allow = history_cap = queue_limit = None
             identity = None
-            owner_id = api.LOCAL_OWNER
+            owner = owner_id = api.LOCAL_OWNER
             if remote is not None:
                 # C1: the owner-only routes do not EXIST here — the same 404 an
                 # unknown target gets, so a remote client cannot even probe.
@@ -1077,7 +1077,11 @@ class _Handler(BaseHTTPRequestHandler):
             elif kind in ("reference", "reference_thumb"):
                 data, ctype = api.reference_bytes(self.server.web_runtime, arg,
                                                   thumb=kind == "reference_thumb",
-                                                  owner=owner)
+                                                  # Uploads made before owner
+                                                  # tagging have no owner record,
+                                                  # so the local port reads the
+                                                  # store unfiltered.
+                                                  owner=None if remote is None else owner)
                 self._send(200, data, ctype)
             elif kind in ("jobs", "job", "image"):
                 jobs = getattr(self.server, "generation", None)
@@ -1180,7 +1184,7 @@ class _Handler(BaseHTTPRequestHandler):
                             body, owner=owner_id, allow=allow,
                             history_cap=history_cap, queue_limit=queue_limit))
                     elif kind == "forget_all":
-                        self._send_api(jobs.forget_all_response(body))
+                        self._send_api(jobs.forget_all_response(body, owner=owner))
                     elif kind == "forget":
                         self._send_api(jobs.forget_response(
                             arg, body, owner=owner, history_cap=history_cap))

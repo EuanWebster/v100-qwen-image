@@ -612,9 +612,11 @@ class JobController:
         with self._condition:
             return self._forget_locked(job_id, delete_files, owner)
 
-    def forget_all(self, *, delete_files: bool = False
+    def forget_all(self, *, delete_files: bool = False, owner: str | None = None
                    ) -> tuple[int, int, int]:
         """Forget EVERY terminal job; queued/running/cancelling jobs untouched.
+
+        ``owner`` narrows it to one owner's jobs (and the live count to theirs).
 
         Returns ``(forgotten, deleted_files, skipped_live)``. Each entry goes
         through exactly the one-forget path, under one lock hold per job set
@@ -623,13 +625,17 @@ class JobController:
         """
         if type(delete_files) is not bool:
             raise JobError("delete_files must be boolean")
+        wanted = None if owner is None else normalize_owner(owner)
         with self._condition:
             forgotten = deleted = 0
             for job_id in tuple(job_id for job_id, record in self._records.items()
-                                if record.terminal):
+                                if record.terminal
+                                and (wanted is None or record.owner == wanted)):
                 deleted += self._forget_locked(job_id, delete_files)
                 forgotten += 1
-            return forgotten, deleted, len(self._records)
+            return forgotten, deleted, sum(
+                1 for record in self._records.values()
+                if wanted is None or record.owner == wanted)
 
     def forget_owner(self, owner: str, *, delete_files: bool = False) -> tuple[int, int]:
         """Forget every TERMINAL job of one owner; ``(forgotten, deleted_files)``.

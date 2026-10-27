@@ -298,10 +298,46 @@ def test_a_spoofed_identity_on_the_local_port_never_reaches_another_owner(
     headers = ["Host: 127.0.0.1:8765", f"{SUB_HEADER}: {ALICE[1]}"]
     out = drive(request(f"/api/v1/jobs/{done.job_id}", headers=headers),
                 runtime=runtime, generation=service)
-    # The local port reads the whole history (unchanged behaviour), and it does
-    # so without ever consulting the spoofed header.
+    # The local port is the owner's own history: an invited person's job is
+    # not part of it, whatever header the request carries.
+    assert " 200 " not in status_line(out)
+
+
+def test_the_owners_history_holds_only_the_owners_jobs(runtime, started):
+    service = WebGeneration(runtime, executor=save)
+    started.append(service)
+    mine = service.controller.wait(
+        service.controller.submit(GenerationConfig()).job_id)
+    theirs = service.controller.wait(
+        service.controller.submit(GenerationConfig(), owner=ALICE[1]).job_id)
+    local = ["Host: 127.0.0.1:8765"]
+
+    listed = body_of(drive(request("/api/v1/jobs", headers=local),
+                           runtime=runtime, generation=service))
+    assert listed["jobs"] == [mine.job_id]
+    out = drive(request(f"/api/v1/jobs/{mine.job_id}", headers=local),
+                runtime=runtime, generation=service)
     assert " 200 " in status_line(out)
-    assert body_of(out)["job_id"] == done.job_id
+    out = drive(request(f"/api/v1/jobs/{theirs.job_id}/image", headers=local),
+                runtime=runtime, generation=service)
+    assert " 200 " not in status_line(out)
+
+
+def test_the_owners_delete_all_leaves_invited_peoples_history(runtime, started):
+    service = WebGeneration(runtime, executor=save)
+    started.append(service)
+    service.controller.wait(service.controller.submit(GenerationConfig()).job_id)
+    theirs = service.controller.wait(
+        service.controller.submit(GenerationConfig(), owner=ALICE[1]).job_id)
+    body = json.dumps({"delete_files": True}).encode()
+    out = drive(request("/api/v1/jobs/forget-all", method="POST",
+                        headers=["Host: 127.0.0.1:8765",
+                                 "Origin: http://127.0.0.1:8765", "X-Qwen-UI: 1",
+                                 "Content-Type: application/json"], body=body),
+                runtime=runtime, generation=service)
+    assert " 200 " in status_line(out), out
+    assert body_of(out)["forgotten"] == 1
+    assert [r.job_id for r in service.controller.snapshots()] == [theirs.job_id]
 
 
 def test_an_unknown_account_is_not_invited(remote):
