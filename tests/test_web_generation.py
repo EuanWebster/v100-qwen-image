@@ -615,7 +615,45 @@ def test_gpu_cache_is_released_after_every_job_outcome(runtime, outcome):
             go.set()
         record = service.controller.wait(job_id)
         assert record.state.value == outcome
-        assert len(releases) == 1 and releases[0] is not None
+        # A failed or cancelled job is released once more by the controller,
+        # after its exception is gone (see the next test).
+        expected = 1 if outcome == 'succeeded' else 2
+        deadline = time.monotonic() + 5
+        while len(releases) < expected and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert len(releases) == expected and releases[0] is not None
+    finally:
+        assert service.close()
+
+
+def test_a_failed_jobs_memory_is_released_after_its_exception_is_gone(runtime):
+    # The release inside _run's finally runs while the failure is still being
+    # raised; its traceback keeps the job's tensors alive, so an out-of-memory
+    # job used to leave ~15.8 GiB on the card with the server idle. A release
+    # must also happen once nothing holds the job's data any more.
+    class Tensor:
+        pass
+
+    held = []
+    alive_at_release = []
+    released = threading.Event()
+
+    def execute(context):
+        tensor = Tensor()
+        held.append(weakref.ref(tensor))
+        raise RuntimeError('CUDA out of memory')
+
+    def release():
+        alive_at_release.append(held[0]() is not None)
+        if len(alive_at_release) == 2:
+            released.set()
+
+    service = WebGeneration(runtime, executor=execute, gpu_cache_release=release)
+    try:
+        job_id = service.submit(envelope()).payload['job_id']
+        assert service.controller.wait(job_id).state == JobState.FAILED
+        assert released.wait(5)
+        assert alive_at_release == [True, False]
     finally:
         assert service.close()
 
