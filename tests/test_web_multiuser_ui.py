@@ -76,6 +76,7 @@ def test_no_browser_dialog_and_the_admin_hash_is_guarded_before_routing():
                         or "never" in stripped), f"live browser dialog call: {line}"
     route = _js_function(js, "routeOnHashchange")
     assert "name === 'admin' && !adminEnabled" in route
+    assert "name === 'settings' && currentUser" in route
     # A remote page typing #admin lands on Create, exactly like any unknown
     # hash — never on a table whose every write would 404.
     guard = route.split("name === 'admin' && !adminEnabled")[1]
@@ -151,6 +152,8 @@ function renderValidation() { validationRan++; }
 function validateForm() { return {errors: []}; }
 function syncPlanStaleness() { stalenessRan++; }
 function renderView(name) { activeView = name; }
+// The rewriter's own availability is not under test here: none is configured.
+function rewritingSomewhere() { return false; }
 // renderSelectedJob's two neighbours on the Create view: each has its own
 // section, and neither decides the queue sentence under test.
 function updateUseAsReferenceControl() {}
@@ -176,6 +179,8 @@ function visible(id) { return $(id).hidden !== true; }
 function snapshot() {
   return {
     adminNav: visible("nav-admin"),
+    settingsNav: visible("nav-settings"),
+    rewriteHint: visible("rewrite-hint"),
     identity: visible("identity"),
     identityName: $("identity-name").textContent,
     signOutHref: $("sign-out").attrs.href || "",
@@ -299,6 +304,17 @@ out.remoteLeavesAdmin = (function () {
     allow: {q8: true, "2k": false, edit: false, official_enhancer: false},
     history: {count: 0, cap: 5, willReplaceOldest: false}}});
   return {activeView: activeView, adminNav: visible("nav-admin")};
+})();
+
+/* ---- 6b. a remote page sitting on Settings is moved off it ---- */
+out.remoteLeavesSettings = (function () {
+  reset();
+  activeView = "settings";
+  applyUserState({recognized: true, admin: false, user: {
+    email: "alice@example.com", displayName: "Alice",
+    allow: {q8: true, "2k": false, edit: false, official_enhancer: false},
+    history: {count: 0, cap: 5, willReplaceOldest: false}}});
+  return {activeView: activeView, settingsNav: visible("nav-settings")};
 })();
 
 /* ---- 7. not invited: the studio is replaced whole ---- */
@@ -461,6 +477,7 @@ def test_the_owners_page_is_unchanged_by_the_remote_additions(tmp_path):
     out = _run_multiuser_harness(tmp_path)
     local = out["local"]
     assert local["adminNav"] is True             # the owner's own listener
+    assert local["settingsNav"] is True and local["rewriteHint"] is True
     assert local["identity"] is False            # no account to name
     assert local["twoK"] is True
     assert local["editField"] is True
@@ -477,6 +494,9 @@ def test_a_remote_account_sees_only_what_its_four_flags_allow(tmp_path):
     out = _run_multiuser_harness(tmp_path)
     remote = out["remote"]
     assert remote["adminNav"] is False           # never a tab whose writes 404
+    # The server chooses a remote account's rewriter: no Settings tab, and no
+    # hint sending the person there.
+    assert remote["settingsNav"] is False and remote["rewriteHint"] is False
     assert remote["identity"] is True
     assert remote["identityName"] == "Alice"
     assert remote["signOutHref"] == "/oauth2/sign_out"
@@ -510,6 +530,18 @@ def test_the_page_converges_when_the_identity_changes(tmp_path):
     moved = out["remoteLeavesAdmin"]
     assert moved["activeView"] == "create"
     assert moved["adminNav"] is False
+
+
+def test_a_remote_page_sitting_on_settings_is_moved_to_create(tmp_path):
+    moved = _run_multiuser_harness(tmp_path)["remoteLeavesSettings"]
+    assert moved == {"activeView": "create", "settingsNav": False}
+
+
+def test_the_hidden_attribute_wins_over_component_display_rules():
+    # Without this rule the remote page's hidden Settings blocks (display:
+    # flex) stayed on screen although the script had hidden them.
+    css = _read("app.css")
+    assert "[hidden] { display: none !important; }" in css
 
 
 def test_the_history_cap_warning_quotes_the_servers_numbers(tmp_path):

@@ -3,6 +3,9 @@
    cyan/violet gradients are inside the logo artwork).
    No external fonts, no CDN, no analytics. System font stack only. */
 
+/* The hidden attribute always wins over a component's own display rule. */
+[hidden] { display: none !important; }
+
 :root,
 :root[data-theme="original"] {
   --bg: #16181b;

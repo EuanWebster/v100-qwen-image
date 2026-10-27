@@ -565,6 +565,19 @@ def remote_host_allowed(values: list[str]) -> bool:
     return bool(name)
 
 
+#: The page documents a remote browser may open by top-level navigation from
+#: another site (C1): the app shell only, never an API route.
+REMOTE_NAVIGATION_TARGETS = frozenset({"/", "/index.html"})
+
+
+def remote_page_navigation(method: str, headers: dict[str, list[str]],
+                           target: str) -> bool:
+    """True for a plain top-level page load of the app shell."""
+    return (method == "GET" and target in REMOTE_NAVIGATION_TARGETS
+            and headers.get("sec-fetch-mode") == ["navigate"]
+            and headers.get("sec-fetch-dest") == ["document"])
+
+
 def remote_request_error(method: str, headers: dict[str, list[str]],
                          settings: RemoteSettings, *, upload: bool = False,
                          max_body_bytes: int | None = None) -> ApiError | None:
@@ -981,6 +994,13 @@ class _Handler(BaseHTTPRequestHandler):
             if not remote_host_allowed(headers.get("host", [])):
                 return ApiError(400, "invalid_host",
                                 "exactly one well-formed Host header is required")
+            if remote_page_navigation(method, headers, target):
+                # People arrive at the public page from other sites: the
+                # redirect back from Google sign-in, or a link in an email.
+                # The browser marks those loads cross-site. Only the static
+                # page itself is let through; every API route keeps the check.
+                headers = {name: values for name, values in headers.items()
+                           if name != "sec-fetch-site"}
             return remote_request_error(method, headers, remote, upload=upload,
                                         max_body_bytes=max_body_bytes)
         host_origin, host_err = validate_host(headers.get("host", []),

@@ -1493,7 +1493,9 @@
       button.disabled = !rewriteAvailable();
     }
     var hint = $('rewrite-hint');
-    if (hint) hint.hidden = rewritingSomewhere();
+    // A remote account cannot choose a rewriter, so the hint pointing at
+    // Settings is never shown to one.
+    if (hint) hint.hidden = rewritingSomewhere() || !!currentUser;
     // Which rewriter is answering is stated, not implied: the two behave
     // differently (one takes the graphics card, one does not), they are chosen
     // separately per draft kind, and the user just chose between them.
@@ -4061,6 +4063,14 @@
       }
     }
 
+    // Settings belong to the owner's machine: the server chooses a remote
+    // account's rewriter, so a remote page has no Settings tab at all, and no
+    // link pointing at one.
+    hideIf('nav-settings', remote);
+    hideIf('rewrite-hint', remote || rewritingSomewhere());
+    var changeLinks = document.querySelectorAll('.rewrite-change');
+    for (var c = 0; c < changeLinks.length; c++) changeLinks[c].hidden = remote;
+    if (remote && activeView === 'settings') renderView('create');
     // Settings writes and model downloads belong to the owner's machine: a
     // remote page never offers a button whose route answers 404.
     var writes = document.querySelectorAll('.settings-writes');
@@ -4505,6 +4515,11 @@
     // remote page typing #admin gets the same view it would get by typing
     // any other unknown hash.
     if (name === 'admin' && !adminEnabled) {
+      renderView('create');
+      return;
+    }
+    // A remote account has no Settings: the server chooses its rewriter.
+    if (name === 'settings' && currentUser) {
       renderView('create');
       return;
     }

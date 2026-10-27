@@ -945,3 +945,38 @@ def test_an_account_id_that_is_not_a_legal_remote_owner_is_refused(sub):
     with pytest.raises(api.ApiError) as caught:
         remote_module.parse_identity(headers)
     assert caught.value.status == 401
+
+
+def navigation_headers(identity):
+    """The proxy's headers on a browser page load: no Origin, no same-origin mark."""
+    return [line for line in remote_headers(identity)
+            if not line.startswith(("Sec-Fetch-Site:", "Origin:"))]
+
+
+def test_a_cross_site_page_navigation_reaches_the_remote_page(remote):
+    # The redirect back from Google sign-in (and a link in an email) is a
+    # cross-site top-level navigation; the remote page must still load.
+    navigation = ["Sec-Fetch-Site: cross-site", "Sec-Fetch-Mode: navigate",
+                  "Sec-Fetch-Dest: document"]
+    out = drive(request("/", headers=navigation_headers(ALICE) + navigation),
+                remote=remote, assets={"index.html": b"<!doctype html>"})
+    assert " 200 " in status_line(out)
+
+
+@pytest.mark.parametrize("path, extra", [
+    ("/api/v1/status", ["Sec-Fetch-Mode: navigate", "Sec-Fetch-Dest: document"]),
+    ("/", ["Sec-Fetch-Mode: no-cors", "Sec-Fetch-Dest: iframe"]),
+    ("/app.js", ["Sec-Fetch-Mode: navigate", "Sec-Fetch-Dest: document"]),
+])
+def test_cross_site_requests_other_than_a_page_load_stay_refused(remote, path, extra):
+    out = drive(request(path, headers=navigation_headers(ALICE)
+                        + ["Sec-Fetch-Site: cross-site"] + extra), remote=remote)
+    assert " 403 " in status_line(out)
+    assert body_of(out)["code"] == "cross_site_denied"
+
+
+def test_the_local_port_still_refuses_a_cross_site_page_load(runtime):
+    out = drive(request("/", headers=["Host: 127.0.0.1:8765", "Sec-Fetch-Site: cross-site",
+                                      "Sec-Fetch-Mode: navigate",
+                                      "Sec-Fetch-Dest: document"]), runtime=runtime)
+    assert " 403 " in status_line(out)
