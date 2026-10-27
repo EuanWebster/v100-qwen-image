@@ -882,7 +882,7 @@ def test_gpu_oom_failure_message_is_plain_language_and_actionable():
     assert m, "out_of_gpu_memory message not found"
     assert "".join(m.groups()) == ("The GPU ran out of memory for this job. "
                                    "Try Q8, a smaller size, fewer reference images, "
-                                   "or Turbo.")
+                                   "or a shorter prompt.")
     # only the closed map may replace the generic sentence; no server text
     assert "failureMessages[job.error_code] ||" in js
 
