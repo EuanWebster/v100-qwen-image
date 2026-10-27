@@ -1,16 +1,29 @@
-/* Lightseed Studio — W1 static workspace.
+/* Lightseed Studio — workbench styles.
    Dark charcoal shell, fine borders, one brand periwinkle accent (the
-   cyan/violet gradients are inside the logo artwork).
+   cyan/violet gradients are inside the logo artwork). Original, Neon and
+   Paper are the same three themes as before; the extra tokens the new
+   workbench needs (hover surface, radii, shadows, mono font) are declared in
+   every theme so no component reads a value that only one theme defines.
    No external fonts, no CDN, no analytics. System font stack only. */
 
 /* The hidden attribute always wins over a component's own display rule. */
 [hidden] { display: none !important; }
 
-:root,
+:root {
+  --radius: 8px;
+  --radius-sm: 4px;
+  --radius-lg: 12px;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+          Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+               "Liberation Mono", "Courier New", monospace;
+}
+
 :root[data-theme="original"] {
   --bg: #16181b;
   --bg-panel: #1d2024;
   --bg-raised: #23262b;
+  --bg-hover: #292d34;
   --border: #33383f;
   --border-soft: #2a2e34;
   --text: #e9e7e2;
@@ -21,14 +34,16 @@
      Original distinct from Neon, which stays cyan. */
   --accent: #7C8CFF;
   --accent-dim: #5361F1;
+  --accent-glow: rgba(124, 140, 255, 0.18);
   --error: #e07b7b;
   --focus: #A9B4FF;
   --on-accent: #14161a;
   --ok: #9fd6a8;
   --ok-border: #3f6b4b;
-  --radius: 8px;
-  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
-          Arial, sans-serif;
+  --ok-glow: rgba(159, 214, 168, 0.25);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.6);
 }
 
 /* Neon theme: dark base, cyan/magenta accents. Text pairs chosen for
@@ -37,17 +52,23 @@
   --bg: #07090f;
   --bg-panel: #0d1220;
   --bg-raised: #131a2c;
+  --bg-hover: #1c2742;
   --border: #1f4557;
   --border-soft: #14293a;
   --text: #dff6ff;
   --text-muted: #8fc7d9;
   --accent: #22d3ee;
   --accent-dim: #0e7490;
+  --accent-glow: rgba(34, 211, 238, 0.2);
   --error: #f77fb1;
   --focus: #67e8f9;
   --on-accent: #062026;
   --ok: #5eead4;
   --ok-border: #155e63;
+  --ok-glow: rgba(94, 234, 212, 0.25);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.6);
+  --shadow-md: 0 4px 16px rgba(4, 22, 34, 0.7);
+  --shadow-lg: 0 12px 36px rgba(4, 22, 34, 0.9);
 }
 
 /* Paper theme: light surfaces, cool brand ink. Muted/accent pairs keep
@@ -56,6 +77,7 @@
   --bg: #f6f3ec;
   --bg-panel: #fffdf7;
   --bg-raised: #ece7db;
+  --bg-hover: #e2dcd0;
   --border: #c9c2b2;
   --border-soft: #ddd6c6;
   --text: #23262b;
@@ -65,16 +87,17 @@
      ivory at 6.50:1 on --accent. */
   --accent: #3F49C4;
   --accent-dim: #2E3799;
+  --accent-glow: rgba(63, 73, 196, 0.15);
   --error: #a13a3a;
   --focus: #2E3799;
   --on-accent: #F7F5EF;
   --ok: #2c6e3f;
   --ok-border: #9fc7a8;
+  --ok-glow: rgba(44, 110, 63, 0.2);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 12px 28px rgba(0, 0, 0, 0.15);
 }
-
-/* (The old neon glow lived on the removed ".brand-mark" tile; the logos carry
-   their own colour, so nothing is added here.) */
-:root[data-theme="neon"] .sticky-actions { border-color: #9445ad; }
 
 * { box-sizing: border-box; }
 
@@ -83,11 +106,12 @@ html, body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font);
-  font-size: 15px;
-  line-height: 1.45;
+  font-size: 14.5px;
+  line-height: 1.5;
+  min-height: 100vh;
 }
 
-body { min-height: 100vh; display: flex; flex-direction: column; }
+body { display: flex; flex-direction: column; }
 
 .visually-hidden {
   position: absolute; width: 1px; height: 1px; margin: -1px;
@@ -96,9 +120,9 @@ body { min-height: 100vh; display: flex; flex-direction: column; }
 }
 
 .skip-link {
-  position: absolute; left: 8px; top: -40px; z-index: 10;
+  position: absolute; left: 8px; top: -40px; z-index: 100;
   background: var(--accent); color: var(--on-accent); padding: 6px 12px;
-  border-radius: var(--radius); text-decoration: none;
+  border-radius: var(--radius-sm); text-decoration: none;
   transition: top 120ms ease;
 }
 .skip-link:focus { top: 8px; }
@@ -108,16 +132,23 @@ body { min-height: 100vh; display: flex; flex-direction: column; }
   outline-offset: 2px;
 }
 
+/* The router moves focus to each view's heading so a screen reader announces
+   the new page. Such a heading is not reachable with Tab, so the ring the
+   outline rule would draw around the whole text block says nothing a reader
+   can act on. */
+[tabindex="-1"]:focus-visible { outline: none; }
+
 /* ---------- Header ---------- */
 
 .app-header {
-  display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
-  padding: 12px 20px;
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 10px 20px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-panel);
+  position: sticky; top: 0; z-index: 50;
 }
 
-.brand { display: flex; align-items: center; gap: 10px; }
+.brand { display: flex; align-items: center; gap: 8px; }
 
 /* The wordmark IS the logo: the horizontal SVG carries "Lightseed", so only
    "Studio" is live text. One <img> per logo variant and CSS shows exactly the
@@ -127,89 +158,120 @@ body { min-height: 100vh; display: flex; flex-direction: column; }
    header because the header wraps). */
 .brand-name {
   margin: 0; display: flex; align-items: center; gap: 8px;
-  font-size: 17px; font-weight: 650; letter-spacing: 0.2px;
+  font-size: 17px; font-weight: 700; letter-spacing: -0.02em;
 }
 .brand-logo { height: 37px; width: auto; display: block; }
 .brand-logo-light { display: none; }
 :root[data-theme="paper"] .brand-logo-dark { display: none; }
 :root[data-theme="paper"] .brand-logo-light { display: block; }
-/* Muted, so the wordmark stays the loud part of the lockup. */
+/* A small uppercase badge, so the live word reads as a product suffix
+   rather than as part of the artwork. */
 .brand-suffix {
-  color: var(--text-muted); font-size: 17px; font-weight: 650;
-  letter-spacing: 0.2px;
+  font-size: 12px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.08em; padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-raised); color: var(--accent);
+  border: 1px solid var(--border);
 }
 
-.main-nav { display: flex; gap: 4px; margin-left: 8px; }
+/* The nav is one segmented control; the brand and the right-hand group sit
+   on either side of it so the tabs stay visually centred. */
+.main-nav {
+  display: flex; align-items: center; gap: 4px;
+  margin-inline: auto;
+  background: var(--bg); padding: 3px;
+  border-radius: var(--radius); border: 1px solid var(--border-soft);
+}
 
 .nav-link {
   color: var(--text-muted); text-decoration: none;
-  padding: 6px 14px; border-radius: var(--radius);
-  border: 1px solid transparent;
+  font-weight: 500; font-size: 13.5px;
+  padding: 5px 14px; border-radius: 6px;
+  display: inline-flex; align-items: center; gap: 6px;
+  transition: color 120ms ease, background 120ms ease;
 }
 .nav-link:hover { color: var(--text); background: var(--bg-raised); }
 .nav-link[aria-current="page"] {
-  color: var(--text); background: var(--bg-raised);
-  border-color: var(--border);
+  color: var(--text); background: var(--bg-panel);
+  box-shadow: var(--shadow-sm); font-weight: 600;
 }
-.nav-settings { margin-left: 12px; border-color: var(--border); }
-
-.connection-chip {
-  margin: 0 0 0 auto; padding: 4px 12px;
-  border: 1px solid var(--border); border-radius: 999px;
-  color: var(--text-muted); font-size: 13px; white-space: nowrap;
-}
-.connection-chip.is-ready {
-  color: var(--ok); border-color: var(--ok-border);
+.header-right {
+  display: flex; align-items: center; gap: 12px;
+  margin-left: auto;
 }
 
 .theme-picker {
-  display: flex; align-items: center; gap: 8px; margin-left: 12px;
+  display: flex; align-items: center; gap: 8px; font-size: 13px;
 }
-.theme-picker label { margin: 0; white-space: nowrap; }
+.theme-picker label { margin: 0; white-space: nowrap; color: var(--text-muted); }
 .theme-picker select {
   width: auto;
   background: var(--bg-raised); color: var(--text);
-  border: 1px solid var(--border); border-radius: 6px;
-  padding: 5px 8px; font-size: 13px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 4px 8px; font-size: 13px; cursor: pointer;
+}
+.theme-picker select:focus { border-color: var(--focus); }
+
+/* The status dot is drawn on the chip itself: the script only writes the
+   chip's TEXT, so a ::before is the only stable place for the state light. */
+.connection-chip {
+  margin: 0; display: inline-flex; align-items: center; gap: 8px;
+  padding: 4px 12px; border-radius: 999px;
+  background: var(--bg-raised); border: 1px solid var(--border);
+  color: var(--text-muted); font-size: 12.5px; white-space: nowrap;
+}
+.connection-chip::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--border); flex: 0 0 auto;
+}
+.connection-chip.is-ready {
+  color: var(--text); border-color: var(--ok-border);
+}
+.connection-chip.is-ready::before {
+  background: var(--ok);
+  box-shadow: 0 0 6px var(--ok-glow);
+  position: relative;
+}
+/* The pulse is a second ring on the same dot, drawn from the chip. */
+.connection-chip.is-ready::after {
+  content: ""; position: relative; left: -16px; top: 0;
+  width: 8px; height: 8px; border-radius: 50%;
+  border: 1px solid var(--ok);
+  animation: pulse-ring 2.4s cubic-bezier(0.2, 0.8, 0.4, 1) infinite;
+  pointer-events: none; flex: 0 0 auto;
+}
+@keyframes pulse-ring {
+  0% { transform: scale(0.9); opacity: 0.9; }
+  60% { transform: scale(2.2); opacity: 0; }
+  100% { transform: scale(2.2); opacity: 0; }
 }
 
 /* ---------- Layout ---------- */
 
-main { flex: 1; padding: 20px; }
+main { flex: 1; min-height: 0; }
 
 .view { max-width: 1400px; margin: 0 auto; }
 .view h2 { margin: 0 0 14px; font-size: 20px; }
 
-.layout {
+.workbench-layout {
   display: grid;
-  grid-template-columns: 380px minmax(0, 1fr);
+  grid-template-columns: minmax(380px, 440px) minmax(0, 1fr);
   gap: 20px;
   align-items: start;
+  padding: 20px;
 }
 
-.controls {
+.controls-sidebar {
+  min-width: 0;
   background: var(--bg-panel);
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
-  padding: 16px;
 }
 
-.preview-column { min-width: 0; }
-
-/* Prompt first, then generation actions, in one opaque sticky panel. */
-
-.sticky-actions {
-  position: sticky; top: 8px; z-index: 5;
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 12px;
-  margin-top: 0;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+.preview-column {
+  min-width: 0;
+  display: flex; flex-direction: column; gap: 16px;
 }
-.prompt-panel { margin-bottom: 16px; max-height: calc(100svh - 16px); overflow-y: auto; }
-.prompt-panel .prompt-field { margin-bottom: 10px; }
-.prompt-panel .job-actions { margin-top: 0; }
 
 /* Quiet scrollbars that follow all three themes; retain a visible drag target. */
 :where(.settings-scroll, .prompt-panel, .plan-panel, main, textarea) {
@@ -238,15 +300,64 @@ main { flex: 1; padding: 20px; }
   }
 }
 
+/* ---------- Prompt panel (top of the sidebar) ---------- */
+
+.prompt-panel {
+  padding: 16px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  border-radius: var(--radius) var(--radius) 0 0;
+  overflow-y: auto;
+  max-height: calc(100svh - 16px);
+}
+.prompt-panel .prompt-field { margin-bottom: 10px; }
+.prompt-panel .job-actions { margin-top: 12px; }
+
+.prompt-textarea {
+  width: 100%;
+  background: var(--bg-raised); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px 12px;
+  font-family: inherit; font-size: 14px; line-height: 1.45;
+  resize: vertical; min-height: 90px;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+.prompt-textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+.prompt-textarea::placeholder { color: var(--text-muted); opacity: 0.7; }
+
 /* ---------- Form ---------- */
 
-.field { margin-bottom: 14px; }
-fieldset.field { border: 1px solid var(--border-soft); border-radius: var(--radius);
-                 padding: 10px 12px; }
-fieldset.field legend { padding: 0 6px; color: var(--text-muted); font-size: 13px; }
+.settings-body {
+  padding: 16px;
+  display: flex; flex-direction: column; gap: 16px;
+}
 
-.field-row { display: flex; gap: 12px; flex-wrap: wrap; }
-.field-row .field { flex: 1 1 120px; min-width: 0; }
+.field { margin-bottom: 12px; }
+.field:last-child { margin-bottom: 0; }
+fieldset.field {
+  border: 0; margin-inline: 0; padding: 0; min-width: 0;
+}
+fieldset.field > legend { padding: 0; }
+
+.field-header {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 6px;
+}
+.field-label {
+  font-weight: 600; font-size: 13.5px; color: var(--text-muted);
+  display: flex; align-items: center; gap: 6px;
+}
+.field-counter {
+  font-size: 11.5px; color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.field-row, .form-row-2 { display: flex; gap: 12px; flex-wrap: wrap; }
+.field-row .field, .form-row-2 > .field { flex: 1 1 120px; min-width: 0; }
 
 label {
   display: block; margin-bottom: 5px;
@@ -256,21 +367,24 @@ label {
 
 input, textarea, select, button { font-family: inherit; font-size: 14px; }
 
-input[type="text"], input[type="number"], textarea {
+input[type="text"], input[type="number"], input[type="email"], textarea {
   width: 100%;
-  background: var(--bg); color: var(--text);
-  border: 1px solid var(--border); border-radius: 6px;
-  padding: 8px 10px;
+  background: var(--bg-raised); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  transition: border-color 140ms ease;
 }
 select {
   width: 100%;
   background: var(--bg-raised); color: var(--text);
-  border: 1px solid var(--border); border-radius: 6px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
   padding: 7px 8px;
 }
 textarea { resize: vertical; }
-input:focus, textarea:focus, select:focus { border-color: var(--accent-dim); }
-
+input:focus, textarea:focus, select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
 input:invalid, textarea:invalid { border-color: var(--border); }
 
 /* Locked by the selected recipe (Turbo owns steps/guidance/quant): the
@@ -280,159 +394,305 @@ input:disabled, select:disabled, textarea:disabled {
   opacity: 0.6; cursor: not-allowed; color: var(--text-muted);
 }
 
+.checkbox-field { display: flex; align-items: center; gap: 8px; }
+.checkbox-field label { display: inline; margin: 0; }
+.checkbox-field input { width: auto; margin: 0; accent-color: var(--accent); }
+
 /* Seed gets a FULL row (never squeezed next to Steps) so all 20 digits can
    be inspected at the 380 px desktop side panel and at 375/320 mobile. */
 .seed-field { max-width: none; }
 .seed-row { display: flex; gap: 8px; align-items: stretch; min-width: 0; }
-.seed-row input { flex: 1 1 auto; min-width: 0; }
+.seed-row input { flex: 1 1 auto; min-width: 0; font-family: var(--font-mono);
+                  font-size: 12.5px; }
 .seed-row .btn-secondary {
   flex: 0 0 auto; min-width: 0; white-space: nowrap;
-  padding: 8px 10px;
 }
 
-.help { margin: 5px 0 0; font-size: 12px; color: var(--text-muted); }
+.help { margin: 5px 0 0; font-size: 12px; color: var(--text-muted);
+        line-height: 1.45; }
 .error { margin: 5px 0 0; font-size: 12.5px; color: var(--error); min-height: 1em; }
+.error:empty { display: none; }
+.field-muted { opacity: 0.72; }
 
-/* Rewrite suggestion block. Visually DISTINCT from the draft so a proposal
-   can never be mistaken for the live prompt, and the original stays visible
-   beside it: applying is always a comparison, never a leap of faith. */
-.rewrite-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 6px; }
-.rewrite-actions .help { margin: 0; }
-.rewrite-proposal {
-  margin-top: 10px; padding: 10px;
-  border: 1px solid var(--accent); border-radius: 8px;
+/* ---------- Info popovers ---------- */
+
+/* A "?" button beside a label opens the explanation on hover, on focus and
+   by click (the script owns aria-expanded and Escape). The panel is
+   absolutely positioned and flips to the label's LEFT edge, so a long
+   explanation on the last control of the scrolling sidebar is not clipped. */
+.info-popover-wrapper {
+  position: relative; display: inline-flex; align-items: center;
+}
+.info-btn {
+  background: transparent; border: 1px solid var(--border-soft);
+  color: var(--text-muted);
+  width: 18px; height: 18px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; cursor: pointer; padding: 0;
+  line-height: 1; flex: 0 0 auto;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+.info-btn:hover, .info-btn:focus-visible {
+  color: var(--text); border-color: var(--accent); background: var(--bg-hover);
+}
+.info-btn[aria-expanded="true"] {
+  color: var(--on-accent); background: var(--accent); border-color: var(--accent);
+}
+.info-popover {
+  position: absolute; top: calc(100% + 8px); left: 0;
+  /* placeInfoPopover overrides left/max-height per panel; these are the
+     defaults for the no-JS case and for the synchronous first paint. */
+  width: min(300px, calc(100vw - 48px));
+  margin: 0; padding: 10px 12px;
+  background: var(--bg-raised); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  font-size: 12px; font-weight: 400; line-height: 1.45;
+  letter-spacing: 0;
+  z-index: 100; display: none; text-align: left;
+  animation: popover-fade 140ms ease-out;
+  /* Never taller than the window: the help texts are short, but a translated
+     or zoomed page must scroll the panel rather than lose its last line. */
+  max-height: min(60vh, 420px); overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.info-popover::before {
+  /* --arrow-x is set by placeInfoPopover so the tail keeps pointing at the
+     control after the panel is slid sideways to fit. */
+  content: ""; position: absolute; top: -5px; left: var(--arrow-x, 12px);
+  width: 8px; height: 8px; transform: rotate(45deg);
   background: var(--bg-raised);
+  border-left: 1px solid var(--border); border-top: 1px solid var(--border);
 }
-.rewrite-proposal:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.rewrite-proposal h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: var(--text); }
-.rewrite-label {
-  margin: 8px 0 2px; font-size: 11px; text-transform: uppercase;
-  letter-spacing: 0.04em; color: var(--text-muted);
+/* A panel opened from a control near the bottom of a scrolling sidebar opens
+   UPWARD: the same panel opened downward was cut off by the scroll container's
+   bottom edge, where no amount of scrolling could reveal it. */
+.info-popover-wrapper.flip-up .info-popover {
+  top: auto; bottom: calc(100% + 8px);
 }
-.rewrite-original, .rewrite-suggested {
-  margin: 0; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere;
-  max-height: 12em; overflow-y: auto;
+.info-popover-wrapper.flip-up .info-popover::before {
+  top: auto; bottom: -5px;
+  border-left: 0; border-top: 0;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
 }
-.rewrite-original { color: var(--text-muted); }
-.rewrite-suggested { color: var(--text); }
-.rewrite-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-
-.preset-row { display: flex; gap: 8px; flex-wrap: wrap; }
-.preset-btn {
-  flex: 1 1 auto;
-  background: var(--bg-raised); color: var(--text-muted);
-  border: 1px solid var(--border); border-radius: 6px;
-  padding: 8px 8px; cursor: pointer;
+/* A dismissal outranks both convenience reveals (see the comment on
+   setInfoPopover): Escape hands focus back to the button, which lives inside
+   the wrapper, so :focus-within would otherwise re-open the panel it just
+   closed. Excluding the pin from the reveal selectors themselves keeps this
+   independent of rule order and specificity. */
+.info-popover-wrapper:hover .info-popover:not([data-closed="true"]),
+.info-popover-wrapper:focus-within .info-popover:not([data-closed="true"]),
+.info-popover[data-open="true"] { display: block; }
+.info-popover[data-closed="true"] { display: none; }
+@keyframes popover-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
-.preset-btn[aria-pressed="true"] {
-  color: var(--on-accent); background: var(--accent); border-color: var(--accent-dim);
-  font-weight: 600;
-}
-
-details.advanced { border: 1px solid var(--border-soft); border-radius: var(--radius);
-                   padding: 8px 12px; }
-details.advanced summary { cursor: pointer; font-weight: 600; color: var(--text-muted);
-                           padding: 4px 0; }
-details.advanced[open] { padding-bottom: 4px; }
-details.advanced .field { margin-top: 12px; }
-details.advanced > .help { margin-top: 10px; }
-
-.checkbox-field { display: flex; align-items: center; gap: 8px; }
-.checkbox-field label { display: inline; margin: 0; }
-.checkbox-field input { width: auto; }
 
 /* ---------- Buttons ---------- */
 
 .btn-primary, .btn-secondary, .btn-danger {
-  border-radius: 6px; padding: 9px 18px; cursor: pointer;
-  border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 8px 16px; cursor: pointer;
+  border: 1px solid var(--border); font-size: 13.5px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  transition: background 120ms ease, border-color 120ms ease,
+              color 120ms ease, filter 120ms ease;
+  text-decoration: none;
 }
 .btn-primary {
   background: var(--accent); border-color: var(--accent-dim);
   color: var(--on-accent); font-weight: 650;
 }
+.btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
 .btn-primary:disabled {
   background: var(--bg-raised); color: var(--text-muted);
-  border-color: var(--border); cursor: not-allowed;
+  border-color: var(--border); cursor: not-allowed; opacity: 0.7;
 }
 .btn-secondary { background: var(--bg-raised); color: var(--text); }
-.btn-secondary:disabled { color: var(--text-muted); cursor: not-allowed; opacity: 0.7; }
+.btn-secondary:hover:not(:disabled) {
+  background: var(--bg-hover); border-color: var(--accent-dim);
+}
+.btn-secondary:disabled { color: var(--text-muted); cursor: not-allowed; opacity: 0.6; }
 .btn-danger {
-  background: var(--bg-raised); color: var(--text);
+  background: var(--bg-raised); color: var(--error);
   border-color: var(--error); font-weight: 650;
 }
-.btn-danger:disabled { color: var(--text-muted); cursor: not-allowed; opacity: 0.7; }
+.btn-danger:hover:not(:disabled) {
+  background: var(--error); color: var(--bg-panel);
+}
+.btn-danger:disabled { color: var(--text-muted); cursor: not-allowed; opacity: 0.6;
+                       border-color: var(--border); }
+.btn-text-action {
+  background: none; border: none; color: var(--accent);
+  padding: 3px 6px; font-size: 12.5px; font-weight: 500; cursor: pointer;
+  border-radius: var(--radius-sm);
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.btn-text-action:hover { background: var(--bg-raised); }
+
+/* ---------- Generate row + job progress ---------- */
 
 .actions { margin-top: 16px; }
-.disabled-reason { margin: 8px 0 0; font-size: 12.5px; color: var(--text-muted); }
-.job-feedback { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
-  font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+.generate-button-row { display: flex; gap: 8px; margin-top: 8px; }
+.btn-generate {
+  flex: 1; font-size: 14.5px; font-weight: 700; padding: 10px 16px;
+  border-radius: var(--radius);
+  box-shadow: 0 2px 8px var(--accent-glow);
+}
+.btn-generate:disabled { box-shadow: none; }
+.btn-cancel { border-radius: var(--radius); font-size: 13px; }
+.btn-cancel:hover:not(:disabled) { border-color: var(--error); color: var(--error); }
+
+.disabled-reason { margin: 8px 0 0; font-size: 12.5px; color: var(--text-muted);
+                   overflow-wrap: anywhere; }
+.disabled-reason:empty { display: none; }
+.job-feedback {
+  padding: 8px 12px; margin: 8px 0 0;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  font-size: 13.5px; line-height: 1.5; overflow-wrap: anywhere;
+}
 .job-feedback[data-state="running"], .job-feedback[data-state="queued"],
 .job-feedback[data-state="submitting"] { border-color: var(--accent); }
 .job-feedback[data-state="succeeded"] { border-color: var(--ok-border); }
-.job-feedback[data-state="failed"], .job-feedback[data-state="error"] { border-color: var(--error); }
-#job-progress-panel { margin: 12px 0; }
-#job-progress-label { display: block; font-size: 13px; line-height: 1.5; }
-#job-progress { display: block; width: 100%; height: 18px; accent-color: var(--accent); }
+.job-feedback[data-state="failed"], .job-feedback[data-state="error"] {
+  border-color: var(--error);
+}
+.job-queue { margin: 6px 0 0; font-size: 12.5px; color: var(--text-muted); }
 
-/* ---------- Preview ---------- */
-
-.preview-frame {
-  position: relative;
-  width: 100%;
-  aspect-ratio: var(--ar-w, 1) / var(--ar-h, 1);
-  /* keep the true ratio when the viewport height caps the box */
-  max-width: calc(62vh * var(--ar-w, 1) / var(--ar-h, 1));
-  margin-inline: auto;
-  display: flex; align-items: center; justify-content: center;
-  background:
-    repeating-conic-gradient(#1a1c20 0% 25%, #1f2226 0% 50%) 0 0 / 24px 24px;
-  border: 1px solid var(--border); border-radius: var(--radius);
+.progress-card {
+  margin-top: 10px; padding: 10px 12px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-soft); border-radius: var(--radius);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.progress-header { display: flex; align-items: center; justify-content: space-between; }
+.progress-title {
+  font-size: 12.5px; font-weight: 600; color: var(--text);
+  display: flex; align-items: center; gap: 6px;
+}
+.shimmer-track {
+  width: 100%; height: 8px; background: var(--bg);
+  border: 1px solid var(--border-soft); border-radius: 999px;
   overflow: hidden;
 }
+#job-progress {
+  display: block; width: 100%; height: 100%;
+  accent-color: var(--accent); border: 0; background: transparent;
+}
+#job-progress::-webkit-progress-bar { background: var(--bg); }
+#job-progress::-webkit-progress-value { background: var(--accent); }
+#job-progress:indeterminate {
+  background: linear-gradient(90deg, var(--accent-dim) 0%, var(--accent) 50%,
+              var(--focus) 100%);
+  background-size: 200% 100%;
+  animation: shimmer-flow 1.8s infinite linear;
+}
+@keyframes shimmer-flow {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+.spin { animation: spin 1.6s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 
-.preview-empty {
-  max-width: 420px; text-align: center; color: var(--text-muted);
-  padding: 24px;
+/* ---------- Cards (settings groups) ---------- */
+
+.control-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  /* NOT overflow:hidden. A card is rounded, not a clip: the help popovers of
+     its fields hang outside its box, and clipping them made the lower ones
+     unreachable (the panel was painted entirely outside the card). The one
+     thing hidden used to do — keep the tinted header inside the rounded top
+     corners — is done by rounding the header itself. */
+  box-shadow: var(--shadow-sm);
 }
-.preview-empty-title { font-size: 16px; font-weight: 650; color: var(--text);
-                       margin: 0 0 8px; }
-.preview-empty p { margin: 0 0 6px; }
-/* Shown over a finished image when the draft's size differs from it: the
-   frame keeps the image's shape, so this is where a preset change shows. */
-.preview-next-size {
-  position: absolute; top: 8px; right: 8px; margin: 0;
-  padding: 4px 8px; font-size: 12px; color: var(--text);
-  background: var(--bg-panel); border: 1px solid var(--accent-dim);
-  border-radius: 6px; pointer-events: none;
+.card-header {
+  padding: 10px 14px; background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+  border-radius: calc(var(--radius) - 1px) calc(var(--radius) - 1px) 0 0;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
 }
-:root[data-theme="paper"] .preview-frame {
-  background: repeating-conic-gradient(#eee9df 0% 25%, #f7f3eb 0% 50%) 0 0 / 24px 24px;
+.card-title {
+  margin: 0; font-size: 12.5px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.05em; color: var(--text);
+  display: flex; align-items: center; gap: 8px;
+}
+.card-content {
+  padding: 14px; display: flex; flex-direction: column; gap: 14px;
 }
 
-#preview-image { width: 100%; height: 100%; object-fit: contain; }
-.history-card { min-width: 0; padding: 12px; border: 1px solid var(--border);
-  border-radius: 12px; overflow-wrap: anywhere; }
-.history-card img { display: block; width: 100%; height: 180px; object-fit: contain;
-  /* Checkerboard UNDER the thumbnail: a transparent PNG/WebP must read as
-     transparent, not as a flat dark rectangle. Preview only — the saved
-     file is never altered. */
-  background:
-    repeating-conic-gradient(#1a1c20 0% 25%, #1f2226 0% 50%) 0 0 / 16px 16px;
-  border-radius: 6px; }
-:root[data-theme="paper"] .history-card img {
-  background: repeating-conic-gradient(#eee9df 0% 25%, #f7f3eb 0% 50%) 0 0 / 16px 16px;
+/* ---------- Aspect presets + tier tabs ---------- */
+
+.preset-tier-tabs {
+  display: flex; background: var(--bg);
+  border: 1px solid var(--border-soft); border-radius: var(--radius-sm);
+  padding: 2px; flex: 0 0 auto;
+}
+.tier-tab-btn {
+  background: none; border: none; padding: 4px 10px;
+  font-size: 11.5px; font-weight: 600; color: var(--text-muted);
+  cursor: pointer; border-radius: 3px;
+  transition: background 120ms ease, color 120ms ease;
+}
+.tier-tab-btn:hover { color: var(--text); }
+.tier-tab-btn[aria-selected="true"] {
+  background: var(--bg-raised); color: var(--text);
+  box-shadow: var(--shadow-sm);
+}
+
+.preset-grid {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px;
+}
+.preset-tier-group > .preset-grid { margin-top: 0; }
+.preset-grid + .preset-tier-group { margin-top: 6px; }
+
+.preset-btn {
+  background: var(--bg-raised); color: var(--text-muted);
+  border: 1px solid var(--border-soft); border-radius: var(--radius-sm);
+  padding: 7px 4px; cursor: pointer; min-width: 0;
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 4px;
+  font-size: 11px; font-weight: 500; line-height: 1.2;
+  transition: background 120ms ease, border-color 120ms ease,
+              color 120ms ease;
+}
+.preset-btn:hover { background: var(--bg-hover); border-color: var(--border); }
+.preset-btn[aria-pressed="true"] {
+  background: var(--bg-panel); border-color: var(--accent);
+  color: var(--accent); font-weight: 600;
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.preset-ratio { font-size: 11px; }
+.preset-size {
+  font-size: 9.5px; font-family: var(--font-mono);
+  color: var(--text-muted); white-space: nowrap;
+}
+.preset-btn[aria-pressed="true"] .preset-size { color: var(--text); }
+/* Proportional glyph, sized from the preset's own width:height by the script
+   (element.style), never a fixed per-ratio class. */
+.aspect-glyph {
+  border: 1.5px solid currentColor; border-radius: 2px;
+  background: var(--accent-glow);
+  display: block; opacity: 0.85;
 }
 
 /* ---------- Reference images ---------- */
 
-.reference-field { border-top: 1px solid var(--border); padding-top: 10px; }
+.reference-field { margin-top: 4px; }
 .reference-field .help { margin-top: 6px; }
-.reference-toolbar { display: flex; align-items: center; gap: 10px;
-  flex-wrap: wrap; margin: 8px 0 4px; }
-.reference-count { font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
-.reference-list { list-style: none; margin: 6px 0 0; padding: 0;
-  display: flex; flex-direction: column; gap: 6px; }
+.reference-toolbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 8px 0 4px;
+}
+.reference-count {
+  font-size: 12px; color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.reference-list {
+  list-style: none; margin: 6px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 6px;
+}
 /* No --warning token exists in any theme: the missing-image state borrows
    --error, which is defined in all three. */
 .reference-card.reference-missing { border-color: var(--error);
@@ -442,104 +702,381 @@ details.advanced > .help { margin-top: 10px; }
    rigid grid forces a wider layout viewport (real horizontal overflow).
    The action row wraps to its own line instead. */
 .reference-card { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
-  padding: 6px; border: 1px solid var(--border); border-radius: 8px; }
-.reference-ordinal { font-size: 12px; font-weight: 650; color: var(--text-muted);
-  font-variant-numeric: tabular-nums; flex: 0 0 auto; min-width: 52px; }
-.reference-card img { display: block; width: 56px; height: 56px; object-fit: contain;
-  border-radius: 4px; border: 1px solid var(--border);
+  padding: 6px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-raised); }
+.reference-ordinal {
+  font-size: 12px; font-weight: 650; color: var(--text-muted);
+  font-variant-numeric: tabular-nums; flex: 0 0 auto; min-width: 52px;
+}
+.reference-card img {
+  display: block; width: 56px; height: 56px; object-fit: contain;
+  border-radius: var(--radius-sm); border: 1px solid var(--border);
   /* Checkerboard UNDER the thumbnail (same treatment as history cards): a
      transparent reference must read as transparent, not as a flat block.
      Preview only — the stored bytes are never altered. */
   background:
-    repeating-conic-gradient(#1a1c20 0% 25%, #1f2226 0% 50%) 0 0 / 12px 12px; }
+    repeating-conic-gradient(#1a1c20 0% 25%, #1f2226 0% 50%) 0 0 / 12px 12px;
+}
 :root[data-theme="paper"] .reference-card img {
   background: repeating-conic-gradient(#eee9df 0% 25%, #f7f3eb 0% 50%) 0 0 / 12px 12px;
 }
-.reference-meta { font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere;
-  font-variant-numeric: tabular-nums; flex: 1 1 8ch; min-width: 0; }
+.reference-meta {
+  font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums; flex: 1 1 8ch; min-width: 0;
+}
 .reference-actions { display: flex; gap: 4px; flex: 0 0 auto; margin-left: auto; }
 .reference-actions button { font-size: 11.5px; padding: 3px 7px; }
-.reference-status { font-size: 12.5px; margin: 8px 0 0; min-height: 1.2em;
-  color: var(--text-muted); overflow-wrap: anywhere; }
+.reference-status {
+  font-size: 12.5px; margin: 8px 0 0; min-height: 1.2em;
+  color: var(--text-muted); overflow-wrap: anywhere;
+}
 
 /* ---------- Recipe (Quality / Turbo) ---------- */
 
-.recipe-field { border-top: 1px solid var(--border); padding-top: 10px; }
-.recipe-field .help { margin-top: 6px; }
+.recipe-toggle-group {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+  background: var(--bg); padding: 4px;
+  border: 1px solid var(--border-soft); border-radius: var(--radius);
+}
+.recipe-option { position: relative; }
+.recipe-option input[type="radio"] {
+  position: absolute; opacity: 0; width: 0; height: 0; margin: 0;
+}
+.recipe-label {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 2px; padding: 7px 8px;
+  border: 1px solid transparent; border-radius: 6px; cursor: pointer;
+  text-align: center; margin: 0;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.recipe-name { font-size: 13px; font-weight: 600; color: var(--text); }
+.recipe-desc { font-size: 11px; color: var(--text-muted); }
+.recipe-option input:checked + .recipe-label {
+  background: var(--bg-panel); border-color: var(--accent);
+  box-shadow: var(--shadow-sm);
+}
+.recipe-option input:checked + .recipe-label .recipe-name { color: var(--accent); }
+.recipe-option input:focus-visible + .recipe-label {
+  outline: 2px solid var(--focus); outline-offset: 2px;
+}
+.recipe-note { color: var(--accent); }
+.recipe-note:empty { display: none; }
 .radio-row { display: flex; gap: 16px; flex-wrap: wrap; }
 .radio-field { display: flex; align-items: center; gap: 7px; }
 .radio-field label { display: inline; margin: 0; font-size: 13.5px; color: var(--text); }
 .radio-field input { width: auto; margin: 0; accent-color: var(--accent); }
-.recipe-note { color: var(--accent); }
-.recipe-field .recipe-note { margin-top: 10px; }
 
-/* ---------- Transparency ---------- */
+/* ---------- Transparency + advanced ---------- */
 
-.transparency-field { border-top: 1px solid var(--border); padding-top: 10px; }
+.transparency-field { border-top: 1px solid var(--border-soft); padding-top: 8px; }
 .transparency-field .help { margin-top: 6px; }
 .transparency-note { color: var(--accent); }
-.effective-prompt-field { margin: 6px 0 0; display: flex; flex-direction: column;
-  gap: 3px; }
+.transparency-note:empty { display: none; }
+.effective-prompt-field {
+  margin: 6px 0 0; display: flex; flex-direction: column; gap: 3px;
+}
+.effective-prompt-field .stat-label { text-transform: none; letter-spacing: 0; }
 .effective-prompt-text {
   font-size: 12.5px; line-height: 1.45; color: var(--text-muted);
-  border: 1px dashed var(--border); border-radius: 6px; padding: 6px 8px;
-  overflow-wrap: anywhere; white-space: pre-wrap;
+  border: 1px dashed var(--border); border-radius: var(--radius-sm);
+  padding: 6px 8px; overflow-wrap: anywhere; white-space: pre-wrap;
 }
-.history-card button { margin: 4px; }
-#job-status, #job-timings { overflow-wrap: anywhere; }
+
+details.advanced {
+  border: 1px solid var(--border-soft); border-radius: var(--radius);
+  padding: 8px 12px; background: var(--bg);
+}
+details.advanced summary {
+  cursor: pointer; font-weight: 600; font-size: 12.5px;
+  color: var(--text-muted); padding: 2px 0;
+}
+details.advanced summary:hover { color: var(--text); }
+details.advanced[open] { padding-bottom: 10px; }
+details.advanced .field { margin-top: 12px; }
+details.advanced > .help { margin-top: 10px; }
+
+/* ---------- Configuration card ---------- */
+
+.api-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+               margin-top: 0; }
+.api-actions .btn-secondary { flex: 0 1 auto; font-size: 12.5px; padding: 6px 10px; }
+.api-status {
+  flex: 1 1 220px; min-width: 0; margin: 0; font-size: 12.5px;
+  color: var(--text-muted); overflow-wrap: anywhere;
+}
+
+/* ---------- Preview column ---------- */
+
+.preview-wrapper {
+  flex: 1 1 auto; display: flex; align-items: center; justify-content: center;
+  min-height: 320px; min-width: 0;
+}
+
+.preview-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: var(--ar-w, 1) / var(--ar-h, 1);
+  /* keep the true ratio when the viewport height caps the box */
+  max-width: min(100%, calc(62vh * var(--ar-w, 1) / var(--ar-h, 1)));
+  margin-inline: auto;
+  display: flex; align-items: center; justify-content: center;
+  background:
+    repeating-conic-gradient(#1a1c20 0% 25%, #1f2226 0% 50%) 0 0 / 24px 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  overflow: hidden;
+}
+:root[data-theme="paper"] .preview-frame {
+  background: repeating-conic-gradient(#eee9df 0% 25%, #f7f3eb 0% 50%) 0 0 / 24px 24px;
+}
+
+.preview-empty {
+  max-width: 420px; text-align: center; color: var(--text-muted);
+  padding: 24px;
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+}
+.empty-icon-ring {
+  width: 52px; height: 52px; border-radius: 50%;
+  background: var(--bg-panel); border: 1px dashed var(--border);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent);
+}
+.preview-empty-title, .empty-headline {
+  font-size: 15.5px; font-weight: 650; color: var(--text); margin: 0;
+}
+.empty-subtext { margin: 0; font-size: 12.5px; color: var(--text-muted); }
+.preview-empty p { margin: 0; }
+/* Shown over a finished image when the draft's size differs from it: the
+   frame keeps the image's shape, so this is where a preset change shows. */
+.preview-next-size {
+  position: absolute; top: 8px; right: 8px; margin: 0;
+  padding: 4px 8px; font-size: 12px; color: var(--text);
+  background: var(--bg-panel); border: 1px solid var(--accent-dim);
+  border-radius: var(--radius-sm); pointer-events: none;
+}
+#preview-image {
+  width: 100%; height: 100%; object-fit: contain; display: block;
+}
+
+.canvas-footer {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap;
+}
+.canvas-status-meta {
+  min-width: 0; flex: 1 1 240px;
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+  font-size: 13px; color: var(--text-muted);
+}
+#job-status, #job-timings { overflow-wrap: anywhere; margin: 0; }
+#job-status { color: var(--text); }
+#job-timings:empty { display: none; }
 
 /* flex-wrap: four labelled buttons ("Download", "Open", "Generate again",
    "Use as reference") do not fit one row in the preview column at 320px. */
-.result-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.result-actions {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  /* Shrinkable: at 320px the three buttons' max-content width exceeds the
+     column, and a non-shrinking row pushed the page 16px wide. They wrap
+     onto a second line instead. */
+  flex: 0 1 auto; min-width: 0; margin-left: auto;
+}
+.result-actions .btn-secondary { font-size: 12.5px; padding: 6px 12px; }
 
 /* ---------- Stats ---------- */
 
 .stats {
   display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px; margin-top: 16px;
+  gap: 10px;
 }
 .stat-card {
   background: var(--bg-panel);
   border: 1px solid var(--border-soft); border-radius: var(--radius);
-  padding: 10px 12px; min-width: 0;
+  padding: 8px 12px; min-width: 0;
 }
-.stat-label { margin: 0; font-size: 12px; color: var(--text-muted);
-              letter-spacing: 0.3px; }
+.stat-label {
+  margin: 0; font-size: 10.5px; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.05em;
+}
 .stat-value {
-  margin: 4px 0 0; font-size: 15px; font-weight: 600;
-  overflow-wrap: anywhere;
+  margin: 2px 0 0; font-size: 13.5px; font-weight: 600;
+  font-family: var(--font-mono); overflow-wrap: anywhere;
 }
 
-/* ---------- History & Settings ---------- */
+/* ---------- Plan panel ---------- */
 
-.history-note {
-  margin-top: 12px; padding: 10px 12px; border-radius: 8px;
-  border: 1px solid var(--error); color: var(--text); max-width: 640px;
+.plan-panel {
+  padding: 14px 16px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-panel);
 }
-.history-card.history-missing img { display: none; }
-.history-card.history-missing::before {
-  content: "Image unavailable"; display: block; padding: 10px;
-  border: 1px dashed var(--border); border-radius: 6px;
-  color: var(--text-muted); font-size: 12px;
+.plan-panel h3 { margin: 0 0 6px; font-size: 13px; text-transform: uppercase;
+                 letter-spacing: 0.05em; }
+/* A result whose snapshot no longer matches the draft must LOOK stale:
+   dashed border and an explicit STALE marker, never a silent re-trust. */
+.plan-panel.stale { border-style: dashed; opacity: 0.85; }
+.plan-panel.stale h3::after { content: " — STALE"; color: var(--text-muted);
+                              font-weight: 400; }
+.plan-note { margin: 0 0 10px; font-size: 12.5px; color: var(--text-muted); }
+.plan-note:empty { display: none; }
+.plan-list { margin: 0; display: grid; gap: 4px; }
+.plan-list > div {
+  display: grid; grid-template-columns: 200px minmax(0, 1fr);
+  gap: 10px; padding: 4px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.plan-list > div:last-child { border-bottom: 0; }
+.plan-list dt { font-size: 12px; color: var(--text-muted); }
+.plan-list dd { margin: 0; font-size: 12.5px; overflow-wrap: anywhere;
+                font-family: var(--font-mono); }
+.plan-blockers {
+  margin: 6px 0 0; padding-left: 18px; font-size: 12.5px;
+  color: var(--text-muted);
 }
 
-.history-empty, .settings-list { color: var(--text); }
+/* ---------- History ---------- */
+
+.history-container {
+  padding: 20px;
+  display: flex; flex-direction: column; gap: 16px;
+  max-width: 1300px; margin: 0 auto; width: 100%;
+}
+.history-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap;
+}
+.history-title {
+  margin: 0 0 4px; font-size: 20px; font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.history-intro { margin: 0; font-size: 12.5px; color: var(--text-muted);
+                 max-width: 70ch; }
+.history-actions { flex: 0 0 auto; }
+
 .history-empty {
   background: var(--bg-panel); border: 1px solid var(--border-soft);
   border-radius: var(--radius); padding: 16px; max-width: 640px;
+  color: var(--text-muted); margin: 0;
 }
 .history-grid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: 12px; margin-top: 12px;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 14px;
 }
 
-/* Header identity (C3): who is signed in on the remote page, and the
-   proxy's own sign-out. Hidden by markup on the owner's page. */
+.history-card {
+  background: var(--bg-panel); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden;
+  display: flex; flex-direction: column;
+  box-shadow: var(--shadow-sm);
+  transition: transform 140ms ease, border-color 140ms ease;
+  min-width: 0; overflow-wrap: anywhere;
+}
+.history-card:hover { transform: translateY(-2px); border-color: var(--accent); }
+.card-media-wrapper {
+  position: relative; width: 100%; aspect-ratio: 16 / 9;
+  background: var(--bg); overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+}
+.history-card img {
+  display: block; width: 100%; height: 100%; object-fit: contain;
+  /* Checkerboard UNDER the thumbnail: a transparent PNG/WebP must read as
+     transparent, not as a flat dark rectangle. Preview only — the saved
+     file is never altered. */
+  background:
+    repeating-conic-gradient(#1a1c20 0% 25%, #1f2226 0% 50%) 0 0 / 16px 16px;
+}
+:root[data-theme="paper"] .history-card img {
+  background: repeating-conic-gradient(#eee9df 0% 25%, #f7f3eb 0% 50%) 0 0 / 16px 16px;
+}
+.card-overlay-chips {
+  position: absolute; top: 6px; left: 6px;
+  display: flex; gap: 4px; flex-wrap: wrap; z-index: 2;
+}
+.card-chip {
+  background: rgba(0, 0, 0, 0.75); color: #fff;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.02em;
+  padding: 2px 6px; border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  white-space: nowrap;
+}
+.card-chip.chip-recipe {
+  background: var(--accent-dim); border-color: var(--accent);
+}
+.card-info {
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 6px;
+  min-width: 0;
+}
+.card-prompt-preview {
+  margin: 0; font-size: 12.5px; line-height: 1.4; color: var(--text);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; overflow-wrap: anywhere;
+}
+.card-meta-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; font-size: 11px; color: var(--text-muted);
+  font-family: var(--font-mono); min-width: 0;
+}
+.card-meta-row span { overflow: hidden; text-overflow: ellipsis;
+                      white-space: nowrap; }
+.history-card .card-actions {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  padding: 0 12px 12px;
+}
+.history-card .card-actions .btn-secondary {
+  font-size: 11.5px; padding: 4px 8px;
+}
+
+.history-note {
+  margin: 0; padding: 10px 12px; border-radius: var(--radius-sm);
+  border: 1px solid var(--error); color: var(--text); max-width: 640px;
+}
+/* A broken thumbnail is stated, never left as a silent icon. */
+.history-card.history-missing img { display: none; }
+.history-card.history-missing .card-media-wrapper::before {
+  content: "Image unavailable"; display: block; padding: 10px;
+  color: var(--text-muted); font-size: 11.5px; text-align: center;
+}
+/* The same statement on the card itself, for a grid built without a media
+   wrapper (older markup). */
+.history-card.history-missing::before {
+  content: "Image unavailable"; display: block; padding: 10px;
+  border: 1px dashed var(--border); border-radius: var(--radius-sm);
+  color: var(--text-muted); font-size: 11.5px; text-align: center;
+}
+
+/* Delete-all row and its in-page confirmation: the question, the file tick
+   box and the two answers live in one bordered panel above the grid —
+   impossible to miss, and never a browser dialog. */
+.history-confirm {
+  padding: 14px 16px; max-width: 640px;
+  background: var(--bg-panel); border: 2px solid var(--error);
+  border-radius: var(--radius);
+}
+.history-confirm-question {
+  margin: 0 0 10px; font-weight: 600; line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.history-confirm-files {
+  margin: 0 0 12px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-raised);
+}
+.history-confirm-files label { font-weight: 600; }
+.history-confirm-buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+.history-status {
+  margin: 0; padding: 10px 12px; border-radius: var(--radius-sm);
+  max-width: 640px;
+  border: 1px solid var(--ok-border); color: var(--text);
+  background: var(--bg-panel); overflow-wrap: anywhere;
+}
+
+/* ---------- Header identity (remote pages) ---------- */
+
 .identity {
   margin: 0; display: flex; align-items: center; gap: 10px;
-  font-size: 13px; color: var(--text-muted); max-width: 32ch;
+  font-size: 12.5px; color: var(--text-muted); max-width: 32ch;
 }
-.identity > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.identity > span { overflow: hidden; text-overflow: ellipsis;
+                   white-space: nowrap; }
 .identity-sign-out {
   color: var(--accent); text-decoration: none; white-space: nowrap;
   border-bottom: 1px solid transparent;
@@ -550,13 +1087,10 @@ details.advanced > .help { margin-top: 10px; }
    button that deletes an image is pressed. It is never a modal: it stays as
    long as the fact does. */
 .history-cap-warning {
-  margin: 0 0 8px; padding: 8px 10px; max-width: 640px;
+  margin: 0 0 8px; padding: 8px 10px;
   border: 1px solid var(--border); border-left: 3px solid var(--error);
-  border-radius: 6px; background: var(--bg-raised);
+  border-radius: var(--radius-sm); background: var(--bg-raised);
   color: var(--text); font-size: 12.5px; line-height: 1.5;
-}
-.job-queue {
-  margin: 6px 0 0; font-size: 12.5px; color: var(--text-muted);
 }
 
 /* A remote account the owner never invited: the studio is replaced whole,
@@ -570,102 +1104,131 @@ details.advanced > .help { margin-top: 10px; }
 .not-invited p { margin: 0 0 12px; color: var(--text); line-height: 1.6; }
 .not-invited p:last-child { margin-bottom: 0; }
 
-/* Delete-all action row and its in-page confirmation: the question, the
-   file tick box and the two answers live in one bordered panel above the
-   grid — impossible to miss, and never a browser dialog. */
-.history-actions { margin-top: 12px; }
-.history-confirm {
-  margin-top: 12px; padding: 14px 16px; max-width: 640px;
-  background: var(--bg-panel); border: 2px solid var(--error);
-  border-radius: var(--radius);
-}
-.history-confirm-question {
-  margin: 0 0 10px; font-weight: 600; line-height: 1.5;
-  overflow-wrap: anywhere;
-}
-.history-confirm-files {
-  margin: 0 0 12px; padding: 8px 10px;
-  border: 1px solid var(--border); border-radius: 6px;
-  background: var(--bg-raised);
-}
-.history-confirm-files label { font-weight: 600; }
-.history-confirm-buttons { display: flex; gap: 8px; }
-.history-status {
-  margin-top: 12px; padding: 10px 12px; border-radius: 8px; max-width: 640px;
-  border: 1px solid var(--ok-border); color: var(--text);
-  background: var(--bg-panel); overflow-wrap: anywhere;
-}
+/* ---------- Settings / Help / Admin pages ---------- */
 
-.settings-list {
-  max-width: 720px; margin: 0;
-  background: var(--bg-panel); border: 1px solid var(--border-soft);
-  border-radius: var(--radius); padding: 6px 18px;
+.page-container {
+  max-width: 960px; margin: 0 auto; padding: 20px;
+  display: flex; flex-direction: column; gap: 18px;
 }
-.settings-list > div {
-  display: grid; grid-template-columns: 220px 1fr; gap: 14px;
-  padding: 12px 0; border-bottom: 1px solid var(--border-soft);
-}
-.settings-list > div:last-child { border-bottom: 0; }
-.settings-list dt { font-weight: 650; }
-.settings-list dd { margin: 0; color: var(--text-muted); }
+.page-header { display: flex; flex-direction: column; gap: 4px; }
+.page-header h2 { margin: 0; font-size: 20px; font-weight: 700;
+                  letter-spacing: -0.02em; }
+.settings-shared { margin: 0; max-width: 70ch; }
 
-/* ---------- Prompt rewriter settings (the server's own choice) ----------
-   The page writes ONE server-side document, so it reads as a form with an
-   explicit Save rather than like the instant-apply controls on Create. A
-   greyed-out choice stays visible WITH its reason: an absent option would
-   leave the user guessing why there is nothing to pick. */
-.settings-shared { max-width: 720px; margin: 0 0 18px; font-size: 13px; }
-.settings-section {
-  max-width: 720px; margin: 0 0 22px; padding: 16px;
-  background: var(--bg-panel); border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-}
-.settings-section h3 { margin: 0 0 6px; font-size: 15px; }
-.settings-section > .help { max-width: 62ch; }
+.settings-section { padding: 0; }
+.settings-section > .card-content { padding: 14px; }
+
 .settings-radios {
-  margin: 14px 0 0; padding: 12px 14px;
-  border: 1px solid var(--border-soft); border-radius: 8px;
+  margin: 10px 0 0; padding: 10px 12px;
+  border: 1px solid var(--border-soft); border-radius: var(--radius-sm);
 }
-.settings-radios legend { padding: 0 6px; font-size: 13px; font-weight: 650;
-                          color: var(--text-muted); }
-.settings-radio { display: flex; align-items: center; gap: 8px; margin: 4px 0;
-                  font-size: 14px; font-weight: 500; color: var(--text); }
-.settings-radio input { width: auto; margin: 0; flex: 0 0 auto; }
+.settings-radios legend {
+  padding: 0 6px; font-size: 12px; font-weight: 650; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.settings-radio {
+  display: flex; align-items: center; gap: 8px; margin: 4px 0;
+  font-size: 13.5px; font-weight: 500; color: var(--text);
+}
+.settings-radio input { width: auto; margin: 0; flex: 0 0 auto;
+                        accent-color: var(--accent); }
 .settings-radio input:disabled + span { color: var(--text-muted); }
 .settings-reason { margin: 2px 0 10px 26px; font-size: 12px; }
 .settings-reason:empty { display: none; }
 /* The local service's own fields belong to its radio, so they sit indented
    under it — but they stay READABLE when another rewriter is active, because
    an edit draft falls back to them and the user must see what it says. */
-.settings-fields { margin: 4px 0 12px 26px; padding-left: 14px;
-                   border-left: 2px solid var(--border-soft); }
+.settings-fields {
+  margin: 4px 0 12px 26px; padding-left: 14px;
+  border-left: 2px solid var(--border-soft);
+}
 .field-narrow { max-width: 180px; }
-.field-muted { opacity: 0.72; }
-.settings-actions { display: flex; flex-wrap: wrap; gap: 10px;
-                    align-items: center; margin-top: 10px; }
+.settings-actions {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+  margin-top: 10px;
+}
 .settings-actions .help { margin: 0; }
 .settings-gpu { margin-top: 12px; }
 #rewrite-save-status:not(:empty) { color: var(--ok); }
 
-/* Which rewriter the Create page is using, and which one produced a
-   suggestion: both are stated, because the two choices cost different things. */
+.settings-list {
+  margin: 0; padding: 6px 18px;
+  background: var(--bg-panel); border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+}
+.settings-list > div {
+  display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 14px;
+  padding: 12px 0; border-bottom: 1px solid var(--border-soft);
+}
+.settings-list > div:last-child { border-bottom: 0; }
+.settings-list dt { font-weight: 650; }
+.settings-list dd { margin: 0; color: var(--text-muted); }
+.settings-list code {
+  font-family: var(--font-mono); font-size: 12px;
+  background: var(--bg-raised); border-radius: 3px; padding: 1px 4px;
+}
+
+.back-link {
+  color: var(--accent); text-decoration: none; display: inline-block;
+  font-size: 13px;
+}
+.back-link:hover { text-decoration: underline; }
+/* A plain link inside help text (the rewrite hint's "Settings") would
+   otherwise keep the browser's dark blue, unreadable on the dark themes. */
+.help a { color: var(--accent); }
+
+/* ---------- Prompt rewriter (Create page) ---------- */
+
+.rewrite-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-top: 6px; min-height: 1.6em;
+}
+/* A suggestion block, visually DISTINCT from the draft so a proposal can
+   never be mistaken for the live prompt, and the original stays visible
+   beside it: applying is always a comparison, never a leap of faith. */
+.rewrite-proposal {
+  margin-top: 10px; padding: 10px;
+  border: 1px solid var(--accent); border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+.rewrite-proposal:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rewrite-proposal h3 {
+  margin: 0 0 6px; font-size: 12.5px; font-weight: 650; color: var(--text);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.rewrite-label {
+  margin: 8px 0 2px; font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--text-muted);
+}
+.rewrite-original, .rewrite-suggested {
+  margin: 0; font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere;
+  max-height: 12em; overflow-y: auto;
+}
+.rewrite-original { color: var(--text-muted); }
+.rewrite-suggested { color: var(--text); }
+.rewrite-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.rewrite-buttons .btn-secondary, .rewrite-buttons .btn-primary {
+  font-size: 12px; padding: 5px 10px;
+}
 .rewrite-active { margin: 6px 0 0; font-size: 12px; color: var(--text-muted); }
 .rewrite-active:empty { display: none; }
 .rewrite-change { color: var(--accent); margin-left: 6px; }
 .rewrite-source { margin: 0 0 8px; font-size: 12px; color: var(--text-muted); }
 .rewrite-source:empty { display: none; }
-.rewrite-actions .help a { color: var(--accent); }
+.rewrite-bar .help { margin: 0; }
 
-/* ---------- First-run model setup ----------
-   The Models card and the Create-page banner. Colour comes only from the theme
-   tokens, so all three themes keep their contrast. */
-.models-banner { max-width: 720px; margin: 0 0 16px; padding: 14px 16px;
-                 border: 1px solid var(--ok-border); border-radius: var(--radius);
-                 background: var(--bg-raised); }
+/* ---------- First-run model setup ---------- */
+
+.models-banner {
+  max-width: 960px; margin: 0 auto 16px; padding: 14px 16px;
+  border: 1px solid var(--ok-border); border-radius: var(--radius);
+  background: var(--bg-raised);
+}
 .models-banner h3 { margin: 0 0 6px; font-size: 15px; }
 .models-banner .help { margin: 0 0 10px; }
-.models-banner-actions { display: flex; flex-wrap: wrap; gap: 10px;
-                         align-items: center; }
+.models-banner-actions {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+}
 .models-banner-actions .btn-primary { text-decoration: none; }
 
 .models-total { margin: 10px 0 4px; font-size: 13px; color: var(--text-muted); }
@@ -674,43 +1237,56 @@ details.advanced > .help { margin-top: 10px; }
 .model-row { padding: 10px 0; border-top: 1px solid var(--border-soft); }
 .model-row:first-child { border-top: 0; }
 .model-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
-.model-tick { display: flex; gap: 8px; align-items: baseline; cursor: pointer; }
-.model-tick input { margin: 0; }
-.model-label { font-weight: 600; }
-.model-tag { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
-             color: var(--text-muted); border: 1px solid var(--border);
-             border-radius: 999px; padding: 1px 7px; }
+.model-tick { display: flex; gap: 8px; align-items: baseline; cursor: pointer;
+              margin: 0; }
+.model-tick input { margin: 0; width: auto; accent-color: var(--accent); }
+.model-label { font-weight: 600; font-size: 13.5px; color: var(--text); }
+.model-tag {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-muted); border: 1px solid var(--border);
+  border-radius: 999px; padding: 1px 7px;
+}
 .model-tag:empty { display: none; }
-.model-size { font-size: 12px; color: var(--text-muted); margin-left: auto; }
+.model-size {
+  font-size: 12px; color: var(--text-muted); margin-left: auto;
+  font-family: var(--font-mono);
+}
 .model-row .settings-reason { padding-left: 26px; }
-.model-row-done .model-label, .model-row-done .model-size { opacity: .62; }
+.model-row-done .model-label, .model-row-done .model-size { opacity: 0.62; }
 .models-files { list-style: none; margin: 6px 0 0; padding: 0 0 0 26px; }
 .models-files:empty { display: none; }
-.models-file { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px;
-               color: var(--text-muted); }
+.models-file {
+  display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px;
+  color: var(--text-muted);
+}
 .models-file-name { overflow-wrap: anywhere; }
-.models-file-count { margin-left: auto; }
+.models-file-count { margin-left: auto; font-family: var(--font-mono); }
 
-.models-server { margin-top: 12px; padding: 10px 12px;
-                 border: 1px solid var(--border-soft);
-                 border-radius: var(--radius); background: var(--bg-raised); }
+.models-server {
+  margin-top: 12px; padding: 10px 12px;
+  border: 1px solid var(--border-soft); border-radius: var(--radius);
+  background: var(--bg-raised);
+}
 .models-server .help { margin: 0 0 6px; }
-.models-command { margin: 0; font-family: monospace; font-size: 12px;
-                  overflow-wrap: anywhere; color: var(--text); }
-
+.models-command {
+  margin: 0; font-family: var(--font-mono); font-size: 12px;
+  overflow-wrap: anywhere; color: var(--text);
+}
 .models-progress { margin-top: 14px; }
 .models-progress label { display: block; font-size: 13px; margin-bottom: 4px; }
-.models-progress progress { width: 100%; height: 10px; }
+.models-progress progress { width: 100%; height: 10px; accent-color: var(--accent); }
+.models-controls { margin-top: 12px; }
 #models-status:not(:empty) { color: var(--ok); }
 /* No --warning token exists in any theme, so the caution line is muted text, */
 #models-note:not(:empty) { color: var(--text-muted); }
-#generate-reason { overflow-wrap: anywhere; }
 
 /* ---------- Admin (local listener only) ---------- */
 
+.admin-shared { max-width: 70ch; }
+.admin-card { padding: 0; }
+.admin-card > .card-content { overflow-x: auto; }
 .admin-table {
-  width: 100%; border-collapse: collapse; margin-top: 12px;
-  font-size: 13px;
+  width: 100%; border-collapse: collapse; font-size: 13px;
 }
 .admin-table caption { text-align: left; }
 .admin-table th, .admin-table td {
@@ -718,115 +1294,143 @@ details.advanced > .help { margin-top: 10px; }
   text-align: left; vertical-align: top;
 }
 .admin-table th {
-  font-size: 12px; font-weight: 600; color: var(--text-muted);
+  font-size: 11.5px; font-weight: 600; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.04em;
   border-bottom-color: var(--border);
 }
 .admin-email { overflow-wrap: anywhere; }
-.admin-when, .admin-count { color: var(--text-muted); white-space: nowrap; }
+.admin-when, .admin-count {
+  color: var(--text-muted); white-space: nowrap;
+  font-family: var(--font-mono); font-size: 12px;
+}
 .admin-name {
   width: 100%; min-width: 8ch; padding: 4px 6px; font-size: 13px;
   background: var(--bg-raised); color: var(--text);
-  border: 1px solid var(--border); border-radius: 6px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
 }
 /* A table cell wraps like text: each tick is an inline-flex label, so the
    four permissions fill the column and wrap without a flex on the <td>. */
 .admin-perm {
   display: inline-flex; align-items: center; gap: 5px; margin: 0 12px 4px 0;
-  font-weight: 400; white-space: nowrap;
+  font-weight: 400; white-space: nowrap; font-size: 12.5px;
 }
-.admin-perm input[type="checkbox"] { width: auto; margin: 0; }
+.admin-perm input[type="checkbox"] { width: auto; margin: 0;
+                                     accent-color: var(--accent); }
 .admin-remove-btn { white-space: nowrap; }
 .admin-cap { margin-top: 10px; }
-.admin-add { margin-top: 24px; max-width: 520px; }
-.admin-add h3 { margin: 0 0 10px; font-size: 15px; }
+.admin-empty { margin-top: 10px; }
+.admin-add { margin-top: 24px; max-width: 560px; }
 .admin-remove {
   margin-top: 16px; padding: 14px 16px; max-width: 640px;
+  border: 2px solid var(--error); border-radius: var(--radius);
+  background: var(--bg-panel);
 }
 .admin-remove-question {
   margin: 0 0 10px; font-weight: 600; line-height: 1.5;
   overflow-wrap: anywhere;
 }
 .admin-status {
-  margin-top: 10px; padding: 8px 12px; border-radius: 6px; max-width: 640px;
+  margin: 0; padding: 8px 12px; border-radius: var(--radius-sm);
+  max-width: 640px;
   border: 1px solid var(--ok-border); background: var(--bg-panel);
   overflow-wrap: anywhere;
 }
 
-.back-link { color: var(--accent); text-decoration: none; display: inline-block;
-             margin-top: 14px; }
-.back-link:hover { text-decoration: underline; }
-
-/* ---------- W2: API actions + server plan panel ---------- */
-
-.api-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.api-actions .btn-secondary { flex: 0 1 auto; }
-.api-status { flex: 1 1 220px; min-width: 0; margin: 0; font-size: 12.5px;
-              color: var(--text-muted); overflow-wrap: anywhere; }
-.plan-panel { margin-top: 18px; padding: 14px 16px; border: 1px solid var(--border);
-              border-radius: 10px; background: var(--bg-raised); }
-.plan-panel h3 { margin: 0 0 6px; font-size: 14px; }
-/* A result whose snapshot no longer matches the draft must LOOK stale:
-   dashed border and an explicit STALE marker, never a silent re-trust. */
-.plan-panel.stale { border-style: dashed; opacity: 0.85; }
-.plan-panel.stale h3::after { content: " — STALE"; color: var(--text-muted);
-                              font-weight: 400; }
-.plan-note { margin: 0 0 10px; font-size: 12.5px; color: var(--text-muted); }
-.plan-list { margin: 0; display: grid; gap: 6px; }
-.plan-list > div { display: grid; grid-template-columns: 220px minmax(0, 1fr);
-                   gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--border-soft); }
-.plan-list > div:last-child { border-bottom: 0; }
-.plan-list dt { font-size: 12px; color: var(--text-muted); }
-.plan-list dd { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
-.plan-blockers { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px;
-                 color: var(--text-muted); }
-
-@media (max-width: 940px) {
-  .plan-list > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
-}
-
-/* ---------- Responsive ---------- */
+/* ---------- Desktop workbench: one window, two scrollers ---------- */
 
 @media (min-width: 941px) {
   body { height: 100svh; min-height: 0; overflow: hidden; }
   .app-header { flex-shrink: 0; }
   main { min-height: 0; overflow-y: auto; }
   main:has(#view-create:not([hidden])) { overflow: hidden; }
-  #view-create, .layout { height: 100%; min-height: 0; }
-  .controls { height: 100%; min-height: 0; }
+  /* The models banner is a sibling ABOVE the workbench and takes its own
+     height, so the view is a column: the banner keeps its height and the
+     grid fills exactly what is left. Sizing the grid at 100% instead started
+     it below the banner and let main clip its bottom edge — the stats row and
+     the result buttons became unreachable with no scrollbar to reach them. */
+  #view-create {
+    height: 100%; min-height: 0; max-width: none; margin: 0;
+    display: flex; flex-direction: column;
+  }
+  .workbench-layout {
+    flex: 1 1 auto; height: auto; min-height: 0; align-items: stretch;
+    padding: 16px; gap: 16px;
+  }
+  .controls-sidebar {
+    height: 100%; min-height: 0;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
   #create-form {
     height: 100%; min-height: 0;
     display: grid; grid-template-rows: auto minmax(0, 1fr);
   }
-  /* Tall enough to show the whole panel (~600px with a finished job) when
-     the window leaves ~200px for the settings below; never shorter than the
-     old min(65svh, 520px) cap on small windows. 340px = header, page padding
-     and that settings allowance. */
+  /* Tall enough to show the whole prompt panel (~600px with a finished job)
+     when the window leaves ~200px for the settings below; never shorter than
+     the old min(65svh, 520px) cap on small windows. 340px = header, page
+     padding and that settings allowance. */
   .prompt-panel {
-    position: static; margin-bottom: 12px;
+    position: static; flex: 0 0 auto;
     max-height: max(min(65svh, 520px), calc(100svh - 340px));
   }
   .settings-scroll {
     min-height: 0; overflow-y: auto; overscroll-behavior-y: contain;
-    scrollbar-gutter: stable; padding: 2px 8px 2px 2px;
+    scrollbar-gutter: stable;
   }
-  .preview-column { height: 100%; min-height: 0; display: flex; flex-direction: column; }
+  .preview-column { height: 100%; min-height: 0; overflow: hidden; }
+  .preview-wrapper {
+    min-height: 0; flex: 1 1 auto;
+    /* The frame is capped by the height this wrapper ACTUALLY got, not by a
+       viewport constant: the models banner above the workbench varies in
+       height (and is absent for an owner with the weights), so a fixed
+       `100svh - Npx` either overflowed the column or wasted space. */
+    container-type: size;
+  }
   .preview-frame {
-    max-width: min(100%, calc((100svh - 310px) * var(--ar-w, 1) / var(--ar-h, 1)));
+    max-width: min(100%,
+      calc(100cqh * var(--ar-w, 1) / var(--ar-h, 1)));
     min-height: 0; flex-shrink: 1;
   }
-  .preview-column > .stats, .result-actions { flex-shrink: 0; }
-  .preview-column > .plan-panel { min-height: 0; max-height: 35%; overflow-y: auto; }
+  .canvas-footer, .stats { flex-shrink: 0; }
+  .preview-column > .plan-panel {
+    min-height: 0; max-height: 34%; overflow-y: auto; flex-shrink: 0;
+  }
 }
 
+/* ---------- Narrow screens: one column, no horizontal scroll ---------- */
+
 @media (max-width: 940px) {
-  .layout { grid-template-columns: minmax(0, 1fr); }
+  .workbench-layout {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 16px; gap: 16px;
+  }
+  .app-header { gap: 10px; padding: 10px 16px; }
+  .main-nav { margin-inline: 0; flex-wrap: wrap; }
+  .header-right { margin-left: 0; flex-wrap: wrap; }
+  .prompt-panel { max-height: none; }
+  .preview-wrapper { min-height: 0; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .plan-list > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
   .settings-list > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
-  main { padding: 14px; }
-  .app-header { gap: 10px; padding: 10px 14px; }
-  .connection-chip { margin-left: 0; }
-  .theme-picker { margin-left: 0; }
-  /* Sticky stays active on mobile; opaque background keeps the pinned
-     Generate/progress/feedback group fully readable while scrolling. */
-  .sticky-actions { top: 4px; padding: 10px; }
+  .page-container, .history-container { padding: 16px; }
+  .canvas-footer { align-items: flex-start; }
+  .result-actions { margin-left: 0; }
+}
+
+@media (max-width: 420px) {
+  .preset-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .history-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ---------- Reduced motion: no pulse, no shimmer, no transitions ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .connection-chip.is-ready::after { display: none; }
+  #job-progress:indeterminate { animation: none; }
+  .spin { animation: none; }
+  .history-card:hover { transform: none; }
 }

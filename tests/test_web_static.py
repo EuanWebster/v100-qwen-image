@@ -108,10 +108,12 @@ def test_seed_grammar_is_bounded_before_bigint_without_truncation():
 
 def test_seed_row_is_a_full_row_with_short_helper_and_accessible_range():
     html = _read("index.html")
-    seed_block = re.search(r'<div class="field seed-field">.*?\n {10}</div>',
-                           html, re.S)
-    assert seed_block, "seed must be its own full-width field row"
-    assert 'id="steps"' not in seed_block.group(0), "seed must not share the Steps row"
+    # Content-bounded, not indentation-bounded: the field's extent is the run
+    # up to the next section, so re-indenting the markup cannot widen the
+    # window to a neighbouring field.
+    start = html.index('<div class="field seed-field">')
+    seed_block = html[start:html.index("<section", start)]
+    assert 'id="steps"' not in seed_block, "seed must not share the Steps row"
     assert "Leave at 0 or choose Random." in html
     # precise range explanation retained accessibly (title attribute)
     assert "18446744073709551615" in html and "title=" in html
@@ -1476,8 +1478,10 @@ def test_w5_rewrite_ui_is_a_suggestion_flow_not_an_automatic_edit():
     button = re.search(r'<button[^>]*id="rewrite-btn"[^>]*>', html).group(0)
     assert "hidden" in button and "disabled" in button
     assert 'id="rewrite-hint"' in html
-    # The help copy names the action and that it is opt-in.
-    help_text = re.search(r'<p id="prompt-help".*?</p>', html, re.S).group(0)
+    # The help copy names the action and that it is opt-in. Tag-agnostic: the
+    # help text sits in a popover (a span, legal inside the label) rather than
+    # always-visible body text.
+    help_text = re.search(r'<(\w+)[^>]*id="prompt-help"[^>]*>[\s\S]*?</\1>', html).group(0)
     assert "Rewrite" in help_text and "Apply" in help_text
 
     # -- the ONLY prompt writes from the rewrite module -------------------
@@ -1700,7 +1704,7 @@ def test_use_as_reference_writes_no_setting_but_the_edit_mode_box():
     # the timings and the other result buttons) exactly as it was.
     history = _js_function(js, "renderHistory")
     reuse_handler = history[history.index("reuse.addEventListener"):]
-    reuse_handler = reuse_handler[:reuse_handler.index("card.appendChild(reuse)")]
+    reuse_handler = reuse_handler[:reuse_handler.index("actions.appendChild(reuse)")]
     assert "renderSelectedJob" not in reuse_handler
 
 

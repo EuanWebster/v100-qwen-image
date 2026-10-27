@@ -31,26 +31,28 @@
     <!-- Local listener only: the status document reports admin: true there,
          so a remote page never offers a tab whose writes would 404. -->
     <a href="#admin" id="nav-admin" class="nav-link" hidden>Admin</a>
-    <a href="#help" id="nav-help" class="nav-link nav-settings">Help</a>
+    <a href="#help" id="nav-help" class="nav-link">Help</a>
   </nav>
-  <!-- Remote only: who is signed in, and the proxy's own sign-out. Both stay
-       hidden on the owner's page, which has no account to name. -->
-  <p class="identity" id="identity" hidden>
-    <span id="identity-name"></span>
-    <a class="identity-sign-out" id="sign-out" href="/oauth2/sign_out">Sign out</a>
-  </p>
-  <div class="theme-picker">
-    <label for="theme-select">Theme</label>
-    <select id="theme-select" aria-describedby="theme-help">
-      <option value="original" selected>Original</option>
-      <option value="neon">Neon</option>
-      <option value="paper">Paper</option>
-    </select>
-    <span id="theme-help" class="visually-hidden">Theme choice is the only
-      thing this page stores in your browser.</span>
+  <div class="header-right">
+    <!-- Remote only: who is signed in, and the proxy's own sign-out. Both stay
+         hidden on the owner's page, which has no account to name. -->
+    <p class="identity" id="identity" hidden>
+      <span id="identity-name"></span>
+      <a class="identity-sign-out" id="sign-out" href="/oauth2/sign_out">Sign out</a>
+    </p>
+    <div class="theme-picker">
+      <label for="theme-select">Theme</label>
+      <select id="theme-select" aria-describedby="theme-help">
+        <option value="original" selected>Original</option>
+        <option value="neon">Neon</option>
+        <option value="paper">Paper</option>
+      </select>
+      <span id="theme-help" class="visually-hidden">Theme choice is the only
+        thing this page stores in your browser.</span>
+    </div>
+    <p class="connection-chip" id="connection-chip" role="status"
+       aria-label="Backend connection status">Not connected</p>
   </div>
-  <p class="connection-chip" id="connection-chip" role="status"
-     aria-label="Backend connection status">Not connected</p>
 </header>
 
 <main id="main">
@@ -73,34 +75,53 @@
       </div>
     </section>
 
-    <div class="layout">
+    <div class="workbench-layout">
 
-      <aside class="controls" aria-label="Generation controls">
+      <aside class="controls-sidebar" aria-label="Generation controls">
         <form id="create-form" novalidate>
 
-          <div class="prompt-panel sticky-actions" role="group" aria-label="Prompt and generation">
-            <div class="field prompt-field">
-              <label for="prompt">Prompt</label>
-              <textarea id="prompt" name="prompt" rows="4"
+          <div class="prompt-panel" role="group" aria-label="Prompt and generation">
+            <div class="prompt-field">
+              <div class="field-header">
+                <label for="prompt" class="field-label">
+                  <span>Prompt</span>
+                  <span class="info-popover-wrapper">
+                    <button type="button" class="info-btn" id="prompt-help-btn"
+                            aria-label="Prompt help" aria-expanded="false"
+                            aria-controls="prompt-help">?</button>
+                    <span id="prompt-help" class="help info-popover" role="tooltip">Your
+                      words are used exactly as typed. Nothing is generated or
+                      auto-filled for you. The optional Rewrite action
+                      <em>suggests</em> a reworded version — it never replaces
+                      your draft unless you press Apply.</span>
+                  </span>
+                </label>
+                <span id="prompt-char-count" class="field-counter">0 characters</span>
+              </div>
+              <textarea id="prompt" name="prompt" class="prompt-textarea" rows="4"
                 placeholder="Describe the image you want to generate…"
                 aria-describedby="prompt-help prompt-error"></textarea>
-              <p id="prompt-help" class="help">Your words are used exactly as typed.
-                Nothing is generated or auto-filled for you. The optional
-                Rewrite action <em>suggests</em> a reworded version — it never
-                replaces your draft unless you press Apply.</p>
               <p class="error" id="prompt-error" aria-live="polite"></p>
               <p class="help rewrite-active" id="rewrite-active" hidden>
                 <span id="rewrite-active-text"></span>
                 <a class="rewrite-change" href="#settings">Change</a>
               </p>
-              <div class="rewrite-actions">
-                <button type="button" id="rewrite-btn" class="btn-secondary" hidden disabled>
-                  Rewrite prompt</button>
-                <p id="rewrite-hint" class="help">Rewriting is off here: choose a
-                  rewriter under <a href="#settings">Settings</a>, or ask the
-                  operator to start this server with one.</p>
-                <p id="rewrite-status" class="help" role="status" aria-live="polite"></p>
+              <div class="rewrite-bar">
+                <button type="button" id="rewrite-btn" class="btn-text-action" hidden disabled>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                       stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                       stroke-linejoin="round" aria-hidden="true">
+                    <path d="M12 20h9"></path>
+                    <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+                  </svg>
+                  <span>Rewrite prompt</span>
+                </button>
+                <span id="rewrite-status" class="help field-counter"
+                      role="status" aria-live="polite"></span>
               </div>
+              <p id="rewrite-hint" class="help">Rewriting is off here: choose a
+                rewriter under <a href="#settings">Settings</a>, or ask the
+                operator to start this server with one.</p>
               <div id="rewrite-proposal" class="rewrite-proposal" hidden tabindex="-1"
                    role="group" aria-labelledby="rewrite-proposal-heading">
                 <h3 id="rewrite-proposal-heading">Suggested prompt — not applied</h3>
@@ -121,287 +142,451 @@
               </div>
             </div>
 
-          <div class="actions job-actions">
-            <p class="history-cap-warning" id="history-cap-warning" hidden
-               role="status"></p>
-            <button type="submit" id="generate-btn" class="btn-primary" disabled>
-              Generate</button>
-            <p class="disabled-reason" id="generate-reason" role="status"></p>
-            <p id="job-feedback" class="job-feedback" role="status" aria-live="polite">Ready to submit a generation.</p>
-            <p class="job-queue" id="job-queue" role="status" hidden></p>
-            <div id="job-progress-panel" hidden>
-              <label for="job-progress" id="job-progress-label">Waiting for generation</label>
-              <progress id="job-progress" max="1" aria-labelledby="job-progress-label"></progress>
-            </div>
-            <button type="button" id="view-result" class="btn-secondary" hidden>View completed image</button>
-            <button type="button" id="cancel-job" class="btn-secondary" disabled>Cancel selected job</button>
-          </div>
-          </div>
-
-          <div class="settings-scroll" tabindex="0" role="region" aria-label="Generation settings">
-          <div class="field edit-mode-field" id="edit-mode-field">
-            <div class="checkbox-field">
-              <input id="edit-mode" type="checkbox" autocomplete="off"
-                     aria-controls="reference-field"
-                     aria-describedby="edit-mode-help">
-              <label for="edit-mode">Edit with reference images</label>
-            </div>
-            <p id="edit-mode-help" class="help">Tick to edit or combine existing
-              images. Unticked, the prompt alone makes the image and any added
-              references are kept but not used.</p>
-          </div>
-          <fieldset class="field reference-field" id="reference-field" hidden>
-            <legend>Reference images</legend>
-            <p id="reference-help" class="help">Add up to
-              <span id="reference-limit">10</span> images (PNG, JPEG or WebP) and
-              refer to them as image 1, image 2 … in your prompt, in the order
-              shown here. Output size comes from the preset, not from the
-              images. Transparent PNG or WebP references keep their
-              transparency, but the model composites them over white when
-              reading them.</p>
-            <div class="reference-toolbar">
-              <button type="button" id="add-reference" class="btn-secondary"
-                      aria-describedby="reference-help reference-status">Add reference</button>
-              <button type="button" id="use-last-image" class="btn-secondary"
-                      aria-describedby="reference-status"
-                      disabled title="No result yet">Use last image as reference</button>
-              <input id="reference-file" type="file" hidden
-                     accept="image/png,image/jpeg,image/webp" multiple>
-              <span id="reference-count" class="reference-count">No references</span>
-            </div>
-            <ol id="reference-list" class="reference-list"
-                aria-label="Reference images, in prompt order"></ol>
-            <p id="reference-empty" class="help">No reference images added —
-              the prompt is used on its own.</p>
-            <p id="reference-status" class="reference-status" role="status"
-               aria-live="polite"></p>
-          </fieldset>
-
-          <fieldset class="field preset-field">
-            <legend>Aspect preset</legend>
-            <div id="presets-1k" class="preset-row" role="group" aria-label="1K resolution presets"></div>
-            <div id="presets-2k-group">
-              <p class="help">2K resolution</p>
-              <div id="presets-2k" class="preset-row" role="group" aria-label="2K resolution presets"></div>
-            </div>
-            <p class="help">Ratios are nominal; actual pixel sizes are shown.
-              2K presets enable tiled decode; 1K presets restore untiled decode.
-              Presets do not guarantee memory fit on your card.</p>
-          </fieldset>
-
-          <fieldset class="field recipe-field" id="recipe-field">
-            <legend>Recipe</legend>
-            <div class="radio-row" role="radiogroup"
-                 aria-describedby="recipe-help recipe-note">
-              <div class="radio-field">
-                <input id="recipe-base" name="recipe" type="radio" value="base"
-                       checked aria-describedby="recipe-help recipe-note">
-                <label for="recipe-base">Quality</label>
+            <div class="actions job-actions">
+              <p class="history-cap-warning" id="history-cap-warning" hidden
+                 role="status"></p>
+              <div class="generate-button-row">
+                <button type="submit" id="generate-btn" class="btn-primary btn-generate"
+                        disabled>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                       stroke="currentColor" stroke-width="2.5" stroke-linecap="round"
+                       stroke-linejoin="round" aria-hidden="true">
+                    <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                  </svg>
+                  <span>Generate</span></button>
+                <button type="button" id="cancel-job" class="btn-secondary btn-cancel"
+                        disabled>Cancel selected job</button>
               </div>
-              <div class="radio-field">
-                <input id="recipe-turbo" name="recipe" type="radio" value="turbo"
+              <p class="disabled-reason" id="generate-reason" role="status"></p>
+              <p id="job-feedback" class="job-feedback" role="status" aria-live="polite">Ready to submit a generation.</p>
+              <p class="job-queue" id="job-queue" role="status" hidden></p>
+              <div class="progress-card" id="job-progress-panel" hidden>
+                <div class="progress-header">
+                  <span class="progress-title">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                         stroke="currentColor" stroke-width="2" class="spin"
+                         aria-hidden="true">
+                      <line x1="12" y1="2" x2="12" y2="6"></line>
+                      <line x1="12" y1="18" x2="12" y2="22"></line>
+                      <line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line>
+                      <line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line>
+                    </svg>
+                    <label for="job-progress" id="job-progress-label">Waiting for generation</label>
+                  </span>
+                </div>
+                <div class="shimmer-track">
+                  <progress id="job-progress" class="shimmer-progress" max="1"
+                            aria-labelledby="job-progress-label"></progress>
+                </div>
+              </div>
+              <button type="button" id="view-result" class="btn-secondary" hidden>View completed image</button>
+            </div>
+          </div>
+
+          <div class="settings-body settings-scroll" tabindex="0" role="region"
+               aria-label="Generation settings">
+
+            <section class="control-card" aria-labelledby="card-creative-title">
+              <header class="card-header">
+                <h3 id="card-creative-title" class="card-title">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                       stroke="currentColor" stroke-width="2" aria-hidden="true">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <polygon points="12 8 8 12 12 16 16 12 12 8"></polygon>
+                  </svg>
+                  Creative attributes
+                </h3>
+              </header>
+              <div class="card-content">
+
+                <fieldset class="field preset-field">
+                  <legend class="field-header">
+                    <span class="field-label">
+                      <span>Aspect preset</span>
+                      <span class="info-popover-wrapper">
+                        <button type="button" class="info-btn" id="preset-help-btn"
+                                aria-label="Preset help" aria-expanded="false"
+                                aria-controls="preset-help">?</button>
+                        <span id="preset-help" class="help info-popover" role="tooltip">Ratios
+                          are nominal; actual pixel sizes are shown. 2K presets
+                          enable tiled decode; 1K presets restore untiled decode.
+                          Presets do not guarantee memory fit on your card.</span>
+                      </span>
+                    </span>
+                    <span class="preset-tier-tabs" id="preset-tier-tabs"
+                          role="tablist" aria-label="Resolution tier">
+                      <button type="button" class="tier-tab-btn" id="preset-tier-1k"
+                              data-tier="1K" role="tab" aria-selected="true">1K</button>
+                      <button type="button" class="tier-tab-btn" id="preset-tier-2k"
+                              data-tier="2K" role="tab" aria-selected="false">2K</button>
+                    </span>
+                  </legend>
+                  <div id="presets-1k" class="preset-grid" data-tier="1K"
+                       role="group" aria-label="1K resolution presets"></div>
+                  <div id="presets-2k-group" class="preset-tier-group" data-tier="2K">
+                    <div id="presets-2k" class="preset-grid"
+                         role="group" aria-label="2K resolution presets"></div>
+                  </div>
+                </fieldset>
+
+                <div class="field edit-mode-field" id="edit-mode-field">
+                  <div class="checkbox-field">
+                    <input id="edit-mode" type="checkbox" autocomplete="off"
+                           aria-controls="reference-field"
+                           aria-describedby="edit-mode-help">
+                    <label for="edit-mode">Edit with reference images</label>
+                    <span class="info-popover-wrapper">
+                      <button type="button" class="info-btn" id="edit-mode-help-btn"
+                              aria-label="Edit mode help" aria-expanded="false"
+                              aria-controls="edit-mode-help">?</button>
+                      <span id="edit-mode-help" class="help info-popover"
+                            role="tooltip">Tick to edit or combine existing images.
+                        Unticked, the prompt alone makes the image and any added
+                        references are kept but not used.</span>
+                    </span>
+                  </div>
+                </div>
+                <fieldset class="field reference-field reference-drawer" id="reference-field" hidden>
+                  <legend>Reference images</legend>
+                  <p id="reference-help" class="help">Add up to
+                    <span id="reference-limit">10</span> images (PNG, JPEG or WebP) and
+                    refer to them as image 1, image 2 … in your prompt, in the order
+                    shown here. Output size comes from the preset, not from the
+                    images. Transparent PNG or WebP references keep their
+                    transparency, but the model composites them over white when
+                    reading them.</p>
+                  <div class="reference-toolbar">
+                    <button type="button" id="add-reference" class="btn-secondary"
+                            aria-describedby="reference-help reference-status">Add reference</button>
+                    <button type="button" id="use-last-image" class="btn-secondary"
+                            aria-describedby="reference-status"
+                            disabled title="No result yet">Use last image as reference</button>
+                    <input id="reference-file" type="file" hidden
+                           accept="image/png,image/jpeg,image/webp" multiple>
+                    <span id="reference-count" class="reference-count field-counter">No references</span>
+                  </div>
+                  <ol id="reference-list" class="reference-list"
+                      aria-label="Reference images, in prompt order"></ol>
+                  <p id="reference-empty" class="help">No reference images added —
+                    the prompt is used on its own.</p>
+                  <p id="reference-status" class="reference-status" role="status"
+                     aria-live="polite"></p>
+                </fieldset>
+
+                <div class="form-row-2">
+                  <div class="field">
+                    <label for="output-format">Output format</label>
+                    <select id="output-format" name="output_format"
+                            aria-describedby="format-error">
+                      <option value="jpg" selected>jpg</option>
+                      <option value="png">png</option>
+                      <option value="webp">webp</option>
+                    </select>
+                    <p class="error" id="format-error" aria-live="polite"></p>
+                  </div>
+                  <div class="field transparency-field">
+                    <div class="field-header">
+                      <span class="checkbox-field">
+                        <input id="transparent" name="transparent_background" type="checkbox"
+                               title="Asks the model for a transparent background and saves PNG or WebP, which keep it. JPEG cannot store transparency, so the format switches to PNG while this is ticked."
+                               aria-describedby="transparency-help transparency-note">
+                        <label for="transparent">Transparent background</label>
+                      </span>
+                      <span class="info-popover-wrapper">
+                        <button type="button" class="info-btn" id="transparency-help-btn"
+                                aria-label="Transparency help" aria-expanded="false"
+                                aria-controls="transparency-help">?</button>
+                        <span id="transparency-help" class="help info-popover"
+                              role="tooltip">Asks the model for an image with a
+                          see-through background and saves it in a format that can
+                          keep one (PNG or WebP). JPEG cannot store transparency, so
+                          ticking this switches jpg to PNG. Your prompt text is kept
+                          exactly as typed — a short fixed instruction is added only
+                          to the text the model reads. The result is not guaranteed
+                          to be transparent: check the image.</span>
+                      </span>
+                    </div>
+                    <p id="transparency-note" class="help transparency-note" role="status"></p>
+                    <p id="effective-prompt-field" class="effective-prompt-field" hidden>
+                      <span class="stat-label">Text the model reads (read-only)</span>
+                      <span id="effective-prompt" class="effective-prompt-text"></span>
+                    </p>
+                  </div>
+                </div>
+
+                <div class="field seed-field">
+                  <div class="field-header">
+                    <label for="seed" class="field-label">
+                      <span>Seed</span>
+                      <span class="info-popover-wrapper">
+                        <button type="button" class="info-btn" id="seed-help-btn"
+                                aria-label="Seed help" aria-expanded="false"
+                                aria-controls="seed-help">?</button>
+                        <span id="seed-help" class="help info-popover"
+                              role="tooltip">Leave at 0 or choose Random.</span>
+                      </span>
+                    </label>
+                    <span class="field-counter">64-bit exact</span>
+                  </div>
+                  <div class="seed-row seed-input-group">
+                    <input id="seed" name="seed" type="text" value="0"
+                           inputmode="numeric" spellcheck="false"
+                           title="Whole number 0–18446744073709551615 (up to 20 decimal digits), kept as an exact decimal string and never rounded. Longer strings are rejected as entered — nothing is ever truncated to fit."
+                           aria-describedby="seed-help seed-error">
+                    <button type="button" id="random-seed" class="btn-secondary"
+                            title="Generate a cryptographically random seed">Random</button>
+                  </div>
+                  <p class="error" id="seed-error" aria-live="polite"></p>
+                </div>
+
+              </div>
+            </section>
+
+            <section class="control-card" aria-labelledby="card-engine-title">
+              <header class="card-header">
+                <h3 id="card-engine-title" class="card-title">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                       stroke="currentColor" stroke-width="2" aria-hidden="true">
+                    <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+                    <line x1="8" y1="21" x2="16" y2="21"></line>
+                    <line x1="12" y1="17" x2="12" y2="21"></line>
+                  </svg>
+                  Engine &amp; performance
+                </h3>
+              </header>
+              <div class="card-content">
+
+                <fieldset class="field recipe-field" id="recipe-field">
+                  <div class="field-header">
+                    <legend class="field-label">
+                      <span>Recipe</span>
+                      <span class="info-popover-wrapper">
+                        <button type="button" class="info-btn" id="recipe-help-btn"
+                                aria-label="Recipe help" aria-expanded="false"
+                                aria-controls="recipe-help">?</button>
+                        <span id="recipe-help" class="help info-popover" role="tooltip">Quality
+                          uses the reference model at the step count you choose — the
+                          slowest, most faithful option. Turbo uses the Turbo image
+                          model (with the same text encoder and decoder as Quality)
+                          and always runs its fixed 8 sampling steps: drawing is
+                          about five times faster, but loading the model and reading
+                          your prompt dominate a whole run, so the total is often
+                          only slightly shorter. Turbo has no negative prompt and no
+                          guidance (CFG 1.0), and runs in FP16 only.</span>
+                      </span>
+                    </legend>
+                  </div>
+                  <div class="recipe-toggle-group" role="radiogroup"
                        aria-describedby="recipe-help recipe-note">
-                <label for="recipe-turbo">Turbo</label>
+                    <div class="recipe-option">
+                      <input id="recipe-base" name="recipe" type="radio" value="base"
+                             checked aria-describedby="recipe-help recipe-note">
+                      <label for="recipe-base" class="recipe-label">
+                        <span class="recipe-name">Quality</span>
+                        <span class="recipe-desc">Reference model</span>
+                      </label>
+                    </div>
+                    <div class="recipe-option">
+                      <input id="recipe-turbo" name="recipe" type="radio" value="turbo"
+                             aria-describedby="recipe-help recipe-note">
+                      <label for="recipe-turbo" class="recipe-label">
+                        <span class="recipe-name">Turbo</span>
+                        <span class="recipe-desc">Fixed 8 steps, FP16</span>
+                      </label>
+                    </div>
+                  </div>
+                  <p id="recipe-note" class="help recipe-note" role="status"></p>
+                  <p class="error" id="recipe-error" aria-live="polite"></p>
+                </fieldset>
+
+                <div class="form-row-2">
+                  <div class="field">
+                    <label for="steps">Steps</label>
+                    <input id="steps" name="steps" type="number" min="1" max="1000"
+                           step="1" value="40" inputmode="numeric"
+                           aria-describedby="steps-error recipe-note">
+                    <p class="error" id="steps-error" aria-live="polite"></p>
+                  </div>
+                  <div class="field">
+                    <label for="cfg">Guidance (CFG)</label>
+                    <input id="cfg" name="cfg" type="number" min="1" step="0.1"
+                           value="1.0" inputmode="decimal" aria-describedby="cfg-error">
+                    <p class="error" id="cfg-error" aria-live="polite"></p>
+                  </div>
+                </div>
+
+                <details class="field advanced advanced-disclosure" id="advanced">
+                  <summary>Advanced settings</summary>
+
+                  <div class="field">
+                    <label for="negative">Negative prompt</label>
+                    <textarea id="negative" name="negative" rows="2"
+                      placeholder="Optional — things to steer away from"></textarea>
+                  </div>
+
+                  <div class="field-row form-row-2">
+                    <div class="field">
+                      <label for="width">Width</label>
+                      <input id="width" name="width" type="number" min="64" max="4096"
+                             step="32" value="1024" inputmode="numeric"
+                             aria-describedby="dims-error">
+                      <p class="error" id="dims-error" aria-live="polite"></p>
+                    </div>
+                    <div class="field">
+                      <label for="height">Height</label>
+                      <input id="height" name="height" type="number" min="64" max="4096"
+                             step="32" value="1024" inputmode="numeric"
+                             aria-describedby="dims-error">
+                    </div>
+                  </div>
+
+                  <div class="field-row form-row-2">
+                    <div class="field">
+                      <label for="quant">Quantization</label>
+                      <select id="quant" name="quant" aria-describedby="quant-help quant-error">
+                        <option value="fp16" selected title="Uses more graphics-card memory to keep the model's original detail. Best starting point for maximum image quality when it fits.">fp16</option>
+                        <option value="q8" id="quant-q8" title="Compresses the model to use less graphics-card memory. Small image differences are possible. Looked similar to FP16 in our tests, but sampling was slightly slower. Experimental.">q8 — experimental</option>
+                      </select>
+                      <p id="quant-help" class="help" aria-live="polite">Uses more graphics-card memory to keep the model's original detail. Best starting point for maximum image quality when it fits.</p>
+                      <p class="error" id="quant-error" aria-live="polite"></p>
+                    </div>
+                    <div class="field">
+                      <label for="offload">Layer offload</label>
+                      <select id="offload" name="offload" aria-describedby="offload-help">
+                        <option value="resident" selected title="Keeps the image model on your graphics card while generating. Uses more video memory, but avoids repeatedly moving layers to and from system RAM. Available now.">resident</option>
+                        <option value="streamed" title="Planned: moves groups of model layers between system RAM and your graphics card as needed. Intended to use less video memory; moving data can make generation slower. Not available yet.">streamed — not available yet</option>
+                        <option value="offload" title="Planned graphics-memory-saving mode. Inactive model data would stay in system RAM to free graphics-card memory. The exact strategy is not implemented; use resident for now.">offload — not available yet</option>
+                      </select>
+                      <p id="offload-help" class="help" aria-live="polite">Keeps the image model on your graphics card while generating. Uses more video memory, but avoids repeatedly moving layers to and from system RAM. Available now.</p>
+                    </div>
+                  </div>
+
+                  <div class="field-row form-row-2">
+                    <div class="field">
+                      <label for="attention">Attention backend</label>
+                      <select id="attention" name="attention" aria-describedby="attention-help">
+                        <option value="auto" selected title="Automatically uses the attention method tested on your V100. Recommended.">auto</option>
+                        <option value="sdpa" title="Explicitly uses the attention method tested on your V100. Auto currently selects this same method.">sdpa</option>
+                        <option value="efficient" title="Alternative attention method. Not supported by this app's current V100 loader; use Auto.">efficient — not available yet</option>
+                        <option value="eager" title="Alternative attention method. Not supported by this app's current V100 loader; use Auto.">eager — not available yet</option>
+                      </select>
+                      <p id="attention-help" class="help" aria-live="polite">Automatically uses the attention method tested on your V100. Recommended.</p>
+                    </div>
+                    <div class="field checkbox-field vae-field">
+                      <input id="vae-tiling" name="vae_tiled_decode" type="checkbox"
+                             title="Converts the generated image in smaller overlapping sections to reduce video-memory use. Enabled by 2K presets. Tile boundaries can sometimes be visible.">
+                      <label for="vae-tiling">VAE tiling</label>
+                    </div>
+                  </div>
+
+                  <p class="help">Start with FP16, resident and Auto for maximum
+                    quality when they fit. Try Q8 for more video-memory headroom.
+                    2K presets enable tiled decoding, but can still use almost all
+                    of the V100's memory.</p>
+                </details>
+
               </div>
-            </div>
-            <p id="recipe-help" class="help">Quality uses the reference model at
-              the step count you choose — the slowest, most faithful option.
-              Turbo uses the Turbo image model (with the same text encoder and
-              decoder as Quality) and always runs its fixed 8 sampling steps:
-              drawing is about five times faster, but loading the model and
-              reading your prompt dominate a whole run, so the total is often
-              only slightly shorter. Turbo has no negative prompt and no
-              guidance (CFG 1.0), and runs in FP16 only.</p>
-            <p id="recipe-note" class="help recipe-note" role="status"></p>
-            <p class="error" id="recipe-error" aria-live="polite"></p>
-          </fieldset>
+            </section>
 
-          <div class="field">
-            <label for="steps">Steps</label>
-            <input id="steps" name="steps" type="number" min="1" max="1000"
-                   step="1" value="40" inputmode="numeric"
-                   aria-describedby="steps-error recipe-note">
-            <p class="error" id="steps-error" aria-live="polite"></p>
-          </div>
-
-          <div class="field">
-            <label for="output-format">Output format</label>
-            <select id="output-format" name="output_format"
-                    aria-describedby="format-error">
-              <option value="jpg" selected>jpg</option>
-              <option value="png">png</option>
-              <option value="webp">webp</option>
-            </select>
-            <p class="error" id="format-error" aria-live="polite"></p>
-          </div>
-
-          <div class="field transparency-field">
-            <div class="checkbox-field">
-              <input id="transparent" name="transparent_background" type="checkbox"
-                     title="Asks the model for a transparent background and saves PNG or WebP, which keep it. JPEG cannot store transparency, so the format switches to PNG while this is ticked."
-                     aria-describedby="transparency-help transparency-note">
-              <label for="transparent">Transparent background</label>
-            </div>
-            <p id="transparency-help" class="help">Asks the model for an image with a
-              see-through background and saves it in a format that can keep one
-              (PNG or WebP). JPEG cannot store transparency, so ticking this switches
-              jpg to PNG. Your prompt text is kept exactly as typed — a short fixed
-              instruction is added only to the text the model reads. The result is
-              not guaranteed to be transparent: check the image.</p>
-            <p id="transparency-note" class="help transparency-note" role="status"></p>
-            <p id="effective-prompt-field" class="effective-prompt-field" hidden>
-              <span class="stat-label">Text the model reads (read-only)</span>
-              <span id="effective-prompt" class="effective-prompt-text"></span>
-            </p>
-          </div>
-
-          <div class="field seed-field">
-            <label for="seed">Seed</label>
-            <div class="seed-row">
-              <input id="seed" name="seed" type="text" value="0"
-                     inputmode="numeric" spellcheck="false"
-                     title="Whole number 0–18446744073709551615 (up to 20 decimal digits), kept as an exact decimal string and never rounded. Longer strings are rejected as entered — nothing is ever truncated to fit."
-                     aria-describedby="seed-help seed-error">
-              <button type="button" id="random-seed" class="btn-secondary"
-                      title="Generate a cryptographically random seed">Random</button>
-            </div>
-            <p class="help" id="seed-help">Leave at 0 or choose Random.</p>
-            <p class="error" id="seed-error" aria-live="polite"></p>
-          </div>
-
-          <details class="field advanced" id="advanced">
-            <summary>Advanced settings</summary>
-
-            <div class="field">
-              <label for="negative">Negative prompt</label>
-              <textarea id="negative" name="negative" rows="2"
-                placeholder="Optional — things to steer away from"></textarea>
-            </div>
-
-            <div class="field-row">
-              <div class="field">
-                <label for="cfg">Guidance (CFG)</label>
-                <input id="cfg" name="cfg" type="number" min="1" step="0.1"
-                       value="1.0" inputmode="decimal" aria-describedby="cfg-error">
-                <p class="error" id="cfg-error" aria-live="polite"></p>
+            <section class="control-card" aria-labelledby="card-config-title">
+              <header class="card-header">
+                <h3 id="card-config-title" class="card-title">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                       stroke="currentColor" stroke-width="2" aria-hidden="true">
+                    <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path>
+                  </svg>
+                  Configuration
+                </h3>
+              </header>
+              <div class="card-content">
+                <div class="actions api-actions" role="group"
+                     aria-label="Configuration and planning">
+                  <button type="button" class="btn-secondary" id="btn-check-config">
+                    Check configuration</button>
+                  <button type="button" class="btn-secondary" id="btn-plan" disabled
+                          title="enabled after the server status is recognized; use Check configuration to reconnect">
+                    Plan</button>
+                  <button type="button" class="btn-secondary" id="btn-export" disabled
+                          title="enabled after the server status is recognized; use Check configuration to reconnect">
+                    Export editable configuration</button>
+                  <button type="button" class="btn-secondary" id="btn-import" disabled
+                          title="enabled after the server status is recognized; use Check configuration to reconnect">
+                    Import editable configuration</button>
+                  <input id="import-file" type="file" accept=".json,application/json" hidden>
+                  <p class="api-status" id="api-message" role="status"
+                     aria-live="polite"></p>
+                </div>
               </div>
-              <div class="field">
-                <label for="width">Width</label>
-                <input id="width" name="width" type="number" min="64" max="4096"
-                       step="32" value="1024" inputmode="numeric"
-                       aria-describedby="dims-error">
-                <p class="error" id="dims-error" aria-live="polite"></p>
-              </div>
-              <div class="field">
-                <label for="height">Height</label>
-                <input id="height" name="height" type="number" min="64" max="4096"
-                       step="32" value="1024" inputmode="numeric"
-                       aria-describedby="dims-error">
-              </div>
-            </div>
+            </section>
 
-            <div class="field-row">
-              <div class="field">
-                <label for="quant">Quantization</label>
-                <select id="quant" name="quant" aria-describedby="quant-help quant-error">
-                  <option value="fp16" selected title="Uses more graphics-card memory to keep the model's original detail. Best starting point for maximum image quality when it fits.">fp16</option>
-                  <option value="q8" id="quant-q8" title="Compresses the model to use less graphics-card memory. Small image differences are possible. Looked similar to FP16 in our tests, but sampling was slightly slower. Experimental.">q8 — experimental</option>
-                </select>
-                <p id="quant-help" class="help" aria-live="polite">Uses more graphics-card memory to keep the model's original detail. Best starting point for maximum image quality when it fits.</p>
-                <p class="error" id="quant-error" aria-live="polite"></p>
-              </div>
-              <div class="field">
-                <label for="offload">Layer offload</label>
-                <select id="offload" name="offload" aria-describedby="offload-help">
-                  <option value="resident" selected title="Keeps the image model on your graphics card while generating. Uses more video memory, but avoids repeatedly moving layers to and from system RAM. Available now.">resident</option>
-                  <option value="streamed" title="Planned: moves groups of model layers between system RAM and your graphics card as needed. Intended to use less video memory; moving data can make generation slower. Not available yet.">streamed — not available yet</option>
-                  <option value="offload" title="Planned graphics-memory-saving mode. Inactive model data would stay in system RAM to free graphics-card memory. The exact strategy is not implemented; use resident for now.">offload — not available yet</option>
-                </select>
-                <p id="offload-help" class="help" aria-live="polite">Keeps the image model on your graphics card while generating. Uses more video memory, but avoids repeatedly moving layers to and from system RAM. Available now.</p>
-              </div>
-            </div>
-
-            <div class="field-row">
-              <div class="field">
-                <label for="attention">Attention backend</label>
-                <select id="attention" name="attention" aria-describedby="attention-help">
-                  <option value="auto" selected title="Automatically uses the attention method tested on your V100. Recommended.">auto</option>
-                  <option value="sdpa" title="Explicitly uses the attention method tested on your V100. Auto currently selects this same method.">sdpa</option>
-                  <option value="efficient" title="Alternative attention method. Not supported by this app's current V100 loader; use Auto.">efficient — not available yet</option>
-                  <option value="eager" title="Alternative attention method. Not supported by this app's current V100 loader; use Auto.">eager — not available yet</option>
-                </select>
-                <p id="attention-help" class="help" aria-live="polite">Automatically uses the attention method tested on your V100. Recommended.</p>
-              </div>
-              <div class="field checkbox-field">
-                <input id="vae-tiling" name="vae_tiled_decode" type="checkbox"
-                       title="Converts the generated image in smaller overlapping sections to reduce video-memory use. Enabled by 2K presets. Tile boundaries can sometimes be visible.">
-                <label for="vae-tiling">VAE tiling</label>
-              </div>
-            </div>
-
-            <p class="help">Start with FP16, resident and Auto for maximum
-              quality when they fit. Try Q8 for more video-memory headroom.
-              2K presets enable tiled decoding, but can still use almost all
-              of the V100's memory.</p>
-          </details>
-
-          <div class="actions api-actions" role="group"
-               aria-label="Configuration and planning">
-            <button type="button" class="btn-secondary" id="btn-check-config">
-              Check configuration</button>
-            <button type="button" class="btn-secondary" id="btn-plan" disabled
-                    title="enabled after the server status is recognized; use Check configuration to reconnect">
-              Plan</button>
-            <button type="button" class="btn-secondary" id="btn-export" disabled
-                    title="enabled after the server status is recognized; use Check configuration to reconnect">
-              Export editable configuration</button>
-            <button type="button" class="btn-secondary" id="btn-import" disabled
-                    title="enabled after the server status is recognized; use Check configuration to reconnect">
-              Import editable configuration</button>
-            <input id="import-file" type="file" accept=".json,application/json" hidden>
-            <p class="api-status" id="api-message" role="status"
-               aria-live="polite"></p>
-          </div>
           </div>
         </form>
       </aside>
 
       <section class="preview-column" aria-label="Preview">
-        <div class="preview-frame" id="preview-frame" data-aspect="1 / 1">
-          <div class="preview-empty" id="preview-empty">
-            <p class="preview-empty-title" id="preview-title">No image yet</p>
-            <p id="preview-message">Submit a generation to the local engine. Completed images appear here.</p>
+        <div class="preview-wrapper">
+          <div class="preview-frame" id="preview-frame" data-aspect="1 / 1">
+            <div class="preview-empty preview-empty-state" id="preview-empty">
+              <div class="empty-icon-ring">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none"
+                     stroke="currentColor" stroke-width="1.75" aria-hidden="true">
+                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                  <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                  <polyline points="21 15 16 10 5 21"></polyline>
+                </svg>
+              </div>
+              <p class="preview-empty-title empty-headline" id="preview-title">No image yet</p>
+              <p id="preview-message" class="empty-subtext">Submit a generation to the local engine. Completed images appear here.</p>
+            </div>
+            <img id="preview-image" hidden alt="">
+            <p class="preview-next-size" id="preview-next-size" hidden></p>
           </div>
-          <img id="preview-image" hidden alt="">
-          <p class="preview-next-size" id="preview-next-size" hidden></p>
-        </div>
-        <p id="job-status" role="status" aria-live="polite">No job selected.</p>
-        <p id="job-timings" class="plan-note"></p>
-
-        <div class="result-actions" aria-label="Result actions">
-          <button type="button" class="btn-secondary" id="action-download"
-                  disabled title="No result yet">Download</button>
-          <button type="button" class="btn-secondary" id="action-open"
-                  disabled title="No result yet">Open</button>
-          <button type="button" class="btn-secondary" id="action-again"
-                  disabled title="No result yet">Generate again</button>
         </div>
 
-        <div class="stats" aria-label="Session statistics">
-          <div class="stat-card">
+        <div class="canvas-footer">
+          <div class="canvas-status-meta">
+            <p id="job-status" role="status" aria-live="polite">No job selected.</p>
+            <p id="job-timings" class="plan-note"></p>
+          </div>
+          <div class="result-actions" aria-label="Result actions">
+            <button type="button" class="btn-secondary" id="action-download"
+                    disabled title="No result yet">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                   stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+              </svg>
+              <span>Download</span></button>
+            <button type="button" class="btn-secondary" id="action-open"
+                    disabled title="No result yet">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                   stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+                <polyline points="15 3 21 3 21 9"></polyline>
+                <line x1="10" y1="14" x2="21" y2="3"></line>
+              </svg>
+              <span>Open</span></button>
+            <button type="button" class="btn-secondary" id="action-again"
+                    disabled title="No result yet">Generate again</button>
+          </div>
+        </div>
+
+        <div class="stats stats-strip" aria-label="Session statistics">
+          <div class="stat-card stat-box">
             <p class="stat-label">Backend</p>
             <p class="stat-value" id="stat-backend">Generation unavailable</p>
           </div>
-          <div class="stat-card">
+          <div class="stat-card stat-box">
             <p class="stat-label">Last result</p>
             <p class="stat-value" id="stat-result">—<span class="visually-hidden">
               (unknown)</span></p>
           </div>
-          <div class="stat-card">
+          <div class="stat-card stat-box">
             <p class="stat-label">Steps taken</p>
             <p class="stat-value" id="stat-steps">—<span class="visually-hidden">(unknown)</span></p>
           </div>
-          <div class="stat-card">
+          <div class="stat-card stat-box">
             <p class="stat-label">Elapsed</p>
             <p class="stat-value" id="stat-elapsed">—<span class="visually-hidden">(unknown)</span></p>
           </div>
@@ -435,39 +620,49 @@
 
   <!-- ===================== History view ===================== -->
   <section id="view-history" class="view" hidden aria-labelledby="history-heading">
-    <h2 id="history-heading" tabindex="-1">History</h2>
-    <p class="history-empty" id="history-empty">
-      No saved generations yet. Completed images from this machine will appear
-      here as thumbnails, including ones from earlier server runs; image files
-      stay on disk when entries are forgotten, unless a delete is confirmed
-      with the file tick box ticked.
-    </p>
-    <div class="history-actions">
-      <button id="history-delete-all" class="btn-danger" type="button" disabled
-              title="Remove every finished history entry. Queued and running jobs are kept.">
-        Delete all history
-      </button>
-    </div>
-    <div class="history-confirm" id="history-confirm" role="group"
-         aria-labelledby="history-confirm-question" hidden>
-      <p class="history-confirm-question" id="history-confirm-question"
-         role="status" aria-live="polite"></p>
-      <div class="field checkbox-field history-confirm-files">
-        <input id="history-confirm-files" type="checkbox" autocomplete="off"
-               title="Tick to delete the image files of these entries from disk, not just the history records. Unticked keeps every file.">
-        <label for="history-confirm-files">Also delete the image files from disk</label>
+    <div class="history-container">
+      <div class="history-header">
+        <div>
+          <h2 id="history-heading" class="history-title" tabindex="-1">History</h2>
+          <p class="history-intro">Completed images from this machine will
+            appear here as cards, including ones from earlier server runs; image
+            files stay on disk when entries are forgotten, unless a delete is
+            confirmed with the file tick box ticked.</p>
+        </div>
+        <div class="history-actions">
+          <button id="history-delete-all" class="btn-danger" type="button" disabled
+                  title="Remove every finished history entry. Queued and running jobs are kept.">
+            Delete all history
+          </button>
+        </div>
       </div>
-      <div class="history-confirm-buttons">
-        <button id="history-confirm-yes" class="btn-danger" type="button">Delete</button>
-        <button id="history-confirm-cancel" class="btn-secondary" type="button">Cancel</button>
+      <p class="history-empty" id="history-empty">
+        No saved generations yet. Completed images from this machine will appear
+        here as thumbnails, including ones from earlier server runs; image files
+        stay on disk when entries are forgotten, unless a delete is confirmed
+        with the file tick box ticked.
+      </p>
+      <div class="history-confirm" id="history-confirm" role="group"
+           aria-labelledby="history-confirm-question" hidden>
+        <p class="history-confirm-question" id="history-confirm-question"
+           role="status" aria-live="polite"></p>
+        <div class="field checkbox-field history-confirm-files">
+          <input id="history-confirm-files" type="checkbox" autocomplete="off"
+                 title="Tick to delete the image files of these entries from disk, not just the history records. Unticked keeps every file.">
+          <label for="history-confirm-files">Also delete the image files from disk</label>
+        </div>
+        <div class="history-confirm-buttons">
+          <button id="history-confirm-yes" class="btn-danger" type="button">Delete</button>
+          <button id="history-confirm-cancel" class="btn-secondary" type="button">Cancel</button>
+        </div>
       </div>
+      <p class="history-status" id="history-status" role="status"
+         aria-live="polite" hidden></p>
+      <div class="history-grid" id="history-grid" aria-live="polite"></div>
+      <p class="history-note" id="history-missing-note" role="status"
+         aria-live="polite" hidden></p>
+      <p><a class="back-link" href="#create">← Back to Create</a></p>
     </div>
-    <p class="history-status" id="history-status" role="status"
-       aria-live="polite" hidden></p>
-    <div class="history-grid" id="history-grid" aria-live="polite"></div>
-    <p class="history-note" id="history-missing-note" role="status"
-       aria-live="polite" hidden></p>
-    <p><a class="back-link" href="#create">← Back to Create</a></p>
   </section>
 
   <!-- ===================== Settings view =====================
@@ -478,284 +673,300 @@
        those stay launch flags the operator owns, and the server refuses
        anything shaped like one. -->
   <section id="view-settings" class="view" hidden aria-labelledby="settings-heading">
-    <h2 id="settings-heading" tabindex="-1">Settings</h2>
-    <p class="help settings-shared">These settings are stored by the server
-      itself, not by this browser: they apply to every browser that uses this
-      server, and they are still there after it restarts.</p>
+    <div class="page-container">
+      <div class="page-header">
+        <h2 id="settings-heading" tabindex="-1">Settings</h2>
+        <p class="help settings-shared">These settings are stored by the server
+          itself, not by this browser: they apply to every browser that uses this
+          server, and they are still there after it restarts.</p>
+      </div>
 
-    <section class="settings-section" aria-labelledby="rewrite-settings-heading">
-      <h3 id="rewrite-settings-heading">Prompt rewriter</h3>
-      <p class="help">The rewriter turns a short draft into a fuller prompt
-        before a generation. It only ever <em>suggests</em>: nothing is written
-        into your draft until you press Apply.</p>
-      <fieldset class="settings-radios">
-        <legend id="rewrite-group-t2i">Prompt enhance (text-to-image)</legend>
-        <label class="settings-radio" id="rewrite-t2i-pe-option" for="rewrite-t2i-pe">
-          <input type="radio" name="rewrite-t2i" id="rewrite-t2i-pe"
-                 value="pe-llamacpp">
-          <span id="rewrite-t2i-pe-label">Official enhancer (Q8, uses GPU)</span>
-        </label>
-        <p class="help settings-reason" id="rewrite-t2i-pe-reason" role="status"></p>
-        <label class="settings-radio" for="rewrite-t2i-local">
-          <input type="radio" name="rewrite-t2i" id="rewrite-t2i-local"
-                 value="local-llm">
-          <span id="rewrite-t2i-local-label">OpenAI-compatible endpoint</span>
-        </label>
-        <p class="help settings-reason" id="rewrite-t2i-local-reason" role="status"></p>
-      </fieldset>
-      <fieldset class="settings-radios">
-        <legend id="rewrite-group-edit">Edit prompt enhance</legend>
-        <label class="settings-radio" id="rewrite-edit-pe-option" for="rewrite-edit-pe">
-          <input type="radio" name="rewrite-edit" id="rewrite-edit-pe"
-                 value="pe-llamacpp">
-          <span id="rewrite-edit-pe-label">Official enhancer (Q8, uses GPU)</span>
-        </label>
-        <p class="help settings-reason" id="rewrite-edit-pe-reason" role="status"></p>
-        <label class="settings-radio" for="rewrite-edit-local">
-          <input type="radio" name="rewrite-edit" id="rewrite-edit-local"
-                 value="local-llm">
-          <span id="rewrite-edit-local-label">OpenAI-compatible endpoint</span>
-        </label>
-        <p class="help settings-reason" id="rewrite-edit-local-reason" role="status"></p>
-      </fieldset>
-      <div class="settings-fields" id="rewrite-local-fields">
-          <div class="field">
-            <label for="rewrite-endpoint">Endpoint URL</label>
-            <input type="text" id="rewrite-endpoint" autocomplete="off"
-                   spellcheck="false"
-                   aria-describedby="rewrite-endpoint-help rewrite-settings-error">
-            <p class="help" id="rewrite-endpoint-help">This machine only, on a
-              port that is listening, ending in /v1/chat/completions — for
-              example http://127.0.0.1:8079/v1/chat/completions. Leave it empty
-              to keep the address the server was started with.</p>
+      <section class="settings-section control-card" aria-labelledby="rewrite-settings-heading">
+        <header class="card-header">
+          <h3 id="rewrite-settings-heading" class="card-title">Prompt rewriter</h3>
+        </header>
+        <div class="card-content">
+          <p class="help">The rewriter turns a short draft into a fuller prompt
+            before a generation. It only ever <em>suggests</em>: nothing is written
+            into your draft until you press Apply.</p>
+          <fieldset class="settings-radios">
+            <legend id="rewrite-group-t2i">Prompt enhance (text-to-image)</legend>
+            <label class="settings-radio" id="rewrite-t2i-pe-option" for="rewrite-t2i-pe">
+              <input type="radio" name="rewrite-t2i" id="rewrite-t2i-pe"
+                     value="pe-llamacpp">
+              <span id="rewrite-t2i-pe-label">Official enhancer (Q8, uses GPU)</span>
+            </label>
+            <p class="help settings-reason" id="rewrite-t2i-pe-reason" role="status"></p>
+            <label class="settings-radio" for="rewrite-t2i-local">
+              <input type="radio" name="rewrite-t2i" id="rewrite-t2i-local"
+                     value="local-llm">
+              <span id="rewrite-t2i-local-label">OpenAI-compatible endpoint</span>
+            </label>
+            <p class="help settings-reason" id="rewrite-t2i-local-reason" role="status"></p>
+          </fieldset>
+          <fieldset class="settings-radios">
+            <legend id="rewrite-group-edit">Edit prompt enhance</legend>
+            <label class="settings-radio" id="rewrite-edit-pe-option" for="rewrite-edit-pe">
+              <input type="radio" name="rewrite-edit" id="rewrite-edit-pe"
+                     value="pe-llamacpp">
+              <span id="rewrite-edit-pe-label">Official enhancer (Q8, uses GPU)</span>
+            </label>
+            <p class="help settings-reason" id="rewrite-edit-pe-reason" role="status"></p>
+            <label class="settings-radio" for="rewrite-edit-local">
+              <input type="radio" name="rewrite-edit" id="rewrite-edit-local"
+                     value="local-llm">
+              <span id="rewrite-edit-local-label">OpenAI-compatible endpoint</span>
+            </label>
+            <p class="help settings-reason" id="rewrite-edit-local-reason" role="status"></p>
+          </fieldset>
+          <div class="settings-fields" id="rewrite-local-fields">
+              <div class="field">
+                <label for="rewrite-endpoint">Endpoint URL</label>
+                <input type="text" id="rewrite-endpoint" autocomplete="off"
+                       spellcheck="false"
+                       aria-describedby="rewrite-endpoint-help rewrite-settings-error">
+                <p class="help" id="rewrite-endpoint-help">This machine only, on a
+                  port that is listening, ending in /v1/chat/completions — for
+                  example http://127.0.0.1:8079/v1/chat/completions. Leave it empty
+                  to keep the address the server was started with.</p>
+              </div>
+              <div class="field">
+                <label for="rewrite-model">Model name</label>
+                <input type="text" id="rewrite-model" autocomplete="off"
+                       aria-describedby="rewrite-model-help rewrite-settings-error">
+                <p class="help" id="rewrite-model-help">The name that service
+                  expects, for example Qwen3.8. Leave empty to keep the name the
+                  server was started with.</p>
+              </div>
+              <div class="field field-narrow">
+                <label for="rewrite-timeout">Timeout (s)</label>
+                <input type="number" id="rewrite-timeout" min="1" max="3600" step="1"
+                       aria-describedby="rewrite-timeout-help rewrite-settings-error">
+                <p class="help" id="rewrite-timeout-help">How long one rewrite may
+                  take, 1-3600 seconds. Leave empty to keep the server's value.</p>
+              </div>
+              <div class="settings-actions settings-writes" id="rewrite-test-actions">
+                <button type="button" id="rewrite-test" class="btn-secondary"
+                        disabled>Test connection</button>
+                <p class="help" id="rewrite-test-status" role="status"
+                   aria-live="polite"></p>
+              </div>
           </div>
-          <div class="field">
-            <label for="rewrite-model">Model name</label>
-            <input type="text" id="rewrite-model" autocomplete="off"
-                   aria-describedby="rewrite-model-help rewrite-settings-error">
-            <p class="help" id="rewrite-model-help">The name that service
-              expects, for example Qwen3.8. Leave empty to keep the name the
-              server was started with.</p>
-          </div>
-          <div class="field field-narrow">
-            <label for="rewrite-timeout">Timeout (s)</label>
-            <input type="number" id="rewrite-timeout" min="1" max="3600" step="1"
-                   aria-describedby="rewrite-timeout-help rewrite-settings-error">
-            <p class="help" id="rewrite-timeout-help">How long one rewrite may
-              take, 1-3600 seconds. Leave empty to keep the server's value.</p>
-          </div>
-          <div class="settings-actions settings-writes" id="rewrite-test-actions">
-            <button type="button" id="rewrite-test" class="btn-secondary"
-                    disabled>Test connection</button>
-            <p class="help" id="rewrite-test-status" role="status"
+          <fieldset class="settings-radios">
+            <legend>Switch</legend>
+            <label class="settings-radio" for="rewrite-off">
+              <input type="checkbox" id="rewrite-off">
+              <span>Off — leave both kinds of draft exactly as you wrote them</span>
+            </label>
+            <p class="help settings-reason" id="rewrite-off-reason" role="status"></p>
+          </fieldset>
+          <p class="help settings-gpu" id="rewrite-gpu-note">An official enhancer
+            loads a Q8 model onto the graphics card for each rewrite — roughly 15–40 s
+            for a text draft, 20–50 s for an edit one, since it reads the reference
+            too. It is unavailable while an image is generating; an image started
+            during a rewrite waits for it.</p>
+          <div class="settings-actions settings-writes" id="rewrite-save-actions">
+            <button type="button" id="rewrite-save" class="btn-primary"
+                    disabled>Save</button>
+            <p class="help" id="rewrite-save-status" role="status"
                aria-live="polite"></p>
           </div>
-      </div>
-      <fieldset class="settings-radios">
-        <legend>Switch</legend>
-        <label class="settings-radio" for="rewrite-off">
-          <input type="checkbox" id="rewrite-off">
-          <span>Off — leave both kinds of draft exactly as you wrote them</span>
-        </label>
-        <p class="help settings-reason" id="rewrite-off-reason" role="status"></p>
-      </fieldset>
-      <p class="help settings-gpu" id="rewrite-gpu-note">An official enhancer
-        loads a Q8 model onto the graphics card for each rewrite — roughly 15–40 s
-        for a text draft, 20–50 s for an edit one, since it reads the reference
-        too. It is unavailable while an image is generating; an image started
-        during a rewrite waits for it.</p>
-      <div class="settings-actions settings-writes" id="rewrite-save-actions">
-        <button type="button" id="rewrite-save" class="btn-primary"
-                disabled>Save</button>
-        <p class="help" id="rewrite-save-status" role="status"
-           aria-live="polite"></p>
-      </div>
-      <p class="error settings-writes" id="rewrite-settings-error"
-         aria-live="polite"></p>
-      <p class="help settings-writes" id="rewrite-settings-note" role="status"></p>
-    </section>
-
-    <!-- First-run model setup. The list below is the server's catalogue, whose
-         ids are fixed by this checkout; the page only ever sends ids back. -->
-    <section class="settings-section" id="models-card" hidden
-             aria-labelledby="models-settings-heading">
-      <h3 id="models-settings-heading">Models</h3>
-      <p class="help" id="models-intro">The files this app needs, and the ones it
-        can use. Nothing is downloaded until you press Download, and the download
-        runs on the machine this server runs on.</p>
-      <p class="error" id="models-error" aria-live="polite"></p>
-      <p class="help" id="models-note" role="status"></p>
-
-      <div class="models-total" id="models-total" role="status"></div>
-
-      <div class="models-list" id="models-list">
-        <div class="model-row" id="model-row-base">
-          <div class="model-head">
-            <span class="model-label" id="model-label-base"></span>
-            <span class="model-tag" id="model-tag-base"></span>
-            <span class="model-size" id="model-size-base"></span>
-          </div>
-          <p class="help settings-reason" id="model-reason-base"></p>
-          <p class="help settings-reason" id="model-dest-base"></p>
-          <p class="help settings-reason" id="model-state-base" role="status"></p>
-          <ul class="models-files" id="model-files-base"></ul>
+          <p class="error settings-writes" id="rewrite-settings-error"
+             aria-live="polite"></p>
+          <p class="help settings-writes" id="rewrite-settings-note" role="status"></p>
         </div>
-        <div class="model-row" id="model-row-turbo">
-          <div class="model-head">
-            <label class="model-tick" for="model-tick-turbo">
-              <input type="checkbox" id="model-tick-turbo" autocomplete="off"
-                     aria-describedby="model-reason-turbo">
-              <span class="model-label" id="model-label-turbo"></span>
-            </label>
-            <span class="model-size" id="model-size-turbo"></span>
-          </div>
-          <p class="help settings-reason" id="model-reason-turbo"></p>
-          <p class="help settings-reason" id="model-dest-turbo"></p>
-          <p class="help settings-reason" id="model-state-turbo" role="status"></p>
-          <ul class="models-files" id="model-files-turbo"></ul>
-        </div>
-        <div class="model-row" id="model-row-q8">
-          <div class="model-head">
-            <label class="model-tick" for="model-tick-q8">
-              <input type="checkbox" id="model-tick-q8" autocomplete="off"
-                     aria-describedby="model-reason-q8">
-              <span class="model-label" id="model-label-q8"></span>
-            </label>
-            <span class="model-size" id="model-size-q8"></span>
-          </div>
-          <p class="help settings-reason" id="model-reason-q8"></p>
-          <p class="help settings-reason" id="model-dest-q8"></p>
-          <p class="help settings-reason" id="model-state-q8" role="status"></p>
-          <ul class="models-files" id="model-files-q8"></ul>
-        </div>
-        <div class="model-row" id="model-row-pe-t2i">
-          <div class="model-head">
-            <label class="model-tick" for="model-tick-pe-t2i">
-              <input type="checkbox" id="model-tick-pe-t2i" autocomplete="off"
-                     aria-describedby="model-reason-pe-t2i">
-              <span class="model-label" id="model-label-pe-t2i"></span>
-            </label>
-            <span class="model-size" id="model-size-pe-t2i"></span>
-          </div>
-          <p class="help settings-reason" id="model-reason-pe-t2i"></p>
-          <p class="help settings-reason" id="model-dest-pe-t2i"></p>
-          <p class="help settings-reason" id="model-state-pe-t2i" role="status"></p>
-          <ul class="models-files" id="model-files-pe-t2i"></ul>
-        </div>
-        <div class="model-row" id="model-row-pe-edit">
-          <div class="model-head">
-            <label class="model-tick" for="model-tick-pe-edit">
-              <input type="checkbox" id="model-tick-pe-edit" autocomplete="off"
-                     aria-describedby="model-reason-pe-edit">
-              <span class="model-label" id="model-label-pe-edit"></span>
-            </label>
-            <span class="model-size" id="model-size-pe-edit"></span>
-          </div>
-          <p class="help settings-reason" id="model-reason-pe-edit"></p>
-          <p class="help settings-reason" id="model-dest-pe-edit"></p>
-          <p class="help settings-reason" id="model-state-pe-edit" role="status"></p>
-          <ul class="models-files" id="model-files-pe-edit"></ul>
-        </div>
-        <div class="model-row" id="model-row-rewrite-prompts">
-          <div class="model-head">
-            <label class="model-tick" for="model-tick-rewrite-prompts">
-              <input type="checkbox" id="model-tick-rewrite-prompts"
-                     autocomplete="off"
-                     aria-describedby="model-reason-rewrite-prompts">
-              <span class="model-label" id="model-label-rewrite-prompts"></span>
-            </label>
-            <span class="model-size" id="model-size-rewrite-prompts"></span>
-          </div>
-          <p class="help settings-reason" id="model-reason-rewrite-prompts"></p>
-          <p class="help settings-reason" id="model-dest-rewrite-prompts"></p>
-          <p class="help settings-reason" id="model-state-rewrite-prompts"
-             role="status"></p>
-          <ul class="models-files" id="model-files-rewrite-prompts"></ul>
-        </div>
-      </div>
+      </section>
 
-      <div class="settings-actions models-controls" id="models-controls">
-        <button type="button" id="models-download" class="btn-primary"
-                disabled>Download</button>
-        <button type="button" id="models-cancel" class="btn-secondary"
-                disabled>Cancel</button>
-        <p class="help" id="models-status" role="status" aria-live="polite"></p>
-      </div>
+      <!-- First-run model setup. The list below is the server's catalogue, whose
+           ids are fixed by this checkout; the page only ever sends ids back. -->
+      <section class="settings-section control-card" id="models-card" hidden
+               aria-labelledby="models-settings-heading">
+        <header class="card-header">
+          <h3 id="models-settings-heading" class="card-title">Models</h3>
+        </header>
+        <div class="card-content">
+          <p class="help" id="models-intro">The files this app needs, and the ones it
+            can use. Nothing is downloaded until you press Download, and the download
+            runs on the machine this server runs on.</p>
+          <p class="error" id="models-error" aria-live="polite"></p>
+          <p class="help" id="models-note" role="status"></p>
 
-      <!-- Replaces the button row's action for a browser that is not on this
-           machine: the download has to run where the models folder is. -->
-      <div class="models-server" id="models-server-only" hidden>
-        <p class="help" id="models-server-text"></p>
-        <p class="models-command" id="models-server-command" role="status"></p>
-      </div>
+          <div class="models-total" id="models-total" role="status"></div>
 
-      <div class="models-progress" id="models-progress" hidden>
-        <label for="models-progress-bar" id="models-progress-label">Downloading</label>
-        <progress id="models-progress-bar" max="1" value="0"
-                  aria-labelledby="models-progress-label"></progress>
-        <ul class="models-files" id="models-progress-files"></ul>
-      </div>
-    </section>
-    <p><a class="back-link" href="#create">← Back to Create</a></p>
+          <div class="models-list" id="models-list">
+            <div class="model-row" id="model-row-base">
+              <div class="model-head">
+                <span class="model-label" id="model-label-base"></span>
+                <span class="model-tag" id="model-tag-base"></span>
+                <span class="model-size" id="model-size-base"></span>
+              </div>
+              <p class="help settings-reason" id="model-reason-base"></p>
+              <p class="help settings-reason" id="model-dest-base"></p>
+              <p class="help settings-reason" id="model-state-base" role="status"></p>
+              <ul class="models-files" id="model-files-base"></ul>
+            </div>
+            <div class="model-row" id="model-row-turbo">
+              <div class="model-head">
+                <label class="model-tick" for="model-tick-turbo">
+                  <input type="checkbox" id="model-tick-turbo" autocomplete="off"
+                         aria-describedby="model-reason-turbo">
+                  <span class="model-label" id="model-label-turbo"></span>
+                </label>
+                <span class="model-size" id="model-size-turbo"></span>
+              </div>
+              <p class="help settings-reason" id="model-reason-turbo"></p>
+              <p class="help settings-reason" id="model-dest-turbo"></p>
+              <p class="help settings-reason" id="model-state-turbo" role="status"></p>
+              <ul class="models-files" id="model-files-turbo"></ul>
+            </div>
+            <div class="model-row" id="model-row-q8">
+              <div class="model-head">
+                <label class="model-tick" for="model-tick-q8">
+                  <input type="checkbox" id="model-tick-q8" autocomplete="off"
+                         aria-describedby="model-reason-q8">
+                  <span class="model-label" id="model-label-q8"></span>
+                </label>
+                <span class="model-size" id="model-size-q8"></span>
+              </div>
+              <p class="help settings-reason" id="model-reason-q8"></p>
+              <p class="help settings-reason" id="model-dest-q8"></p>
+              <p class="help settings-reason" id="model-state-q8" role="status"></p>
+              <ul class="models-files" id="model-files-q8"></ul>
+            </div>
+            <div class="model-row" id="model-row-pe-t2i">
+              <div class="model-head">
+                <label class="model-tick" for="model-tick-pe-t2i">
+                  <input type="checkbox" id="model-tick-pe-t2i" autocomplete="off"
+                         aria-describedby="model-reason-pe-t2i">
+                  <span class="model-label" id="model-label-pe-t2i"></span>
+                </label>
+                <span class="model-size" id="model-size-pe-t2i"></span>
+              </div>
+              <p class="help settings-reason" id="model-reason-pe-t2i"></p>
+              <p class="help settings-reason" id="model-dest-pe-t2i"></p>
+              <p class="help settings-reason" id="model-state-pe-t2i" role="status"></p>
+              <ul class="models-files" id="model-files-pe-t2i"></ul>
+            </div>
+            <div class="model-row" id="model-row-pe-edit">
+              <div class="model-head">
+                <label class="model-tick" for="model-tick-pe-edit">
+                  <input type="checkbox" id="model-tick-pe-edit" autocomplete="off"
+                         aria-describedby="model-reason-pe-edit">
+                  <span class="model-label" id="model-label-pe-edit"></span>
+                </label>
+                <span class="model-size" id="model-size-pe-edit"></span>
+              </div>
+              <p class="help settings-reason" id="model-reason-pe-edit"></p>
+              <p class="help settings-reason" id="model-dest-pe-edit"></p>
+              <p class="help settings-reason" id="model-state-pe-edit" role="status"></p>
+              <ul class="models-files" id="model-files-pe-edit"></ul>
+            </div>
+            <div class="model-row" id="model-row-rewrite-prompts">
+              <div class="model-head">
+                <label class="model-tick" for="model-tick-rewrite-prompts">
+                  <input type="checkbox" id="model-tick-rewrite-prompts"
+                         autocomplete="off"
+                         aria-describedby="model-reason-rewrite-prompts">
+                  <span class="model-label" id="model-label-rewrite-prompts"></span>
+                </label>
+                <span class="model-size" id="model-size-rewrite-prompts"></span>
+              </div>
+              <p class="help settings-reason" id="model-reason-rewrite-prompts"></p>
+              <p class="help settings-reason" id="model-dest-rewrite-prompts"></p>
+              <p class="help settings-reason" id="model-state-rewrite-prompts"
+                 role="status"></p>
+              <ul class="models-files" id="model-files-rewrite-prompts"></ul>
+            </div>
+          </div>
+
+          <div class="settings-actions models-controls" id="models-controls">
+            <button type="button" id="models-download" class="btn-primary"
+                    disabled>Download</button>
+            <button type="button" id="models-cancel" class="btn-secondary"
+                    disabled>Cancel</button>
+            <p class="help" id="models-status" role="status" aria-live="polite"></p>
+          </div>
+
+          <!-- Replaces the button row's action for a browser that is not on this
+               machine: the download has to run where the models folder is. -->
+          <div class="models-server" id="models-server-only" hidden>
+            <p class="help" id="models-server-text"></p>
+            <p class="models-command" id="models-server-command" role="status"></p>
+          </div>
+
+          <div class="models-progress" id="models-progress" hidden>
+            <label for="models-progress-bar" id="models-progress-label">Downloading</label>
+            <progress id="models-progress-bar" max="1" value="0"
+                      aria-labelledby="models-progress-label"></progress>
+            <ul class="models-files" id="models-progress-files"></ul>
+          </div>
+        </div>
+      </section>
+      <p><a class="back-link" href="#create">← Back to Create</a></p>
+    </div>
   </section>
 
   <!-- ===================== Help view ===================== -->
   <section id="view-help" class="view" hidden aria-labelledby="help-heading">
-    <h2 id="help-heading" tabindex="-1">Help</h2>
-    <dl class="settings-list">
-      <div><dt>Backend status</dt><dd id="settings-backend">This page talks
-        only to the local qwen-web server on the same origin, when it is
-        running. Opened over file:// or without that server it is
-        disconnected: planning and authoritative validation are unavailable.
-        Real generation requires explicit server enablement.</dd></div>
-      <div><dt>Generation gates</dt><dd id="settings-gates">Unknown until the
-        server answers: adapter, hardware, assets and calibration gates are
-        reported by /api/v1/status. Asset and hardware checks run per job;
-        exact calibration preflight is not wired into generation.</dd></div>
-      <div><dt>Generation</dt><dd id="settings-generation">Planning and
-        authoritative config validation come from the local server;
-        generation uses the engine through a serial job queue when enabled
-        by the server operator.</dd></div>
-      <div><dt>Runtime paths &amp; model files</dt><dd>Runtime paths
-        (output, cache, log, benchmarks, models, manifest) belong to the
-        server's own configuration and can never be set from this page;
-        the editable-config export omits them. Settings → Models can download
-        model files, but only from the catalogue this server was built with: the
-        page sends ids, never URLs or paths. Files are written to the server's
-        own models dir — which the card names, next to the size of each download
-        — and a download can be cancelled at any time; files already fetched stay
-        put and the next Download resumes with the rest. Until every required
-        model is installed, generation stays disabled. Nothing is downloaded
-        without a press of Download.</dd></div>
-      <div><dt>Validation of full settings</dt><dd>What this page checks is
-        a lightweight form check only, not a fitness or memory check. The
-        local server performs the authoritative GenerationConfig validation
-        when it is reachable.</dd></div>
-      <div><dt>Privacy</dt><dd>This page makes no third-party requests and
-        loads no external fonts, scripts or analytics; its only requests
-        are same-origin calls to the local server. The only thing the
-        browser stores is your chosen theme (Original, Neon or Paper), kept
-        under one local key; your prompt, draft and settings are never
-        saved by the browser. Plain static hosting serves these files but
-        enforces nothing by itself — locality is controlled by the qwen-web
-        server's explicit bind addresses. Remote access uses the LAN or
-        Tailscale address selected by the operator.</dd></div>
-      <div><dt>History</dt><dd>Each finished job stores one small
-        <code>job.json</code> file inside its own output folder holding its
-        settings, state and image checksum. History is rebuilt from those
-        files at server start, so completed images reappear after a restart.
-        An image whose file no longer matches its checksum is never served:
-        the entry stays listed with its image marked unavailable, so you can
-        still read its settings and forget it.
-        "Forget entry" deletes that one <code>job.json</code> and nothing
-        else, so the image file stays on disk and the entry stays gone after
-        a restart.</dd></div>
-      <div><dt>Drafts</dt><dd>Nothing is saved by the browser automatically
-        except the theme choice above. Prompts, seeds and form values are
-        never stored; an opt-in draft store for validated form values may
-        come later.</dd></div>
-    </dl>
-    <p><a class="back-link" href="#create">← Back to Create</a></p>
+    <div class="page-container">
+      <div class="page-header">
+        <h2 id="help-heading" tabindex="-1">Help</h2>
+      </div>
+      <dl class="settings-list control-card">
+        <div><dt>Backend status</dt><dd id="settings-backend">This page talks
+          only to the local qwen-web server on the same origin, when it is
+          running. Opened over file:// or without that server it is
+          disconnected: planning and authoritative validation are unavailable.
+          Real generation requires explicit server enablement.</dd></div>
+        <div><dt>Generation gates</dt><dd id="settings-gates">Unknown until the
+          server answers: adapter, hardware, assets and calibration gates are
+          reported by /api/v1/status. Asset and hardware checks run per job;
+          exact calibration preflight is not wired into generation.</dd></div>
+        <div><dt>Generation</dt><dd id="settings-generation">Planning and
+          authoritative config validation come from the local server;
+          generation uses the engine through a serial job queue when enabled
+          by the server operator.</dd></div>
+        <div><dt>Runtime paths &amp; model files</dt><dd>Runtime paths
+          (output, cache, log, benchmarks, models, manifest) belong to the
+          server's own configuration and can never be set from this page;
+          the editable-config export omits them. Settings → Models can download
+          model files, but only from the catalogue this server was built with: the
+          page sends ids, never URLs or paths. Files are written to the server's
+          own models dir — which the card names, next to the size of each download
+          — and a download can be cancelled at any time; files already fetched stay
+          put and the next Download resumes with the rest. Until every required
+          model is installed, generation stays disabled. Nothing is downloaded
+          without a press of Download.</dd></div>
+        <div><dt>Validation of full settings</dt><dd>What this page checks is
+          a lightweight form check only, not a fitness or memory check. The
+          local server performs the authoritative GenerationConfig validation
+          when it is reachable.</dd></div>
+        <div><dt>Privacy</dt><dd>This page makes no third-party requests and
+          loads no external fonts, scripts or analytics; its only requests
+          are same-origin calls to the local server. The only thing the
+          browser stores is your chosen theme (Original, Neon or Paper), kept
+          under one local key; your prompt, draft and settings are never
+          saved by the browser. Plain static hosting serves these files but
+          enforces nothing by itself — locality is controlled by the qwen-web
+          server's explicit bind addresses. Remote access uses the LAN or
+          Tailscale address selected by the operator.</dd></div>
+        <div><dt>History</dt><dd>Each finished job stores one small
+          <code>job.json</code> file inside its own output folder holding its
+          settings, state and image checksum. History is rebuilt from those
+          files at server start, so completed images reappear after a restart.
+          An image whose file no longer matches its checksum is never served:
+          the entry stays listed with its image marked unavailable, so you can
+          still read its settings and forget it.
+          "Forget entry" deletes that one <code>job.json</code> and nothing
+          else, so the image file stays on disk and the entry stays gone after
+          a restart.</dd></div>
+        <div><dt>Drafts</dt><dd>Nothing is saved by the browser automatically
+          except the theme choice above. Prompts, seeds and form values are
+          never stored; an opt-in draft store for validated form values may
+          come later.</dd></div>
+      </dl>
+      <p><a class="back-link" href="#create">← Back to Create</a></p>
+    </div>
   </section>
 
   <!-- ===================== Admin view (local listener only) =====================
@@ -766,76 +977,88 @@
        confirmation lives in the page (never alert()/confirm()), and its tick
        box is the only thing that authorizes deleting an account's files. -->
   <section id="view-admin" class="view" hidden aria-labelledby="admin-heading">
-    <h2 id="admin-heading" tabindex="-1">Admin</h2>
-    <p class="help admin-shared">Accounts for this server. Changes are saved
-      as soon as you make them: a tick box writes through, and Add and Remove
-      take effect immediately.</p>
-
-    <table class="admin-table" id="admin-table">
-      <caption class="visually-hidden">Invited users</caption>
-      <thead>
-        <tr>
-          <th scope="col">Email</th>
-          <th scope="col">Name</th>
-          <th scope="col">First sign-in</th>
-          <th scope="col">Images</th>
-          <th scope="col">Queued or running</th>
-          <th scope="col">Permissions</th>
-          <th scope="col"><span class="visually-hidden">Remove</span></th>
-        </tr>
-      </thead>
-      <tbody id="admin-users-body"></tbody>
-    </table>
-    <p class="help admin-empty" id="admin-empty" hidden>No accounts are
-      invited yet. Add one below.</p>
-    <p class="help admin-cap" id="admin-cap"></p>
-
-    <section class="admin-add" aria-labelledby="admin-add-heading">
-      <h3 id="admin-add-heading">Add a user</h3>
-      <form id="admin-add-form" novalidate>
-        <div class="field">
-          <label for="admin-add-email">Email address</label>
-          <input type="email" id="admin-add-email" autocomplete="off"
-                 spellcheck="false" aria-describedby="admin-add-help admin-error">
-          <p class="help" id="admin-add-help">The address they sign in with.
-            A new account starts with q8 only; tick the other permissions
-            above afterwards.</p>
-        </div>
-        <div class="field">
-          <label for="admin-add-name">Display name (optional)</label>
-          <input type="text" id="admin-add-name" autocomplete="off"
-                 maxlength="80" aria-describedby="admin-name-help admin-error">
-          <p class="help" id="admin-name-help">Shown instead of the address in
-            their header. Leave empty to show the address.</p>
-        </div>
-        <div class="settings-actions">
-          <button type="submit" id="admin-add-submit" class="btn-primary"
-                  disabled>Add user</button>
-        </div>
-      </form>
-    </section>
-
-    <div class="admin-remove" id="admin-remove-confirm" role="group"
-         aria-labelledby="admin-remove-question" hidden>
-      <p class="admin-remove-question" id="admin-remove-question" tabindex="-1"></p>
-      <div class="field checkbox-field">
-        <input type="checkbox" id="admin-delete-data" autocomplete="off"
-               aria-describedby="admin-delete-data-help">
-        <label for="admin-delete-data">Also delete their images and references</label>
+    <div class="page-container">
+      <div class="page-header">
+        <h2 id="admin-heading" tabindex="-1">Admin</h2>
+        <p class="help admin-shared">Accounts for this server. Changes are saved
+          as soon as you make them: a tick box writes through, and Add and Remove
+          take effect immediately.</p>
       </div>
-      <p class="help" id="admin-delete-data-help">Unticked, their finished
-        images and uploaded references stay on disk but leave their history.
-        Ticked, both are deleted with the account.</p>
-      <div class="history-confirm-buttons">
-        <button type="button" id="admin-remove-yes" class="btn-danger">Remove
-          user</button>
-        <button type="button" id="admin-remove-cancel" class="btn-secondary">Cancel</button>
+
+      <div class="control-card admin-card">
+        <div class="card-content">
+          <table class="admin-table" id="admin-table">
+            <caption class="visually-hidden">Invited users</caption>
+            <thead>
+              <tr>
+                <th scope="col">Email</th>
+                <th scope="col">Name</th>
+                <th scope="col">First sign-in</th>
+                <th scope="col">Images</th>
+                <th scope="col">Queued or running</th>
+                <th scope="col">Permissions</th>
+                <th scope="col"><span class="visually-hidden">Remove</span></th>
+              </tr>
+            </thead>
+            <tbody id="admin-users-body"></tbody>
+          </table>
+          <p class="help admin-empty" id="admin-empty" hidden>No accounts are
+            invited yet. Add one below.</p>
+          <p class="help admin-cap" id="admin-cap"></p>
+        </div>
       </div>
+
+      <section class="admin-add control-card" aria-labelledby="admin-add-heading">
+        <header class="card-header">
+          <h3 id="admin-add-heading" class="card-title">Add a user</h3>
+        </header>
+        <div class="card-content">
+          <form id="admin-add-form" novalidate>
+            <div class="field">
+              <label for="admin-add-email">Email address</label>
+              <input type="email" id="admin-add-email" autocomplete="off"
+                     spellcheck="false" aria-describedby="admin-add-help admin-error">
+              <p class="help" id="admin-add-help">The address they sign in with.
+                A new account starts with q8 only; tick the other permissions
+                above afterwards.</p>
+            </div>
+            <div class="field">
+              <label for="admin-add-name">Display name (optional)</label>
+              <input type="text" id="admin-add-name" autocomplete="off"
+                     maxlength="80" aria-describedby="admin-name-help admin-error">
+              <p class="help" id="admin-name-help">Shown instead of the address in
+                their header. Leave empty to show the address.</p>
+            </div>
+            <div class="settings-actions">
+              <button type="submit" id="admin-add-submit" class="btn-primary"
+                      disabled>Add user</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <div class="admin-remove" id="admin-remove-confirm" role="group"
+           aria-labelledby="admin-remove-question" hidden>
+        <p class="admin-remove-question" id="admin-remove-question" tabindex="-1"></p>
+        <div class="field checkbox-field">
+          <input type="checkbox" id="admin-delete-data" autocomplete="off"
+                 aria-describedby="admin-delete-data-help">
+          <label for="admin-delete-data">Also delete their images and references</label>
+        </div>
+        <p class="help" id="admin-delete-data-help">Unticked, their finished
+          images and uploaded references stay on disk but leave their history.
+          Ticked, both are deleted with the account.</p>
+        <div class="history-confirm-buttons">
+          <button type="button" id="admin-remove-yes" class="btn-danger">Remove
+            user</button>
+          <button type="button" id="admin-remove-cancel" class="btn-secondary">Cancel</button>
+        </div>
+      </div>
+      <p class="error" id="admin-error" aria-live="polite"></p>
+      <p class="admin-status" id="admin-status" role="status" aria-live="polite"
+         hidden></p>
+      <p><a class="back-link" href="#create">← Back to Create</a></p>
     </div>
-    <p class="error" id="admin-error" aria-live="polite"></p>
-    <p class="admin-status" id="admin-status" role="status" aria-live="polite"
-       hidden></p>
-    <p><a class="back-link" href="#create">← Back to Create</a></p>
   </section>
 
 </main>
