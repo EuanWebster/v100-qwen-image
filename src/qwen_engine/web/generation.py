@@ -22,7 +22,7 @@ from qwen_engine.core import generate
 from qwen_engine.errors import GenerationCancelled
 from qwen_engine.jobs import (
     JobCancelled, JobController, JobError, JobHistoryFullError,
-    JobQueueLimitError,
+    JobQueueLimitError, release_cyclic_references,
 )
 from qwen_engine.owners import LOCAL_OWNER
 from qwen_engine.web import remote as _remote
@@ -104,7 +104,22 @@ class WebGeneration:
         self._lock = threading.Lock()
         self._metrics = {}
         self._executor = executor or self._execute
+        if memory_release is None:
+            memory_release = self._release_after_failed_job
         self.controller = JobController(runtime.output_dir, self._run, memory_release=memory_release)
+
+    def _release_after_failed_job(self):
+        """The controller's release for a failed or cancelled job.
+
+        The release in _run's ``finally`` runs while the failure is still being
+        raised, and its traceback holds the job's tensors, so it frees almost
+        nothing: a 2K out-of-memory left 15.8 GiB on the card with the server
+        idle (2026-10-27). The controller calls this once the exception is gone,
+        so the tensors are collectable and the cache goes back to the driver
+        now rather than never.
+        """
+        release_cyclic_references()
+        self._gpu_cache_release()
 
     def _execute(self, context):
         # Identical asset verification, adapter and host policy to --run,
