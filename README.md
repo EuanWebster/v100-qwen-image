@@ -120,7 +120,9 @@ offered in that same list, or place it under `models/q8/` yourself.
 
 Serves on port 8765 with a single shared job queue. It binds `127.0.0.1` plus
 a LAN and a Tailscale address; override these with `QWEN_LAN_HOST`,
-`QWEN_TAILSCALE_HOST` and `QWEN_WEB_PORT`. Set `QWEN_ATTEST_UNBOUNDED_HOST=0`
+`QWEN_TAILSCALE_HOST` and `QWEN_WEB_PORT`. It also answers to this PC's
+hostname, `<hostname>.local` and its Tailscale MagicDNS name, listed in
+`cache/web-settings.json` (written on first run; edit it to change them). Set `QWEN_ATTEST_UNBOUNDED_HOST=0`
 when running under a cgroup memory limit. See
 [`docs/lan-tailscale.md`](docs/lan-tailscale.md).
 

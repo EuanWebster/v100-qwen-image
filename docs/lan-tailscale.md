@@ -37,7 +37,23 @@ The underlying server now accepts repeated `--host` options for explicit IPv4
 loopback, RFC1918 LAN and Tailscale/CGNAT literals. IPv6, public IPs, hostnames
 and wildcard binds remain refused. Host must match the particular listener IP
 and actual port; `localhost` is an alias only on the 127.0.0.1 listener. Origin
-must match that exact origin, including its port. Existing JSON, X-Qwen-UI,
+must match that exact origin, including its port.
+
+Browsers may also use this machine's own names, listed in
+`cache/web-settings.json` and accepted on every listener:
+
+```json
+{"host_names": ["tiktak-ai", "tiktak-ai.local", "tiktak-ai.tail3e3fc8.ts.net"]}
+```
+
+The first `./start-web.sh` writes that file with the hostname,
+`<hostname>.local` (mDNS) and the Tailscale MagicDNS name, so
+`http://tiktak-ai.local:8765/` works. Edit it and restart to change the list;
+`[]` accepts IP addresses only. A file that is not exactly that shape stops the
+server at startup. `qwen-web --host-name NAME` adds names for one run. Names
+are matched as text and never resolved; any other name is still refused, which
+is what stops a DNS-rebinding page from reaching the server under its own
+domain. Existing JSON, X-Qwen-UI,
 body limits, response headers, image verification and path protections remain.
 All listeners use the same worker and cancel/close it once at shutdown.
 
