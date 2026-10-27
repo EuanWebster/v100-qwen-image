@@ -376,8 +376,12 @@
   };
   // END GENERATED PRESETS
 
-  var VIEWS = { create: 'view-create', history: 'view-history', settings: 'view-settings' };
-  var VIEW_HEADINGS = { create: 'create-heading', history: 'history-heading', settings: 'settings-heading' };
+  // Help is a view like the others: the markup ships #view-help and a
+  // #nav-help link, so leaving it out of this map made the tab a dead link.
+  var VIEWS = { create: 'view-create', history: 'view-history',
+                settings: 'view-settings', help: 'view-help' };
+  var VIEW_HEADINGS = { create: 'create-heading', history: 'history-heading',
+                        settings: 'settings-heading', help: 'help-heading' };
 
   function $(id) { return document.getElementById(id); }
 
@@ -1396,6 +1400,19 @@
     if (proposal) hideProposal();
     var status = $('rewrite-status');
     if (status) status.textContent = '';
+    // Every route that rewrites the textarea ends here (typing, Apply, Edit,
+    // an imported plan), so the counter has exactly one place to be updated.
+    updatePromptCharCount();
+  }
+
+  // Live character count beside the Prompt label. It counts the draft the
+  // same way validation does (Python's strip semantics), so the number and
+  // the "prompt is required" error can never disagree.
+  function updatePromptCharCount() {
+    var area = $('prompt');
+    if (!area) return;
+    var len = pyStrip(area.value).length;
+    setText('prompt-char-count', len + (len === 1 ? ' character' : ' characters'));
   }
 
   function hideProposal() {
@@ -3754,6 +3771,36 @@
     return null;
   }
 
+  // Only one tier's tiles are on screen at a time. The tier shown follows the
+  // selected preset (by any route: a tile, Random, an import, a hint's Apply
+  // ratio), and a tier with no exact match leaves the last choice in place —
+  // hand-typed dimensions must not make the tiles jump.
+  var presetTierShown = '1K';
+
+  // Whether a tier is OFFERED at all is the server's answer, stated once by
+  // applyUserState on #presets-2k-group. The tab pair is a filter inside that
+  // decision, so it never writes the group's own hidden flag.
+  function presetTierAllowed(tier) {
+    var group = $('presets-2k-group');
+    if (tier !== '2K') return true;
+    return !(group && group.hidden);
+  }
+
+  function syncPresetTier(tier) {
+    if (presetTierAllowed(tier)) presetTierShown = tier;
+    else presetTierShown = '1K';
+    var tabs = ['1K', '2K'];
+    for (var i = 0; i < tabs.length; i++) {
+      var tab = $('preset-tier-' + tabs[i].toLowerCase());
+      if (tab) tab.setAttribute('aria-selected',
+        String(tabs[i] === presetTierShown));
+      var grid = $(tabs[i] === '1K' ? 'presets-1k' : 'presets-2k');
+      if (grid) grid.hidden = tabs[i] !== presetTierShown;
+    }
+    var tabsRow = $('preset-tier-tabs');
+    if (tabsRow) tabsRow.hidden = !presetTierAllowed('2K');
+  }
+
   // Recompute exact preset match from the CURRENT dimension values, so manual
   // edits never leave a stale pressed preset. Non-preset dimensions clear all.
   function syncPresetButtons() {
@@ -3763,6 +3810,7 @@
       buttons[i].setAttribute('aria-pressed',
         String(buttons[i].dataset.preset === name));
     }
+    if (name) syncPresetTier(PRESETS[name].tier);
   }
 
   function applyPreset(name) {
@@ -4088,6 +4136,8 @@
       var card = document.createElement('article');
       card.className = 'history-card';
       if (job.state === 'succeeded') {
+        var media = document.createElement('div');
+        media.className = 'card-media-wrapper';
         var image = document.createElement('img');
         image.src = job.image_url;
         image.alt = job.config.prompt;
@@ -4104,20 +4154,47 @@
             'status, or use its "View job" details.');
           $('history-missing-note').hidden = false;
         });
-        card.appendChild(image);
+        media.appendChild(image);
+        // Facts a reader wants before opening the job, stated over the image:
+        // which recipe made it and at what size.
+        var chips = document.createElement('div');
+        chips.className = 'card-overlay-chips';
+        var recipeChip = document.createElement('span');
+        recipeChip.className = 'card-chip chip-recipe';
+        recipeChip.textContent = job.config.recipe === 'turbo' ? 'Turbo' : 'Quality';
+        chips.appendChild(recipeChip);
+        var sizeChip = document.createElement('span');
+        sizeChip.className = 'card-chip';
+        sizeChip.textContent = job.config.width + '×' + job.config.height;
+        chips.appendChild(sizeChip);
+        media.appendChild(chips);
+        card.appendChild(media);
       }
+      var info = document.createElement('div');
+      info.className = 'card-info';
       var label = document.createElement('p');
-      label.textContent = job.state +
-        (job.config.recipe === 'turbo' ? ' · Turbo' : '') +
-        ' · seed ' + job.config.seed + ' · ' +
-        job.config.prompt.slice(0, 160);
-      card.appendChild(label);
+      label.className = 'card-prompt-preview';
+      label.textContent = job.config.prompt.slice(0, 160) || 'No prompt recorded';
+      info.appendChild(label);
+      var meta = document.createElement('p');
+      meta.className = 'card-meta-row';
+      var stateCell = document.createElement('span');
+      stateCell.textContent = job.state;
+      meta.appendChild(stateCell);
+      var seedCell = document.createElement('span');
+      seedCell.textContent = 'seed ' + job.config.seed +
+        (job.config.recipe === 'turbo' ? ' · Turbo' : '');
+      meta.appendChild(seedCell);
+      info.appendChild(meta);
+      card.appendChild(info);
+      var actions = document.createElement('div');
+      actions.className = 'card-actions';
       var view = document.createElement('button');
       view.type = 'button';
       view.className = 'btn-secondary';
       view.textContent = 'View job';
       view.addEventListener('click', function () { renderSelectedJob(jobCache[id]); location.hash = '#create'; });
-      card.appendChild(view);
+      actions.appendChild(view);
       // Only entries that HAVE an image get the shortcut: a queued, cancelled
       // or failed job has nothing to feed back in.
       if (job.state === 'succeeded') {
@@ -4137,7 +4214,7 @@
           location.hash = '#create';
           useJobImageAsReference(id);
         });
-        card.appendChild(reuse);
+        actions.appendChild(reuse);
       }
       if (jobTerminal(job)) {
         var forget = document.createElement('button');
@@ -4147,9 +4224,11 @@
         forget.title = 'Remove this saved history entry; the in-page ' +
           'confirmation asks whether its image file is deleted too';
         forget.addEventListener('click', function () { openHistoryConfirm(id); });
-        card.appendChild(forget);
+        actions.appendChild(forget);
       }
+      card.appendChild(actions);
       grid.appendChild(card);
+
     });
     updateHistoryControls();
   }
@@ -4592,6 +4671,162 @@
     });
   }
 
+  /* ---------------- Info popovers ---------------- */
+
+  // The "?" buttons reveal a static explanation in place of a permanently
+  // visible paragraph. Hover and focus are pure CSS (:hover / :focus-within);
+  // a CLICK is what needs script, because a keyboard or touch user has no
+  // hover and the panel would otherwise vanish as soon as focus moved to it.
+  // The open panel is marked on the panel itself (data-open) and the button's
+  // own aria-expanded, so the two can never disagree.
+  function infoPopoverTarget(button) {
+    var id = button.getAttribute('aria-controls');
+    return id ? $(id) : null;
+  }
+
+  function setInfoPopover(button, open) {
+    var panel = infoPopoverTarget(button);
+    if (!panel) return;
+    // The panel is revealed by hover and by :focus-within as a convenience,
+    // but a CLOSE must win over that. Escape hands focus back to the button,
+    // which is inside the wrapper, so :focus-within would instantly re-open
+    // what the user just dismissed. data-closed pins it shut until the next
+    // pointer or keyboard interaction with that button.
+    if (open) {
+      panel.setAttribute('data-open', 'true');
+      panel.removeAttribute('data-closed');
+      placeInfoPopover(button);
+    } else {
+      panel.removeAttribute('data-open');
+      // The placement is per-open: drop it so a panel revealed by the CSS
+      // hover/focus rules alone opens at its stylesheet position.
+      panel.style.removeProperty('left');
+      panel.style.removeProperty('max-height');
+      panel.style.removeProperty('--arrow-x');
+      if (button.getAttribute('aria-expanded') === 'true') {
+        panel.setAttribute('data-closed', 'true');
+      }
+    }
+    button.setAttribute('aria-expanded', String(open));
+  }
+
+  // The next hover, focus or click of a dismissed button forgets the pin, so
+  // the convenience reveals work again from the second interaction on.
+  function clearInfoPopoverDismissal(button) {
+    var panel = infoPopoverTarget(button);
+    if (panel) panel.removeAttribute('data-closed');
+  }
+
+  function closeInfoPopovers(except) {
+    var buttons = document.querySelectorAll('.info-btn');
+    for (var i = 0; i < buttons.length; i++) {
+      if (buttons[i] !== except) setInfoPopover(buttons[i], false);
+    }
+  }
+
+  // One open panel at a time: opening one closes the rest, clicking the open
+  // one again closes it.
+  function toggleInfoPopover(button) {
+    var open = button.getAttribute('aria-expanded') !== 'true';
+    closeInfoPopovers(button);
+    setInfoPopover(button, open);
+  }
+
+  // Every clipped ancestor narrows the visible band, so the limit is the
+  // intersection of ALL of them on each axis (a card with overflow:hidden
+  // inside the scrolling pane clips at whichever edge is tighter), never just
+  // the first one found. A pane that scrolls on one axis clips both, because
+  // CSS turns the visible other axis into auto.
+  function visibleBand(node) {
+    var box = { top: 0, bottom: window.innerHeight,
+                left: 0, right: window.innerWidth };
+    var probe = node;
+    while (probe && probe.nodeType === 1) {
+      var style = window.getComputedStyle(probe);
+      var rect = null;
+      if (/(auto|scroll|hidden|clip)/.test(style.overflowY)) {
+        rect = probe.getBoundingClientRect();
+        if (rect.top > box.top) box.top = rect.top;
+        if (rect.bottom < box.bottom) box.bottom = rect.bottom;
+      }
+      if (/(auto|scroll|hidden|clip)/.test(style.overflowX)) {
+        rect = rect || probe.getBoundingClientRect();
+        if (rect.left > box.left) box.left = rect.left;
+        if (rect.right < box.right) box.right = rect.right;
+      }
+      probe = probe.parentNode;
+    }
+    return box;
+  }
+
+  // Place the panel inside the band. Every decision is made from the panel's
+  // measured rect, never from arithmetic on the CSS offsets: the panel's real
+  // distance below its button is not the number in the stylesheet, so a
+  // computed cap lands a few pixels over the edge it was meant to keep inside.
+  // Steps: open downward, flip when the other side is roomier, shrink the
+  // height to the edge it is anchored against, then slide it sideways so a
+  // control near the pane's right edge does not push it out (the scrolling
+  // pane clips sideways too). The arrow follows the button, so it still points
+  // at the control it explains.
+  function placeInfoPopover(button) {
+    var wrapper = button.parentNode;
+    if (!wrapper || !wrapper.classList ||
+        !wrapper.classList.contains('info-popover-wrapper')) return null;
+    var panel = infoPopoverTarget(button);
+    if (!panel) return null;
+    var gap = 8;
+    wrapper.classList.remove('flip-up');
+    panel.style.maxHeight = '';
+    panel.style.removeProperty('left');
+    var band = visibleBand(wrapper.parentNode);
+    var anchor = wrapper.getBoundingClientRect();
+    // A hidden panel has no rect: it is either already ruled out by CSS (the
+    // pin) or about to be shown by the hover/focus rule that is running now,
+    // in which case this same read has already flushed that style.
+    var rect = panel.getBoundingClientRect();
+    if (!rect.height || !rect.width) return null;
+    var roomBelow = band.bottom - rect.top;
+    var roomAbove = rect.bottom - band.top;
+    var flip = rect.bottom > band.bottom && roomAbove > roomBelow;
+    if (flip) {
+      wrapper.classList.add('flip-up');
+      rect = panel.getBoundingClientRect();
+      if (rect.height) roomAbove = rect.bottom - band.top;
+    }
+    // The panel is anchored on one edge, so the room is measured from the
+    // edge it hangs from, and flooring the cap keeps the far edge inside by
+    // construction in both directions: downward bottom = top + cap, upward
+    // top = bottom - cap >= band.top.
+    var room = Math.floor(flip ? roomAbove : roomBelow);
+    if (room > 0 && rect.height > room) {
+      panel.style.maxHeight = room + 'px';
+    }
+    var placed = panel.getBoundingClientRect();
+    var width = placed.width || rect.width;
+    var left = anchor.left;
+    var minLeft = band.left + gap;
+    var maxLeft = Math.max(minLeft, band.right - gap - width);
+    if (left > maxLeft) left = maxLeft;
+    if (left < minLeft) left = minLeft;
+    var offset = Math.round(left - anchor.left);
+    if (offset) panel.style.left = offset + 'px';
+    else panel.style.removeProperty('left');
+    var arrow = Math.round(anchor.left + anchor.width / 2 - left);
+    arrow = Math.max(10, Math.min(Math.max(10, width - 18), arrow));
+    panel.style.setProperty('--arrow-x', arrow + 'px');
+    return { flip: flip, room: room, offset: offset };
+  }
+
+  // Escape closes whichever panel a click opened and hands focus back to the
+  // button that owns it. Returns whether anything was closed.
+  function closeInfoPopoversOnEscape() {
+    var open = document.querySelector('.info-btn[aria-expanded="true"]');
+    if (!open) return false;
+    closeInfoPopovers(null);
+    open.focus();   // never strand focus on a panel that just vanished
+    return true;
+  }
+
   /* ---------------- Wiring ---------------- */
 
   function init() {
@@ -4602,7 +4837,26 @@
       button.className = 'preset-btn';
       button.dataset.preset = name;
       button.setAttribute('aria-pressed', String(name === 'square'));
-      button.textContent = preset.ratio + ' · ' + preset.width + '×' + preset.height;
+      button.setAttribute('aria-label', preset.ratio + ' ' +
+        preset.width + ' by ' + preset.height + ' pixels');
+      // The glyph is drawn from THIS preset's own width:height, so a future
+      // ratio needs no new rule; the long side stays 18px so tiles match.
+      var glyph = document.createElement('span');
+      glyph.className = 'aspect-glyph';
+      glyph.setAttribute('aria-hidden', 'true');
+      var longSide = 18;
+      var ratio = preset.width / preset.height;
+      glyph.style.width = (ratio >= 1 ? longSide : Math.round(longSide * ratio)) + 'px';
+      glyph.style.height = (ratio >= 1 ? Math.round(longSide / ratio) : longSide) + 'px';
+      button.appendChild(glyph);
+      var ratioLabel = document.createElement('span');
+      ratioLabel.className = 'preset-ratio';
+      ratioLabel.textContent = preset.ratio;
+      button.appendChild(ratioLabel);
+      var sizeText = document.createElement('span');
+      sizeText.className = 'preset-size';
+      sizeText.textContent = preset.width + '×' + preset.height;
+      button.appendChild(sizeText);
       $('presets-' + preset.tier.toLowerCase()).appendChild(button);
     });
     $('create-form').addEventListener('submit', function (ev) {
@@ -4727,6 +4981,44 @@
       });
     }
 
+    // The 1K/2K tabs only FILTER the visible tiles: neither tab writes a
+    // dimension, so switching tiers can never change the draft. A tier the
+    // server did not offer is not selectable at all.
+    Array.prototype.forEach.call(
+      document.querySelectorAll('.tier-tab-btn'),
+      function (tab) {
+        tab.addEventListener('click', function () {
+          syncPresetTier(tab.dataset.tier);
+        });
+      });
+
+    // Info popovers: click toggles (hover and focus are CSS), a click outside
+    // closes, Escape closes and returns focus to the button that opened it.
+    Array.prototype.forEach.call(
+      document.querySelectorAll('.info-btn'),
+      function (button) {
+        button.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          clearInfoPopoverDismissal(button);
+          toggleInfoPopover(button);
+        });
+        // Hover or a fresh click re-arms the convenience reveal. Focus alone
+        // must NOT: Escape returns focus to this button, and a focus event
+        // clearing the pin would re-open the panel the user just dismissed.
+        button.addEventListener('pointerenter', function () {
+          clearInfoPopoverDismissal(button);
+          placeInfoPopover(button);
+        });
+        button.addEventListener('focus', function () {
+          placeInfoPopover(button);
+        });
+      });
+    document.addEventListener('click', function () { closeInfoPopovers(null); });
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key !== 'Escape') return;
+      closeInfoPopoversOnEscape();
+    });
+
     $('random-seed').addEventListener('click', function () {
       $('seed').value = randomSeedString();
       renderValidation(validateForm().errors);
@@ -4845,6 +5137,11 @@
     initTheme();   // persisted theme applied before first paint of content
     initialRoute();
     syncPresetButtons();
+    // syncPresetButtons only moves the tabs when the draft matches a preset;
+    // a hand-typed draft keeps the tier that is already on screen, so the
+    // initial sync states that starting choice explicitly.
+    syncPresetTier(presetTierShown);
+    updatePromptCharCount();   // a restored draft shows its real count
     applyRecipeMode();   // lock state matches the checked recipe on load
     renderValidation(validateForm().errors);
     // The Settings form starts unread: nothing is selectable until the server
