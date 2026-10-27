@@ -574,8 +574,36 @@
     });
   }
 
+  // 2K at FP16 fits only short prompts, because the prompt's tokens join the
+  // image tokens in the transformer's attention. Measured on the V100 at
+  // 2752x1536, FP16 (2026-10-27): 500 prompt tokens fit with a 15.08 GiB
+  // peak and 600 ran out of memory, while Q8 fit 1,500 tokens with over
+  // 5 GiB to spare. The page cannot count tokens, so it counts characters:
+  // English prompts run about 4-6 characters a token, and 1,600 characters
+  // keeps a prompt near 400 tokens or fewer. A warning only: the job is still
+  // submitted, and the server decides nothing from it.
+  var MEMORY_WARNING_PIXELS = 3000000;
+  var MEMORY_WARNING_PROMPT_CHARS = 1600;
+
+  function syncMemoryWarning() {
+    var box = $('memory-warning');
+    if (!box) return;
+    var pixels = parseInt($('width').value, 10) * parseInt($('height').value, 10);
+    var chars = pyStrip($('prompt').value).length;
+    // NaN (an empty or half-typed size) compares false, so no warning.
+    var show = pixels > MEMORY_WARNING_PIXELS && $('quant').value === 'fp16' &&
+      chars > MEMORY_WARNING_PROMPT_CHARS;
+    box.hidden = !show;
+    setText('memory-warning', show
+      ? 'This prompt (' + chars + ' characters) is long for a 2K image at ' +
+        'FP16 and may run out of GPU memory. Choose Q8 under Advanced ' +
+        'settings, or shorten the prompt to under 1,600 characters.'
+      : '');
+  }
+
   function renderValidation(errors) {
     syncOptionHelp();
+    syncMemoryWarning();
     setText('steps-error', errors.steps || '');
     setText('seed-error', errors.seed || '');
     setText('cfg-error', errors.cfg || '');
@@ -4760,7 +4788,7 @@
       // Plain-language, actionable and prompt-free; unknown codes keep the
       // generic fixed sentence below (closed list, no server text).
       out_of_gpu_memory: 'The GPU ran out of memory for this job. Try Q8, ' +
-        'a smaller size, fewer reference images, or Turbo.'
+        'a smaller size, fewer reference images, or a shorter prompt.'
     };
     var descriptions = {
       queued: 'Queued — waiting for the current generation to finish.',
