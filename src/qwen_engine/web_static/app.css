@@ -544,6 +544,14 @@ input:disabled, select:disabled, textarea:disabled {
 .btn-cancel { border-radius: var(--radius); font-size: 13px; }
 .btn-cancel:hover:not(:disabled) { border-color: var(--error); color: var(--error); }
 
+/* Above Generate, so it is read before the job is sent. A caution, not an
+   error: the job is still allowed. */
+.memory-warning {
+  margin: 0 0 8px; padding: 8px 10px;
+  border: 1px solid var(--border); border-left: 3px solid var(--error);
+  border-radius: var(--radius-sm); background: var(--bg-raised);
+  color: var(--text); font-size: 12.5px; line-height: 1.5;
+}
 .disabled-reason { margin: 8px 0 0; font-size: 12.5px; color: var(--text-muted);
                    overflow-wrap: anywhere; }
 .disabled-reason:empty { display: none; }

@@ -563,6 +563,13 @@ See [`encoder-cpu-performance.md`](encoder-cpu-performance.md).
 - **No memory preflight.** Submitting a job is not a guarantee it fits. Peak
   reserved VRAM on measured 1K jobs is 14.6–15.3 GiB of 16 GiB (FP16 text-to-image
   and edits); a 2K job is larger and uses tiled decode.
+- **2K at FP16 fits only short prompts.** The prompt's tokens join the image
+  tokens in the transformer's attention, so a long prompt adds to the 2K
+  denoise peak. Measured at 2752×1536, FP16, 2026-10-27: 10 prompt tokens
+  peak at 14.80 GiB, 500 tokens at 15.08 GiB, and 600 or more run out of
+  memory. Q8 fit 1,500 tokens at 9.72 GiB. The web page warns above 1,600
+  characters (about 400 tokens) for any FP16 size over 3 megapixels; the job
+  is still allowed.
 - **2K decode headroom is unmeasured.** An untiled 2048² decode does not fit,
   so 2K **presets** turn VAE tiling on and 1K presets turn it off (both the CLI
   `--preset` and the web UI). The web API refuses a config above 4096 latent
