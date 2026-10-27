@@ -530,6 +530,43 @@ details.advanced > .help { margin-top: 10px; }
   gap: 12px; margin-top: 12px;
 }
 
+/* Header identity (C3): who is signed in on the remote page, and the
+   proxy's own sign-out. Hidden by markup on the owner's page. */
+.identity {
+  margin: 0; display: flex; align-items: center; gap: 10px;
+  font-size: 13px; color: var(--text-muted); max-width: 32ch;
+}
+.identity > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.identity-sign-out {
+  color: var(--accent); text-decoration: none; white-space: nowrap;
+  border-bottom: 1px solid transparent;
+}
+.identity-sign-out:hover { border-bottom-color: var(--accent); }
+
+/* The history cap warning sits ABOVE Generate, so it is read before the
+   button that deletes an image is pressed. It is never a modal: it stays as
+   long as the fact does. */
+.history-cap-warning {
+  margin: 0 0 8px; padding: 8px 10px; max-width: 640px;
+  border: 1px solid var(--border); border-left: 3px solid var(--error);
+  border-radius: 6px; background: var(--bg-raised);
+  color: var(--text); font-size: 12.5px; line-height: 1.5;
+}
+.job-queue {
+  margin: 6px 0 0; font-size: 12.5px; color: var(--text-muted);
+}
+
+/* A remote account the owner never invited: the studio is replaced whole,
+   so the panel is the page. */
+.not-invited {
+  max-width: 640px; margin: 40px auto; padding: 24px;
+  background: var(--bg-panel); border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.not-invited h2 { margin: 0 0 12px; font-size: 20px; }
+.not-invited p { margin: 0 0 12px; color: var(--text); line-height: 1.6; }
+.not-invited p:last-child { margin-bottom: 0; }
+
 /* Delete-all action row and its in-page confirmation: the question, the
    file tick box and the two answers live in one bordered panel above the
    grid — impossible to miss, and never a browser dialog. */
@@ -665,6 +702,52 @@ details.advanced > .help { margin-top: 10px; }
 /* No --warning token exists in any theme, so the caution line is muted text, */
 #models-note:not(:empty) { color: var(--text-muted); }
 #generate-reason { overflow-wrap: anywhere; }
+
+/* ---------- Admin (local listener only) ---------- */
+
+.admin-table {
+  width: 100%; border-collapse: collapse; margin-top: 12px;
+  font-size: 13px;
+}
+.admin-table caption { text-align: left; }
+.admin-table th, .admin-table td {
+  padding: 8px 10px; border-bottom: 1px solid var(--border-soft);
+  text-align: left; vertical-align: top;
+}
+.admin-table th {
+  font-size: 12px; font-weight: 600; color: var(--text-muted);
+  border-bottom-color: var(--border);
+}
+.admin-email { overflow-wrap: anywhere; }
+.admin-when, .admin-count { color: var(--text-muted); white-space: nowrap; }
+.admin-name {
+  width: 100%; min-width: 8ch; padding: 4px 6px; font-size: 13px;
+  background: var(--bg-raised); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+}
+/* A table cell wraps like text: each tick is an inline-flex label, so the
+   four permissions fill the column and wrap without a flex on the <td>. */
+.admin-perm {
+  display: inline-flex; align-items: center; gap: 5px; margin: 0 12px 4px 0;
+  font-weight: 400; white-space: nowrap;
+}
+.admin-perm input[type="checkbox"] { width: auto; margin: 0; }
+.admin-remove-btn { white-space: nowrap; }
+.admin-cap { margin-top: 10px; }
+.admin-add { margin-top: 24px; max-width: 520px; }
+.admin-add h3 { margin: 0 0 10px; font-size: 15px; }
+.admin-remove {
+  margin-top: 16px; padding: 14px 16px; max-width: 640px;
+}
+.admin-remove-question {
+  margin: 0 0 10px; font-weight: 600; line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.admin-status {
+  margin-top: 10px; padding: 8px 12px; border-radius: 6px; max-width: 640px;
+  border: 1px solid var(--ok-border); background: var(--bg-panel);
+  overflow-wrap: anywhere;
+}
 
 .back-link { color: var(--accent); text-decoration: none; display: inline-block;
              margin-top: 14px; }

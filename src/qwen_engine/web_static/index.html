@@ -28,8 +28,17 @@
     <a href="#create" id="nav-create" class="nav-link" aria-current="page">Create</a>
     <a href="#history" id="nav-history" class="nav-link">History</a>
     <a href="#settings" id="nav-settings" class="nav-link">Settings</a>
+    <!-- Local listener only: the status document reports admin: true there,
+         so a remote page never offers a tab whose writes would 404. -->
+    <a href="#admin" id="nav-admin" class="nav-link" hidden>Admin</a>
     <a href="#help" id="nav-help" class="nav-link nav-settings">Help</a>
   </nav>
+  <!-- Remote only: who is signed in, and the proxy's own sign-out. Both stay
+       hidden on the owner's page, which has no account to name. -->
+  <p class="identity" id="identity" hidden>
+    <span id="identity-name"></span>
+    <a class="identity-sign-out" id="sign-out" href="/oauth2/sign_out">Sign out</a>
+  </p>
   <div class="theme-picker">
     <label for="theme-select">Theme</label>
     <select id="theme-select" aria-describedby="theme-help">
@@ -113,10 +122,13 @@
             </div>
 
           <div class="actions job-actions">
+            <p class="history-cap-warning" id="history-cap-warning" hidden
+               role="status"></p>
             <button type="submit" id="generate-btn" class="btn-primary" disabled>
               Generate</button>
             <p class="disabled-reason" id="generate-reason" role="status"></p>
             <p id="job-feedback" class="job-feedback" role="status" aria-live="polite">Ready to submit a generation.</p>
+            <p class="job-queue" id="job-queue" role="status" hidden></p>
             <div id="job-progress-panel" hidden>
               <label for="job-progress" id="job-progress-label">Waiting for generation</label>
               <progress id="job-progress" max="1" aria-labelledby="job-progress-label"></progress>
@@ -127,7 +139,7 @@
           </div>
 
           <div class="settings-scroll" tabindex="0" role="region" aria-label="Generation settings">
-          <div class="field edit-mode-field">
+          <div class="field edit-mode-field" id="edit-mode-field">
             <div class="checkbox-field">
               <input id="edit-mode" type="checkbox" autocomplete="off"
                      aria-controls="reference-field"
@@ -168,8 +180,10 @@
           <fieldset class="field preset-field">
             <legend>Aspect preset</legend>
             <div id="presets-1k" class="preset-row" role="group" aria-label="1K resolution presets"></div>
-            <p class="help">2K resolution</p>
-            <div id="presets-2k" class="preset-row" role="group" aria-label="2K resolution presets"></div>
+            <div id="presets-2k-group">
+              <p class="help">2K resolution</p>
+              <div id="presets-2k" class="preset-row" role="group" aria-label="2K resolution presets"></div>
+            </div>
             <p class="help">Ratios are nominal; actual pixel sizes are shown.
               2K presets enable tiled decode; 1K presets restore untiled decode.
               Presets do not guarantee memory fit on your card.</p>
@@ -291,7 +305,7 @@
                 <label for="quant">Quantization</label>
                 <select id="quant" name="quant" aria-describedby="quant-help quant-error">
                   <option value="fp16" selected title="Uses more graphics-card memory to keep the model's original detail. Best starting point for maximum image quality when it fits.">fp16</option>
-                  <option value="q8" title="Compresses the model to use less graphics-card memory. Small image differences are possible. Looked similar to FP16 in our tests, but sampling was slightly slower. Experimental.">q8 — experimental</option>
+                  <option value="q8" id="quant-q8" title="Compresses the model to use less graphics-card memory. Small image differences are possible. Looked similar to FP16 in our tests, but sampling was slightly slower. Experimental.">q8 — experimental</option>
                 </select>
                 <p id="quant-help" class="help" aria-live="polite">Uses more graphics-card memory to keep the model's original detail. Best starting point for maximum image quality when it fits.</p>
                 <p class="error" id="quant-error" aria-live="polite"></p>
@@ -476,7 +490,7 @@
         into your draft until you press Apply.</p>
       <fieldset class="settings-radios">
         <legend id="rewrite-group-t2i">Prompt enhance (text-to-image)</legend>
-        <label class="settings-radio" for="rewrite-t2i-pe">
+        <label class="settings-radio" id="rewrite-t2i-pe-option" for="rewrite-t2i-pe">
           <input type="radio" name="rewrite-t2i" id="rewrite-t2i-pe"
                  value="pe-llamacpp">
           <span id="rewrite-t2i-pe-label">Official enhancer (Q8, uses GPU)</span>
@@ -491,7 +505,7 @@
       </fieldset>
       <fieldset class="settings-radios">
         <legend id="rewrite-group-edit">Edit prompt enhance</legend>
-        <label class="settings-radio" for="rewrite-edit-pe">
+        <label class="settings-radio" id="rewrite-edit-pe-option" for="rewrite-edit-pe">
           <input type="radio" name="rewrite-edit" id="rewrite-edit-pe"
                  value="pe-llamacpp">
           <span id="rewrite-edit-pe-label">Official enhancer (Q8, uses GPU)</span>
@@ -530,7 +544,7 @@
             <p class="help" id="rewrite-timeout-help">How long one rewrite may
               take, 1-3600 seconds. Leave empty to keep the server's value.</p>
           </div>
-          <div class="settings-actions">
+          <div class="settings-actions settings-writes" id="rewrite-test-actions">
             <button type="button" id="rewrite-test" class="btn-secondary"
                     disabled>Test connection</button>
             <p class="help" id="rewrite-test-status" role="status"
@@ -550,14 +564,15 @@
         for a text draft, 20–50 s for an edit one, since it reads the reference
         too. It is unavailable while an image is generating; an image started
         during a rewrite waits for it.</p>
-      <div class="settings-actions">
+      <div class="settings-actions settings-writes" id="rewrite-save-actions">
         <button type="button" id="rewrite-save" class="btn-primary"
                 disabled>Save</button>
         <p class="help" id="rewrite-save-status" role="status"
            aria-live="polite"></p>
       </div>
-      <p class="error" id="rewrite-settings-error" aria-live="polite"></p>
-      <p class="help" id="rewrite-settings-note" role="status"></p>
+      <p class="error settings-writes" id="rewrite-settings-error"
+         aria-live="polite"></p>
+      <p class="help settings-writes" id="rewrite-settings-note" role="status"></p>
     </section>
 
     <!-- First-run model setup. The list below is the server's catalogue, whose
@@ -659,7 +674,7 @@
         </div>
       </div>
 
-      <div class="settings-actions">
+      <div class="settings-actions models-controls" id="models-controls">
         <button type="button" id="models-download" class="btn-primary"
                 disabled>Download</button>
         <button type="button" id="models-cancel" class="btn-secondary"
@@ -743,7 +758,101 @@
     <p><a class="back-link" href="#create">← Back to Create</a></p>
   </section>
 
+  <!-- ===================== Admin view (local listener only) =====================
+       Shown only when the status document says admin: true — a remote page
+       never sees this tab or its routes. Every write answers with the WHOLE
+       refreshed document and the table below is rebuilt from it, so a tick
+       shown here is a permission the server's file holds. The remove
+       confirmation lives in the page (never alert()/confirm()), and its tick
+       box is the only thing that authorizes deleting an account's files. -->
+  <section id="view-admin" class="view" hidden aria-labelledby="admin-heading">
+    <h2 id="admin-heading" tabindex="-1">Admin</h2>
+    <p class="help admin-shared">Accounts for this server. Changes are saved
+      as soon as you make them: a tick box writes through, and Add and Remove
+      take effect immediately.</p>
+
+    <table class="admin-table" id="admin-table">
+      <caption class="visually-hidden">Invited users</caption>
+      <thead>
+        <tr>
+          <th scope="col">Email</th>
+          <th scope="col">Name</th>
+          <th scope="col">First sign-in</th>
+          <th scope="col">Images</th>
+          <th scope="col">Queued or running</th>
+          <th scope="col">Permissions</th>
+          <th scope="col"><span class="visually-hidden">Remove</span></th>
+        </tr>
+      </thead>
+      <tbody id="admin-users-body"></tbody>
+    </table>
+    <p class="help admin-empty" id="admin-empty" hidden>No accounts are
+      invited yet. Add one below.</p>
+    <p class="help admin-cap" id="admin-cap"></p>
+
+    <section class="admin-add" aria-labelledby="admin-add-heading">
+      <h3 id="admin-add-heading">Add a user</h3>
+      <form id="admin-add-form" novalidate>
+        <div class="field">
+          <label for="admin-add-email">Email address</label>
+          <input type="email" id="admin-add-email" autocomplete="off"
+                 spellcheck="false" aria-describedby="admin-add-help admin-error">
+          <p class="help" id="admin-add-help">The address they sign in with.
+            A new account starts with q8 only; tick the other permissions
+            above afterwards.</p>
+        </div>
+        <div class="field">
+          <label for="admin-add-name">Display name (optional)</label>
+          <input type="text" id="admin-add-name" autocomplete="off"
+                 maxlength="80" aria-describedby="admin-name-help admin-error">
+          <p class="help" id="admin-name-help">Shown instead of the address in
+            their header. Leave empty to show the address.</p>
+        </div>
+        <div class="settings-actions">
+          <button type="submit" id="admin-add-submit" class="btn-primary"
+                  disabled>Add user</button>
+        </div>
+      </form>
+    </section>
+
+    <div class="admin-remove" id="admin-remove-confirm" role="group"
+         aria-labelledby="admin-remove-question" hidden>
+      <p class="admin-remove-question" id="admin-remove-question" tabindex="-1"></p>
+      <div class="field checkbox-field">
+        <input type="checkbox" id="admin-delete-data" autocomplete="off"
+               aria-describedby="admin-delete-data-help">
+        <label for="admin-delete-data">Also delete their images and references</label>
+      </div>
+      <p class="help" id="admin-delete-data-help">Unticked, their finished
+        images and uploaded references stay on disk but leave their history.
+        Ticked, both are deleted with the account.</p>
+      <div class="history-confirm-buttons">
+        <button type="button" id="admin-remove-yes" class="btn-danger">Remove
+          user</button>
+        <button type="button" id="admin-remove-cancel" class="btn-secondary">Cancel</button>
+      </div>
+    </div>
+    <p class="error" id="admin-error" aria-live="polite"></p>
+    <p class="admin-status" id="admin-status" role="status" aria-live="polite"
+       hidden></p>
+    <p><a class="back-link" href="#create">← Back to Create</a></p>
+  </section>
+
 </main>
+
+<!-- Remote only, and only for an account the owner has not invited: the
+     whole studio is replaced, because there is no subset of it this person
+     may use. Kept outside <main> so hiding the studio cannot leave a stray
+     heading behind. -->
+<section class="not-invited" id="not-invited" hidden
+         aria-labelledby="not-invited-heading">
+  <h2 id="not-invited-heading" tabindex="-1">This account isn't invited</h2>
+  <p>You are signed in as <span id="not-invited-email"></span>, but this
+    studio has no place for that account yet. Ask the owner to invite you,
+    then reload this page.</p>
+  <p><a class="identity-sign-out" id="not-invited-sign-out"
+        href="/oauth2/sign_out">Sign out</a></p>
+</section>
 
 <script src="app.js" defer></script>
 </body>

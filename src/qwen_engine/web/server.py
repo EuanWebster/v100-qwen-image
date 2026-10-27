@@ -54,6 +54,7 @@ import stat as stat_module
 import sys
 import threading
 from pathlib import Path
+from collections.abc import Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib import resources
@@ -147,6 +148,17 @@ _REFERENCE_ROUTE = re.compile(r"/api/v1/references/([0-9a-f]{64})(/thumb)?\Z")
 MODELS_ROUTE = api.MODELS_HREF
 MODELS_DOWNLOAD_ROUTE = api.MODELS_DOWNLOAD_HREF
 MODELS_CANCEL_ROUTE = api.MODELS_CANCEL_HREF
+
+#: Admin (contract C4). Five routes, no ids and no paths on the wire: an
+#: account is named by email inside a closed JSON envelope, and every write
+#: answers with the whole refreshed user list. They exist on a listener the
+#: operator controls; a listener that serves remote users refuses them with the
+#: ordinary "no such route", so nothing about them is discoverable there.
+ADMIN_USERS_ROUTE = "/api/v1/admin/users"
+ADMIN_ADD_ROUTE = "/api/v1/admin/users/add"
+ADMIN_REMOVE_ROUTE = "/api/v1/admin/users/remove"
+ADMIN_PERMISSIONS_ROUTE = "/api/v1/admin/users/permissions"
+ADMIN_DISPLAY_NAME_ROUTE = "/api/v1/admin/users/display-name"
 
 #: The one route that accepts raw bytes instead of JSON (design §2.4).
 _OCTET_STREAM_CONTENT_TYPE_RE = re.compile(r"application/octet-stream\Z",
@@ -333,6 +345,8 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "settings_get", target
         if target == MODELS_ROUTE:
             return "models", target
+        if target == ADMIN_USERS_ROUTE:
+            return "admin_users", target
         if target == JOBS_ROUTE:
             return "jobs", target
         match = _REFERENCE_ROUTE.fullmatch(target)
@@ -361,6 +375,14 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
             return "forget_all", target
         if target == REFERENCES_ROUTE:
             return "upload", REFERENCES_ROUTE
+        if target == ADMIN_ADD_ROUTE:
+            return "admin_add", target
+        if target == ADMIN_REMOVE_ROUTE:
+            return "admin_remove", target
+        if target == ADMIN_PERMISSIONS_ROUTE:
+            return "admin_permissions", target
+        if target == ADMIN_DISPLAY_NAME_ROUTE:
+            return "admin_display_name", target
     ref_match = _REFERENCE_ROUTE.fullmatch(target)
     if ref_match:
         raise ApiError(405, "method_not_allowed", "this route does not accept that method",
@@ -389,6 +411,15 @@ def resolve_route(method: str, target: str) -> tuple[str, str]:
     if target in (MODELS_DOWNLOAD_ROUTE, MODELS_CANCEL_ROUTE):
         raise ApiError(405, "method_not_allowed",
                        "a model download is started or stopped with POST",
+                       headers=(("Allow", "POST"),))
+    if target == ADMIN_USERS_ROUTE:
+        raise ApiError(405, "method_not_allowed",
+                       "the admin user list is read with GET",
+                       headers=(("Allow", "GET"),))
+    if target in (ADMIN_ADD_ROUTE, ADMIN_REMOVE_ROUTE, ADMIN_PERMISSIONS_ROUTE,
+                  ADMIN_DISPLAY_NAME_ROUTE):
+        raise ApiError(405, "method_not_allowed",
+                       "this admin action is sent with POST",
                        headers=(("Allow", "POST"),))
     known = set(STATIC_ROUTES) | {STATUS_ROUTE, PLAN_ROUTE, EXPORT_ROUTE,
                                   IMPORT_ROUTE, REWRITE_ROUTE, SETTINGS_ROUTE,
@@ -481,6 +512,93 @@ def load_static_assets() -> dict[str, bytes]:
 
 
 # ---------------------------------------------------------------------------
+# Server identity + the status document's listener-specific additions
+# ---------------------------------------------------------------------------
+
+
+def read_server_version() -> str:
+    """The git short sha of this checkout, or ``"unknown"``.
+
+    Read ONCE at startup (never per request: ``git`` in a request path would be
+    a subprocess per page load). Everything that could go wrong — no git, a
+    packaged copy, a detached read — collapses to the one word the offline page
+    can print. The value is bounded to a short sha's shape so it can never
+    carry anything but hex or a dash.
+    """
+    try:
+        import subprocess
+
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))),
+            capture_output=True, timeout=5, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "unknown"
+    if completed.returncode != 0:
+        return "unknown"
+    try:
+        text = completed.stdout.decode("ascii", "strict").strip()
+    except UnicodeDecodeError:
+        return "unknown"
+    if not text or len(text) > 40 or any(ch not in "0123456789abcdef" for ch in text):
+        return "unknown"
+    return text
+
+
+def status_payload(server: Any, handler: Any) -> dict[str, Any]:
+    """The status document for ONE request, with the listener's own additions.
+
+    ``api.status_response`` stays the pure, runtime-only document (its key set
+    is pinned by tests and by the plan gate). What a listener adds is decided
+    here, per request:
+
+    * ``admin`` — true only where the admin routes are actually served, so the
+      tab can never appear on a page whose writes would 404;
+    * ``server_version`` — the startup identity (C5), unless the runtime
+      already carries one;
+    * ``user`` — the remote identity block, supplied by the listener through
+      ``status_user(handler)`` (D2's hook). A local listener has no hook and
+      therefore no block, which is exactly "this page is the owner's".
+
+    Every field is added only when its source exists: a server without an
+    admin service reports no ``admin`` key at all rather than a false one.
+    """
+    payload = dict(api.status_response(server.web_runtime).payload)
+    if "server_version" not in payload:
+        version = getattr(server, "server_version", None)
+        payload["server_version"] = version if isinstance(version, str) \
+            else read_server_version()
+    service = getattr(server, "admin", None)
+    if "admin" not in payload:
+        payload["admin"] = service is not None and _admin_allowed_on(server,
+                                                                    handler)
+    if "user" not in payload:
+        hook = getattr(server, "status_user", None)
+        if callable(hook):
+            block = hook(handler)
+            if isinstance(block, Mapping):
+                payload["user"] = dict(block)
+    return payload
+
+
+def _admin_allowed_on(server: Any, handler: Any) -> bool:
+    """Whether THIS request may use the admin routes.
+
+    Absent means "yes": every pre-existing listener is the owner's own, and a
+    server built by the tests carries no attribute at all. A bool is honoured;
+    a callable is asked (D2's listener context can then decide per request).
+    """
+    flag = getattr(server, "admin_enabled", True)
+    if callable(flag):
+        try:
+            return bool(flag(handler))
+        except Exception:  # pragma: no cover - a hook must never 500 a page
+            return False
+    return bool(flag)
+
+
+# ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
 
@@ -495,6 +613,25 @@ class _Handler(BaseHTTPRequestHandler):
     # (the console only ever sees fixed startup/diagnostic lines).
     def log_message(self, fmt: str, *args: Any) -> None:  # pragma: no cover
         pass
+
+    def _admin_service(self) -> Any:
+        """The admin service for THIS request, or the ordinary "no such route".
+
+        Two independent gates, both of which must pass:
+
+        * the listener must carry one at all (``server.admin``), so a
+          planning-only or test server has no admin surface;
+        * this request must be allowed one (``server.admin_enabled``), which
+          D2's remote listener sets to false.
+
+        The refusal is the 404 a route that was never published gives — not a
+        403 — because "there is no admin page here" is the truth a remote user
+        is allowed to learn, and nothing more.
+        """
+        service = getattr(self.server, "admin", None)
+        if service is None or not _admin_allowed_on(self.server, self):
+            raise ApiError(404, "not_found", "no such route")
+        return service
 
     def _header_map(self) -> dict[str, list[str]]:
         out: dict[str, list[str]] = {}
@@ -715,7 +852,13 @@ class _Handler(BaseHTTPRequestHandler):
                 asset, ctype = STATIC_ROUTES[arg]
                 self._send(200, self.server.assets[asset], ctype)
             elif kind == "status":
-                self._send_api(api.status_response(self.server.web_runtime))
+                self._send_api(ApiResponse(200, status_payload(self.server, self)))
+            elif kind == "admin_users":
+                # Refused BEFORE any body/route work, and refused with the same
+                # answer a never-published route gives: on a listener that
+                # serves other people, the admin page does not exist.
+                service = self._admin_service()
+                self._send_api(service.list_response())
             elif kind == "settings_get":
                 self._send_api(settings_get_response(
                     getattr(self.server, "rewrite", None)))
@@ -754,6 +897,18 @@ class _Handler(BaseHTTPRequestHandler):
                     # Envelope + semantics are validated by the wire contract
                     # BEFORE the service sees the prompt.
                     self._send_api(service.submit(api.build_rewrite_request(body)))
+                    return
+                if kind.startswith("admin_"):
+                    # The service is resolved (and may refuse with the ordinary
+                    # 404) BEFORE one body byte is read: a listener that does
+                    # not serve the admin page never consumes an admin write.
+                    service = self._admin_service()
+                    length = int(headers["content-length"][0])
+                    body = self.rfile.read(length)
+                    if len(body) != length:
+                        self.send_error(400, "request body ended early")
+                        return
+                    self._send_api(service.post_response(kind, body))
                     return
                 length = int(headers["content-length"][0])
                 body = self.rfile.read(length)
@@ -908,6 +1063,12 @@ class _Server(HTTPServer):
     assets: dict[str, bytes]
     bound_ip: str
     bound_port: int
+    #: Set by ``main``: the checkout's short sha, the owner's admin service
+    #: (absent on a server without a cache dir) and whether THIS listener may
+    #: serve the admin routes.
+    server_version: str
+    admin: Any
+    admin_enabled: bool
 
     def __init__(self, addr_info, handler) -> None:
         self._queue: "queue.Queue[Any]" = queue.Queue(
@@ -1513,6 +1674,20 @@ def main(argv: list[str] | None = None) -> int:
     setup_service = _setup.ModelSetupService.for_paths(
         models_dir=paths["models_dir"], manifest_path=paths["manifest_path"])
 
+    # The owner's Admin page (C4) needs exactly one durable place for the
+    # allowlist: the cache directory the operator already gave this server.
+    # No cache dir means no admin page at all — a user store that could not be
+    # written would be a page whose writes vanish.
+    admin_service = None
+    users_path = (os.path.join(paths["cache_dir"], "users.json")
+                  if paths["cache_dir"] is not None else None)
+    if users_path is not None:
+        from qwen_engine.web import admin as _admin
+        from qwen_engine.users import UserStore
+
+        admin_service = _admin.AdminService(UserStore(users_path))
+    server_version = read_server_version()
+
     runtime = WebRuntime(**paths, manifest_summary=summary,
                          generation_enabled=args.enable_generation,
                          rewrite_block=rewrite.status_block(),
@@ -1577,6 +1752,17 @@ def main(argv: list[str] | None = None) -> int:
         listener.generation = httpd.generation
         listener.rewrite = rewrite
         listener.setup = setup_service
+        listener.server_version = server_version
+        if admin_service is not None:
+            # One service object, shared by every listener of this process, so
+            # the store has ONE lock. Whether a listener may SERVE the admin
+            # routes is the separate ``admin_enabled`` decision below.
+            admin_service.generation = httpd.generation
+            listener.admin = admin_service
+        # Local listeners are the owner's own, so the Admin tab is offered
+        # there. The remote listener (D2) sets this to False — or to a callable
+        # that decides per request — and then the routes answer 404.
+        listener.admin_enabled = True
         print(f"qwen-web listening on http://{listener.bound_ip}:{port}")
     mode = "generation enabled (serial jobs)" if httpd.generation else "planning only (no generation)"
     if rewrite.available:
