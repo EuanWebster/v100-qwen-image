@@ -29,6 +29,7 @@ from qwen_engine.core import GenerationResult
 from qwen_engine.web import api, rewrite_service as rs, server
 from qwen_engine.web import remote as remote_module
 from qwen_engine.web.generation import WebGeneration
+from qwen_engine.web.admin import AdminService
 from qwen_engine.web.server import RemoteSettings
 
 PNG = base64.b64decode(
@@ -178,7 +179,7 @@ def remote(users, runtime, generation):
 
 
 def drive(raw: bytes, *, remote=None, runtime=None, generation=None,
-          rewrite=None, assets=None) -> str:
+          rewrite=None, assets=None, admin=None) -> str:
     """Handle one raw request; ``remote=None`` is the LOCAL port."""
     handler = server._Handler.__new__(server._Handler)
     handler.rfile = io.BytesIO(raw)
@@ -195,7 +196,7 @@ def drive(raw: bytes, *, remote=None, runtime=None, generation=None,
         bound_ip="127.0.0.1", bound_port=8765,
         assets=assets if assets is not None else {"app.js": b"console.log('x')"},
         web_runtime=runtime, rewrite=rewrite, generation=generation,
-        remote=remote)
+        remote=remote, admin=admin)
     handler.close_connection = False
     handler.request_version = "HTTP/1.1"
     handler.address_string = lambda: "127.0.0.1"
@@ -281,7 +282,9 @@ def test_identity_headers_are_ignored_on_the_local_port(runtime):
     out = drive(request("/api/v1/status", headers=headers), runtime=runtime)
     assert " 200 " in status_line(out)
     payload = body_of(out)
-    assert payload["admin"] is True
+    # This bare server has no admin service, so it offers no Admin tab; the
+    # point here is that the claimed identity produced no user block.
+    assert payload["admin"] is False
     assert "user" not in payload
 
 
@@ -848,13 +851,22 @@ def test_the_status_history_count_is_this_accounts_finished_jobs(remote, generat
     assert payload["user"]["history"]["count"] == 2
 
 
-def test_the_local_status_document_reports_admin_and_no_user_block(runtime):
+def test_the_local_status_document_reports_admin_and_no_user_block(runtime, users):
     payload = body_of(drive(request("/api/v1/status",
                                     headers=["Host: 127.0.0.1:8765"]),
-                            runtime=runtime))
+                            runtime=runtime, admin=AdminService(users)))
     assert payload["admin"] is True
     assert "user" not in payload
     assert isinstance(payload["server_version"], str)
+
+
+def test_the_admin_routes_do_not_exist_on_the_remote_port(remote, users):
+    # Even a remote listener that was (wrongly) handed the admin service must
+    # answer the admin page with the same 404 as an unknown route.
+    out = drive(request("/api/v1/admin/users", headers=remote_headers(ALICE)),
+                remote=remote, admin=AdminService(users))
+    assert " 404 " in status_line(out)
+    assert body_of(out)["code"] == "not_found"
 
 
 def test_server_version_is_a_short_sha_or_unknown():
