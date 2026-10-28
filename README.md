@@ -201,7 +201,7 @@ it step by step. Every setting is an environment variable read by
 ### 2. Install
 
 ```bash
-git clone https://github.com/EuanWebster/v100-qwen-image.git
+git clone https://github.com/The-Deflection-Engine/v100-qwen-image.git
 cd v100-qwen-image
 uv venv --python 3.13 .venv
 uv pip sync --python .venv/bin/python --index-strategy unsafe-best-match requirements.lock
