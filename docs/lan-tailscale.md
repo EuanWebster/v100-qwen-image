@@ -9,11 +9,13 @@ Run from the project directory:
 ```
 
 The script selects the project virtual environment and starts real generation
-on all three explicit IPv4 addresses, sharing one serial job queue:
+on up to three explicit IPv4 addresses, sharing one serial job queue:
 
-- Localhost: http://127.0.0.1:8765
-- LAN: http://192.168.68.103:8765
-- Tailscale: http://100.98.64.62:8765
+- Localhost: http://127.0.0.1:8765, always.
+- LAN: the private IPv4 address of the default route (`ip -4 route get`), if
+  the machine has one. On the development PC, http://192.168.68.103:8765.
+- Tailscale: `tailscale ip -4`, if Tailscale is up. On the development PC,
+  http://100.98.64.62:8765.
 
 The script also works when invoked by absolute path from another directory.
 Stop it with Ctrl+C. It runs in the foreground; no login/boot autostart or
@@ -28,9 +30,10 @@ QWEN_WEB_PORT=8766 ./start-web.sh
 QWEN_LAN_HOST=192.168.68.104 ./start-web.sh
 ```
 
-`QWEN_TAILSCALE_HOST` can override the Tailscale IP. If an address changes or
-its interface is down, update it before starting: binding any requested address
-must succeed, otherwise startup closes earlier listeners and refuses. There is
+`QWEN_TAILSCALE_HOST` can override the Tailscale IP; set either variable to
+`""` to leave that network out. Binding any requested address must succeed,
+otherwise startup closes earlier listeners and refuses, which is why only
+addresses found on this machine are passed by default. There is
 no wildcard fallback. The executable bit is tracked in git.
 
 The underlying server now accepts repeated `--host` options for explicit IPv4
